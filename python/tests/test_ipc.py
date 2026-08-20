@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+
+
+def _sock_path() -> str:
+    fd, p = tempfile.mkstemp(suffix=".sock", prefix="fe-ipc-py-")
+    os.close(fd)
+    os.unlink(p)
+    return p
+
+
+def _wait_sock(path: str, timeout: float = 10.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"socket 未出现: {path}")
+
+
+def _rpc(path: str, req: dict) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(15.0)
+        s.connect(path)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    return json.loads(buf.decode("utf-8").strip())
+
+
+@pytest.fixture
+def server():
+    sock = _sock_path()
+    env = dict(os.environ, FUSION_EXECUTOR_SOCK=sock)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_sock(sock)
+        yield sock
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if os.path.exists(sock):
+            os.unlink(sock)
+
+
+def test_health_over_uds(server: str):
+    resp = _rpc(server, {"jsonrpc": "2.0", "id": 1, "method": "executor.health", "params": {}})
+    assert resp["jsonrpc"] == "2.0"
+    assert resp["id"] == 1
+    assert resp["result"]["ok"] is True
+    assert resp["result"]["ax_trusted"] is True
+    assert "version" in resp["result"]
+
+
+def test_execute_echo_over_uds(server: str):
+    resp = _rpc(
+        server,
+        {"jsonrpc": "2.0", "id": 2, "method": "executor.execute", "params": {"command": "echo hi"}},
+    )
+    r = resp["result"]
+    assert r["exit_code"] == 0
+    assert r["stdout"] == "hi\n"
+
+
+def test_execute_diagnostics_over_uds(server: str):
+    resp = _rpc(
+        server,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "executor.execute",
+            "params": {"command": "python3 -c \"raise ValueError('boom')\""},
+        },
+    )
+    r = resp["result"]
+    assert r["exit_code"] != 0
+    assert r["diagnostics"]["error_type"] == "ValueError"
+
+
+def test_unknown_method_over_uds(server: str):
+    resp = _rpc(server, {"jsonrpc": "2.0", "id": 4, "method": "nope", "params": {}})
+    assert resp["error"]["code"] == -32601
+
+
+def test_snapshot_rollback_over_uds(server: str, tmp_path: Path):
+    d = tmp_path / "repo"
+    d.mkdir()
+
+    def g(*a):
+        subprocess.run(["git", "-C", str(d), *a], check=True, capture_output=True)
+
+    g("init", "-q")
+    g("config", "user.email", "t@t")
+    g("config", "user.name", "t")
+    (d / "app.py").write_text("print(1)\n")
+    g("add", ".")
+    g("commit", "-q", "-m", "base")
+    (d / "app.py").write_text("BROKEN\n")
+
+    snap = _rpc(
+        server,
+        {"jsonrpc": "2.0", "id": 5, "method": "executor.snapshot_create", "params": {"cwd": str(d)}},
+    )
+    sid = snap["result"]["snapshot_id"]
+    assert sid, "快照 id 非空"
+
+    (d / "app.py").write_text("WORSE\n")
+    rb = _rpc(
+        server,
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "executor.rollback",
+            "params": {"snapshot_id": sid, "cwd": str(d)},
+        },
+    )
+    assert rb["result"]["ok"] is True
+    assert (d / "app.py").read_text() == "BROKEN\n"
+
+
+def test_execute_stream_chunks_then_done_over_uds(server: str):
+    req = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "executor.execute_stream",
+        "params": {"command": "echo hi", "enable_rollback_snapshot": False},
+    }
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(15.0)
+        s.connect(server)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        buf = b""
+        frames: list[dict] = []
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                frame = json.loads(line.decode("utf-8"))
+                frames.append(frame)
+                if frame.get("result", {}).get("type") == "done":
+                    break
+            if frames and frames[-1].get("result", {}).get("type") == "done":
+                break
+    assert frames, "应至少收到一帧"
+    types = [f["result"]["type"] for f in frames]
+    assert types[-1] == "done"
+    assert all(f["id"] == 7 for f in frames), "所有帧共用 id"
+    done = frames[-1]["result"]["result"]
+    assert done["exit_code"] == 0
+    assert "hi" in done["stdout"]

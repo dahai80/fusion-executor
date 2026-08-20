@@ -1,0 +1,92 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fe-core",
+    "crates/fe-security",
+    "crates/fe-sandbox",
+    "crates/fe-gui",
+    "crates/fe-rollback",
+    "crates/fe-diagnostics",
+    "crates/fe-ipc",
+    "crates/fe-pyo3",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "Apache-2.0"
+authors = ["Fusion-MLX Team"]
+
+[workspace.dependencies]
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# 异步运行时
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util", "time", "process", "net"] }
+futures = "0.3"
+
+# 日志追踪
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 通用工具
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+shell-words = "1"
+
+# PTY / 进程
+portable-pty = "0.8"
+nix = { version = "0.27", features = ["process", "signal", "resource", "term"] }
+libc = "0.2"
+
+# macOS GUI (fe-gui)
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+core-graphics = "0.24"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+accessibility = "0.2"
+accessibility-sys = "0.2"
+# 截图 RGBA → PNG → base64
+png = "0.18"
+base64 = "0.23"
+
+# 诊断 (fe-diagnostics)
+tree-sitter = "0.25"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
+
+# Python 绑定 (fe-pyo3) — 0.29 支持 Python 3.14
+# extension-module 由 maturin 通过 pyproject features=["pyo3/extension-module"] 注入;
+# 此处不默认开 — 否则 cargo test 无法链接 libpython (符号运行时由宿主解析)
+pyo3 = { version = "0.29" }
+
+# 基准测试 (P5 dev-dep)
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# 内部 crate
+fe-core = { path = "crates/fe-core" }
+fe-security = { path = "crates/fe-security" }
+fe-sandbox = { path = "crates/fe-sandbox" }
+fe-gui = { path = "crates/fe-gui" }
+fe-rollback = { path = "crates/fe-rollback" }
+fe-diagnostics = { path = "crates/fe-diagnostics" }
+fe-ipc = { path = "crates/fe-ipc" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

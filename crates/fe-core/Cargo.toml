@@ -1,0 +1,32 @@
+[package]
+name = "fe-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+fe-security.workspace = true
+fe-sandbox.workspace = true
+fe-rollback.workspace = true
+fe-diagnostics.workspace = true
+fe-gui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "init"
+harness = false

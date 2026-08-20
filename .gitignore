@@ -1,0 +1,39 @@
+# Rust
+/target
+crates/*/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.python-version
+
+# pytest / coverage / ruff / mypy caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+
+# maturin native outputs
+*.so
+*.dylib
+*.abi3.h
+*.abi3.so
+
+# macOS
+.DS_Store
+
+# editor
+.idea/
+.vscode/
+*.swp
+
+# fusion-executor runtime
+/tmp/

@@ -1,0 +1,44 @@
+[project]
+name = "fusion-executor"
+version = "0.1.0"
+description = "Fusion-Executor — controlled execution sandbox + macOS OS-level control hub"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Fusion-MLX Team" }]
+dependencies = ["pydantic>=2.0.0"]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "pytest-mock>=3.14.0",
+]
+
+[project.scripts]
+fusion-executor = "fusion_executor.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["python/tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fusion_executor"]
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "crates/fe-pyo3/Cargo.toml"
+python-source = "python"
+module-name = "fusion_executor._native"
+features = ["pyo3/extension-module"]
