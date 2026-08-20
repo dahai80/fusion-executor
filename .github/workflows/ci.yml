@@ -60,19 +60,29 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install maturin + test deps
+      - name: Create venv + install deps
         run: |
+          python -m venv .venv
+          source .venv/bin/activate
           python -m pip install --upgrade pip
           pip install maturin pytest pytest-asyncio pytest-cov ruff
 
       - name: Build native extension (editable)
-        run: maturin develop --release
+        run: |
+          source .venv/bin/activate
+          maturin develop --release
 
       - name: ruff check
-        run: ruff check .
+        run: |
+          source .venv/bin/activate
+          ruff check .
 
       - name: ruff format check
-        run: ruff format . --check
+        run: |
+          source .venv/bin/activate
+          ruff format . --check
 
       - name: pytest
-        run: pytest python/tests -v
+        run: |
+          source .venv/bin/activate
+          pytest python/tests -v
