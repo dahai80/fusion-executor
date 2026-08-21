@@ -3,7 +3,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 
-from .models import Diagnostics, ExecutionResult, GuiResult
+from .models import (
+    Diagnostics,
+    EditResult,
+    ExecutionResult,
+    GlobEntry,
+    GrepMatch,
+    GuiResult,
+)
 
 logger = logging.getLogger("fusion_executor")
 
@@ -27,9 +34,10 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
     ) -> ExecutionResult:
-        logger.debug("run command=%r timeout=%s cwd=%s", command, timeout, cwd)
+        logger.debug("run command=%r timeout=%s cwd=%s task_id=%s", command, timeout, cwd, task_id)
         native = self._native.execute_sync(
             command,
+            task_id,
             cwd,
             timeout,
             env_vars,
@@ -49,6 +57,9 @@ class FusionSandboxExecutor:
             exit_code=native.exit_code,
             stdout=native.stdout,
             stderr=native.stderr,
+            task_id=native.task_id,
+            command=native.command,
+            duration_sec=native.duration_sec,
             timed_out=native.timed_out,
             blocked_by_security=native.blocked_by_security,
             security_reason=native.security_reason,
@@ -56,11 +67,12 @@ class FusionSandboxExecutor:
             diagnostics=diag,
         )
         logger.info(
-            "run done exit=%s blocked=%s timed_out=%s diag=%s",
+            "run done exit=%s blocked=%s timed_out=%s diag=%s dur=%.3fs",
             result.exit_code,
             result.blocked_by_security,
             result.timed_out,
             result.diagnostics.error_type if result.diagnostics else None,
+            result.duration_sec,
         )
         return result
 
@@ -77,9 +89,10 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
     ) -> Iterator[str | ExecutionResult]:
-        logger.debug("run_streaming command=%r timeout=%s cwd=%s", command, timeout, cwd)
+        logger.debug("run_streaming command=%r timeout=%s cwd=%s task_id=%s", command, timeout, cwd, task_id)
         it = self._native.execute_streaming(
             command,
+            task_id,
             cwd,
             timeout,
             env_vars,
@@ -119,6 +132,9 @@ class FusionSandboxExecutor:
             exit_code=payload.get("exit_code", -1),
             stdout=payload.get("stdout", ""),
             stderr=payload.get("stderr", ""),
+            task_id=payload.get("task_id"),
+            command=payload.get("command"),
+            duration_sec=payload.get("duration_sec", 0.0),
             timed_out=payload.get("timed_out", False),
             blocked_by_security=payload.get("blocked_by_security", False),
             security_reason=payload.get("security_reason"),
@@ -135,6 +151,76 @@ class FusionSandboxExecutor:
     def snapshot_create(self, cwd: str) -> str:
         logger.info("snapshot_create cwd=%s", cwd)
         return self._native.snapshot_create(cwd)
+
+    def file_edit(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        *,
+        cwd: str | None = None,
+    ) -> EditResult:
+        logger.debug("file_edit path=%r cwd=%s", path, cwd)
+        native = self._native.file_edit(path, old_string, new_string, cwd)
+        result = EditResult(
+            ok=native.ok,
+            path=native.path,
+            error=native.error,
+            matches=native.matches,
+        )
+        logger.info("file_edit done ok=%s matches=%s path=%s", result.ok, result.matches, result.path)
+        return result
+
+    def glob(self, pattern: str, *, cwd: str | None = None) -> list[GlobEntry]:
+        logger.debug("glob pattern=%r cwd=%s", pattern, cwd)
+        native_entries = self._native.glob(pattern, cwd)
+        out = [GlobEntry(path=e.path, is_dir=e.is_dir) for e in native_entries]
+        logger.info("glob done count=%s", len(out))
+        return out
+
+    def grep(
+        self,
+        pattern: str,
+        paths: list[str],
+        *,
+        cwd: str | None = None,
+    ) -> list[GrepMatch]:
+        logger.debug("grep pattern=%r paths=%s cwd=%s", pattern, paths, cwd)
+        native_matches = self._native.grep(pattern, paths, cwd)
+        out = [GrepMatch(path=m.path, line_number=m.line_number, content=m.content) for m in native_matches]
+        logger.info("grep done matches=%s", len(out))
+        return out
+
+    def apply_patch(self, diff: str, *, cwd: str | None = None) -> EditResult:
+        logger.debug("apply_patch cwd=%s diff_len=%s", cwd, len(diff))
+        native = self._native.apply_patch(diff, cwd)
+        result = EditResult(
+            ok=native.ok,
+            path=native.path,
+            error=native.error,
+            matches=native.matches,
+        )
+        logger.info("apply_patch done ok=%s matches=%s path=%s", result.ok, result.matches, result.path)
+        return result
+
+    def replace_function(
+        self,
+        path: str,
+        fn_name: str,
+        new_body: str,
+        *,
+        cwd: str | None = None,
+    ) -> EditResult:
+        logger.debug("replace_function path=%r fn=%s cwd=%s", path, fn_name, cwd)
+        native = self._native.replace_function(path, fn_name, new_body, cwd)
+        result = EditResult(
+            ok=native.ok,
+            path=native.path,
+            error=native.error,
+            matches=native.matches,
+        )
+        logger.info("replace_function done ok=%s fn=%s", result.ok, fn_name)
+        return result
 
     def gui_action(self, action: dict) -> GuiResult:
         logger.debug("gui_action action=%s", action)

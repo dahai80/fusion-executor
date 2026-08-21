@@ -6,7 +6,13 @@ import tempfile
 
 import pytest
 
-from fusion_executor import ExecutionResult, FusionSandboxExecutor
+from fusion_executor import (
+    EditResult,
+    ExecutionResult,
+    FusionSandboxExecutor,
+    GlobEntry,
+    GrepMatch,
+)
 
 
 @pytest.fixture(scope="module")
@@ -108,6 +114,45 @@ def test_snapshot_non_repo_empty(executor: FusionSandboxExecutor):
         shutil.rmtree(d, ignore_errors=True)
 
 
+@pytest.fixture
+def uds_server():
+    import sys
+    import time
+
+    fd, sp = tempfile.mkstemp(suffix=".sock", prefix="fe-tools-uds-")
+    os.close(fd)
+    os.unlink(sp)
+    env = dict(os.environ, FUSION_EXECUTOR_SOCK=sp)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if os.path.exists(sp):
+                break
+            time.sleep(0.05)
+        else:
+            raise TimeoutError(f"socket 未出现: {sp}")
+        yield sp
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if os.path.exists(sp):
+            os.unlink(sp)
+
+
 def _consume_stream(executor: FusionSandboxExecutor, command: str, **kw):
     chunks: list[str] = []
     result = None
@@ -149,3 +194,153 @@ def test_run_streaming_diagnostics_on_error(executor: FusionSandboxExecutor):
     assert result.exit_code != 0
     assert result.diagnostics is not None
     assert result.diagnostics.error_type == "ValueError"
+
+
+def test_run_populates_schema_fields(executor: FusionSandboxExecutor):
+    result = executor.run("echo hi", task_id="task-abc")
+    assert result.task_id == "task-abc"
+    assert result.command == "echo hi"
+    assert result.duration_sec > 0.0
+
+
+def test_run_blocked_preserves_task_id_and_command(executor: FusionSandboxExecutor):
+    result = executor.run("rm -rf /", task_id="blocked-1")
+    assert result.task_id == "blocked-1"
+    assert result.command == "rm -rf /"
+    assert result.blocked_by_security
+    assert result.duration_sec == 0.0
+
+
+def test_run_streaming_done_has_schema_fields(executor: FusionSandboxExecutor):
+    _chunks, result = _consume_stream(executor, "echo hi", task_id="stream-1")
+    assert result is not None
+    assert result.task_id == "stream-1"
+    assert result.command == "echo hi"
+    assert result.duration_sec > 0.0
+
+
+# ── 原生文件工具 (fe-tools) ──
+
+
+def test_file_edit_unique_replace(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "app.py"
+    fp.write_text("x = 1\ny = 2\n")
+    r = executor.file_edit("app.py", "x = 1", "x = 99", cwd=str(tmp_path))
+    assert isinstance(r, EditResult)
+    assert r.ok
+    assert r.matches == 1
+    assert fp.read_text() == "x = 99\ny = 2\n"
+
+
+def test_file_edit_ambiguous_rejected(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "a.txt"
+    fp.write_text("dup\ndup\n")
+    r = executor.file_edit("a.txt", "dup", "one", cwd=str(tmp_path))
+    assert not r.ok
+    assert r.matches == 2
+    assert fp.read_text() == "dup\ndup\n"
+
+
+def test_glob_python_files(executor: FusionSandboxExecutor, tmp_path):
+    (tmp_path / "a.py").write_text("")
+    (tmp_path / "b.py").write_text("")
+    (tmp_path / "c.txt").write_text("")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "d.py").write_text("")
+    entries = executor.glob("**/*.py", cwd=str(tmp_path))
+    paths = sorted(e.path for e in entries)
+    assert paths == ["a.py", "b.py", "sub/d.py"]
+    assert all(isinstance(e, GlobEntry) for e in entries)
+
+
+def test_grep_matches_lines(executor: FusionSandboxExecutor, tmp_path):
+    (tmp_path / "a.py").write_text("import os\nx = 1\nimport sys\n")
+    ms = executor.grep(r"^import\s", ["a.py"], cwd=str(tmp_path))
+    assert len(ms) == 2
+    assert all(isinstance(m, GrepMatch) for m in ms)
+    assert ms[0].line_number == 1
+    assert ms[0].content == "import os"
+    assert ms[1].line_number == 3
+
+
+def test_apply_patch_simple(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "app.py"
+    fp.write_text("line1\nline2\nline3\n")
+    diff = "--- a/app.py\n+++ b/app.py\n@@ -1,3 +1,4 @@\n line1\n line2\n+line2b\n line3\n"
+    r = executor.apply_patch(diff, cwd=str(tmp_path))
+    assert r.ok
+    assert fp.read_text() == "line1\nline2\nline2b\nline3\n"
+
+
+def test_replace_function_python(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "mod.py"
+    fp.write_text("def old():\n    return 1\n\ndef keep():\n    return 2\n")
+    r = executor.replace_function("mod.py", "old", "def old():\n    return 99\n", cwd=str(tmp_path))
+    assert r.ok
+    after = fp.read_text()
+    assert "return 99" in after
+    assert "return 2" in after
+    assert "return 1" not in after
+
+
+def test_replace_function_not_found(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "mod.py"
+    fp.write_text("def keep():\n    return 2\n")
+    r = executor.replace_function("mod.py", "ghost", "def ghost():\n    pass\n", cwd=str(tmp_path))
+    assert not r.ok
+    assert "未找到" in r.error
+
+
+def _rpc_once(sock: str, req: dict) -> dict:
+    import json
+    import socket
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(15.0)
+        s.connect(sock)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    return json.loads(buf.decode("utf-8").strip())
+
+
+def test_file_edit_over_uds_roundtrip(uds_server: str, tmp_path):
+    fp = tmp_path / "app.py"
+    fp.write_text("hello\n")
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "executor.file_edit",
+            "params": {
+                "path": "app.py",
+                "old_string": "hello",
+                "new_string": "world",
+                "cwd": str(tmp_path),
+            },
+        },
+    )
+    assert resp["result"]["ok"] is True
+    assert resp["result"]["matches"] == 1
+    assert fp.read_text() == "world\n"
+
+
+def test_glob_over_uds_roundtrip(uds_server: str, tmp_path):
+    (tmp_path / "a.py").write_text("")
+    (tmp_path / "b.py").write_text("")
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "executor.glob",
+            "params": {"pattern": "*.py", "cwd": str(tmp_path)},
+        },
+    )
+    paths = sorted(e["path"] for e in resp["result"])
+    assert paths == ["a.py", "b.py"]

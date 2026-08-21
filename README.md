@@ -4,11 +4,11 @@
 
 Rust 核心 + PyO3/maturin Python 绑定。Fusion monorepo 第一个 maturin/PyO3 工程 (其余 23 个 Python 工程用 setuptools)。
 
-**状态: v1.2 完成 (P1-P5 + KeyPress + 流式 + 修饰键 + 截图尺寸)** — 安全 + 沙箱 + 诊断切片 + Git 回滚 + UDS JSON-RPC IPC 服务 + macOS GUI (AXUIElement + CoreGraphics + CGEvent 按键合成 + 修饰键组合) + 实时 stdio 流式传输 (NDJSON chunk/done) + 截图 width/height metadata + 加固 (criterion 基准 + 覆盖率 95%)。81 Rust + 40 Python 测试全绿。
+**状态: v1.3 完成 (P1-P5 + KeyPress + 流式 + 修饰键 + 截图尺寸 + 原生文件工具 + 外科补丁引擎)** — 安全 + 沙箱 + 诊断切片 + Git 回滚 + UDS JSON-RPC IPC 服务 + macOS GUI (AXUIElement + CoreGraphics + CGEvent 按键合成 + 修饰键组合) + 实时 stdio 流式传输 (NDJSON chunk/done) + 截图 width/height metadata + 原生文件工具 (file_edit/glob/grep 本地化替代 Claude SDK FileEdit/Glob/Grep) + 外科补丁引擎 (Unified Diff apply + 函数级替换, 禁全文件重写) + Data Schema §4.1 补齐 (task_id/command/duration_sec) + 加固 (criterion 基准 + 覆盖率 95%)。94 Rust + 52 Python 测试全绿。
 
 ## 架构
 
-8-crate Cargo workspace (resolver 2), 一个 PyO3 绑定 crate 由 maturin 构建。
+9-crate Cargo workspace (resolver 2), 一个 PyO3 绑定 crate 由 maturin 构建。
 
 ```
 fusion-executor/
@@ -22,6 +22,7 @@ fusion-executor/
 │   ├── fe-rollback/        # git 快照/回滚 (P2)
 │   ├── fe-diagnostics/     # Traceback 正则 + tree-sitter 切片 (P2)
 │   ├── fe-ipc/             # UDS JSON-RPC 2.0 服务 (P3)
+│   ├── fe-tools/           # 原生文件工具: file_edit/glob/grep + 补丁引擎 (v1.3)
 │   └── fe-pyo3/            # PyO3 绑定; maturin target → fusion_executor._native
 ├── python/
 │   └── fusion_executor/    # Pydantic v2 模型 + FusionSandboxExecutor 薄封装
@@ -116,7 +117,35 @@ r = await ex.run_async("echo hi", task_id="t1", cwd="/tmp", timeout=30.0)
 
 `run` 签名: `run(command, *, task_id=None, cwd=None, timeout=30.0, env_vars=None, enable_rollback_snapshot=True) -> ExecutionResult`。
 
-`ExecutionResult` 字段: `exit_code, stdout, stderr, timed_out, blocked_by_security, security_reason, snapshot_id, diagnostics`。
+`ExecutionResult` 字段: `exit_code, stdout, stderr, task_id, command, duration_sec, timed_out, blocked_by_security, security_reason, snapshot_id, diagnostics`。
+
+### 原生文件工具 + 外科补丁引擎 (v1.3)
+
+替代 Claude SDK FileEdit/Glob/Grep — 原生 Rust 实现, 经 fe-security 路径守卫 (拒绝逃逸 cwd / 越敏感目录), 原子写 (`.fe-tmp-{pid}` + rename)。
+
+```python
+from fusion_executor import FusionSandboxExecutor, EditResult, GlobEntry, GrepMatch
+
+ex = FusionSandboxExecutor()
+
+# file_edit — 唯一匹配精确替换 (>1 匹配拒绝, 避免误改)
+r: EditResult = ex.file_edit("app.py", "x = 1", "x = 99", cwd="/repo")
+assert r.ok and r.matches == 1
+
+# glob — 通配符匹配, 返回相对 cwd 路径
+entries: list[GlobEntry] = ex.glob("**/*.py", cwd="/repo")
+
+# grep — 正则搜文件/目录 (递归, 跳二进制, 1000 命中上限)
+hits: list[GrepMatch] = ex.grep(r"^import\s", ["app.py"], cwd="/repo")
+
+# apply_patch — Unified Diff 应用 (diffy); 禁全文件重写 (new_range 全删 → 拒绝)
+r = ex.apply_patch("--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,2 @@\n-x\n+x\n+y\n", cwd="/repo")
+
+# replace_function — 函数级替换 (tree-sitter AST 定位, py/js/ts/rs); 无语法 → 正则兜底
+r = ex.replace_function("mod.py", "old_fn", "def old_fn():\n    return 99\n", cwd="/repo")
+```
+
+`EditResult{ok, path, error, matches}`; `GlobEntry{path, is_dir}`; `GrepMatch{path, line_number, content}`。replace_function 找不到函数 → `ok=False, error="未找到函数 ..."`。
 
 ### 实时 stdio 流式传输 (v1.2)
 
@@ -148,7 +177,7 @@ python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecu
 # Socket: /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK)
 ```
 
-协议: 换行分隔 JSON-RPC 2.0, 错误码 -32700/-32600/-32601/-32603 + 扩展 -32010(安全)/-32011(超时)/-32012(回滚)/-32013(AX)。方法 `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`shutdown`。
+协议: 换行分隔 JSON-RPC 2.0, 错误码 -32700/-32600/-32601/-32603 + 扩展 -32010(安全)/-32011(超时)/-32012(回滚)/-32013(AX)。方法 `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`/`shutdown`。
 
 `executor.execute_stream` 流式: 多帧 (chunk/done) 共用同一 id, 换行分隔逐帧写出 —
 - chunk: `{"jsonrpc":"2.0","id":id,"result":{"type":"chunk","data":"..."}}`
@@ -202,4 +231,12 @@ fusion-code TS 客户端 sketch 见 `docs/ipc-client-typescript.md`; fusion-stud
   - 截图尺寸 metadata: `GuiResult` 加 `screenshot_width`/`screenshot_height` (u32, PNG 像素); fe-gui 从 `CGImageRef` 宽高填充
   - +12 Rust 测试 (fe-core execute_streaming 4: echo/blocked/timeout/diagnostics; fe-ipc 2: stream chunks/done over UDS, blocked single frame) + 5 Python 测试 (streaming echo/blocked/timeout/diagnostics, UDS stream)
   - 退出闸门: 81 Rust + 40 Python 测试全绿; clippy/fmt/ruff 净; maturin 构建
+- **v1.3 — Data Schema 补齐 + 原生文件工具 + 外科补丁引擎** ✅ 完成
+  - Data Schema §4.1 补齐 (Gap #1): `ExecutionResult` 加 `task_id`/`command`/`duration_sec` 字段, 4 层贯穿 (fe-core serde struct → fe-pyo3 `NativeExecutionResult` → Python `ExecutionResult` Pydantic → fe-ipc done 帧回填)。`blocked_with` 带回 task_id/command; 拦截结果 `duration_sec=0.0`
+  - fe-tools 新 crate (Gap #2): `file_edit` (唯一匹配精确替换, >1 拒绝, 原子写) / `glob` (通配符, 相对 cwd 路径, 规范化 base 修相对路径 bug) / `grep` (正则, 递归 walkdir, 跳二进制, 1000 上限)。依赖 fe-security `validate_cwd` 路径守卫 (拒逃逸 cwd / 越敏感目录)
+  - 外科补丁引擎 (Gap #3, fe-tools): `apply_patch` (diffy Unified Diff apply; 全文件重写启发式 `new_range.start==0 && end==0` → 拒绝; target 从 `patch.modified()`/`original()` 取 `a/`/`b/` 前缀) + `replace_function` (tree-sitter AST 定位函数节点 — 栈式前序遍历修 tree-sitter 0.25 `Node::children(&mut cursor)` 借用问题, 无 `descendants()`; py/js/ts/tsx/rs 语法, 无则正则兜底; 字节切片替换 `[..span.start]+new_body+[span.end..]`)
+  - 4 层接线: fe-core `tools: Tools` 字段 + 5 wrapper 方法 (`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`); fe-ipc `executor.file_edit`/`glob`/`grep`/`apply_patch`/`replace_function` 5 arm; fe-pyo3 `NativeEditResult`/`NativeGlobEntry`/`NativeGrepMatch` pyclass + 5 `#[pymethods]`; Python `EditResult`/`GlobEntry`/`GrepMatch` Pydantic + `FusionSandboxExecutor` 5 方法
+  - clippy 修 `ExecutionStreamEvent::Done(ExecutionResult)` → `Done(Box<ExecutionResult>)` (large_enum_variant, Done 264B vs Chunk 24B; serde 对 Box 透明, 序列化不变)
+  - +13 fe-tools Rust 单元测试 (file_edit 唯一/无匹配/歧义/未找到, glob, grep 命中/递归, apply_patch 简单/未找到, replace_function python/未找到/rust, guard_path 逃逸) + 12 Python 测试 (file_edit 唯一/歧义, glob, grep, apply_patch, replace_function python/未找到, file_edit/glob UDS 往返 subprocess 模式)
+  - 退出闸门: 94 Rust + 52 Python 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat); fmt/ruff 净; maturin 构建
 

@@ -7,6 +7,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 use fe_core::gui::{GuiAction, GuiResult as RsGuiResult};
+use fe_core::tools::{
+    EditResult as RsEditResult, GlobEntry as RsGlobEntry, GrepMatch as RsGrepMatch,
+};
 use fe_core::{
     Diagnostics as RsDiag, ExecutionRequest, ExecutionResult as RsResult, ExecutionStreamEvent,
     Executor,
@@ -52,6 +55,12 @@ struct PyExecutionResult {
     #[pyo3(get)]
     stderr: String,
     #[pyo3(get)]
+    task_id: Option<String>,
+    #[pyo3(get)]
+    command: Option<String>,
+    #[pyo3(get)]
+    duration_sec: f64,
+    #[pyo3(get)]
     timed_out: bool,
     #[pyo3(get)]
     blocked_by_security: bool,
@@ -69,6 +78,9 @@ impl From<RsResult> for PyExecutionResult {
             exit_code: r.exit_code,
             stdout: r.stdout,
             stderr: r.stderr,
+            task_id: r.task_id,
+            command: r.command,
+            duration_sec: r.duration_sec,
             timed_out: r.timed_out,
             blocked_by_security: r.blocked_by_security,
             security_reason: r.security_reason,
@@ -105,6 +117,72 @@ impl From<RsGuiResult> for PyGuiResult {
             screenshot_width: r.screenshot_width,
             screenshot_height: r.screenshot_height,
             error: r.error,
+        }
+    }
+}
+
+/// Python 可见文件工具结果 — 镜像 fe_tools::EditResult
+#[pyclass(name = "NativeEditResult", skip_from_py_object)]
+#[derive(Clone)]
+struct PyEditResult {
+    #[pyo3(get)]
+    ok: bool,
+    #[pyo3(get)]
+    path: Option<String>,
+    #[pyo3(get)]
+    error: Option<String>,
+    #[pyo3(get)]
+    matches: u32,
+}
+
+impl From<RsEditResult> for PyEditResult {
+    fn from(r: RsEditResult) -> Self {
+        Self {
+            ok: r.ok,
+            path: r.path,
+            error: r.error,
+            matches: r.matches,
+        }
+    }
+}
+
+/// Python 可见 glob 命中 — 镜像 fe_tools::GlobEntry
+#[pyclass(name = "NativeGlobEntry", skip_from_py_object)]
+#[derive(Clone)]
+struct PyGlobEntry {
+    #[pyo3(get)]
+    path: String,
+    #[pyo3(get)]
+    is_dir: bool,
+}
+
+impl From<RsGlobEntry> for PyGlobEntry {
+    fn from(e: RsGlobEntry) -> Self {
+        Self {
+            path: e.path,
+            is_dir: e.is_dir,
+        }
+    }
+}
+
+/// Python 可见 grep 命中 — 镜像 fe_tools::GrepMatch
+#[pyclass(name = "NativeGrepMatch", skip_from_py_object)]
+#[derive(Clone)]
+struct PyGrepMatch {
+    #[pyo3(get)]
+    path: String,
+    #[pyo3(get)]
+    line_number: u32,
+    #[pyo3(get)]
+    content: String,
+}
+
+impl From<RsGrepMatch> for PyGrepMatch {
+    fn from(m: RsGrepMatch) -> Self {
+        Self {
+            path: m.path,
+            line_number: m.line_number,
+            content: m.content,
         }
     }
 }
@@ -189,19 +267,20 @@ impl PyExecutor {
         }
     }
 
-    /// execute_sync(command, cwd=None, timeout_sec=30.0, env_vars=None, enable_rollback_snapshot=True)
+    /// execute_sync(command, task_id=None, cwd=None, timeout_sec=30.0, env_vars=None, enable_rollback_snapshot=True)
     /// -> NativeExecutionResult
     fn execute_sync(
         &self,
         command: String,
+        task_id: Option<String>,
         cwd: Option<String>,
         timeout_sec: Option<f64>,
         env_vars: Option<std::collections::HashMap<String, String>>,
         enable_rollback_snapshot: Option<bool>,
     ) -> PyExecutionResult {
         let req = ExecutionRequest {
-            command,
-            task_id: None,
+            command: command.clone(),
+            task_id: task_id.clone(),
             cwd,
             timeout_sec: timeout_sec.unwrap_or(30.0),
             env_vars,
@@ -212,6 +291,9 @@ impl PyExecutor {
             Err(e) => PyExecutionResult {
                 exit_code: -1,
                 stderr: format!("executor 内部错误: {}", e),
+                task_id,
+                command: Some(command),
+                duration_sec: 0.0,
                 blocked_by_security: false,
                 timed_out: false,
                 stdout: String::new(),
@@ -296,11 +378,12 @@ impl PyExecutor {
         }
     }
 
-    /// execute_streaming(command, cwd=None, timeout_sec=30.0, env_vars=None, enable_rollback_snapshot=True)
+    /// execute_streaming(command, task_id=None, cwd=None, timeout_sec=30.0, env_vars=None, enable_rollback_snapshot=True)
     /// -> NativeStreamIterator — 迭代 yield chunk 帧 {type:"chunk",data} 直至 done 帧 {type:"done",result:{...}}
     fn execute_streaming(
         &self,
         command: String,
+        task_id: Option<String>,
         cwd: Option<String>,
         timeout_sec: Option<f64>,
         env_vars: Option<std::collections::HashMap<String, String>>,
@@ -308,7 +391,7 @@ impl PyExecutor {
     ) -> PyResult<PyStreamIterator> {
         let req = ExecutionRequest {
             command,
-            task_id: None,
+            task_id,
             cwd,
             timeout_sec: timeout_sec.unwrap_or(30.0),
             env_vars,
@@ -321,6 +404,94 @@ impl PyExecutor {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("execute_streaming 失败: {e}"))
             })?;
         Ok(PyStreamIterator::new(rx, handle))
+    }
+
+    /// file_edit(path, old_string, new_string, cwd=None) -> NativeEditResult
+    /// 唯一匹配 old_string → new_string 精确替换, 原子写
+    fn file_edit(
+        &self,
+        path: String,
+        old_string: String,
+        new_string: String,
+        cwd: Option<String>,
+    ) -> PyEditResult {
+        match self
+            .inner
+            .file_edit(&path, &old_string, &new_string, cwd.as_deref())
+        {
+            Ok(r) => r.into(),
+            Err(e) => {
+                tracing::warn!(error = %e, "file_edit 失败");
+                PyEditResult {
+                    ok: false,
+                    path: Some(path),
+                    error: Some(format!("file_edit 失败: {e}")),
+                    matches: 0,
+                }
+            }
+        }
+    }
+
+    /// glob(pattern, cwd=None) -> list[NativeGlobEntry]
+    fn glob(&self, pattern: String, cwd: Option<String>) -> PyResult<Vec<PyGlobEntry>> {
+        self.inner
+            .glob(&pattern, cwd.as_deref())
+            .map(|entries| entries.into_iter().map(PyGlobEntry::from).collect())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("glob 失败: {e}")))
+    }
+
+    /// grep(pattern, paths, cwd=None) -> list[NativeGrepMatch]
+    fn grep(
+        &self,
+        pattern: String,
+        paths: Vec<String>,
+        cwd: Option<String>,
+    ) -> PyResult<Vec<PyGrepMatch>> {
+        self.inner
+            .grep(&pattern, &paths, cwd.as_deref())
+            .map(|ms| ms.into_iter().map(PyGrepMatch::from).collect())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("grep 失败: {e}")))
+    }
+
+    /// apply_patch(diff, cwd=None) -> NativeEditResult — Unified Diff 应用, 禁全文件重写
+    fn apply_patch(&self, diff: String, cwd: Option<String>) -> PyEditResult {
+        match self.inner.apply_patch(&diff, cwd.as_deref()) {
+            Ok(r) => r.into(),
+            Err(e) => {
+                tracing::warn!(error = %e, "apply_patch 失败");
+                PyEditResult {
+                    ok: false,
+                    path: None,
+                    error: Some(format!("apply_patch 失败: {e}")),
+                    matches: 0,
+                }
+            }
+        }
+    }
+
+    /// replace_function(path, fn_name, new_body, cwd=None) -> NativeEditResult — 函数级替换
+    fn replace_function(
+        &self,
+        path: String,
+        fn_name: String,
+        new_body: String,
+        cwd: Option<String>,
+    ) -> PyEditResult {
+        match self
+            .inner
+            .replace_function(&path, &fn_name, &new_body, cwd.as_deref())
+        {
+            Ok(r) => r.into(),
+            Err(e) => {
+                tracing::warn!(error = %e, "replace_function 失败");
+                PyEditResult {
+                    ok: false,
+                    path: Some(path),
+                    error: Some(format!("replace_function 失败: {e}")),
+                    matches: 0,
+                }
+            }
+        }
     }
 
     /// serve(sock_path=None) — 启动 UDS JSON-RPC 2.0 服务器, 永驻直到进程退出
@@ -343,6 +514,9 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDiagnostics>()?;
     m.add_class::<PyExecutionResult>()?;
     m.add_class::<PyGuiResult>()?;
+    m.add_class::<PyEditResult>()?;
+    m.add_class::<PyGlobEntry>()?;
+    m.add_class::<PyGrepMatch>()?;
     m.add_class::<PyStreamIterator>()?;
     m.add_class::<PyExecutor>()?;
     Ok(())

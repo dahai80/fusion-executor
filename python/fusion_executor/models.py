@@ -24,6 +24,9 @@ class ExecutionResult(BaseModel):
     exit_code: int = Field(description="0=成功, -124=超时, -1=拦截/内部异常")
     stdout: str = ""
     stderr: str = ""
+    task_id: str | None = None
+    command: str | None = None
+    duration_sec: float = 0.0
     timed_out: bool = False
     blocked_by_security: bool = False
     security_reason: str | None = None
@@ -38,3 +41,21 @@ class GuiResult(BaseModel):
     screenshot_width: int | None = None
     screenshot_height: int | None = None
     error: str | None = None
+
+
+class EditResult(BaseModel):
+    ok: bool = False
+    path: str | None = None
+    error: str | None = None
+    matches: int = 0
+
+
+class GlobEntry(BaseModel):
+    path: str
+    is_dir: bool = False
+
+
+class GrepMatch(BaseModel):
+    path: str
+    line_number: int
+    content: str

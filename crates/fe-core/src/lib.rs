@@ -4,6 +4,7 @@
 // 重型组件 (tree-sitter / git handle) 懒加载，new() <5ms (NFR)
 
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -17,12 +18,17 @@ use fe_gui::{GuiAction, GuiController, GuiResult};
 use fe_rollback::RollbackManager;
 use fe_sandbox::{Sandbox, SandboxConfig};
 use fe_security::{SecurityGuard, SecurityVerdict};
+use fe_tools::{EditResult, GlobEntry, GrepMatch, Tools};
 
 pub use fe_diagnostics as diagnostics;
 pub use fe_gui as gui;
 pub use fe_rollback as rollback;
 pub use fe_sandbox as sandbox;
 pub use fe_security as security;
+pub use fe_tools as tools;
+pub use fe_tools::{
+    EditResult as ToolsEditResult, GlobEntry as ToolsGlobEntry, GrepMatch as ToolsGrepMatch,
+};
 
 // BLOCKING_RT — 多线程 1 worker，避免 asyncio 调用者嵌套 runtime panic
 // 模式源自 fusion-design/crates/fd-ai-adapter/src/lib.rs:251-257
@@ -83,6 +89,12 @@ pub struct ExecutionResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub duration_sec: f64,
     pub timed_out: bool,
     pub blocked_by_security: bool,
     pub security_reason: Option<String>,
@@ -99,6 +111,22 @@ impl ExecutionResult {
             ..Default::default()
         }
     }
+
+    /// 带 task_id/command 的拦截结果 (PRD §4.1 — result 回填请求侧标识)
+    pub fn blocked_with(
+        reason: impl Into<String>,
+        task_id: Option<String>,
+        command: Option<String>,
+    ) -> Self {
+        Self {
+            exit_code: EXIT_BLOCKED,
+            blocked_by_security: true,
+            security_reason: Some(reason.into()),
+            task_id,
+            command,
+            ..Default::default()
+        }
+    }
 }
 
 /// 流式事件 — Chunk (实时 stdio 分块) / Done (最终 ExecutionResult, 含 diagnostics)
@@ -107,7 +135,7 @@ impl ExecutionResult {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecutionStreamEvent {
     Chunk { data: String },
-    Done(ExecutionResult),
+    Done(Box<ExecutionResult>),
 }
 
 /// Executor — 校验 + 沙箱执行的编排器
@@ -117,6 +145,7 @@ pub struct Executor {
     slicer: Slicer,
     rollback: RollbackManager,
     gui: GuiController,
+    tools: Tools,
 }
 
 impl Default for Executor {
@@ -127,19 +156,62 @@ impl Default for Executor {
 
 impl Executor {
     pub fn new() -> Self {
-        info!("Executor::new() — 初始化 SecurityGuard + Sandbox + Slicer + Rollback + Gui");
+        info!("Executor::new() — 初始化 SecurityGuard + Sandbox + Slicer + Rollback + Gui + Tools");
         Self {
             security: SecurityGuard::new(),
             sandbox: Sandbox::new(),
             slicer: Slicer::new(),
             rollback: RollbackManager::new(),
             gui: GuiController::new(),
+            tools: Tools::new(),
         }
     }
 
     /// GUI 动作 (P4 FR-05) — 同步入口, 供 fe-pyo3/fe-ipc 调用
     pub fn gui_action(&self, action: GuiAction) -> Result<GuiResult> {
         self.gui.execute(action)
+    }
+
+    /// 原生文件工具 — file_edit (PRD FileEdit 本地化)
+    pub fn file_edit(
+        &self,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+        cwd: Option<&str>,
+    ) -> Result<EditResult> {
+        self.tools.file_edit(path, old_string, new_string, cwd)
+    }
+
+    /// 原生文件工具 — glob (PRD GlobTool 本地化)
+    pub fn glob(&self, pattern: &str, cwd: Option<&str>) -> Result<Vec<GlobEntry>> {
+        self.tools.glob(pattern, cwd)
+    }
+
+    /// 原生文件工具 — grep (PRD GrepTool 本地化)
+    pub fn grep(
+        &self,
+        pattern: &str,
+        paths: &[String],
+        cwd: Option<&str>,
+    ) -> Result<Vec<GrepMatch>> {
+        self.tools.grep(pattern, paths, cwd)
+    }
+
+    /// 外科补丁引擎 — apply_patch (PRD §DeepSeek Unified Diff 应用)
+    pub fn apply_patch(&self, diff: &str, cwd: Option<&str>) -> Result<EditResult> {
+        self.tools.apply_patch(diff, cwd)
+    }
+
+    /// 外科补丁引擎 — replace_function (PRD §DeepSeek 函数级替换, 禁全文件重写)
+    pub fn replace_function(
+        &self,
+        path: &str,
+        fn_name: &str,
+        new_body: &str,
+        cwd: Option<&str>,
+    ) -> Result<EditResult> {
+        self.tools.replace_function(path, fn_name, new_body, cwd)
     }
 
     /// 快照 — 公开供 fe-pyo3 直接调用
@@ -160,11 +232,16 @@ impl Executor {
     /// 异步执行 — 校验 → 沙箱执行 → return
     pub async fn execute_async(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
         info!(command = %req.command, "execute_async — 校验中");
+        let start = Instant::now();
         let verdict = self.security.validate(&req.command);
         if !verdict.allowed {
             let reason = verdict.reason.unwrap_or_else(|| "未知原因".to_string());
             info!(%reason, "安全校验拦截");
-            return Ok(ExecutionResult::blocked(reason));
+            return Ok(ExecutionResult::blocked_with(
+                reason,
+                req.task_id.clone(),
+                Some(req.command.clone()),
+            ));
         }
         // cwd 校验
         if let Some(cwd) = &req.cwd {
@@ -172,7 +249,11 @@ impl Executor {
             if !cwd_v.allowed {
                 let reason = cwd_v.reason.unwrap_or_else(|| "cwd 非法".to_string());
                 info!(%reason, "cwd 校验拦截");
-                return Ok(ExecutionResult::blocked(reason));
+                return Ok(ExecutionResult::blocked_with(
+                    reason,
+                    req.task_id.clone(),
+                    Some(req.command.clone()),
+                ));
             }
         }
 
@@ -221,6 +302,9 @@ impl Executor {
             exit_code: sb.exit_code,
             stdout: sb.stdout,
             stderr: sb.stderr,
+            task_id: req.task_id.clone(),
+            command: Some(req.command.clone()),
+            duration_sec: start.elapsed().as_secs_f64(),
             timed_out: sb.timed_out,
             snapshot_id: snapshot_id.filter(|s| !s.is_empty()),
             diagnostics: diag,
@@ -241,6 +325,7 @@ impl Executor {
         req: ExecutionRequest,
     ) -> Result<(mpsc::Receiver<ExecutionStreamEvent>, JoinHandle<()>)> {
         info!(command = %req.command, "execute_streaming — 校验中");
+        let start = Instant::now();
         let verdict = self.security.validate(&req.command);
         if !verdict.allowed {
             let reason = verdict.reason.unwrap_or_else(|| "未知原因".to_string());
@@ -248,7 +333,13 @@ impl Executor {
             let (tx, rx) = mpsc::channel(8);
             let handle = tokio::spawn(async move {
                 let _ = tx
-                    .send(ExecutionStreamEvent::Done(ExecutionResult::blocked(reason)))
+                    .send(ExecutionStreamEvent::Done(Box::new(
+                        ExecutionResult::blocked_with(
+                            reason,
+                            req.task_id.clone(),
+                            Some(req.command.clone()),
+                        ),
+                    )))
                     .await;
             });
             return Ok((rx, handle));
@@ -261,7 +352,13 @@ impl Executor {
                 let (tx, rx) = mpsc::channel(8);
                 let handle = tokio::spawn(async move {
                     let _ = tx
-                        .send(ExecutionStreamEvent::Done(ExecutionResult::blocked(reason)))
+                        .send(ExecutionStreamEvent::Done(Box::new(
+                            ExecutionResult::blocked_with(
+                                reason,
+                                req.task_id.clone(),
+                                Some(req.command.clone()),
+                            ),
+                        )))
                         .await;
                 });
                 return Ok((rx, handle));
@@ -303,6 +400,8 @@ impl Executor {
 
         let slicer = self.slicer.clone();
         let cwd_for_diag = req.cwd.clone();
+        let task_id_for_done = req.task_id.clone();
+        let command_for_done = req.command.clone();
 
         let (outer_tx, outer_rx) = mpsc::channel::<ExecutionStreamEvent>(64);
         let handle = tokio::spawn(async move {
@@ -329,12 +428,17 @@ impl Executor {
                             exit_code: sb.exit_code,
                             stdout: sb.stdout,
                             stderr: sb.stderr,
+                            task_id: task_id_for_done.clone(),
+                            command: Some(command_for_done.clone()),
+                            duration_sec: start.elapsed().as_secs_f64(),
                             timed_out: sb.timed_out,
                             snapshot_id: snapshot_id.filter(|s| !s.is_empty()),
                             diagnostics: diag,
                             ..Default::default()
                         };
-                        let _ = outer_tx.send(ExecutionStreamEvent::Done(result)).await;
+                        let _ = outer_tx
+                            .send(ExecutionStreamEvent::Done(Box::new(result)))
+                            .await;
                         break;
                     }
                 }

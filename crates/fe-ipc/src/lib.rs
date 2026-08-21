@@ -7,7 +7,8 @@
 //   扩展: -32010 安全拦截, -32011 超时, -32012 回滚失败, -32013 AX 未授权
 // 匹配 fusion-studio IPCClient.swift: 按字节读到 0x0A, 8s 超时
 //
-// 方法: executor.health/execute/snapshot_create/rollback/gui_action/diagnostics/shutdown
+// 方法: executor.health/execute/execute_stream/snapshot_create/rollback/gui_action/diagnostics
+//       executor.file_edit/glob/grep/apply_patch/replace_function/shutdown
 
 use std::path::Path;
 use std::sync::Arc;
@@ -303,6 +304,68 @@ async fn handle_method(
         "executor.shutdown" => {
             info!("收到 shutdown 请求 (注意: 按进程退出, 此方法仅回确认)");
             Ok(json!({"ok": true}))
+        }
+        "executor.file_edit" => {
+            let path =
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+            let old_string = param_str(&params, "old_string")
+                .ok_or((ERR_INVALID_REQ, "缺少 old_string".to_string()))?;
+            let new_string = param_str(&params, "new_string")
+                .ok_or((ERR_INVALID_REQ, "缺少 new_string".to_string()))?;
+            let cwd = params.get("cwd").and_then(|c| c.as_str());
+            let r = executor
+                .file_edit(&path, &old_string, &new_string, cwd)
+                .map_err(|e| (ERR_INTERNAL, format!("file_edit 失败: {}", e)))?;
+            Ok(serde_json::to_value(&r).unwrap_or(json!({})))
+        }
+        "executor.glob" => {
+            let pattern = param_str(&params, "pattern")
+                .ok_or((ERR_INVALID_REQ, "缺少 pattern".to_string()))?;
+            let cwd = params.get("cwd").and_then(|c| c.as_str());
+            let entries = executor
+                .glob(&pattern, cwd)
+                .map_err(|e| (ERR_INTERNAL, format!("glob 失败: {}", e)))?;
+            Ok(serde_json::to_value(&entries).unwrap_or(json!({})))
+        }
+        "executor.grep" => {
+            let pattern = param_str(&params, "pattern")
+                .ok_or((ERR_INVALID_REQ, "缺少 pattern".to_string()))?;
+            let paths: Vec<String> = params
+                .get("paths")
+                .and_then(|p| p.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .ok_or((ERR_INVALID_REQ, "缺少 paths 数组".to_string()))?;
+            let cwd = params.get("cwd").and_then(|c| c.as_str());
+            let matches = executor
+                .grep(&pattern, &paths, cwd)
+                .map_err(|e| (ERR_INTERNAL, format!("grep 失败: {}", e)))?;
+            Ok(serde_json::to_value(&matches).unwrap_or(json!({})))
+        }
+        "executor.apply_patch" => {
+            let diff =
+                param_str(&params, "diff").ok_or((ERR_INVALID_REQ, "缺少 diff".to_string()))?;
+            let cwd = params.get("cwd").and_then(|c| c.as_str());
+            let r = executor
+                .apply_patch(&diff, cwd)
+                .map_err(|e| (ERR_INTERNAL, format!("apply_patch 失败: {}", e)))?;
+            Ok(serde_json::to_value(&r).unwrap_or(json!({})))
+        }
+        "executor.replace_function" => {
+            let path =
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+            let fn_name = param_str(&params, "fn_name")
+                .ok_or((ERR_INVALID_REQ, "缺少 fn_name".to_string()))?;
+            let new_body = param_str(&params, "new_body")
+                .ok_or((ERR_INVALID_REQ, "缺少 new_body".to_string()))?;
+            let cwd = params.get("cwd").and_then(|c| c.as_str());
+            let r = executor
+                .replace_function(&path, &fn_name, &new_body, cwd)
+                .map_err(|e| (ERR_INTERNAL, format!("replace_function 失败: {}", e)))?;
+            Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         _ => Err((
             ERR_METHOD_NOT_FOUND,
