@@ -9,6 +9,7 @@ members = [
     "crates/fe-diagnostics",
     "crates/fe-ipc",
     "crates/fe-tools",
+    "crates/fe-telemetry",
     "crates/fe-pyo3",
 ]
 
@@ -72,6 +73,9 @@ glob = "0.3"
 walkdir = "2"
 diffy = "0.4"
 
+# 实时遥测 (fe-telemetry) — CPU/内存采样, GPU 由调用方注入
+sysinfo = "0.32"
+
 # Python 绑定 (fe-pyo3) — 0.29 支持 Python 3.14
 # extension-module 由 maturin 通过 pyproject features=["pyo3/extension-module"] 注入;
 # 此处不默认开 — 否则 cargo test 无法链接 libpython (符号运行时由宿主解析)
@@ -89,6 +93,7 @@ fe-rollback = { path = "crates/fe-rollback" }
 fe-diagnostics = { path = "crates/fe-diagnostics" }
 fe-ipc = { path = "crates/fe-ipc" }
 fe-tools = { path = "crates/fe-tools" }
+fe-telemetry = { path = "crates/fe-telemetry" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

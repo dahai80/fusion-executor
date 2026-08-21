@@ -11,6 +11,7 @@ from .models import (
     GrepMatch,
     GuiResult,
     RollbackPolicy,
+    TelemetrySample,
 )
 
 logger = logging.getLogger("fusion_executor")
@@ -251,6 +252,26 @@ class FusionSandboxExecutor:
             result.error,
         )
         return result
+
+    def telemetry_stream(
+        self,
+        *,
+        interval_ms: int = 100,
+        max_samples: int = 0,
+    ) -> Iterator[TelemetrySample]:
+        logger.debug("telemetry_stream interval_ms=%s max_samples=%s", interval_ms, max_samples)
+        it = self._native.telemetry_stream(interval_ms, max_samples)
+        for count, frame in enumerate(it, start=1):
+            sample = TelemetrySample(
+                ts_ms=frame.get("ts_ms", 0),
+                cpu_pct=frame.get("cpu_pct", 0.0),
+                mem_mb=frame.get("mem_mb", 0.0),
+                gpu_pct=frame.get("gpu_pct"),
+                gpu_mem_mb=frame.get("gpu_mem_mb"),
+                task_id=frame.get("task_id"),
+            )
+            logger.debug("telemetry sample #%s cpu=%.1f%% mem=%.1fMB", count, sample.cpu_pct, sample.mem_mb)
+            yield sample
 
     def serve(self, sock_path: str | None = None) -> None:
         logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (永驻)", sock_path)

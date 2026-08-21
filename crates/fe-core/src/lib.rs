@@ -18,6 +18,7 @@ use fe_gui::{GuiAction, GuiController, GuiResult};
 use fe_rollback::RollbackManager;
 use fe_sandbox::{Sandbox, SandboxConfig};
 use fe_security::{SecurityGuard, SecurityVerdict};
+use fe_telemetry::{start_stream as start_telemetry, TelemetryConfig, TelemetrySample};
 use fe_tools::{EditResult, GlobEntry, GrepMatch, Tools};
 
 pub use fe_diagnostics as diagnostics;
@@ -25,6 +26,10 @@ pub use fe_gui as gui;
 pub use fe_rollback as rollback;
 pub use fe_sandbox as sandbox;
 pub use fe_security as security;
+pub use fe_telemetry as telemetry;
+pub use fe_telemetry::{
+    TelemetryConfig as TelemetryStreamConfig, TelemetrySample as TelemetryFrame,
+};
 pub use fe_tools as tools;
 pub use fe_tools::{
     EditResult as ToolsEditResult, GlobEntry as ToolsGlobEntry, GrepMatch as ToolsGrepMatch,
@@ -583,6 +588,17 @@ impl Executor {
         });
         Ok((outer_rx, handle))
     }
+
+    /// 实时遥测流 — 10Hz CPU/内存采样, GPU 由调用方注入 (executor 不跑模型)。
+    /// 返回 (Receiver<TelemetrySample>, JoinHandle)。调用方迭代 rx 收帧,
+    /// 丢弃 rx 则采样任务自动停止 (通道关闭)。Executor 无状态: 每次调用独立流。
+    pub fn telemetry_stream(
+        &self,
+        cfg: TelemetryConfig,
+    ) -> (mpsc::Receiver<TelemetrySample>, JoinHandle<()>) {
+        info!(interval_ms = cfg.interval_ms, "telemetry_stream — 启动采样");
+        start_telemetry(cfg, BLOCKING_RT.handle().clone())
+    }
 }
 
 #[cfg(test)]
@@ -803,6 +819,29 @@ mod tests {
             // 文件保持损坏 (未回滚)
             let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
             assert_eq!(content, "broken\n", "无 policy 文件应保持改动: {content}");
+        });
+    }
+
+    #[test]
+    fn telemetry_stream_yields_samples_and_stops() {
+        rt().block_on(async {
+            let ex = Executor::new();
+            let cfg = TelemetryConfig {
+                interval_ms: 20,
+                max_samples: 4,
+            };
+            let (mut rx, handle) = ex.telemetry_stream(cfg);
+            let mut samples = Vec::new();
+            while let Some(s) = rx.recv().await {
+                samples.push(s);
+            }
+            let _ = handle.await;
+            assert_eq!(samples.len(), 4, "应产出 4 帧");
+            assert!(samples.iter().all(|s| s.mem_mb >= 0.0));
+            assert!(
+                samples.iter().all(|s| s.gpu_pct.is_none()),
+                "GPU 默认不注入"
+            );
         });
     }
 }

@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 use fe_core::gui::{GuiAction, GuiResult as RsGuiResult};
+use fe_core::telemetry::{TelemetryConfig, TelemetrySample};
 use fe_core::tools::{
     EditResult as RsEditResult, GlobEntry as RsGlobEntry, GrepMatch as RsGrepMatch,
 };
@@ -224,7 +225,7 @@ impl PyStreamIterator {
         };
         // detach GIL, 在 BLOCKING_RT 上收帧 (与 execute_sync 同 runtime, 避免嵌套 panic)
         let ev = py.detach(|| fe_core::BLOCKING_RT.block_on(rx.recv()));
-        let ev = match ev {
+        let ev: ExecutionStreamEvent = match ev {
             Some(e) => e,
             None => {
                 // 通道关闭 → 释放 handle, 抛 StopIteration
@@ -252,6 +253,50 @@ impl PyStreamIterator {
                 });
             }
         }
+        Ok(obj)
+    }
+}
+
+/// 遥测迭代器 — 消费 tokio mpsc<TelemetrySample>, 每次 __next__ 返回一帧 dict
+/// sample: {"type":"sample","ts_ms":..,"cpu_pct":..,"mem_mb":..,"gpu_pct":null,...}
+/// 通道关闭 → StopIteration
+#[pyclass(name = "NativeTelemetryIterator", skip_from_py_object)]
+struct PyTelemetryIterator {
+    rx: Option<tokio::sync::mpsc::Receiver<TelemetrySample>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[pymethods]
+impl PyTelemetryIterator {
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let rx = match self.rx.as_mut() {
+            Some(rx) => rx,
+            None => return Err(pyo3::exceptions::PyStopIteration::new_err("exhausted")),
+        };
+        let sample = py.detach(|| fe_core::BLOCKING_RT.block_on(rx.recv()));
+        let sample: TelemetrySample = match sample {
+            Some(s) => s,
+            None => {
+                self.rx = None;
+                if let Some(h) = self.handle.take() {
+                    fe_core::BLOCKING_RT.block_on(async {
+                        let _ = h.await;
+                    });
+                }
+                return Err(pyo3::exceptions::PyStopIteration::new_err("done"));
+            }
+        };
+        let json_str = serde_json::to_string(&sample).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("遥测帧序列化失败: {e}"))
+        })?;
+        let obj = py
+            .import("json")?
+            .call_method1("loads", (json_str,))?
+            .unbind();
         Ok(obj)
     }
 }
@@ -452,6 +497,25 @@ impl PyExecutor {
         Ok(PyStreamIterator::new(rx, handle))
     }
 
+    /// telemetry_stream(interval_ms=100, max_samples=0) -> NativeTelemetryIterator
+    /// 迭代 yield TelemetrySample dict (ts_ms/cpu_pct/mem_mb/gpu_pct/gpu_mem_mb/task_id)
+    /// 默认 10Hz 无限采样; max_samples>0 达此值后结束
+    fn telemetry_stream(
+        &self,
+        interval_ms: Option<u64>,
+        max_samples: Option<u64>,
+    ) -> PyResult<PyTelemetryIterator> {
+        let cfg = TelemetryConfig {
+            interval_ms: interval_ms.unwrap_or(100),
+            max_samples: max_samples.unwrap_or(0),
+        };
+        let (rx, handle) = self.inner.telemetry_stream(cfg);
+        Ok(PyTelemetryIterator {
+            rx: Some(rx),
+            handle: Some(handle),
+        })
+    }
+
     /// file_edit(path, old_string, new_string, cwd=None) -> NativeEditResult
     /// 唯一匹配 old_string → new_string 精确替换, 原子写
     fn file_edit(
@@ -564,6 +628,7 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGlobEntry>()?;
     m.add_class::<PyGrepMatch>()?;
     m.add_class::<PyStreamIterator>()?;
+    m.add_class::<PyTelemetryIterator>()?;
     m.add_class::<PyExecutor>()?;
     Ok(())
 }

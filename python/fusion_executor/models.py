@@ -66,3 +66,12 @@ class GrepMatch(BaseModel):
     path: str
     line_number: int
     content: str
+
+
+class TelemetrySample(BaseModel):
+    ts_ms: int = Field(description="采样时间戳 (毫秒, 调用方纪元)")
+    cpu_pct: float = Field(description="进程 CPU 占用百分比 (单核倍数)")
+    mem_mb: float = Field(description="进程常驻内存 (MB)")
+    gpu_pct: float | None = Field(default=None, description="GPU 占用百分比 (调用方注入)")
+    gpu_mem_mb: float | None = Field(default=None, description="GPU 显存占用 (MB, 调用方注入)")
+    task_id: str | None = Field(default=None, description="关联任务 id")

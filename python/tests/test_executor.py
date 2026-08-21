@@ -13,6 +13,7 @@ from fusion_executor import (
     GlobEntry,
     GrepMatch,
     RollbackPolicy,
+    TelemetrySample,
 )
 
 
@@ -418,3 +419,68 @@ def test_auto_rollback_over_uds_roundtrip(uds_server: str, tmp_path):
     assert resp["result"]["auto_rolled_back"] is True
     assert (tmp_path / "app.py").read_text() == "print(1)\n"
     del _json
+
+
+def test_telemetry_native_iterator(executor: FusionSandboxExecutor):
+    it = executor._native.telemetry_stream(20, 3)
+    frames = [f for f in it]
+    assert len(frames) == 3, "max_samples=3 应产 3 帧"
+    assert frames[0]["ts_ms"] == 0
+    assert frames[1]["ts_ms"] == 20
+    assert frames[2]["ts_ms"] == 40
+    assert frames[0]["mem_mb"] > 0.0, "本进程内存非零"
+    assert frames[0]["cpu_pct"] >= 0.0
+    assert frames[0].get("gpu_pct") is None, "GPU 默认不注入 (serde skip)"
+
+
+def test_telemetry_python_wrapper(executor: FusionSandboxExecutor):
+    samples = list(executor.telemetry_stream(interval_ms=20, max_samples=4))
+    assert len(samples) == 4
+    assert all(isinstance(s, TelemetrySample) for s in samples)
+    assert samples[0].ts_ms == 0
+    assert samples[3].ts_ms == 60
+    assert samples[0].mem_mb > 0.0
+    assert all(s.gpu_pct is None for s in samples)
+
+
+def test_telemetry_over_uds(uds_server: str):
+    import json as _json
+    import socket as _socket
+
+    with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+        s.settimeout(15.0)
+        s.connect(uds_server)
+        s.sendall(
+            (
+                _json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 11,
+                        "method": "executor.telemetry_stream",
+                        "params": {"interval_ms": 20, "max_samples": 3},
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        frames = []
+        buf = b""
+        while len(frames) < 3:
+            chunk = s.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip():
+                    frames.append(_json.loads(line.decode("utf-8")))
+    assert len(frames) == 3, "UDS 应收 3 帧 sample"
+    assert all(f["id"] == 11 for f in frames)
+    assert all(f["result"]["type"] == "sample" for f in frames)
+    samples = [f["result"]["sample"] for f in frames]
+    assert samples[0]["ts_ms"] == 0
+    assert samples[2]["ts_ms"] == 40
+    assert samples[0]["mem_mb"] > 0.0
+    assert samples[0].get("gpu_pct") is None, "GPU 默认不注入 (serde skip)"
+    del _json, _socket

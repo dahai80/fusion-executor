@@ -7,7 +7,7 @@
 //   扩展: -32010 安全拦截, -32011 超时, -32012 回滚失败, -32013 AX 未授权
 // 匹配 fusion-studio IPCClient.swift: 按字节读到 0x0A, 8s 超时
 //
-// 方法: executor.health/execute/execute_stream/snapshot_create/rollback/gui_action/diagnostics
+// 方法: executor.health/execute/execute_stream/telemetry_stream/snapshot_create/rollback/gui_action/diagnostics
 //       executor.file_edit/glob/grep/apply_patch/replace_function/shutdown
 
 use std::path::Path;
@@ -175,6 +175,13 @@ async fn handle_conn(stream: UnixStream, executor: Arc<Executor>) {
             }
             continue;
         }
+        if method == "executor.telemetry_stream" {
+            if let Err(e) = handle_telemetry_stream(&mut writer, req_id, params, &executor).await {
+                warn!(error = %e, "telemetry_stream 写帧失败");
+                break;
+            }
+            continue;
+        }
 
         let resp = match handle_method(method, params, &executor).await {
             Ok(r) => ok_resp(req_id, r),
@@ -231,6 +238,41 @@ async fn handle_execute_stream(
             }),
         };
         let frame = serde_json::to_string(&ok_resp(id.clone(), result))? + "\n";
+        if writer.write_all(frame.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+    let _ = handle.await;
+    Ok(())
+}
+
+/// 实时遥测流 — 逐帧写出 TelemetrySample, 共用 id, 换行分隔。
+/// sample: {"jsonrpc":"2.0","id":id,"result":{"type":"sample",...TelemetrySample}}
+/// params: {interval_ms?:u64, max_samples?:u64} (缺省 10Hz / 无限)
+async fn handle_telemetry_stream(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    id: Value,
+    params: Value,
+    executor: &Arc<Executor>,
+) -> Result<()> {
+    let interval_ms = params
+        .get("interval_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(100);
+    let max_samples = params
+        .get("max_samples")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cfg = fe_core::TelemetryStreamConfig {
+        interval_ms,
+        max_samples,
+    };
+    let (mut rx, handle) = executor.telemetry_stream(cfg);
+    while let Some(sample) = rx.recv().await {
+        let frame = serde_json::to_string(&ok_resp(
+            id.clone(),
+            json!({"type": "sample", "sample": serde_json::to_value(&sample).unwrap_or(json!({}))}),
+        ))? + "\n";
         if writer.write_all(frame.as_bytes()).await.is_err() {
             break;
         }
@@ -534,6 +576,43 @@ mod tests {
         assert_eq!(v["result"]["type"], "done");
         assert_eq!(v["result"]["result"]["exit_code"], -1);
         assert_eq!(v["result"]["result"]["blocked_by_security"], true);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn telemetry_stream_samples_over_uds() {
+        let sock = tmp_sock("telemetry");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let req = r#"{"jsonrpc":"2.0","id":11,"method":"executor.telemetry_stream","params":{"interval_ms":20,"max_samples":3}}"#;
+        let mut s = UnixStream::connect(&sock).await.unwrap();
+        s.write_all((req.to_string() + "\n").as_bytes())
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(s);
+        let mut buf = Vec::new();
+        let mut count = 0;
+        loop {
+            buf.clear();
+            if reader.read_until(b'\n', &mut buf).await.unwrap() == 0 {
+                break;
+            }
+            let line = String::from_utf8_lossy(&buf).trim().to_string();
+            if line.is_empty() {
+                break;
+            }
+            let v: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["id"], 11, "遥测帧共用 id");
+            assert_eq!(v["result"]["type"], "sample");
+            let sample = &v["result"]["sample"];
+            assert!(sample["mem_mb"].as_f64().unwrap_or(0.0) >= 0.0);
+            assert!(sample["cpu_pct"].as_f64().unwrap_or(-1.0) >= 0.0);
+            count += 1;
+            if count >= 3 {
+                break;
+            }
+        }
+        assert_eq!(count, 3, "应收到 3 帧遥测样本");
         let _ = std::fs::remove_file(&sock);
     }
 }
