@@ -12,7 +12,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-core-graphics.workspace = true
+core-graphics = { workspace = true, features = ["highsierra"] }
 core-foundation.workspace = true
 core-foundation-sys.workspace = true
 accessibility.workspace = true

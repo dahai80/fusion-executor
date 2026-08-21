@@ -29,7 +29,10 @@ use core_foundation::string::CFString;
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::context::CGContext;
 use core_graphics::display::CGDisplay;
-use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode, KeyCode};
+use core_graphics::event::{
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, KeyCode,
+    ScrollEventUnit,
+};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use core_graphics::image::CGImage;
@@ -61,6 +64,19 @@ pub enum GuiAction {
     },
     Screenshot {},
     InspectTree {},
+    Scroll {
+        dx: i32,
+        dy: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<(f64, f64)>,
+    },
+    Drag {
+        from: (f64, f64),
+        to: (f64, f64),
+    },
+    Wait {
+        seconds: f64,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -106,6 +122,10 @@ impl GuiController {
     }
 
     pub fn execute(&self, action: GuiAction) -> Result<GuiResult> {
+        // Wait — 纯延时, trusted-independent, 不需 AX 授权, 先处理 (CI 可测)
+        if let GuiAction::Wait { seconds } = &action {
+            return self.wait(*seconds);
+        }
         if !Self::ax_trusted() {
             warn!("AX 未授权 (TCC Accessibility) — GUI 操作降级");
             return Ok(GuiResult {
@@ -124,6 +144,9 @@ impl GuiController {
             GuiAction::KeyPress { key, modifiers } => self.key_press(&key, &modifiers),
             GuiAction::Screenshot {} => self.screenshot(),
             GuiAction::InspectTree {} => self.inspect_tree(),
+            GuiAction::Scroll { dx, dy, at } => self.scroll(dx, dy, at),
+            GuiAction::Drag { from, to } => self.drag(from, to),
+            GuiAction::Wait { .. } => unreachable!("Wait 已在 ax_trusted 前处理"),
         }
     }
 
@@ -687,6 +710,103 @@ impl GuiController {
         }
         Ok(B64.encode(&buf))
     }
+
+    /// 滚轮滚动 — CGEvent new_scroll_event (highsierra feature)。
+    /// dx=水平 (axis2), dy=垂直 (axis1); LINE 单位。at 给定则先移动光标到该坐标。
+    /// core-graphics 0.24 safe wrapper 封装 CGEventCreateScrollWheelEvent2 的 unsafe FFI。
+    fn scroll(&self, dx: i32, dy: i32, at: Option<(f64, f64)>) -> Result<GuiResult> {
+        info!(dx, dy, at = ?at, "Scroll");
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("CGEventSource 创建失败 (scroll)"))?;
+        if let Some((x, y)) = at {
+            let moved = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::MouseMoved,
+                CGPoint::new(x, y),
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow!("CGEvent MouseMoved 创建失败 (scroll 光标定位)"))?;
+            moved.post(CGEventTapLocation::HID);
+        }
+        // new_scroll_event(source, units, wheel_count, wheel1=axis2水平, wheel2=axis1垂直, wheel3=0)
+        let ev = CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, dx, dy, 0).map_err(
+            |_| anyhow!("CGEvent scroll 创建失败 (CGEventCreateScrollWheelEvent2 返回 null)"),
+        )?;
+        ev.post(CGEventTapLocation::HID);
+        debug!(dx, dy, "Scroll 完成 (ScrollWheel posted)");
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
+
+    /// 拖拽 — mouseDown(from) → LeftMouseDragged(间帧) → mouseUp(to)。
+    /// 左键单次拖拽; 间帧线性插值平滑 (默认 16 帧)。CGEvent new_mouse_event 各带位置, 无需 set_location。
+    fn drag(&self, from: (f64, f64), to: (f64, f64)) -> Result<GuiResult> {
+        info!(from = ?from, to = ?to, "Drag");
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("CGEventSource 创建失败 (drag)"))?;
+        let steps = 16i32;
+        // 1. mouseDown at from (左键按下)
+        let down = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::LeftMouseDown,
+            CGPoint::new(from.0, from.1),
+            CGMouseButton::Left,
+        )
+        .map_err(|_| anyhow!("CGEvent LeftMouseDown 创建失败 (drag)"))?;
+        down.post(CGEventTapLocation::HID);
+        // 2. LeftMouseDragged 间帧 (from → to 线性插值)
+        for i in 1..steps {
+            let t = i as f64 / steps as f64;
+            let x = from.0 + (to.0 - from.0) * t;
+            let y = from.1 + (to.1 - from.1) * t;
+            let moved = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::LeftMouseDragged,
+                CGPoint::new(x, y),
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow!("CGEvent LeftMouseDragged 创建失败 (drag 间帧 {i})"))?;
+            moved.post(CGEventTapLocation::HID);
+        }
+        // 3. mouseUp at to (左键抬起)
+        let up = CGEvent::new_mouse_event(
+            source,
+            CGEventType::LeftMouseUp,
+            CGPoint::new(to.0, to.1),
+            CGMouseButton::Left,
+        )
+        .map_err(|_| anyhow!("CGEvent LeftMouseUp 创建失败 (drag)"))?;
+        up.post(CGEventTapLocation::HID);
+        debug!(steps, "Drag 完成 (down→drag→up posted)");
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
+
+    /// 等待 — 纯延时, 非 AX/CGEvent。GUI 动作间停顿 (如点击后等动画)。
+    /// seconds 限 [0, 60] 秒, 超界裁剪。trusted-independent (无 TCC 依赖, 可单测)。
+    fn wait(&self, seconds: f64) -> Result<GuiResult> {
+        let secs = if seconds < 0.0 {
+            warn!(seconds, "Wait 负值, 裁剪为 0");
+            0.0
+        } else if seconds > 60.0 {
+            warn!(seconds, "Wait 超 60s 上限, 裁剪为 60");
+            60.0
+        } else {
+            seconds
+        };
+        info!(seconds = secs, "Wait");
+        if secs > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+        }
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
 }
 
 impl Default for GuiController {
@@ -722,6 +842,21 @@ mod tests {
             },
             GuiAction::Screenshot {},
             GuiAction::InspectTree {},
+            GuiAction::Scroll {
+                dx: 0,
+                dy: -3,
+                at: Some((100.0, 200.0)),
+            },
+            GuiAction::Scroll {
+                dx: 5,
+                dy: 0,
+                at: None,
+            },
+            GuiAction::Drag {
+                from: (10.0, 20.0),
+                to: (30.0, 40.0),
+            },
+            GuiAction::Wait { seconds: 0.0 },
         ];
         for a in cases {
             let s = serde_json::to_string(&a).unwrap();
@@ -909,5 +1044,42 @@ mod tests {
                 Some("accessibility-permission-required")
             );
         }
+    }
+
+    /// 新动作 tag snake_case — scroll/drag/wait 序列化 tag
+    #[test]
+    fn gui_action_new_variants_snake_case() {
+        let s = serde_json::to_string(&GuiAction::Scroll {
+            dx: 0,
+            dy: -1,
+            at: None,
+        })
+        .unwrap();
+        assert!(s.contains("\"kind\":\"scroll\""), "scroll tag: {s}");
+        let s = serde_json::to_string(&GuiAction::Drag {
+            from: (0.0, 0.0),
+            to: (1.0, 1.0),
+        })
+        .unwrap();
+        assert!(s.contains("\"kind\":\"drag\""), "drag tag: {s}");
+        let s = serde_json::to_string(&GuiAction::Wait { seconds: 1.0 }).unwrap();
+        assert!(s.contains("\"kind\":\"wait\""), "wait tag: {s}");
+    }
+
+    /// Wait trusted-independent — 无 TCC 依赖, CI 可跑。seconds=0 应立即 ok=true。
+    #[test]
+    fn wait_zero_seconds_ok_without_trust() {
+        let ctrl = GuiController::new();
+        let r = ctrl.execute(GuiAction::Wait { seconds: 0.0 }).unwrap();
+        assert!(r.ok, "Wait 0s 应 ok=true (trusted-independent)");
+        assert!(r.error.is_none(), "Wait 无错误: {:?}", r.error);
+    }
+
+    /// Wait 裁剪 — 负值裁 0 (不睡眠), 不 panic。正值裁 60 路径手动验 (CI 不跑 60s)。
+    #[test]
+    fn wait_clamps_negative_to_zero() {
+        let ctrl = GuiController::new();
+        let r = ctrl.execute(GuiAction::Wait { seconds: -5.0 }).unwrap();
+        assert!(r.ok, "负值 Wait 应裁 0 后 ok=true");
     }
 }

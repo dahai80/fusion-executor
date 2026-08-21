@@ -197,3 +197,56 @@ def test_gui_action_bad_kind_over_uds(server: str):
     # 反序列化失败 → JSON-RPC error (-32600 invalid req)
     assert "error" in resp
     assert resp["error"]["code"] == -32600
+
+
+def test_gui_action_wait_ok_without_trust():
+    # Wait 纯延时, trusted-independent — 无 TCC 依赖, CI 可跑。0s 立即返回 ok=True。
+    ex = FusionSandboxExecutor()
+    r = ex.gui_action({"kind": "wait", "seconds": 0.0})
+    assert isinstance(r, GuiResult)
+    assert r.ok is True, f"Wait 0s 应 ok=True (trusted-independent): {r.error}"
+    assert r.error is None
+
+
+def test_gui_action_wait_negative_clamps():
+    # 负值 Wait 裁 0 (不睡眠), ok=True
+    ex = FusionSandboxExecutor()
+    r = ex.gui_action({"kind": "wait", "seconds": -5.0})
+    assert r.ok is True, f"负值 Wait 应裁 0 后 ok=True: {r.error}"
+
+
+def test_gui_action_wait_over_uds(server: str):
+    # Wait 经 UDS 往返, trusted-independent — 0s 应 ok=True
+    resp = _rpc(
+        server,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "executor.gui_action",
+            "params": {"action": {"kind": "wait", "seconds": 0.0}},
+        },
+    )
+    assert resp["jsonrpc"] == "2.0"
+    assert resp["id"] == 3
+    assert resp["result"]["ok"] is True
+    assert resp["result"]["error"] is None
+
+
+def test_gui_action_scroll_when_trusted():
+    if not _ax_trusted():
+        pytest.skip("AX 未授权 — 跳过真实滚轮合成测试 (CI 路径)")
+    ex = FusionSandboxExecutor()
+    r = ex.gui_action({"kind": "scroll", "dx": 0, "dy": -3})
+    assert isinstance(r, GuiResult)
+    assert r.ok is True, f"Scroll 应成功: {r.error}"
+    assert r.error is None
+
+
+def test_gui_action_drag_when_trusted():
+    if not _ax_trusted():
+        pytest.skip("AX 未授权 — 跳过真实拖拽合成测试 (CI 路径)")
+    ex = FusionSandboxExecutor()
+    r = ex.gui_action({"kind": "drag", "from": [10.0, 10.0], "to": [50.0, 50.0]})
+    assert isinstance(r, GuiResult)
+    assert r.ok is True, f"Drag 应成功: {r.error}"
+    assert r.error is None
