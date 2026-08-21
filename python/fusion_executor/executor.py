@@ -10,6 +10,7 @@ from .models import (
     GlobEntry,
     GrepMatch,
     GuiResult,
+    RollbackPolicy,
 )
 
 logger = logging.getLogger("fusion_executor")
@@ -33,8 +34,10 @@ class FusionSandboxExecutor:
         timeout: float = 30.0,
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
+        auto_rollback: RollbackPolicy | None = None,
     ) -> ExecutionResult:
         logger.debug("run command=%r timeout=%s cwd=%s task_id=%s", command, timeout, cwd, task_id)
+        policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         native = self._native.execute_sync(
             command,
             task_id,
@@ -42,6 +45,7 @@ class FusionSandboxExecutor:
             timeout,
             env_vars,
             enable_rollback_snapshot,
+            policy_dict,
         )
         diag = None
         if native.diagnostics is not None:
@@ -65,13 +69,15 @@ class FusionSandboxExecutor:
             security_reason=native.security_reason,
             snapshot_id=native.snapshot_id,
             diagnostics=diag,
+            auto_rolled_back=native.auto_rolled_back,
         )
         logger.info(
-            "run done exit=%s blocked=%s timed_out=%s diag=%s dur=%.3fs",
+            "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s dur=%.3fs",
             result.exit_code,
             result.blocked_by_security,
             result.timed_out,
             result.diagnostics.error_type if result.diagnostics else None,
+            result.auto_rolled_back,
             result.duration_sec,
         )
         return result
@@ -88,8 +94,10 @@ class FusionSandboxExecutor:
         timeout: float = 30.0,
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
+        auto_rollback: RollbackPolicy | None = None,
     ) -> Iterator[str | ExecutionResult]:
         logger.debug("run_streaming command=%r timeout=%s cwd=%s task_id=%s", command, timeout, cwd, task_id)
+        policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         it = self._native.execute_streaming(
             command,
             task_id,
@@ -97,6 +105,7 @@ class FusionSandboxExecutor:
             timeout,
             env_vars,
             enable_rollback_snapshot,
+            policy_dict,
         )
         for frame in it:
             ftype = frame.get("type")
@@ -140,6 +149,7 @@ class FusionSandboxExecutor:
             security_reason=payload.get("security_reason"),
             snapshot_id=payload.get("snapshot_id"),
             diagnostics=diag,
+            auto_rolled_back=payload.get("auto_rolled_back", False),
         )
 
     def rollback(self, snapshot_id: str, cwd: str | None = None) -> bool:

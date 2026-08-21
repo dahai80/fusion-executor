@@ -66,6 +66,8 @@ impl RollbackManager {
     }
 
     /// 整体回滚 — checkout 工作区 + 应用快照
+    /// snapshot_id == HEAD (干净基线快照) 时, 仅 checkout -- . 即恢复至初始状态,
+    /// 跳过 stash apply (HEAD SHA 非 stash commit, apply 必失败)。
     pub async fn rollback(&self, snapshot_id: &str, cwd: &str) -> Result<bool> {
         if !Self::is_repo(cwd).await {
             warn!(cwd, "非 git repo, 无法回滚");
@@ -77,6 +79,14 @@ impl RollbackManager {
             return Ok(true);
         }
         Self::git(cwd, &["checkout", "--", "."]).await?;
+        // 干净基线快照: snapshot_id == HEAD, checkout -- . 已恢复, 无需 stash apply
+        let head = Self::git(cwd, &["rev-parse", "HEAD"])
+            .await
+            .unwrap_or_default();
+        if snapshot_id == head {
+            info!(cwd, %snapshot_id, "回滚成功 (HEAD 基线, 仅 checkout)");
+            return Ok(true);
+        }
         match Self::git(cwd, &["stash", "apply", snapshot_id]).await {
             Ok(_) => {
                 info!(cwd, %snapshot_id, "回滚成功");

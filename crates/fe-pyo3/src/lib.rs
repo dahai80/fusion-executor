@@ -12,7 +12,7 @@ use fe_core::tools::{
 };
 use fe_core::{
     Diagnostics as RsDiag, ExecutionRequest, ExecutionResult as RsResult, ExecutionStreamEvent,
-    Executor,
+    Executor, RollbackPolicy,
 };
 use fe_ipc::IpcServer;
 
@@ -70,6 +70,8 @@ struct PyExecutionResult {
     snapshot_id: Option<String>,
     #[pyo3(get)]
     diagnostics: Option<PyDiagnostics>,
+    #[pyo3(get)]
+    auto_rolled_back: bool,
 }
 
 impl From<RsResult> for PyExecutionResult {
@@ -86,6 +88,7 @@ impl From<RsResult> for PyExecutionResult {
             security_reason: r.security_reason,
             snapshot_id: r.snapshot_id,
             diagnostics: r.diagnostics.map(PyDiagnostics::from),
+            auto_rolled_back: r.auto_rolled_back,
         }
     }
 }
@@ -267,17 +270,37 @@ impl PyExecutor {
         }
     }
 
-    /// execute_sync(command, task_id=None, cwd=None, timeout_sec=30.0, env_vars=None, enable_rollback_snapshot=True)
+    /// execute_sync(command, task_id=None, cwd=None, timeout_sec=30.0, env_vars=None,
+    ///               enable_rollback_snapshot=True, auto_rollback_policy=None)
     /// -> NativeExecutionResult
+    #[allow(clippy::too_many_arguments)]
     fn execute_sync(
         &self,
+        py: Python<'_>,
         command: String,
         task_id: Option<String>,
         cwd: Option<String>,
         timeout_sec: Option<f64>,
         env_vars: Option<std::collections::HashMap<String, String>>,
         enable_rollback_snapshot: Option<bool>,
+        auto_rollback_policy: Option<Bound<'_, PyAny>>,
     ) -> PyExecutionResult {
+        let policy = match auto_rollback_policy {
+            Some(obj) => match py
+                .import("json")
+                .and_then(|json| json.call_method1("dumps", (&obj,)))
+                .and_then(|s| s.extract::<String>())
+                .ok()
+                .and_then(|s| serde_json::from_str::<RollbackPolicy>(&s).ok())
+            {
+                Some(p) => Some(p),
+                None => {
+                    tracing::warn!("auto_rollback_policy 入参无效, 忽略");
+                    None
+                }
+            },
+            None => None,
+        };
         let req = ExecutionRequest {
             command: command.clone(),
             task_id: task_id.clone(),
@@ -285,6 +308,7 @@ impl PyExecutor {
             timeout_sec: timeout_sec.unwrap_or(30.0),
             env_vars,
             enable_rollback_snapshot: enable_rollback_snapshot.unwrap_or(true),
+            auto_rollback_policy: policy,
         };
         match self.inner.execute(req) {
             Ok(r) => r.into(),
@@ -300,6 +324,7 @@ impl PyExecutor {
                 security_reason: None,
                 snapshot_id: None,
                 diagnostics: None,
+                auto_rolled_back: false,
             },
         }
     }
@@ -378,17 +403,37 @@ impl PyExecutor {
         }
     }
 
-    /// execute_streaming(command, task_id=None, cwd=None, timeout_sec=30.0, env_vars=None, enable_rollback_snapshot=True)
+    /// execute_streaming(command, task_id=None, cwd=None, timeout_sec=30.0, env_vars=None,
+    ///                    enable_rollback_snapshot=True, auto_rollback_policy=None)
     /// -> NativeStreamIterator — 迭代 yield chunk 帧 {type:"chunk",data} 直至 done 帧 {type:"done",result:{...}}
+    #[allow(clippy::too_many_arguments)]
     fn execute_streaming(
         &self,
+        py: Python<'_>,
         command: String,
         task_id: Option<String>,
         cwd: Option<String>,
         timeout_sec: Option<f64>,
         env_vars: Option<std::collections::HashMap<String, String>>,
         enable_rollback_snapshot: Option<bool>,
+        auto_rollback_policy: Option<Bound<'_, PyAny>>,
     ) -> PyResult<PyStreamIterator> {
+        let policy = match auto_rollback_policy {
+            Some(obj) => match py
+                .import("json")
+                .and_then(|json| json.call_method1("dumps", (&obj,)))
+                .and_then(|s| s.extract::<String>())
+                .ok()
+                .and_then(|s| serde_json::from_str::<RollbackPolicy>(&s).ok())
+            {
+                Some(p) => Some(p),
+                None => {
+                    tracing::warn!("auto_rollback_policy 入参无效, 忽略");
+                    None
+                }
+            },
+            None => None,
+        };
         let req = ExecutionRequest {
             command,
             task_id,
@@ -396,6 +441,7 @@ impl PyExecutor {
             timeout_sec: timeout_sec.unwrap_or(30.0),
             env_vars,
             enable_rollback_snapshot: enable_rollback_snapshot.unwrap_or(true),
+            auto_rollback_policy: policy,
         };
         // execute_streaming async → BLOCKING_RT.block_on 取 (rx, handle); 后续 __next__ 同 RT 收帧
         let (rx, handle) = fe_core::BLOCKING_RT

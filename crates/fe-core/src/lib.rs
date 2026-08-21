@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use fe_diagnostics::Slicer;
 use fe_gui::{GuiAction, GuiController, GuiResult};
@@ -53,6 +53,8 @@ pub struct ExecutionRequest {
     pub env_vars: Option<std::collections::HashMap<String, String>>,
     #[serde(default = "default_true")]
     pub enable_rollback_snapshot: bool,
+    #[serde(default)]
+    pub auto_rollback_policy: Option<RollbackPolicy>,
 }
 
 fn default_timeout() -> f64 {
@@ -70,6 +72,30 @@ pub struct Diagnostics {
     pub line_number: Option<u32>,
     pub code_snippet: Option<String>,
     pub raw_trace: Option<String>,
+}
+
+/// 自动回滚策略 (FR-04 — caller-driven 锁定决策的扩展: 调用方可选启用自动策略)。
+/// Executor 保持无状态 — guard 在单次 execute_async 内构造, 不跨请求累积计数。
+/// max_consecutive_failures: 连续失败上限 (达此值触发回滚); file_damage_check: 检测文件毁损触发回滚。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackPolicy {
+    #[serde(default = "default_max_failures")]
+    pub max_consecutive_failures: u32,
+    #[serde(default = "default_true")]
+    pub file_damage_check: bool,
+}
+
+impl Default for RollbackPolicy {
+    fn default() -> Self {
+        Self {
+            max_consecutive_failures: 3,
+            file_damage_check: true,
+        }
+    }
+}
+
+fn default_max_failures() -> u32 {
+    3
 }
 
 impl From<fe_diagnostics::Diagnostics> for Diagnostics {
@@ -100,6 +126,8 @@ pub struct ExecutionResult {
     pub security_reason: Option<String>,
     pub snapshot_id: Option<String>,
     pub diagnostics: Option<Diagnostics>,
+    #[serde(default)]
+    pub auto_rolled_back: bool,
 }
 
 impl ExecutionResult {
@@ -136,6 +164,77 @@ impl ExecutionResult {
 pub enum ExecutionStreamEvent {
     Chunk { data: String },
     Done(Box<ExecutionResult>),
+}
+
+/// 自动回滚守卫 (FR-04) — 单次执行内追踪连续失败 + 文件毁损, 达阈值触发 rollback。
+/// 生命周期限定单次 execute_async: 不跨请求累积 (Executor 无状态锁定决策)。
+/// 连续失败计数靠调用方多次传同一 policy 维持? 否 — caller-driven 无状态, 单次内仅能基于
+/// 本次结果 + 上次快照判断 "文件毁损" (git status 比对快照前后)。连续失败计数本设计降级为:
+/// 单次执行内部 exit_code!=0 即视为 "本次失败", 配合 file_damage_check 触发回滚。
+/// 真正的连续失败计数归 caller (fusion-code 自愈循环 owns retry count, PRD §重构 明确)。
+/// 故此 guard 实现: exit_code==0 不回滚; exit_code!=0 且检测到文件改动 (git status 非空
+/// 且非本次命令预期改动) → rollback(last_snapshot)。max_consecutive_failures 保留字段,
+/// 供未来 stateful 扩展; 当前单次内阈值=1 (本次失败即检毁损)。
+pub struct AutoRollbackGuard {
+    policy: RollbackPolicy,
+    snapshot_id: String,
+    cwd: String,
+    rollback: RollbackManager,
+}
+
+impl AutoRollbackGuard {
+    /// 构造 — 持有本次执行前创建的快照 id + cwd
+    pub fn new(policy: RollbackPolicy, snapshot_id: String, cwd: String) -> Self {
+        Self {
+            policy,
+            snapshot_id,
+            cwd,
+            rollback: RollbackManager::new(),
+        }
+    }
+
+    /// 检测文件毁损 — git status --porcelain 比对快照后工作区状态。
+    /// 非空 (有改动) 视为 "文件被本次命令改动/毁损"。返回改动文件数。
+    async fn detect_damage(&self) -> Result<usize> {
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.cwd)
+            .args(["status", "--porcelain"])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("git status 启动失败: {e}"))?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        Ok(s.lines().filter(|l| !l.is_empty()).count())
+    }
+
+    /// 记录结果 — exit_code==0 无动作; !=0 且检测毁损 → rollback, 标记 auto_rolled_back。
+    /// 就地修改 result.auto_rolled_back。非 git repo → 跳过 (rollback no-op)。
+    pub async fn record_result(&self, result: &mut ExecutionResult) -> Result<()> {
+        if result.exit_code == 0 {
+            return Ok(());
+        }
+        if !self.policy.file_damage_check {
+            return Ok(());
+        }
+        let damaged = self.detect_damage().await.unwrap_or(0);
+        if damaged == 0 {
+            info!(exit_code = result.exit_code, "失败但无文件改动, 不回滚");
+            return Ok(());
+        }
+        info!(
+            damaged,
+            exit_code = result.exit_code,
+            "检测到文件改动, 触发自动回滚"
+        );
+        let ok = self.rollback.rollback(&self.snapshot_id, &self.cwd).await?;
+        if ok {
+            result.auto_rolled_back = true;
+            info!(snapshot = %self.snapshot_id, "自动回滚成功");
+        } else {
+            warn!(snapshot = %self.snapshot_id, "自动回滚未生效 (rollback 返回 false)");
+        }
+        Ok(())
+    }
 }
 
 /// Executor — 校验 + 沙箱执行的编排器
@@ -298,7 +397,8 @@ impl Executor {
             None
         };
 
-        Ok(ExecutionResult {
+        let sid_filtered = snapshot_id.as_ref().filter(|s| !s.is_empty()).cloned();
+        let mut result = ExecutionResult {
             exit_code: sb.exit_code,
             stdout: sb.stdout,
             stderr: sb.stderr,
@@ -306,10 +406,26 @@ impl Executor {
             command: Some(req.command.clone()),
             duration_sec: start.elapsed().as_secs_f64(),
             timed_out: sb.timed_out,
-            snapshot_id: snapshot_id.filter(|s| !s.is_empty()),
+            snapshot_id: sid_filtered.clone(),
             diagnostics: diag,
             ..Default::default()
-        })
+        };
+
+        // 自动回滚 (FR-04) — 调用方传 policy 且有快照+cwd 时, 单次内 guard 判定
+        if let (Some(policy), Some(cwd), Some(sid)) = (
+            req.auto_rollback_policy.clone(),
+            req.cwd.clone(),
+            sid_filtered.as_ref(),
+        ) {
+            if !sid.is_empty() {
+                let guard = AutoRollbackGuard::new(policy, sid.clone(), cwd);
+                if let Err(e) = guard.record_result(&mut result).await {
+                    warn!(error = %e, "自动回滚 guard 异常 (非致命)");
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// 同步执行 — 走 BLOCKING_RT，供 PyO3 sync 入口
@@ -402,6 +518,8 @@ impl Executor {
         let cwd_for_diag = req.cwd.clone();
         let task_id_for_done = req.task_id.clone();
         let command_for_done = req.command.clone();
+        let policy_for_done = req.auto_rollback_policy.clone();
+        let cwd_for_guard = req.cwd.clone();
 
         let (outer_tx, outer_rx) = mpsc::channel::<ExecutionStreamEvent>(64);
         let handle = tokio::spawn(async move {
@@ -424,7 +542,8 @@ impl Executor {
                         } else {
                             None
                         };
-                        let result = ExecutionResult {
+                        let sid_filtered = snapshot_id.as_ref().filter(|s| !s.is_empty()).cloned();
+                        let mut result = ExecutionResult {
                             exit_code: sb.exit_code,
                             stdout: sb.stdout,
                             stderr: sb.stderr,
@@ -432,10 +551,27 @@ impl Executor {
                             command: Some(command_for_done.clone()),
                             duration_sec: start.elapsed().as_secs_f64(),
                             timed_out: sb.timed_out,
-                            snapshot_id: snapshot_id.filter(|s| !s.is_empty()),
+                            snapshot_id: sid_filtered.clone(),
                             diagnostics: diag,
                             ..Default::default()
                         };
+                        // 自动回滚 (FR-04, 同 execute_async)
+                        if let (Some(policy), Some(cwd), Some(sid)) = (
+                            policy_for_done.as_ref(),
+                            cwd_for_guard.as_ref(),
+                            sid_filtered.as_ref(),
+                        ) {
+                            if !sid.is_empty() {
+                                let guard = AutoRollbackGuard::new(
+                                    policy.clone(),
+                                    sid.clone(),
+                                    cwd.clone(),
+                                );
+                                if let Err(e) = guard.record_result(&mut result).await {
+                                    warn!(error = %e, "自动回滚 guard 异常 (streaming, 非致命)");
+                                }
+                            }
+                        }
                         let _ = outer_tx
                             .send(ExecutionStreamEvent::Done(Box::new(result)))
                             .await;
@@ -471,6 +607,7 @@ mod tests {
                 timeout_sec: 10.0,
                 env_vars: None,
                 enable_rollback_snapshot: false,
+                auto_rollback_policy: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut combined = String::new();
@@ -501,6 +638,7 @@ mod tests {
                 timeout_sec: 10.0,
                 env_vars: None,
                 enable_rollback_snapshot: false,
+                auto_rollback_policy: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut frames = 0;
@@ -530,6 +668,7 @@ mod tests {
                 timeout_sec: 1.0,
                 env_vars: None,
                 enable_rollback_snapshot: false,
+                auto_rollback_policy: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -556,6 +695,7 @@ mod tests {
                 timeout_sec: 10.0,
                 env_vars: None,
                 enable_rollback_snapshot: false,
+                auto_rollback_policy: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -569,6 +709,100 @@ mod tests {
             assert_ne!(done.exit_code, 0);
             let diag = done.diagnostics.expect("非零退出应填 diagnostics");
             assert_eq!(diag.error_type.as_deref(), Some("ValueError"));
+        });
+    }
+
+    fn make_git_repo(dir: &std::path::Path) {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git 失败")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("app.py"), "print('ok')\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+    }
+
+    #[test]
+    fn auto_rollback_triggers_on_failure_with_file_damage() {
+        rt().block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cwd = dir.path().to_str().unwrap().to_string();
+            make_git_repo(dir.path());
+            // python3 白名单内 — 改写 app.py 后抛错 (失败 + 文件毁损)
+            let cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\"";
+            let req = ExecutionRequest {
+                command: cmd.to_string(),
+                task_id: None,
+                cwd: Some(cwd.clone()),
+                timeout_sec: 15.0,
+                env_vars: None,
+                enable_rollback_snapshot: true,
+                auto_rollback_policy: Some(RollbackPolicy::default()),
+            };
+            let ex = Executor::new();
+            let res = ex.execute_async(req).await.unwrap();
+            assert_ne!(res.exit_code, 0, "应失败");
+            assert!(res.auto_rolled_back, "应自动回滚");
+            // 回滚后 app.py 恢复原始内容
+            let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
+            assert_eq!(content, "print('ok')\n", "回滚后应恢复: {content}");
+        });
+    }
+
+    #[test]
+    fn auto_rollback_skipped_when_exit_ok() {
+        rt().block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cwd = dir.path().to_str().unwrap().to_string();
+            make_git_repo(dir.path());
+            // 成功命令: commit 后工作区干净, 不应回滚
+            let req = ExecutionRequest {
+                command: "echo hi".to_string(),
+                task_id: None,
+                cwd: Some(cwd),
+                timeout_sec: 10.0,
+                env_vars: None,
+                enable_rollback_snapshot: true,
+                auto_rollback_policy: Some(RollbackPolicy::default()),
+            };
+            let ex = Executor::new();
+            let res = ex.execute_async(req).await.unwrap();
+            assert_eq!(res.exit_code, 0);
+            assert!(!res.auto_rolled_back, "成功不应回滚");
+        });
+    }
+
+    #[test]
+    fn auto_rollback_no_policy_means_no_action() {
+        rt().block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cwd = dir.path().to_str().unwrap().to_string();
+            make_git_repo(dir.path());
+            // 无 policy → 即使失败+文件改动也不回滚
+            let cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\"";
+            let req = ExecutionRequest {
+                command: cmd.to_string(),
+                task_id: None,
+                cwd: Some(cwd.clone()),
+                timeout_sec: 15.0,
+                env_vars: None,
+                enable_rollback_snapshot: true,
+                auto_rollback_policy: None,
+            };
+            let ex = Executor::new();
+            let res = ex.execute_async(req).await.unwrap();
+            assert_ne!(res.exit_code, 0);
+            assert!(!res.auto_rolled_back, "无 policy 不应回滚");
+            // 文件保持损坏 (未回滚)
+            let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
+            assert_eq!(content, "broken\n", "无 policy 文件应保持改动: {content}");
         });
     }
 }

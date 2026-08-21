@@ -12,6 +12,7 @@ from fusion_executor import (
     FusionSandboxExecutor,
     GlobEntry,
     GrepMatch,
+    RollbackPolicy,
 )
 
 
@@ -344,3 +345,76 @@ def test_glob_over_uds_roundtrip(uds_server: str, tmp_path):
     )
     paths = sorted(e["path"] for e in resp["result"])
     assert paths == ["a.py", "b.py"]
+
+
+# ── 自动回滚 (FR-04 auto policy) ──
+
+
+def test_auto_rollback_triggers_on_failure_with_file_damage(executor: FusionSandboxExecutor, git_repo: str):
+    with open(os.path.join(git_repo, "app.py")) as f:
+        assert f.read() == "print(1)\n"
+    cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\""
+    result = executor.run(cmd, cwd=git_repo, auto_rollback=RollbackPolicy())
+    assert result.exit_code != 0
+    assert result.auto_rolled_back is True
+    with open(os.path.join(git_repo, "app.py")) as f:
+        assert f.read() == "print(1)\n", "文件已回滚到基线"
+
+
+def test_auto_rollback_skipped_when_exit_ok(executor: FusionSandboxExecutor, git_repo: str):
+    result = executor.run("echo ok", cwd=git_repo, auto_rollback=RollbackPolicy())
+    assert result.exit_code == 0
+    assert result.auto_rolled_back is False
+
+
+def test_auto_rollback_no_policy_means_no_action(executor: FusionSandboxExecutor, git_repo: str):
+    cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\""
+    result = executor.run(cmd, cwd=git_repo)
+    assert result.exit_code != 0
+    assert result.auto_rolled_back is False
+    with open(os.path.join(git_repo, "app.py")) as f:
+        assert f.read() == "broken\n", "无 policy 不回滚, 改动保留"
+
+
+def test_auto_rollback_streaming_triggers(executor: FusionSandboxExecutor, git_repo: str):
+    cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\""
+    result = None
+    for frame in executor.run_streaming(cmd, cwd=git_repo, auto_rollback=RollbackPolicy()):
+        if isinstance(frame, ExecutionResult):
+            result = frame
+            break
+    assert result is not None
+    assert result.exit_code != 0
+    assert result.auto_rolled_back is True
+    with open(os.path.join(git_repo, "app.py")) as f:
+        assert f.read() == "print(1)\n", "流式路径自动回滚恢复基线"
+
+
+def test_auto_rollback_over_uds_roundtrip(uds_server: str, tmp_path):
+    import json as _json
+
+    d = str(tmp_path)
+    subprocess.run(["git", "-C", d, "init", "-q"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", d, "config", "user.email", "t@t"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", d, "config", "user.name", "t"], check=True, capture_output=True)
+    (tmp_path / "app.py").write_text("print(1)\n")
+    subprocess.run(["git", "-C", d, "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", d, "commit", "-q", "-m", "base"], check=True, capture_output=True)
+    cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\""
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "executor.execute",
+            "params": {
+                "command": cmd,
+                "cwd": d,
+                "auto_rollback_policy": {"max_consecutive_failures": 3, "file_damage_check": True},
+            },
+        },
+    )
+    assert resp["result"]["exit_code"] != 0
+    assert resp["result"]["auto_rolled_back"] is True
+    assert (tmp_path / "app.py").read_text() == "print(1)\n"
+    del _json

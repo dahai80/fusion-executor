@@ -11,6 +11,11 @@ class Diagnostics(BaseModel):
     raw_trace: str | None = None
 
 
+class RollbackPolicy(BaseModel):
+    max_consecutive_failures: int = Field(default=3, description="连续失败上限 (保留字段, 供 stateful 扩展)")
+    file_damage_check: bool = Field(default=True, description="失败时检测文件毁损 (git status) 触发回滚")
+
+
 class ExecutionRequest(BaseModel):
     command: str
     task_id: str | None = None
@@ -18,6 +23,7 @@ class ExecutionRequest(BaseModel):
     timeout_sec: float = Field(default=30.0, description="秒; 超时退出码 -124")
     env_vars: dict[str, str] | None = None
     enable_rollback_snapshot: bool = True
+    auto_rollback_policy: RollbackPolicy | None = None
 
 
 class ExecutionResult(BaseModel):
@@ -32,6 +38,7 @@ class ExecutionResult(BaseModel):
     security_reason: str | None = None
     snapshot_id: str | None = None
     diagnostics: Diagnostics | None = None
+    auto_rolled_back: bool = False
 
 
 class GuiResult(BaseModel):

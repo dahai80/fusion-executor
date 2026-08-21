@@ -9,6 +9,7 @@ from .models import (
     GlobEntry,
     GrepMatch,
     GuiResult,
+    RollbackPolicy,
 )
 
 __all__ = [
@@ -20,5 +21,6 @@ __all__ = [
     "GlobEntry",
     "GrepMatch",
     "GuiResult",
+    "RollbackPolicy",
 ]
 __version__ = "0.1.0"
