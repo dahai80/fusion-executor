@@ -4,11 +4,11 @@
 
 Rust 核心 + PyO3/maturin Python 绑定。Fusion monorepo 第一个 maturin/PyO3 工程 (其余 23 个 Python 工程用 setuptools)。
 
-**状态: v1.3 完成 (P1-P5 + KeyPress + 流式 + 修饰键 + 截图尺寸 + 原生文件工具 + 外科补丁引擎)** — 安全 + 沙箱 + 诊断切片 + Git 回滚 + UDS JSON-RPC IPC 服务 + macOS GUI (AXUIElement + CoreGraphics + CGEvent 按键合成 + 修饰键组合) + 实时 stdio 流式传输 (NDJSON chunk/done) + 截图 width/height metadata + 原生文件工具 (file_edit/glob/grep 本地化替代 Claude SDK FileEdit/Glob/Grep) + 外科补丁引擎 (Unified Diff apply + 函数级替换, 禁全文件重写) + Data Schema §4.1 补齐 (task_id/command/duration_sec) + 加固 (criterion 基准 + 覆盖率 95%)。94 Rust + 52 Python 测试全绿。
+**状态: v1.4 完成 (P1-P5 + KeyPress + 流式 + 修饰键 + 截图尺寸 + 原生文件工具 + 外科补丁引擎 + 自动回滚 + 实时遥测 + GUI scroll/drag/wait)** — 安全 + 沙箱 + 诊断切片 + Git 回滚 + UDS JSON-RPC IPC 服务 + macOS GUI (AXUIElement + CoreGraphics + CGEvent 按键合成 + 修饰键组合 + scroll/drag/wait) + 实时 stdio 流式传输 (NDJSON chunk/done) + 截图 width/height metadata + 原生文件工具 (file_edit/glob/grep 本地化替代 Claude SDK FileEdit/Glob/Grep) + 外科补丁引擎 (Unified Diff apply + 函数级替换, 禁全文件重写) + Data Schema §4.1 补齐 (task_id/command/duration_sec) + 自动回滚 (FR-04 可选策略, git status 毁损检测触发) + 实时遥测 (10Hz CPU/内存 UDS 广播, GPU 调用方注入) + 加固 (criterion 基准 + 覆盖率 95%)。105 Rust + 60 Python 测试全绿。
 
 ## 架构
 
-9-crate Cargo workspace (resolver 2), 一个 PyO3 绑定 crate 由 maturin 构建。
+10-crate Cargo workspace (resolver 2), 一个 PyO3 绑定 crate 由 maturin 构建。
 
 ```
 fusion-executor/
@@ -19,10 +19,11 @@ fusion-executor/
 │   ├── fe-security/        # Security Guard: 正则黑名单 + 分词器 + 白名单
 │   ├── fe-sandbox/         # PTY 子进程, 超时, 截断, OOM 上限
 │   ├── fe-gui/             # macOS Computer Use: AXUIElement + CoreGraphics (P4)
-│   ├── fe-rollback/        # git 快照/回滚 (P2)
+│   ├── fe-rollback/        # git 快照/回滚 (P2) + 自动回滚 guard (v1.4)
 │   ├── fe-diagnostics/     # Traceback 正则 + tree-sitter 切片 (P2)
 │   ├── fe-ipc/             # UDS JSON-RPC 2.0 服务 (P3)
 │   ├── fe-tools/           # 原生文件工具: file_edit/glob/grep + 补丁引擎 (v1.3)
+│   ├── fe-telemetry/       # 实时遥测: 10Hz CPU/内存采样流 (v1.4)
 │   └── fe-pyo3/            # PyO3 绑定; maturin target → fusion_executor._native
 ├── python/
 │   └── fusion_executor/    # Pydantic v2 模型 + FusionSandboxExecutor 薄封装
@@ -168,6 +169,38 @@ for frame in ex.run_streaming("echo hi", enable_rollback_snapshot=False):
 
 拦截 (安全违规) → 仅单帧 done, 无 chunk。超时 → done 帧 `timed_out=True, exit_code=-124`。失败命令 → done 帧含 `diagnostics`。
 
+### 自动回滚 (v1.4 — FR-04 可选策略)
+
+`run()` / `run_streaming()` 接受可选 `auto_rollback: RollbackPolicy`。启用后, 命令失败 (`exit_code != 0`) 且检测到工作区文件改动 (`git status --porcelain` 非空) 时, 自动 `rollback(本次快照)`, 标记 `result.auto_rolled_back=True`。Executor 仍无状态 — guard 生命周期限单次执行, 不跨请求累积失败计数 (连续失败计数归 caller 自愈循环)。
+
+```python
+from fusion_executor import FusionSandboxExecutor, RollbackPolicy
+
+ex = FusionSandboxExecutor()
+policy = RollbackPolicy(max_consecutive_failures=3, file_damage_check=True)
+# 命令写坏 app.py 后失败 → 自动回滚恢复 git 基线
+r = ex.run("python3 -c \"open('app.py','w').write('broken'); raise ValueError(1)\"",
+           cwd="/repo", auto_rollback=policy)
+assert r.exit_code != 0 and r.auto_rolled_back
+```
+
+`RollbackPolicy{max_consecutive_failures=3 (保留字段), file_damage_check=True}`。无快照 (`enable_rollback_snapshot=False`) → guard 跳过。非 git repo → 毁损检测失败视为 0 改动, 不回滚。
+
+### 实时遥测 (v1.4 — GPU/CPU UDS 广播)
+
+`telemetry_stream()` 生成器逐帧 yield `TelemetrySample` — 10Hz (可调 `interval_ms`) 进程 CPU/内存采样。GPU 字段默认 None (executor 不跑模型, 无 GPU 句柄), 由调用方注入。`max_samples>0` 达此值自动结束; 丢弃迭代器则采样任务自动停止 (通道关闭)。Executor 无状态: 每次调用独立流。
+
+```python
+from fusion_executor import FusionSandboxExecutor, TelemetrySample
+
+ex = FusionSandboxExecutor()
+for s in ex.telemetry_stream(interval_ms=100, max_samples=50):
+    print(f"t={s.ts_ms}ms cpu={s.cpu_pct:.1f}% mem={s.mem_mb:.1f}MB")
+    # s.gpu_pct / s.gpu_mem_mb 默认 None (serde skip, 调用方注入)
+```
+
+`TelemetrySample{ts_ms (毫秒, 调用方纪元), cpu_pct (单核倍数), mem_mb (常驻内存 MB), gpu_pct?, gpu_mem_mb?, task_id?}`。底层 fe-telemetry `start_stream(cfg, rt::Handle)` 在 `BLOCKING_RT` 上 spawn sysinfo 采样任务; 4 层 wiring (fe-telemetry → fe-core → fe-ipc `executor.telemetry_stream` 多帧 → fe-pyo3 `NativeTelemetryIterator` → Python 生成器)。
+
 ## IPC 服务 (UDS JSON-RPC)
 
 启动 UDS JSON-RPC 2.0 服务器 — 供 fusion-code (TypeScript) / fusion-studio (Swift) 经 Unix Domain Socket 调用:
@@ -177,11 +210,14 @@ python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecu
 # Socket: /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK)
 ```
 
-协议: 换行分隔 JSON-RPC 2.0, 错误码 -32700/-32600/-32601/-32603 + 扩展 -32010(安全)/-32011(超时)/-32012(回滚)/-32013(AX)。方法 `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`/`shutdown`。
+协议: 换行分隔 JSON-RPC 2.0, 错误码 -32700/-32600/-32601/-32603 + 扩展 -32010(安全)/-32011(超时)/-32012(回滚)/-32013(AX)。方法 `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`/`telemetry_stream`/`shutdown`。
 
 `executor.execute_stream` 流式: 多帧 (chunk/done) 共用同一 id, 换行分隔逐帧写出 —
 - chunk: `{"jsonrpc":"2.0","id":id,"result":{"type":"chunk","data":"..."}}`
 - done: `{"jsonrpc":"2.0","id":id,"result":{"type":"done","result":{...ExecutionResult}}}` (UDS 路径 done 嵌套在 `result.result`, 与 PyO3 路径扁平不同 — 两条路径分离, 各自消费者读对应形状)
+
+`executor.telemetry_stream` 流式: 多帧 sample 共用同一 id, 换行分隔逐帧写出 —
+- sample: `{"jsonrpc":"2.0","id":id,"result":{"type":"sample","sample":{...TelemetrySample}}}` (params `interval_ms`(默认 100)/`max_samples`(默认 0=无限); GPU 字段 None 时 serde skip 省略)
 
 fusion-code TS 客户端 sketch 见 `docs/ipc-client-typescript.md`; fusion-studio 用现有 `IPCClient.swift udsCall` 指向同一 socket。
 
@@ -239,4 +275,10 @@ fusion-code TS 客户端 sketch 见 `docs/ipc-client-typescript.md`; fusion-stud
   - clippy 修 `ExecutionStreamEvent::Done(ExecutionResult)` → `Done(Box<ExecutionResult>)` (large_enum_variant, Done 264B vs Chunk 24B; serde 对 Box 透明, 序列化不变)
   - +13 fe-tools Rust 单元测试 (file_edit 唯一/无匹配/歧义/未找到, glob, grep 命中/递归, apply_patch 简单/未找到, replace_function python/未找到/rust, guard_path 逃逸) + 12 Python 测试 (file_edit 唯一/歧义, glob, grep, apply_patch, replace_function python/未找到, file_edit/glob UDS 往返 subprocess 模式)
   - 退出闸门: 94 Rust + 52 Python 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat); fmt/ruff 净; maturin 构建
+- **v1.4 — 自动回滚 + 实时遥测 + GUI scroll/drag/wait** ✅ 完成
+  - 自动回滚 (FR-04 可选策略, fe-core `AutoRollbackGuard` + fe-rollback): `RollbackPolicy{max_consecutive_failures (保留字段), file_damage_check}`; 命令失败 + `git status --porcelain` 非空 → `rollback(本次快照)` + `result.auto_rolled_back=True`; guard 限单次执行 (Executor 无状态, 连续失败计数归 caller); 4 层 wiring (fe-core `execute_async`/`execute_streaming` 构造 guard → fe-pyo3 `auto_rollback_policy` dict→serde → Python `RollbackPolicy` Pydantic + `run()`/`run_streaming()` kwargs); fe-rollback HEAD 基线 bug 修 (stash SHA != HEAD 时 stash apply, 相等则 skip)
+  - 实时遥测 (fe-telemetry 新 crate): `TelemetrySample{ts_ms,cpu_pct,mem_mb,gpu_pct?,gpu_mem_mb?,task_id?}` + `TelemetryConfig{interval_ms=100(10Hz),max_samples=0(无限)}`; `start_stream(cfg, rt::Handle)` 在 `BLOCKING_RT` 上 spawn sysinfo 采样任务 (`refresh_processes_specifics(pid, mem+cpu)`, 首帧 sleep 后采); 通道关闭/max_samples 达则停; GPU 默认 None (调用方注入), serde `skip_serializing_if`; 4 层 wiring (fe-core `telemetry_stream(cfg)` → fe-ipc `executor.telemetry_stream` 多帧 sample → fe-pyo3 `NativeTelemetryIterator` `__next__` block_on(rx.recv) → Python `telemetry_stream()` 生成器 yield `TelemetrySample`); never-type fallback 修 (显式 `TelemetrySample` 类型标注)
+  - GUI scroll/drag/wait (fe-gui CGEvent 合成): `scroll` (dx/dy 像素, CGEvent scrollWheel 单位轴) / `drag` (from x,y → to x,y, mouseMove+leftMouseDown+move+leftMouseUp) / `wait` (seconds 睡眠, 测试辅助); +14 Rust 单元测试 + 14 Python GUI 测试
+  - +3 fe-telemetry Rust 单元测试 (stream 产样/通道关闭停止/序列化) +1 fe-core +1 fe-ipc (UDS telemetry 3 帧) +5 Python auto-rollback 测试 +3 Python telemetry 测试 (native iter/wrapper/UDS)
+  - 退出闸门: 105 Rust + 60 Python 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat); fmt/ruff 净; maturin 构建
 
