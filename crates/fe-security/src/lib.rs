@@ -93,6 +93,8 @@ const WHITELIST: &[&str] = &[
     "cargo-nextest",
     "swift",
     "swiftc",
+    "go",
+    "tsc",
     "git",
     "ls",
     "cat",
@@ -572,6 +574,14 @@ mod tests {
         assert!(!v.allowed);
         assert_eq!(v.stage, Some(SecurityStage::Tokenizer));
         assert!(v.reason.as_ref().unwrap().contains("白名单"));
+    }
+
+    #[test]
+    fn allows_go_and_tsc_whitelisted() {
+        let g = guard().validate("go build ./...");
+        assert!(g.allowed, "go 应在白名单, reason={:?}", g.reason);
+        let t = guard().validate("tsc --noEmit app.ts");
+        assert!(t.allowed, "tsc 应在白名单, reason={:?}", t.reason);
     }
 
     #[test]

@@ -7,8 +7,11 @@
 //   Python   Traceback (most recent call last): ... <type>Error: <msg>
 //            File "path", line N
 //   Node     Error: <msg> at <fn> (path:line:col)
+//   Bun      error: <msg> at path:line:col (小写, 裸 at 无括号)
+//   TS       path.ts(l,c): error TSxxxx: <msg> (tsc 编译器; 兼容 :l:c 与 - 形式)
 //   Rust     thread 't' panicked at path:line:col
 //   Swift    path:line:col: error: <msg>
+//   Go       panic: <msg> ... goroutine ... \tfile.go:line  /  file.go:line:col: <msg>
 
 use std::path::Path;
 
@@ -31,14 +34,19 @@ pub struct Diagnostics {
 #[derive(Clone)]
 pub struct Slicer {
     python_re: Regex,
+    ts_re: Regex,
+    ts_dash_re: Regex,
     node_re: Regex,
+    bun_re: Regex,
     rust_re: Regex,
+    go_panic_re: Regex,
     swift_re: Regex,
+    go_compile_re: Regex,
 }
 
 impl Slicer {
     pub fn new() -> Self {
-        info!("Slicer::new() — 编译 4 语言 traceback 正则");
+        info!("Slicer::new() — 编译 8 语言 traceback 正则");
         Self {
             // Python: Traceback ... File "path", line N ... <Type>Error: msg
             // (?ms): m=^按行锚, s=.跨行 (.*? 跨过 "in forward\n return...\n" 到达错误行)
@@ -46,16 +54,40 @@ impl Slicer {
                 r#"(?ms)Traceback \(most recent call last\):.*?File "([^"]+)", line (\d+).*?^(\w+(?:Error|Exception|Warning)):\s*([^\n]*)"#,
             )
             .expect("python_re 编译失败"),
+            // TS: path.ts(l,c): error TSxxxx: msg (tsc 括号形式)
+            // (?m): ^按行锚; group1=path(.ts/.tsx 等), group2=line, group3=TS 码, group4=msg
+            ts_re: Regex::new(
+                r#"(?m)^([^:\s][^:\n]*?)\((\d+),\d+\):\s+error\s+(TS\d+):\s*([^\n]*)"#,
+            )
+            .expect("ts_re 编译失败"),
+            // TS watch: path.ts:l:c - error TSxxxx: msg (tsc watch 冒号-短横形式)
+            ts_dash_re: Regex::new(
+                r#"(?m)^([^:\s][^:\n]*?):(\d+):\d+\s+-\s+error\s+(TS\d+):\s*([^\n]*)"#,
+            )
+            .expect("ts_dash_re 编译失败"),
             // Node: Error: msg ... at fn (path:line:col)
             node_re: Regex::new(r"Error:\s*(.*)\n\s+at\s+.*\(([^()]+):(\d+):\d+\)")
                 .expect("node_re 编译失败"),
+            // Bun: error: msg ... at path:line:col (小写 error, 裸 at 无括号)
+            bun_re: Regex::new(r"error:\s*(.*)\n\s+at\s+([^()]+):(\d+):\d+")
+                .expect("bun_re 编译失败"),
             // Rust: thread 't' panicked at path:line:col
             rust_re: Regex::new(r"thread '.*?' panicked at ([^:\n]+):(\d+):\d+")
                 .expect("rust_re 编译失败"),
+            // Go panic: panic: msg ... goroutine N [running]: ... \tfile.go:line
+            // (?s): .跨行; group1=panic msg, group2=file, group3=line (最后一栈帧)
+            go_panic_re: Regex::new(
+                r#"(?s)panic:\s*([^\n]*)\n.*?goroutine \d+ \[running\]:.*?\n\t([^:\n]+):(\d+)"#,
+            )
+            .expect("go_panic_re 编译失败"),
             // Swift: path:line:col: error: msg
             // (?m): ^按行锚; [^:\n]* 防跨行吞掉上一行
             swift_re: Regex::new(r"(?m)^([^:\s][^:\n]*):(\d+):\d+:\s*error:\s*([^\n]*)")
                 .expect("swift_re 编译失败"),
+            // Go compile: file.go:line:col: msg (无 error 关键字; swift_re 漏因无 "error:")
+            // (?m): ^按行锚; group1=file(.go), group2=line, group3=msg
+            go_compile_re: Regex::new(r"(?m)^([^:\s][^:\n]*\.go):(\d+):\d+:\s*([^\n]*)")
+                .expect("go_compile_re 编译失败"),
         }
     }
 
@@ -65,16 +97,28 @@ impl Slicer {
         let tail = tail_lines(output, 30);
         debug!(tail_len = tail.len(), "slice — 提取 traceback");
 
+        if let Some(d) = self.extract_ts(&tail) {
+            return self.enrich(d, cwd);
+        }
         if let Some(d) = self.extract_python(&tail) {
             return self.enrich(d, cwd);
         }
         if let Some(d) = self.extract_node(&tail) {
             return self.enrich(d, cwd);
         }
+        if let Some(d) = self.extract_bun(&tail) {
+            return self.enrich(d, cwd);
+        }
         if let Some(d) = self.extract_rust(&tail) {
             return self.enrich(d, cwd);
         }
+        if let Some(d) = self.extract_go_panic(&tail) {
+            return self.enrich(d, cwd);
+        }
         if let Some(d) = self.extract_swift(&tail) {
+            return self.enrich(d, cwd);
+        }
+        if let Some(d) = self.extract_go_compile(&tail) {
             return self.enrich(d, cwd);
         }
         // 无匹配 → 仅存原始 trace
@@ -103,6 +147,31 @@ impl Slicer {
         })
     }
 
+    fn extract_ts(&self, tail: &str) -> Option<Diagnostics> {
+        if let Some(c) = self.ts_re.captures(tail) {
+            return Some(self.build_ts_diag(c));
+        }
+        let c = self.ts_dash_re.captures(tail)?;
+        Some(self.build_ts_diag(c))
+    }
+
+    fn build_ts_diag(&self, c: regex::Captures) -> Diagnostics {
+        let file_path = c.get(1).map(|m| m.as_str().to_string());
+        let line_number = c.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+        let error_type = c.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let msg = c
+            .get(4)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        Diagnostics {
+            error_type: Some(error_type.clone()),
+            file_path,
+            line_number,
+            raw_trace: Some(format!("{}: {}", error_type, msg)),
+            code_snippet: None,
+        }
+    }
+
     fn extract_node(&self, tail: &str) -> Option<Diagnostics> {
         let c = self.node_re.captures(tail)?;
         let msg = c.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
@@ -113,6 +182,20 @@ impl Slicer {
             file_path,
             line_number,
             raw_trace: Some(format!("Error: {}", msg)),
+            code_snippet: None,
+        })
+    }
+
+    fn extract_bun(&self, tail: &str) -> Option<Diagnostics> {
+        let c = self.bun_re.captures(tail)?;
+        let msg = c.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let file_path = c.get(2).map(|m| m.as_str().to_string());
+        let line_number = c.get(3).and_then(|m| m.as_str().parse::<u32>().ok());
+        Some(Diagnostics {
+            error_type: Some("error".to_string()),
+            file_path,
+            line_number,
+            raw_trace: Some(format!("error: {}", msg)),
             code_snippet: None,
         })
     }
@@ -141,6 +224,40 @@ impl Slicer {
             file_path,
             line_number,
             raw_trace: Some(format!("error: {}", msg)),
+            code_snippet: None,
+        })
+    }
+
+    fn extract_go_panic(&self, tail: &str) -> Option<Diagnostics> {
+        let c = self.go_panic_re.captures(tail)?;
+        let msg = c
+            .get(1)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        let file_path = c.get(2).map(|m| m.as_str().to_string());
+        let line_number = c.get(3).and_then(|m| m.as_str().parse::<u32>().ok());
+        Some(Diagnostics {
+            error_type: Some("panic".to_string()),
+            file_path,
+            line_number,
+            raw_trace: Some(format!("panic: {}", msg)),
+            code_snippet: None,
+        })
+    }
+
+    fn extract_go_compile(&self, tail: &str) -> Option<Diagnostics> {
+        let c = self.go_compile_re.captures(tail)?;
+        let file_path = c.get(1).map(|m| m.as_str().to_string());
+        let line_number = c.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+        let msg = c
+            .get(3)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        Some(Diagnostics {
+            error_type: Some("compile error".to_string()),
+            file_path,
+            line_number,
+            raw_trace: Some(format!("compile error: {}", msg)),
             code_snippet: None,
         })
     }
@@ -271,6 +388,60 @@ mod tests {
         assert_eq!(d.error_type.as_deref(), Some("error"));
         assert_eq!(d.file_path.as_deref(), Some("main.swift"));
         assert_eq!(d.line_number, Some(15));
+    }
+
+    #[test]
+    fn extract_ts_compiler_error() {
+        let out = "tsc\nsrc/router.ts(42,7): error TS2322: Type 'string' is not assignable to type 'number'.";
+        let d = s().slice(out, None);
+        assert_eq!(d.error_type.as_deref(), Some("TS2322"));
+        assert_eq!(d.file_path.as_deref(), Some("src/router.ts"));
+        assert_eq!(d.line_number, Some(42));
+        assert!(d.raw_trace.as_deref().unwrap().contains("TS2322"));
+    }
+
+    #[test]
+    fn extract_ts_watch_error() {
+        let out =
+            "tsc -w\nsrc/util.ts:10:5 - error TS7006: Parameter 'x' implicitly has an 'any' type.";
+        let d = s().slice(out, None);
+        assert_eq!(d.error_type.as_deref(), Some("TS7006"));
+        assert_eq!(d.file_path.as_deref(), Some("src/util.ts"));
+        assert_eq!(d.line_number, Some(10));
+    }
+
+    #[test]
+    fn extract_bun_runtime_error() {
+        let out = "bun run app.ts\nerror: Could not resolve: \"foo\"\n    at /Users/x/app.ts:5:18";
+        let d = s().slice(out, None);
+        assert_eq!(d.error_type.as_deref(), Some("error"));
+        assert_eq!(d.file_path.as_deref(), Some("/Users/x/app.ts"));
+        assert_eq!(d.line_number, Some(5));
+        assert!(d
+            .raw_trace
+            .as_deref()
+            .unwrap()
+            .contains("Could not resolve"));
+    }
+
+    #[test]
+    fn extract_go_panic() {
+        let out = "go run main.go\npanic: runtime error: index out of range [1] with length 1\n\ngoroutine 1 [running]:\nmain.main()\n\t/Users/x/main.go:12 +0x1b4";
+        let d = s().slice(out, None);
+        assert_eq!(d.error_type.as_deref(), Some("panic"));
+        assert_eq!(d.file_path.as_deref(), Some("/Users/x/main.go"));
+        assert_eq!(d.line_number, Some(12));
+        assert!(d.raw_trace.as_deref().unwrap().contains("runtime error"));
+    }
+
+    #[test]
+    fn extract_go_compile_error() {
+        let out = "go build ./...\n./main.go:8:7: undefined: foo";
+        let d = s().slice(out, None);
+        assert_eq!(d.error_type.as_deref(), Some("compile error"));
+        assert_eq!(d.file_path.as_deref(), Some("./main.go"));
+        assert_eq!(d.line_number, Some(8));
+        assert!(d.raw_trace.as_deref().unwrap().contains("undefined"));
     }
 
     #[test]

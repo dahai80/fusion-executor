@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+import socket
 from collections.abc import Iterator
 
 from .models import (
@@ -15,6 +18,9 @@ from .models import (
 )
 
 logger = logging.getLogger("fusion_executor")
+
+DEFAULT_SOCK = "/tmp/fusion-executor.sock"
+SUB_CHANNELS = ("telemetry", "stdio", "screenshot")
 
 
 class FusionSandboxExecutor:
@@ -273,6 +279,119 @@ class FusionSandboxExecutor:
             logger.debug("telemetry sample #%s cpu=%.1f%% mem=%.1fMB", count, sample.cpu_pct, sample.mem_mb)
             yield sample
 
+    def subscribe(
+        self,
+        channels: list[str],
+        *,
+        sock_path: str | None = None,
+        interval_ms: int | None = None,
+        screenshot_interval_ms: int | None = None,
+    ) -> Subscription:
+        logger.info("subscribe channels=%s sock=%s interval_ms=%s", channels, sock_path, interval_ms)
+        bad = [c for c in channels if c not in SUB_CHANNELS]
+        if bad:
+            raise ValueError(f"未知通道: {bad}, 可选 {list(SUB_CHANNELS)}")
+        path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        sub = Subscription(path, channels, interval_ms, screenshot_interval_ms)
+        sub._open()
+        return sub
+
     def serve(self, sock_path: str | None = None) -> None:
         logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (永驻)", sock_path)
         self._native.serve(sock_path)
+
+
+class Subscription:
+    def __init__(
+        self,
+        sock_path: str,
+        channels: list[str],
+        interval_ms: int | None,
+        screenshot_interval_ms: int | None,
+    ) -> None:
+        self._sock_path = sock_path
+        self._channels = channels
+        self._interval_ms = interval_ms
+        self._screenshot_interval_ms = screenshot_interval_ms
+        self._sock: socket.socket | None = None
+        self._sub_id: str | None = None
+        self._buf = b""
+
+    def _open(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(15.0)
+        sock.connect(self._sock_path)
+        self._sock = sock
+        params: dict = {"channels": self._channels}
+        if self._interval_ms is not None:
+            params["interval_ms"] = self._interval_ms
+        if self._screenshot_interval_ms is not None:
+            params["screenshot_interval_ms"] = self._screenshot_interval_ms
+        req = {"jsonrpc": "2.0", "id": 1, "method": "executor.subscribe", "params": params}
+        sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        resp = self._read_json()
+        if resp is None or "error" in resp:
+            err = resp.get("error") if resp else None
+            raise RuntimeError(f"subscribe 失败: {err}")
+        self._sub_id = resp["result"]["subscription_id"]
+        logger.info("subscribe ok sub_id=%s channels=%s", self._sub_id, self._channels)
+
+    def _read_json(self) -> dict | None:
+        assert self._sock is not None
+        while b"\n" not in self._buf:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                return None
+            self._buf += chunk
+        line, self._buf = self._buf.split(b"\n", 1)
+        text = line.decode("utf-8").strip()
+        if not text:
+            return None
+        return json.loads(text)
+
+    @property
+    def subscription_id(self) -> str | None:
+        return self._sub_id
+
+    def __iter__(self) -> Iterator[dict]:
+        return self
+
+    def __next__(self) -> dict:
+        while True:
+            frame = self._read_json()
+            if frame is None:
+                raise StopIteration
+            if "method" in frame and frame.get("method") == "executor.event":
+                params = frame.get("params", {})
+                if self._sub_id is None or params.get("subscription_id") == self._sub_id:
+                    logger.debug("event channel=%s", params.get("channel"))
+                    return params
+            logger.debug("跳过非 event 帧: %s", frame.get("id"))
+
+    def unsubscribe(self) -> bool:
+        if self._sock is None or self._sub_id is None:
+            return False
+        try:
+            req = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "executor.unsubscribe",
+                "params": {"subscription_id": self._sub_id},
+            }
+            self._sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            resp = self._read_json()
+            ok = bool(resp and resp.get("result", {}).get("ok"))
+            logger.info("unsubscribe sub_id=%s ok=%s", self._sub_id, ok)
+            return ok
+        except OSError as e:
+            logger.warning("unsubscribe 发送失败: %s", e)
+            return False
+        finally:
+            if self._sock is not None:
+                self._sock.close()
+                self._sock = None
+
+    def close(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None

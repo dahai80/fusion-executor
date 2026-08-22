@@ -24,6 +24,18 @@ def _ax_trusted() -> bool:
         return False
 
 
+def _ax_access_trusted() -> bool:
+    # 探测 TCC Accessibility (非 Screen Recording) — Rust !ax_trusted() 降级闸门用此权限。
+    # hover 仅带坐标, 不走 AX 树遍历: trusted→ok=True, untrusted→ok=False+accessibility-permission-required。
+    # 与 _ax_trusted() (screenshot=Screen Recording) 分离 — 两 TCC 权限独立。
+    try:
+        ex = FusionSandboxExecutor()
+        r = ex.gui_action({"kind": "hover", "ax_position": [0.0, 0.0]})
+        return r.ok
+    except Exception:
+        return False
+
+
 def _sock_path() -> str:
     fd, p = tempfile.mkstemp(suffix=".sock", prefix="fe-gui-py-")
     os.close(fd)
@@ -250,3 +262,137 @@ def test_gui_action_drag_when_trusted():
     assert isinstance(r, GuiResult)
     assert r.ok is True, f"Drag 应成功: {r.error}"
     assert r.error is None
+
+
+# ── v1.5 新动作 (double_click/right_click/hover/window_*) ──
+
+
+# CI 路径 (untrusted): 7 个新变体均经 !ax_trusted() 闸门降级 — 证明 4 层 auto-flow
+NEW_VARIANTS_CI = [
+    {"kind": "double_click", "ax_position": [5.0, 5.0]},
+    {"kind": "right_click", "ax_position": [5.0, 5.0]},
+    {"kind": "hover", "ax_position": [5.0, 5.0]},
+    {"kind": "window_close"},
+    {"kind": "window_minimize"},
+    {"kind": "window_zoom"},
+    {"kind": "window_resize", "width": 800.0, "height": 600.0},
+]
+
+
+def test_gui_action_new_variants_degrade_without_trust():
+    # trusted 机走真实 AX/CGEvent (非降级路径) — 仅 CI (untrusted) 跑降级断言
+    # 闸门 = TCC Accessibility (Rust !ax_trusted()), 用 _ax_access_trusted() 探测 (非 Screen Recording)
+    if _ax_access_trusted():
+        pytest.skip("AX Accessibility 已授权 — 降级路径仅 CI (untrusted) 跑")
+    ex = FusionSandboxExecutor()
+    for action in NEW_VARIANTS_CI:
+        r = ex.gui_action(action)
+        assert isinstance(r, GuiResult), f"{action['kind']} 应返回 GuiResult"
+        assert r.ok is False, f"{action['kind']} 未授权应 ok=False"
+        assert r.error is not None and "accessibility-permission-required" in r.error, (
+            f"{action['kind']} 降级错误应含 accessibility-permission-required: {r.error}"
+        )
+
+
+def test_gui_action_pointer_variants_when_trusted():
+    # pointer 变体 (double_click/right_click/hover) 带坐标 → CGEvent 合成, 无需 AX 树遍历 → ok=True
+    # window_* 变体需真实 GUI 会话 (AX 窗口树), 沙箱内 fail — 不在此断言
+    if not _ax_access_trusted():
+        pytest.skip("AX Accessibility 未授权 — 跳过真实 pointer 合成测试 (CI 路径)")
+    ex = FusionSandboxExecutor()
+    for action in [
+        {"kind": "hover", "ax_position": [10.0, 20.0]},
+        {"kind": "double_click", "ax_position": [5.0, 5.0]},
+        {"kind": "right_click", "ax_position": [5.0, 5.0]},
+    ]:
+        r = ex.gui_action(action)
+        assert isinstance(r, GuiResult), f"{action['kind']} 应返回 GuiResult"
+        assert r.ok is True, f"{action['kind']} 带坐标应 ok=True: {r.error}"
+        assert r.error is None
+
+
+# ── v1.5 #14 双向 server-push (subscribe/unsubscribe) ──
+
+
+def test_subscribe_telemetry_yields_event_frames(server: str):
+    ex = FusionSandboxExecutor(sock_path=server)
+    sub = ex.subscribe(["telemetry"], interval_ms=20)
+    assert sub.subscription_id is not None
+    assert sub.subscription_id.startswith("sub-")
+    frames = []
+    deadline = time.time() + 5.0
+    for params in sub:
+        assert params["channel"] == "telemetry"
+        assert params["subscription_id"] == sub.subscription_id
+        assert "data" in params
+        frames.append(params)
+        if len(frames) >= 3 or time.time() > deadline:
+            break
+    assert len(frames) >= 3, f"应收到 >=3 telemetry 推送帧, got={len(frames)}"
+    sub.unsubscribe()
+
+
+def test_subscribe_stdio_broadcasts_across_connections(server: str):
+    # 连接 A 订阅 stdio (后台线程读), 连接 B 经 UDS execute_stream → A 收到 stdio 推送
+    import threading
+
+    ex_a = FusionSandboxExecutor(sock_path=server)
+    sub = ex_a.subscribe(["stdio"])
+    assert sub.subscription_id is not None
+    a_frames: list[dict] = []
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                params = next(sub)
+            except StopIteration:
+                break
+            except OSError:
+                break
+            if params["channel"] == "stdio" and params["subscription_id"] == sub.subscription_id:
+                a_frames.append(params)
+                break
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    # 连接 B: execute_stream echo via raw UDS
+    b = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    b.settimeout(15.0)
+    b.connect(server)
+    req = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "executor.execute_stream",
+        "params": {"command": "echo hi", "enable_rollback_snapshot": False},
+    }
+    b.sendall((json.dumps(req) + "\n").encode("utf-8"))
+    buf = b""
+    b_done = False
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        try:
+            chunk = b.recv(4096)
+        except TimeoutError:
+            chunk = b""
+        if chunk:
+            buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            v = json.loads(line.decode("utf-8").strip())
+            if v.get("id") == 7 and v.get("result", {}).get("type") == "done":
+                b_done = True
+        if b_done:
+            break
+    b.close()
+    stop.set()
+    t.join(timeout=2.0)
+    sub.unsubscribe()
+    assert b_done, "B 应收到自己 done 帧"
+    assert a_frames, "A 应收到 stdio 跨连接推送"
+
+
+def test_subscribe_unknown_channel_raises(server: str):
+    ex = FusionSandboxExecutor(sock_path=server)
+    with pytest.raises(ValueError, match="未知通道"):
+        ex.subscribe(["bogus"])

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .executor import FusionSandboxExecutor
+from .executor import FusionSandboxExecutor, Subscription
 from .models import (
     Diagnostics,
     EditResult,
@@ -23,6 +23,7 @@ __all__ = [
     "GrepMatch",
     "GuiResult",
     "RollbackPolicy",
+    "Subscription",
     "TelemetrySample",
 ]
 __version__ = "0.1.0"

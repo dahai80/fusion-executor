@@ -4,7 +4,7 @@
 
 Rust 核心 + PyO3/maturin Python 绑定。Fusion monorepo 第一个 maturin/PyO3 工程 (其余 23 个 Python 工程用 setuptools)。
 
-**状态: v1.4 完成 (P1-P5 + KeyPress + 流式 + 修饰键 + 截图尺寸 + 原生文件工具 + 外科补丁引擎 + 自动回滚 + 实时遥测 + GUI scroll/drag/wait)** — 安全 + 沙箱 + 诊断切片 + Git 回滚 + UDS JSON-RPC IPC 服务 + macOS GUI (AXUIElement + CoreGraphics + CGEvent 按键合成 + 修饰键组合 + scroll/drag/wait) + 实时 stdio 流式传输 (NDJSON chunk/done) + 截图 width/height metadata + 原生文件工具 (file_edit/glob/grep 本地化替代 Claude SDK FileEdit/Glob/Grep) + 外科补丁引擎 (Unified Diff apply + 函数级替换, 禁全文件重写) + Data Schema §4.1 补齐 (task_id/command/duration_sec) + 自动回滚 (FR-04 可选策略, git status 毁损检测触发) + 实时遥测 (10Hz CPU/内存 UDS 广播, GPU 调用方注入) + 加固 (criterion 基准 + 覆盖率 95%)。105 Rust + 60 Python 测试全绿。
+**状态: v1.5 进行中 — 诊断切片扩语言 (TS/Go) + GUI 更多动作 + 双向 IPC server-push** — 安全 + 沙箱 + 诊断切片 + Git 回滚 + UDS JSON-RPC IPC 服务 + macOS GUI (AXUIElement + CoreGraphics + CGEvent 按键合成 + 修饰键组合 + scroll/drag/wait + double_click/right_click/hover + 窗口控制 close/minimize/zoom/resize) + 实时 stdio 流式传输 (NDJSON chunk/done) + 截图 width/height metadata + 原生文件工具 (file_edit/glob/grep 本地化替代 Claude SDK FileEdit/Glob/Grep) + 外科补丁引擎 (Unified Diff apply + 函数级替换, 禁全文件重写) + Data Schema §4.1 补齐 (task_id/command/duration_sec) + 自动回滚 (FR-04 可选策略, git status 毁损检测触发) + 实时遥测 (10Hz CPU/内存 UDS 广播, GPU 调用方注入) + 加固 (criterion 基准 + 覆盖率 95%) + v1.5 诊断切片扩 8 语言 (Python/TS/Node/Bun/Rust/Go-panic/Swift/Go-compile, 真实 tsc/go E2E 验证) + v1.5 GUI 更多动作 (double_click/right_click/hover/window_*, 16 GuiAction 变体, 0 新增 unsafe) + v1.5 双向 IPC server-push (BroadcastHub 三通道 telemetry/stdio/screenshot 订阅广播, Executor 无状态, 0 新增 unsafe)。120 Rust + 64 Python 测试全绿。
 
 ## 架构
 
@@ -21,7 +21,7 @@ fusion-executor/
 │   ├── fe-gui/             # macOS Computer Use: AXUIElement + CoreGraphics (P4)
 │   ├── fe-rollback/        # git 快照/回滚 (P2) + 自动回滚 guard (v1.4)
 │   ├── fe-diagnostics/     # Traceback 正则 + tree-sitter 切片 (P2)
-│   ├── fe-ipc/             # UDS JSON-RPC 2.0 服务 (P3)
+│   ├── fe-ipc/             # UDS JSON-RPC 2.0 服务 (P3) + 双向 server-push BroadcastHub (v1.5 #14)
 │   ├── fe-tools/           # 原生文件工具: file_edit/glob/grep + 补丁引擎 (v1.3)
 │   ├── fe-telemetry/       # 实时遥测: 10Hz CPU/内存采样流 (v1.4)
 │   └── fe-pyo3/            # PyO3 绑定; maturin target → fusion_executor._native
@@ -64,6 +64,11 @@ pytest python/tests/test_executor.py::test_run_echo -v   # 单测试
 
 # 冒烟
 python -c "from fusion_executor import FusionSandboxExecutor; print(repr(FusionSandboxExecutor().run('echo hi').stdout))"
+
+# 启动 UDS server + 订阅广播 (v1.5 #14)
+python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"   # 另一终端
+# 另一终端: 订阅 telemetry 推送
+python -c "from fusion_executor import FusionSandboxExecutor; s=FusionSandboxExecutor().subscribe(['telemetry'], interval_ms=100); [print(next(s)) for _ in range(3)]; s.unsubscribe()"
 ```
 
 ## Lint
@@ -114,6 +119,13 @@ ex.rollback(snap, cwd="/path/to/repo")  # git checkout -- . && git stash apply <
 
 # 异步 (asyncio 调用者)
 r = await ex.run_async("echo hi", task_id="t1", cwd="/tmp", timeout=30.0)
+
+# 双向 server-push 订阅 (v1.5 #14 — 需运行中的 serve())
+# 三通道: telemetry (10Hz CPU/内存) / stdio (跨连接命令流) / screenshot (周期截图)
+sub = ex.subscribe(["telemetry", "stdio"], interval_ms=100, screenshot_interval_ms=1000)
+for params in sub:  # __next__ yield executor.event 帧的 params (dict)
+    print(params["channel"], params["data"])
+sub.unsubscribe()  # 或 sub.close()
 ```
 
 `run` 签名: `run(command, *, task_id=None, cwd=None, timeout=30.0, env_vars=None, enable_rollback_snapshot=True) -> ExecutionResult`。
@@ -179,8 +191,11 @@ from fusion_executor import FusionSandboxExecutor, RollbackPolicy
 ex = FusionSandboxExecutor()
 policy = RollbackPolicy(max_consecutive_failures=3, file_damage_check=True)
 # 命令写坏 app.py 后失败 → 自动回滚恢复 git 基线
-r = ex.run("python3 -c \"open('app.py','w').write('broken'); raise ValueError(1)\"",
-           cwd="/repo", auto_rollback=policy)
+r = ex.run(
+    "python3 -c \"open('app.py','w').write('broken'); raise ValueError(1)\"",
+    cwd="/repo",
+    auto_rollback=policy,
+)
 assert r.exit_code != 0 and r.auto_rolled_back
 ```
 
@@ -201,6 +216,34 @@ for s in ex.telemetry_stream(interval_ms=100, max_samples=50):
 
 `TelemetrySample{ts_ms (毫秒, 调用方纪元), cpu_pct (单核倍数), mem_mb (常驻内存 MB), gpu_pct?, gpu_mem_mb?, task_id?}`。底层 fe-telemetry `start_stream(cfg, rt::Handle)` 在 `BLOCKING_RT` 上 spawn sysinfo 采样任务; 4 层 wiring (fe-telemetry → fe-core → fe-ipc `executor.telemetry_stream` 多帧 → fe-pyo3 `NativeTelemetryIterator` → Python 生成器)。
 
+### 双向 server-push 订阅 (v1.5 #14 — fusion-studio §5 120Hz 看板广播)
+
+`subscribe()` 开一条 UDS 连接订阅广播通道 — 一次订阅, server 持续推送 notification 帧, 客户端可在此连接上并发发别的请求 (duplex)。区别于 `telemetry_stream`/`execute_stream` (请求发起, 单流即停): 订阅是 **server 主动推**, 多连接共享同一源 (扇出)。
+
+```python
+from fusion_executor import FusionSandboxExecutor
+
+ex = FusionSandboxExecutor()
+# 三通道: telemetry (10Hz CPU/内存) / stdio (跨连接命令 chunk+done) / screenshot (周期截图)
+sub = ex.subscribe(["telemetry", "stdio"], interval_ms=100, screenshot_interval_ms=1000)
+print(sub.subscription_id)  # "sub-N"
+for params in sub:
+    print(params["channel"], params["data"])
+    if ...:
+        break
+sub.unsubscribe()  # 或 sub.close()
+```
+
+三通道源 (fe-ipc `BroadcastHub` 内 lazy 启停, 0 订阅自退):
+- **telemetry** — 单一 `executor.telemetry_stream` 扇出给所有 telemetry 订阅 (10Hz 默认, `interval_ms` 可调)。
+- **stdio** — `execute`/`execute_stream` 处理器扇出 chunk/done 给所有 stdio 订阅 (**跨连接**: A 订阅, B 跑命令, A 收推送)。
+- **screenshot** — 周期 `gui_action(Screenshot)` 采样扇出 (`screenshot_interval_ms` 默认 1000, 慢于 telemetry); TCC 未授权 → 帧 `data.ok=false`/error, 不崩 (走 fe-gui safe wrapper)。
+
+推帧格式 (server 主动, **无 id** — JSON-RPC notification 约定; 客户端按有无 `id` 区分响应 vs 推送):
+- `{"jsonrpc":"2.0","method":"executor.event","params":{"subscription_id":"sub-1","channel":"telemetry","data":{...}}}`
+
+`Subscription` 纯 Python UDS 客户端 — 连接运行中的 `serve()` socket; `__next__` 过滤 `executor.event` 帧匹配本 sub_id, 跳过非 event 帧; `unsubscribe()` 发 unsubscribe + 关 socket。`SUB_CHANNELS = ("telemetry", "stdio", "screenshot")` — 未知通道 `ValueError`。fe-ipc 0 新增 unsafe (截图复用 fe-gui safe wrapper); fe-core Executor 保持无状态 (广播扇出是 IPC broker 关注点, 非 executor 状态)。
+
 ## IPC 服务 (UDS JSON-RPC)
 
 启动 UDS JSON-RPC 2.0 服务器 — 供 fusion-code (TypeScript) / fusion-studio (Swift) 经 Unix Domain Socket 调用:
@@ -210,7 +253,7 @@ python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecu
 # Socket: /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK)
 ```
 
-协议: 换行分隔 JSON-RPC 2.0, 错误码 -32700/-32600/-32601/-32603 + 扩展 -32010(安全)/-32011(超时)/-32012(回滚)/-32013(AX)。方法 `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`/`telemetry_stream`/`shutdown`。
+协议: 换行分隔 JSON-RPC 2.0, 错误码 -32700/-32600/-32601/-32603 + 扩展 -32010(安全)/-32011(超时)/-32012(回滚)/-32013(AX)。方法 `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`/`telemetry_stream`/`subscribe`/`unsubscribe`/`shutdown`。
 
 `executor.execute_stream` 流式: 多帧 (chunk/done) 共用同一 id, 换行分隔逐帧写出 —
 - chunk: `{"jsonrpc":"2.0","id":id,"result":{"type":"chunk","data":"..."}}`
@@ -218,6 +261,8 @@ python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecu
 
 `executor.telemetry_stream` 流式: 多帧 sample 共用同一 id, 换行分隔逐帧写出 —
 - sample: `{"jsonrpc":"2.0","id":id,"result":{"type":"sample","sample":{...TelemetrySample}}}` (params `interval_ms`(默认 100)/`max_samples`(默认 0=无限); GPU 字段 None 时 serde skip 省略)
+
+`executor.subscribe` / `executor.unsubscribe` (v1.5 #14 双向 server-push) — 见上「双向 server-push 订阅」小节。subscribe 响应 `{ok:true, subscription_id:"sub-N"}`, 之后 server 持续推 notification 帧 (无 id, `method:"executor.event"`); 连接 duplex, 可并发发别的请求。params `channels`(`["telemetry","stdio","screenshot"]`)/`interval_ms`(默认 100)/`screenshot_interval_ms`(默认 1000)。
 
 fusion-code TS 客户端 sketch 见 `docs/ipc-client-typescript.md`; fusion-studio 用现有 `IPCClient.swift udsCall` 指向同一 socket。
 
@@ -230,7 +275,7 @@ fusion-code TS 客户端 sketch 见 `docs/ipc-client-typescript.md`; fusion-stud
   - fe-pyo3: `execute_sync` 绑定; `maturin develop` 可用; `FusionSandboxExecutor.run("echo hi")` 工作
   - 退出闸门: 真实执行 echo/python; 拦截 `rm -rf /`/sudo 链/ncat; 1s 超时杀无限循环 (exit -124)
 - **P2 — 诊断 + 回滚** ✅ 完成
-  - fe-diagnostics: 4 语言 (Python/Node/Rust/Swift) traceback 正则提取 + 上下 20 行代码切片, 报错行标 `>` (7 单元测试)
+  - fe-diagnostics: 8 语言 (Python/TS/Node/Bun/Rust/Go/Swift/Go-compile) traceback 正则提取 + 上下 20 行代码切片, 报错行标 `>` (12 单元测试)
   - fe-rollback: git CLI 快照/回滚 — `snapshot_create` (stash create/HEAD) + `rollback` (checkout + stash apply) + `rollback_file` 单文件 (3 单元测试)
   - fe-core: pipeline 加快照 (exec 前, 非致命) + 诊断切片 (exit_code!=0 时) + `snapshot_create_async`/`rollback_async` 公开
   - fe-pyo3: `NativeDiagnostics` + `diagnostics` 字段 + `snapshot_create`/`rollback` 方法; env_vars/enable_rollback_snapshot 透传
@@ -281,4 +326,26 @@ fusion-code TS 客户端 sketch 见 `docs/ipc-client-typescript.md`; fusion-stud
   - GUI scroll/drag/wait (fe-gui CGEvent 合成): `scroll` (dx/dy 像素, CGEvent scrollWheel 单位轴) / `drag` (from x,y → to x,y, mouseMove+leftMouseDown+move+leftMouseUp) / `wait` (seconds 睡眠, 测试辅助); +14 Rust 单元测试 + 14 Python GUI 测试
   - +3 fe-telemetry Rust 单元测试 (stream 产样/通道关闭停止/序列化) +1 fe-core +1 fe-ipc (UDS telemetry 3 帧) +5 Python auto-rollback 测试 +3 Python telemetry 测试 (native iter/wrapper/UDS)
   - 退出闸门: 105 Rust + 60 Python 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat); fmt/ruff 净; maturin 构建
+- **v1.5 进行中**
+  - **#12 — 诊断切片扩语言 (TS/Go)** ✅ 完成
+    - fe-diagnostics `Slicer` 正则 4→9 覆盖 8 语言: 新增 `ts_re` (tsc 括号 `file.ts(l,c): error TSxxxx:`) / `ts_dash_re` (tsc watch `file.ts:l:c - error TSxxxx:`) / `bun_re` (Bun 小写 `error:` + 裸 `at`) / `go_panic_re` (`(?s)` 跨行 `panic: ... goroutine ... \tfile.go:line`, 取末栈帧) / `go_compile_re` (`file.go:l:c: msg` 无 `error:` 关键字)。新增 `extract_ts`/`extract_bun`/`extract_go_panic`/`extract_go_compile` 方法; `slice()` 排序 ts→python→node→bun→rust→go_panic→swift→go_compile (按扩展名/关键字互不冲突)。零新依赖 (纯文本行切片)
+    - fe-security 白名单 +`go` +`tsc` (否则真实 `go build`/`tsc --noEmit` 被 Stage-2 拦截无 E2E)
+    - +5 fe-diagnostics 单元测试 +1 白名单测试。真实工具链 E2E: tsc 7.0.2 `TS2322`/`bad.ts`/line 2 ✓; `go build` `compile error`/`main.go`/line 6 ✓; `go run` panic `panic.go`/line 7 ✓。诊断自动经 execute→ExecutionResult.diagnostics 流通 (exit_code!=0), 无 4 层 wiring
+  - **#13 — GUI 更多动作** ✅ 完成
+    - fe-gui `GuiAction` 9→16 变体: 新增 `double_click` (ax_label/ax_position, CGEvent 2× LeftMouseDown/Up, 第二击 `EventField::MOUSE_EVENT_CLICK_STATE=2`) / `right_click` (ax_label/ax_position, CGEvent RightMouseDown/Up + `CGMouseButton::Right`) / `hover` (ax_position, CGEvent MouseMoved 无按键) / `window_close` / `window_minimize` / `window_zoom` (bundle_id, AX 按钮属性 `kAXCloseButtonAttribute`/`kAXMinimizeButtonAttribute`/`kAXZoomButtonAttribute` → `press()`) / `window_resize` (bundle_id + width/height, 拖右下角 resize 把手 — 读 AXPosition+AXSize 算坐标, 复用 `drag()` CGEvent; 非 AXValueCreate 设 AXSize 避免新增 unsafe block, 留在既定 3 处 unsafe scope 内)
+    - `resolve_click_position` helper 共用 click/double_click/right_click (ax_position 优先, 否则 ax_label→AX 树定位读 AXPosition; 无二者报错)
+    - **4 层 auto-flow**: fe-core/fe-ipc/fe-pyo3 在 GuiAction enum 级反序列化后 dispatch — 新变体零 wiring 自动流通 (仅 fe-gui 改 enum+execute+方法+测试); Python `gui_action(action: dict)` 通用无 per-variant 逻辑
+    - **0 新增 unsafe**: 全走 accessibility 0.2 safe wrapper (attribute/press) + core-graphics 0.24 safe wrapper (CGEvent/set_integer_value_field); 复用 fe-gui crate 级 `#![allow(unsafe_code)]` scope
+    - +5 fe-gui Rust 单元测试 (serde 往返/snake_case/window 降级/pointer 降级/no-target) +2 Python 测试 (new_variants_degrade CI 路径 / pointer_variants_when_trusted TCC 路径; `_ax_access_trusted()` 探测分离 TCC Accessibility 与 Screen Recording 两权限)
+    - 退出闸门: trusted 机 hover/double_click/right_click 带坐标 → `ok=True` (CGEvent posted); window_* 需真实 GUI 会话 (AX 窗口树) 沙箱内降级。116 Rust + 62 Python 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6); fmt/ruff 净; maturin 构建
+  - **#14 — 双向 IPC server-push (订阅/广播)** ✅ 完成
+    - fe-ipc `BroadcastHub` (Arc 共享) — IPC broker 关注点, **fe-core Executor 保持无状态** (广播扇出不进 executor)。registry: sub_id → Subscriber{conn_id, channels, tx}; conn/sub counter AtomicU64; telemetry_task/screenshot_task `Mutex<Option<JoinHandle>>` lazy 启停 (0 订阅自退, 下次 subscribe 重启; 源方法取 `&self` 非 `self: Arc<Self>` — 避免自移后 `.take()`)
+    - 连接 DUPLEX: `handle_conn` 拆 read_task (分发请求) + push_task (写 server-push 帧) 共享 `Arc<AsyncMutex<OwnedWriteHalf>>` (锁下行写原子); 每连接 `mpsc::channel<Value>(128)` push 帧 + oneshot close
+    - 三广播源: **telemetry** (单一 `executor.telemetry_stream` 扇出, 10Hz 默认 `interval_ms=100`) / **stdio** (execute/execute_stream 处理器调 `hub.broadcast_stdio()` 扇出 chunk/done — **跨连接** A 订阅 B 跑命令 A 收推送) / **screenshot** (周期 `gui_action(Screenshot)` 采样 `spawn_blocking`, `screenshot_interval_ms=1000` 慢于 telemetry; TCC 未授权 → 帧 data.ok=false 不崩, 复用 fe-gui safe wrapper)
+    - 推帧格式: `{"jsonrpc":"2.0","method":"executor.event","params":{"subscription_id":"sub-N","channel":..,"data":..}}` — **无 id** (notification 约定), 客户端按有无 id 区分响应 vs 推送。`collect_targets(channel)` 锁外 try_send (快照 sub_id+tx 后释放锁)
+    - fe-ipc **0 新增 unsafe** (截图复用 fe-gui safe wrapper, crate 仍 `unsafe_code="deny"`)。fe-pyo3 无改动 — server-push 需运行中 server, 纯 Python UDS 客户端 `Subscription` 连接 `serve()` socket
+    - Python `Subscription` 纯 Python UDS 客户端: `_open()` 连接+发 subscribe+读响应设 `_sub_id`; `__next__` 过滤 `executor.event` 帧匹配 sub_id, 跳过非 event 帧; `unsubscribe()` 发 unsubscribe+关 socket; `SUB_CHANNELS=("telemetry","stdio","screenshot")` 未知通道 `ValueError`。`FusionSandboxExecutor.subscribe(channels, *, sock_path, interval_ms, screenshot_interval_ms) -> Subscription`
+    - +7 fe-ipc Rust 单元测试 (subscribe telemetry 推帧/missing channels -32600/unsubscribe 停推/stdio 跨连接广播 + 原有 health/unknown/malformed/execute/stream) +3 Python 测试 (subscribe telemetry 推帧/stdio 跨连接广播/未知通道 ValueError); 测试用 `UnixStream::into_split()` → `(OwnedReadHalf, OwnedWriteHalf)` 避借用后移
+    - 退出闸门: 120 Rust + 64 Python (6 skip TCC) 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6); fmt/ruff 净; maturin 构建
+- **v1.5 完成** (#12 诊断切片扩语言 + #13 GUI 更多动作 + #14 双向 IPC server-push) — 120 Rust + 64 Python (6 skip TCC) 测试全绿; 10 crates; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat); `cargo fmt --check` + `ruff check/format` 净; `maturin develop --release` 构建。零新增 unsafe (#13/#14 均走 safe wrapper)。下一步: v1.6 或按需。
 

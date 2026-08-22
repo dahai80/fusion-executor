@@ -16,8 +16,9 @@ use accessibility::AXUIElement;
 use accessibility::AXUIElementActions as _;
 use accessibility::AXUIElementAttributes as _;
 use accessibility_sys::{
-    kAXFocusedApplicationAttribute, kAXPositionAttribute, kAXSizeAttribute, kAXValueTypeCGPoint,
-    kAXValueTypeCGSize, AXIsProcessTrusted, AXValueGetValue, AXValueRef,
+    kAXCloseButtonAttribute, kAXFocusedApplicationAttribute, kAXMinimizeButtonAttribute,
+    kAXPositionAttribute, kAXSizeAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize,
+    kAXZoomButtonAttribute, AXIsProcessTrusted, AXValueGetValue, AXValueRef,
 };
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -30,8 +31,8 @@ use core_graphics::color_space::CGColorSpace;
 use core_graphics::context::CGContext;
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, KeyCode,
-    ScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
+    KeyCode, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
@@ -73,6 +74,31 @@ pub enum GuiAction {
     Drag {
         from: (f64, f64),
         to: (f64, f64),
+    },
+    DoubleClick {
+        ax_label: Option<String>,
+        ax_position: Option<(f64, f64)>,
+    },
+    RightClick {
+        ax_label: Option<String>,
+        ax_position: Option<(f64, f64)>,
+    },
+    Hover {
+        ax_position: (f64, f64),
+    },
+    WindowClose {
+        bundle_id: Option<String>,
+    },
+    WindowMinimize {
+        bundle_id: Option<String>,
+    },
+    WindowZoom {
+        bundle_id: Option<String>,
+    },
+    WindowResize {
+        bundle_id: Option<String>,
+        width: f64,
+        height: f64,
     },
     Wait {
         seconds: f64,
@@ -146,6 +172,23 @@ impl GuiController {
             GuiAction::InspectTree {} => self.inspect_tree(),
             GuiAction::Scroll { dx, dy, at } => self.scroll(dx, dy, at),
             GuiAction::Drag { from, to } => self.drag(from, to),
+            GuiAction::DoubleClick {
+                ax_label,
+                ax_position,
+            } => self.double_click(ax_label.as_deref(), ax_position),
+            GuiAction::RightClick {
+                ax_label,
+                ax_position,
+            } => self.right_click(ax_label.as_deref(), ax_position),
+            GuiAction::Hover { ax_position } => self.hover(ax_position),
+            GuiAction::WindowClose { bundle_id } => self.window_button(bundle_id, "close"),
+            GuiAction::WindowMinimize { bundle_id } => self.window_button(bundle_id, "minimize"),
+            GuiAction::WindowZoom { bundle_id } => self.window_button(bundle_id, "zoom"),
+            GuiAction::WindowResize {
+                bundle_id,
+                width,
+                height,
+            } => self.window_resize(bundle_id, width, height),
             GuiAction::Wait { .. } => unreachable!("Wait 已在 ax_trusted 前处理"),
         }
     }
@@ -786,6 +829,186 @@ impl GuiController {
         })
     }
 
+    /// 双击 — 先定位 AX 点击目标取坐标, 再 CGEvent 合成两次 left click, click_state=2。
+    /// click_state 字段 (EventField::MOUSE_EVENT_CLICK_STATE=1) 告知系统这是连续第二击。
+    /// 复用 find_click_target 取坐标 (与 click() 同路径); 无坐标目标 → 降级。
+    fn double_click(
+        &self,
+        ax_label: Option<&str>,
+        ax_position: Option<(f64, f64)>,
+    ) -> Result<GuiResult> {
+        info!(ax_label, ax_position = ?ax_position, "DoubleClick");
+        let pos = self.resolve_click_position(ax_label, ax_position)?;
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("CGEventSource 创建失败 (double_click)"))?;
+        // 两次 left click, 第二击 click_state=2 (区分单击/双击手势)
+        for click_no in 1..=2i64 {
+            let down = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::LeftMouseDown,
+                CGPoint::new(pos.0, pos.1),
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow!("CGEvent LeftMouseDown 创建失败 (double_click {click_no})"))?;
+            down.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_no);
+            down.post(CGEventTapLocation::HID);
+            let up = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::LeftMouseUp,
+                CGPoint::new(pos.0, pos.1),
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow!("CGEvent LeftMouseUp 创建失败 (double_click {click_no})"))?;
+            up.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_no);
+            up.post(CGEventTapLocation::HID);
+        }
+        debug!(pos = ?pos, "DoubleClick 完成 (2× down/up posted, click_state=2)");
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
+
+    /// 右击 — 先定位取坐标, CGEvent RightMouseDown/RightMouseUp + CGMouseButton::Right。
+    fn right_click(
+        &self,
+        ax_label: Option<&str>,
+        ax_position: Option<(f64, f64)>,
+    ) -> Result<GuiResult> {
+        info!(ax_label, ax_position = ?ax_position, "RightClick");
+        let pos = self.resolve_click_position(ax_label, ax_position)?;
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("CGEventSource 创建失败 (right_click)"))?;
+        let down = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::RightMouseDown,
+            CGPoint::new(pos.0, pos.1),
+            CGMouseButton::Right,
+        )
+        .map_err(|_| anyhow!("CGEvent RightMouseDown 创建失败 (right_click)"))?;
+        down.post(CGEventTapLocation::HID);
+        let up = CGEvent::new_mouse_event(
+            source,
+            CGEventType::RightMouseUp,
+            CGPoint::new(pos.0, pos.1),
+            CGMouseButton::Right,
+        )
+        .map_err(|_| anyhow!("CGEvent RightMouseUp 创建失败 (right_click)"))?;
+        up.post(CGEventTapLocation::HID);
+        debug!(pos = ?pos, "RightClick 完成 (right down/up posted)");
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
+
+    /// 悬停 — CGEvent MouseMoved 到指定坐标 (不按键, 仅移动光标)。
+    fn hover(&self, ax_position: (f64, f64)) -> Result<GuiResult> {
+        info!(ax_position = ?ax_position, "Hover");
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("CGEventSource 创建失败 (hover)"))?;
+        let moved = CGEvent::new_mouse_event(
+            source,
+            CGEventType::MouseMoved,
+            CGPoint::new(ax_position.0, ax_position.1),
+            CGMouseButton::Left,
+        )
+        .map_err(|_| anyhow!("CGEvent MouseMoved 创建失败 (hover)"))?;
+        moved.post(CGEventTapLocation::HID);
+        debug!(pos = ?ax_position, "Hover 完成 (MouseMoved posted)");
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
+
+    /// 解析点击坐标 — 优先 ax_position; 否则 ax_label 匹配 AX 节点读 AXPosition。
+    /// click/double_click/right_click 共用。无 label 无 position → 报错。
+    fn resolve_click_position(
+        &self,
+        ax_label: Option<&str>,
+        ax_position: Option<(f64, f64)>,
+    ) -> Result<(f64, f64)> {
+        if let Some(pos) = ax_position {
+            return Ok(pos);
+        }
+        let label = ax_label.ok_or_else(|| anyhow!("需 ax_label 或 ax_position 定位点击坐标"))?;
+        let app = Self::focused_app()?;
+        let win = app
+            .focused_window()
+            .or_else(|_| app.main_window())
+            .map_err(|e| anyhow!("取 focused window 失败: {e}"))?;
+        let target = Self::find_click_target(&win, Some(label), None)?;
+        Self::read_position(&target).ok_or_else(|| anyhow!("目标节点无 AXPosition, 无法取坐标"))
+    }
+
+    /// 窗口按钮 — close/minimize/zoom。按 AX 按钮属性取子元素 → press()。
+    /// bundle_id 给定则聚焦该 app, 否则用当前 focused app。
+    /// 安全: accessibility 0.2 safe wrapper (attribute/press), 零手写 unsafe。
+    fn window_button(&self, bundle_id: Option<String>, which: &str) -> Result<GuiResult> {
+        info!(bundle_id = ?bundle_id, which, "WindowButton");
+        let app = match bundle_id.as_deref() {
+            Some(b) => AXUIElement::application_with_bundle(b)
+                .map_err(|e| anyhow!("定位 app 失败 {b}: {e}"))?,
+            None => Self::focused_app()?,
+        };
+        let win = app
+            .focused_window()
+            .or_else(|_| app.main_window())
+            .map_err(|e| anyhow!("取 window 失败: {e}"))?;
+        let btn_attr_name = match which {
+            "close" => kAXCloseButtonAttribute,
+            "minimize" => kAXMinimizeButtonAttribute,
+            "zoom" => kAXZoomButtonAttribute,
+            other => return Err(anyhow!("未知窗口按钮: {other}")),
+        };
+        let btn_attr = AXAttribute::<CFType>::new(&CFString::from_static_string(btn_attr_name));
+        let cf = win
+            .attribute(&btn_attr)
+            .map_err(|e| anyhow!("取 {which} 按钮属性失败: {e}"))?;
+        let btn = cf
+            .downcast::<AXUIElement>()
+            .ok_or_else(|| anyhow!("{which} 按钮属性非 AXUIElement"))?;
+        btn.press()
+            .map_err(|e| anyhow!("press {which} 按钮失败: {e}"))?;
+        debug!(which, "WindowButton 完成 (press posted)");
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
+
+    /// 窗口缩放 — 拖右下角 resize 把手到目标尺寸。读当前 AXPosition+AXSize 取右下角,
+    /// 算目标右下角, CGEvent 拖拽 (复用 drag 坐标逻辑, 零新增依赖)。
+    /// 用拖拽而非 AXValueCreate 设 AXSize — 后者需新 unsafe block (AXValueCreate extern "C"),
+    /// 超出既定 3 处 unsafe scope; 拖拽走 safe CGEvent wrapper, 复用已测 drag 路径。
+    fn window_resize(
+        &self,
+        bundle_id: Option<String>,
+        width: f64,
+        height: f64,
+    ) -> Result<GuiResult> {
+        info!(bundle_id = ?bundle_id, width, height, "WindowResize");
+        let app = match bundle_id.as_deref() {
+            Some(b) => AXUIElement::application_with_bundle(b)
+                .map_err(|e| anyhow!("定位 app 失败 {b}: {e}"))?,
+            None => Self::focused_app()?,
+        };
+        let win = app
+            .focused_window()
+            .or_else(|_| app.main_window())
+            .map_err(|e| anyhow!("取 window 失败: {e}"))?;
+        let pos = Self::read_position(&win).ok_or_else(|| anyhow!("窗口无 AXPosition"))?;
+        let sz = Self::read_size(&win).ok_or_else(|| anyhow!("窗口无 AXSize"))?;
+        // 右下角 resize 把手 = 当前右下角; 拖到 (左上角 + 目标尺寸) 右下角
+        let from = (pos.0 + sz.0, pos.1 + sz.1);
+        let to = (pos.0 + width, pos.1 + height);
+        if width < 50.0 || height < 50.0 {
+            warn!(width, height, "目标尺寸过小, 可能拖不动");
+        }
+        self.drag(from, to)
+    }
+
     /// 等待 — 纯延时, 非 AX/CGEvent。GUI 动作间停顿 (如点击后等动画)。
     /// seconds 限 [0, 60] 秒, 超界裁剪。trusted-independent (无 TCC 依赖, 可单测)。
     fn wait(&self, seconds: f64) -> Result<GuiResult> {
@@ -855,6 +1078,27 @@ mod tests {
             GuiAction::Drag {
                 from: (10.0, 20.0),
                 to: (30.0, 40.0),
+            },
+            GuiAction::DoubleClick {
+                ax_label: None,
+                ax_position: Some((1.0, 2.0)),
+            },
+            GuiAction::RightClick {
+                ax_label: Some("Ctx".into()),
+                ax_position: None,
+            },
+            GuiAction::Hover {
+                ax_position: (50.0, 60.0),
+            },
+            GuiAction::WindowClose {
+                bundle_id: Some("x.y".into()),
+            },
+            GuiAction::WindowMinimize { bundle_id: None },
+            GuiAction::WindowZoom { bundle_id: None },
+            GuiAction::WindowResize {
+                bundle_id: None,
+                width: 100.0,
+                height: 200.0,
             },
             GuiAction::Wait { seconds: 0.0 },
         ];
@@ -1064,6 +1308,168 @@ mod tests {
         assert!(s.contains("\"kind\":\"drag\""), "drag tag: {s}");
         let s = serde_json::to_string(&GuiAction::Wait { seconds: 1.0 }).unwrap();
         assert!(s.contains("\"kind\":\"wait\""), "wait tag: {s}");
+    }
+
+    /// v1.5 新动作 serde 往返 — double_click/right_click/hover/window_*/window_resize
+    #[test]
+    fn gui_action_v15_variants_serde_roundtrip() {
+        let cases = vec![
+            GuiAction::DoubleClick {
+                ax_label: Some("Open".into()),
+                ax_position: Some((10.0, 20.0)),
+            },
+            GuiAction::DoubleClick {
+                ax_label: None,
+                ax_position: Some((5.0, 5.0)),
+            },
+            GuiAction::RightClick {
+                ax_label: Some("Menu".into()),
+                ax_position: None,
+            },
+            GuiAction::Hover {
+                ax_position: (300.0, 400.0),
+            },
+            GuiAction::WindowClose {
+                bundle_id: Some("com.apple.TextEdit".into()),
+            },
+            GuiAction::WindowMinimize { bundle_id: None },
+            GuiAction::WindowZoom {
+                bundle_id: Some("com.apple.Safari".into()),
+            },
+            GuiAction::WindowResize {
+                bundle_id: None,
+                width: 800.0,
+                height: 600.0,
+            },
+        ];
+        for a in cases {
+            let s = serde_json::to_string(&a).unwrap();
+            let back: GuiAction = serde_json::from_str(&s).unwrap();
+            let s2 = serde_json::to_string(&back).unwrap();
+            assert_eq!(s, s2, "serde 往返不一致: {s}");
+        }
+    }
+
+    /// v1.5 新动作 tag snake_case
+    #[test]
+    fn gui_action_v15_variants_snake_case() {
+        let s = serde_json::to_string(&GuiAction::DoubleClick {
+            ax_label: None,
+            ax_position: Some((1.0, 2.0)),
+        })
+        .unwrap();
+        assert!(s.contains("\"kind\":\"double_click\""), "tag: {s}");
+        let s = serde_json::to_string(&GuiAction::RightClick {
+            ax_label: None,
+            ax_position: Some((1.0, 2.0)),
+        })
+        .unwrap();
+        assert!(s.contains("\"kind\":\"right_click\""), "tag: {s}");
+        let s = serde_json::to_string(&GuiAction::Hover {
+            ax_position: (1.0, 2.0),
+        })
+        .unwrap();
+        assert!(s.contains("\"kind\":\"hover\""), "tag: {s}");
+        let s = serde_json::to_string(&GuiAction::WindowClose { bundle_id: None }).unwrap();
+        assert!(s.contains("\"kind\":\"window_close\""), "tag: {s}");
+        let s = serde_json::to_string(&GuiAction::WindowMinimize { bundle_id: None }).unwrap();
+        assert!(s.contains("\"kind\":\"window_minimize\""), "tag: {s}");
+        let s = serde_json::to_string(&GuiAction::WindowZoom { bundle_id: None }).unwrap();
+        assert!(s.contains("\"kind\":\"window_zoom\""), "tag: {s}");
+        let s = serde_json::to_string(&GuiAction::WindowResize {
+            bundle_id: None,
+            width: 1.0,
+            height: 1.0,
+        })
+        .unwrap();
+        assert!(s.contains("\"kind\":\"window_resize\""), "tag: {s}");
+    }
+
+    /// 未授权时新窗口动作降级 — CI 无 TCC 走此路径; trusted 机真实 AX 操作手动验
+    #[test]
+    fn window_actions_degrade_without_ax_trust() {
+        if GuiController::ax_trusted() {
+            // trusted: 真实窗口操作需手动 TCC + GUI 会话, CI/sandbox 跳过
+            return;
+        }
+        let ctrl = GuiController::new();
+        for action in [
+            GuiAction::WindowClose { bundle_id: None },
+            GuiAction::WindowMinimize {
+                bundle_id: Some("com.apple.TextEdit".into()),
+            },
+            GuiAction::WindowZoom { bundle_id: None },
+            GuiAction::WindowResize {
+                bundle_id: None,
+                width: 800.0,
+                height: 600.0,
+            },
+        ] {
+            let r = ctrl.execute(action).unwrap();
+            assert!(!r.ok, "未授权应降级");
+            assert_eq!(
+                r.error.as_deref(),
+                Some("accessibility-permission-required"),
+                "未授权错误标记"
+            );
+        }
+    }
+
+    /// 未授权时 double_click/right_click/hover 降级 (CI 路径)
+    #[test]
+    fn pointer_actions_degrade_without_ax_trust() {
+        let ctrl = GuiController::new();
+        for action in [
+            GuiAction::DoubleClick {
+                ax_label: None,
+                ax_position: Some((10.0, 20.0)),
+            },
+            GuiAction::RightClick {
+                ax_label: None,
+                ax_position: Some((10.0, 20.0)),
+            },
+            GuiAction::Hover {
+                ax_position: (10.0, 20.0),
+            },
+        ] {
+            let r = ctrl.execute(action).unwrap();
+            if !GuiController::ax_trusted() {
+                assert!(!r.ok, "未授权应降级");
+                assert_eq!(
+                    r.error.as_deref(),
+                    Some("accessibility-permission-required")
+                );
+            }
+        }
+    }
+
+    /// Hover 无坐标降级 — 不可能触发 (ax_position 必填非 Option), 仅编译期保证。
+    /// double_click/right_click 无 label 无 position → resolve_click_position 返 Err (经 ? 上抛)。
+    /// CI 无 TCC → 降级 ok:false; trusted 机 → execute 返 Err (无定位坐标), 不 panic。
+    #[test]
+    fn double_click_no_target_error_when_trusted() {
+        let ctrl = GuiController::new();
+        let res = ctrl.execute(GuiAction::DoubleClick {
+            ax_label: None,
+            ax_position: None,
+        });
+        if !GuiController::ax_trusted() {
+            let r = res.unwrap();
+            assert!(!r.ok, "未授权应降级");
+            assert_eq!(
+                r.error.as_deref(),
+                Some("accessibility-permission-required")
+            );
+        } else {
+            // trusted: 无 label/position → resolve_click_position 报错上抛 Err, 不 panic
+            assert!(res.is_err(), "trusted 无定位坐标应返 Err");
+            assert!(
+                res.unwrap_err()
+                    .to_string()
+                    .contains("ax_label 或 ax_position"),
+                "错误应提及定位缺失"
+            );
+        }
     }
 
     /// Wait trusted-independent — 无 TCC 依赖, CI 可跑。seconds=0 应立即 ok=true。
