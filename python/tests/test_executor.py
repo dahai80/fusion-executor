@@ -484,3 +484,47 @@ def test_telemetry_over_uds(uds_server: str):
     assert samples[0]["mem_mb"] > 0.0
     assert samples[0].get("gpu_pct") is None, "GPU 默认不注入 (serde skip)"
     del _json, _socket
+
+
+# ── v1.6 E2E 自愈闭环 smoke (PRD §5: run→diagnose→file_edit→re-run) ──
+
+# 故障脚本: add(1, "two") 在 return a + b 处抛 TypeError
+BUG_SRC = (
+    'def add(a, b):\n    return a + b\n\n\ndef main():\n    result = add(1, "two")\n    print(result)\n\n\nmain()\n'
+)
+
+
+def test_self_healing_closed_loop(executor: FusionSandboxExecutor, tmp_path):
+    # 1. 落盘故障脚本
+    bug = tmp_path / "bug.py"
+    bug.write_text(BUG_SRC)
+
+    # 2. 首次执行 — 应失败, diagnostics 切片定位到 bug.py
+    first = executor.run("python bug.py", cwd=str(tmp_path), timeout=15.0, enable_rollback_snapshot=False)
+    assert first.exit_code != 0, "故障脚本应非零退出"
+    assert not first.blocked_by_security
+    assert first.diagnostics is not None, "exit!=0 应触发诊断切片"
+    assert first.diagnostics.error_type == "TypeError", f"应识别 TypeError: {first.diagnostics.error_type}"
+    assert first.diagnostics.file_path is not None, "应定位文件路径"
+    assert "bug.py" in first.diagnostics.file_path, f"file_path 应含 bug.py: {first.diagnostics.file_path}"
+    assert first.diagnostics.line_number is not None and first.diagnostics.line_number >= 1
+
+    # 3. file_edit 手术式修复调用点 (add(1, "two") → add(1, 2)) — 无模型, 确定性补丁
+    fix = executor.file_edit(
+        "bug.py",
+        '    result = add(1, "two")',
+        "    result = add(1, 2)",
+        cwd=str(tmp_path),
+    )
+    assert isinstance(fix, EditResult)
+    assert fix.ok, f"file_edit 应成功: {fix.error}"
+    assert fix.matches == 1
+
+    # 4. 二次执行 — 应通过 (闭环收敛)
+    second = executor.run("python bug.py", cwd=str(tmp_path), timeout=15.0, enable_rollback_snapshot=False)
+    assert second.exit_code == 0, f"修复后应 exit 0: stderr={second.stderr}"
+    assert "3" in second.stdout, "修复后应输出 3"
+    assert second.diagnostics is None, "exit==0 不应触发诊断"
+
+    # 5. 过程数据清理 — 只保留 tmp_path (pytest 自动清)
+    bug.unlink(missing_ok=True)

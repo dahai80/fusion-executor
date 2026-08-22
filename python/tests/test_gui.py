@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from fusion_executor import FusionSandboxExecutor, GuiResult
+from fusion_executor import FusionSandboxExecutor, GuiResult, Subscription
 
 
 def _ax_trusted() -> bool:
@@ -396,3 +396,98 @@ def test_subscribe_unknown_channel_raises(server: str):
     ex = FusionSandboxExecutor(sock_path=server)
     with pytest.raises(ValueError, match="未知通道"):
         ex.subscribe(["bogus"])
+
+
+# ── v1.6 覆盖率补缺 (Subscription 错误/边界路径) ──
+
+
+def test_subscribe_passes_screenshot_interval(server: str):
+    # 覆盖 _open 行 329: screenshot_interval_ms 非空 → 写入 params
+    ex = FusionSandboxExecutor(sock_path=server)
+    sub = ex.subscribe(["screenshot"], interval_ms=None, screenshot_interval_ms=200)
+    assert sub.subscription_id is not None
+    sub.unsubscribe()
+
+
+def test_subscription_close_without_open():
+    # 覆盖 close() 行 395-397: open 后显式 close 关 socket
+    sub = Subscription("/tmp/fe-cov-close.sock", ["telemetry"], None, None)
+    assert sub._sock is None
+    sub.close()  # 未 open — 仍安全
+    assert sub._sock is None
+
+
+def test_subscription_unsubscribe_without_open_returns_false():
+    # 覆盖 unsubscribe() 行 373: sock/sub_id 均空 → 提前返回 False
+    sub = Subscription("/tmp/fe-cov-nosub.sock", ["telemetry"], None, None)
+    assert sub.unsubscribe() is False
+    assert sub._sock is None
+
+
+def test_subscription_subscribe_error_raises():
+    # 覆盖 _open 行 334-335: 服务端返 error → RuntimeError
+    sock_path = _sock_path()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(sock_path)
+    listener.listen(1)
+    listener.settimeout(5.0)
+
+    def fake_server():
+        conn, _ = listener.accept()
+        conn.recv(4096)
+        conn.sendall(
+            (json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32600, "message": "bad"}}) + "\n").encode()
+        )
+        conn.close()
+
+    import threading
+
+    t = threading.Thread(target=fake_server, daemon=True)
+    t.start()
+    try:
+        sub = Subscription(sock_path, ["telemetry"], None, None)
+        with pytest.raises(RuntimeError, match="subscribe 失败"):
+            sub._open()
+    finally:
+        listener.close()
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+
+def test_subscription_next_raises_stopiteration_on_closed_stream():
+    # 覆盖 _read_json 行 344 (recv 空返回 None) + __next__ 行 363 (None → StopIteration)
+    # 伪 server: 发合法 subscribe 响应后立即关连接 → __next__ 内 recv 返 b"" → None → StopIteration
+    sock_path = _sock_path()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(sock_path)
+    listener.listen(1)
+    listener.settimeout(5.0)
+
+    def fake_server():
+        conn, _ = listener.accept()
+        conn.recv(4096)
+        conn.sendall(
+            (
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"ok": True, "subscription_id": "sub-eof"}}) + "\n"
+            ).encode()
+        )
+        conn.close()
+
+    import threading
+
+    t = threading.Thread(target=fake_server, daemon=True)
+    t.start()
+    try:
+        sub = Subscription(sock_path, ["telemetry"], None, None)
+        sub._open()
+        assert sub.subscription_id == "sub-eof"
+        with pytest.raises(StopIteration):
+            next(sub)
+        # sock 仍开 (服务端关了对端, 本地未关) → close() 覆盖 396-397
+        assert sub._sock is not None
+        sub.close()
+        assert sub._sock is None
+    finally:
+        listener.close()
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
