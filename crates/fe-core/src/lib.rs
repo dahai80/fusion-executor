@@ -86,10 +86,22 @@ pub struct ExecutionRequest {
     /// false=stdio 独立管道 (FR-03 双工 stdout/stderr 分离, Slicer 吃 stderr)。PTY 合并时 stderr 恒空。
     #[serde(default = "default_use_pty")]
     pub use_pty: bool,
+    /// Issue #3: 进程数上限 (RLIMIT_NPROC, 经 ulimit -u 注入)。默认 1024 — 拦 fork bomb 并发扩散,
+    /// 够工具链链式 spawn。0=不限 (受信 opt-out)。Darwin 实测生效。
+    #[serde(default = "default_nproc")]
+    pub max_nproc: u32,
+    /// Issue #3: CPU 秒上限 (RLIMIT_CPU, 经 ulimit -t 注入)。默认 0=不限 (依赖 timeout_sec watchdog)。
+    /// >0 到顶 SIGXCPU (CPU 死循环防御)。Darwin 实测生效。
+    #[serde(default)]
+    pub max_cpu_sec: u32,
 }
 
 fn default_use_pty() -> bool {
     true
+}
+
+fn default_nproc() -> u32 {
+    1024
 }
 
 fn default_timeout() -> f64 {
@@ -477,6 +489,8 @@ impl Executor {
             seatbelt: req.seatbelt,
             inherit_env: req.inherit_env,
             use_pty: req.use_pty,
+            max_nproc: req.max_nproc,
+            max_cpu_sec: req.max_cpu_sec,
         };
         info!(
             seatbelt = req.seatbelt,
@@ -626,6 +640,8 @@ impl Executor {
             seatbelt: req.seatbelt,
             inherit_env: req.inherit_env,
             use_pty: req.use_pty,
+            max_nproc: req.max_nproc,
+            max_cpu_sec: req.max_cpu_sec,
         };
         info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg)?;
@@ -755,6 +771,8 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut combined = String::new();
@@ -789,6 +807,8 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut frames = 0;
@@ -822,6 +842,8 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -852,6 +874,8 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -904,6 +928,8 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -933,6 +959,8 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -960,6 +988,8 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -994,6 +1024,8 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -1032,6 +1064,8 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();

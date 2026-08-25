@@ -50,6 +50,14 @@ class ExecutionRequest(BaseModel):
         default=True,
         description="I/O 后端: True(默认)=PTY (合流 stdout/stderr 保 ANSI/Traceback, stderr 恒空); False=stdio (stdout/stderr 独立捕获, 需分流的调用方 opt-in)",
     )
+    max_nproc: int = Field(
+        default=1024,
+        description="进程数上限 (RLIMIT_NPROC, 经 ulimit -u 注入); 拦 fork bomb 并发扩散, 够工具链链式 spawn; 0=不限 (受信 opt-out); Darwin 实测生效",
+    )
+    max_cpu_sec: int = Field(
+        default=0,
+        description="CPU 秒上限 (RLIMIT_CPU, 经 ulimit -t 注入); >0 到顶 SIGXCPU (CPU 死循环防御); 0=不限 (依赖 timeout_sec watchdog); Darwin 实测生效",
+    )
 
 
 class ExecutionResult(BaseModel):

@@ -53,6 +53,8 @@ class FusionSandboxExecutor:
         seatbelt: bool = False,
         inherit_env: bool = False,
         use_pty: bool = True,
+        max_nproc: int = 1024,
+        max_cpu_sec: int = 0,
     ) -> ExecutionResult:
         # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
         if not isinstance(command, str):
@@ -67,14 +69,20 @@ class FusionSandboxExecutor:
             for k, v in env_vars.items():
                 if not isinstance(k, str) or not isinstance(v, str):
                     raise TypeError(f"env_vars 键值均须 str, 得 ({type(k).__name__},{type(v).__name__})")
+        if not isinstance(max_nproc, int) or max_nproc < 0:
+            raise ValueError(f"max_nproc 必须为非负 int, 得 {max_nproc!r}")
+        if not isinstance(max_cpu_sec, int) or max_cpu_sec < 0:
+            raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
         logger.debug(
-            "run command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s",
+            "run command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s",
             command,
             timeout_sec,
             cwd,
             task_id,
             inherit_env,
             use_pty,
+            max_nproc,
+            max_cpu_sec,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         native = self._native.execute_sync(
@@ -88,6 +96,8 @@ class FusionSandboxExecutor:
             seatbelt,
             inherit_env,
             use_pty,
+            max_nproc,
+            max_cpu_sec,
         )
         diag = None
         if native.diagnostics is not None:
@@ -143,24 +153,32 @@ class FusionSandboxExecutor:
         seatbelt: bool = False,
         inherit_env: bool = False,
         use_pty: bool = True,
+        max_nproc: int = 1024,
+        max_cpu_sec: int = 0,
     ) -> Iterator[str | ExecutionResult]:
         # M-PY-01: 同 run() 前置校验
         if not isinstance(command, str):
             raise TypeError(f"command 必须为 str, 得 {type(command).__name__}")
         if timeout_sec is not None and timeout_sec <= 0:
             raise ValueError(f"timeout_sec 必须为正数, 得 {timeout_sec}")
+        if not isinstance(max_nproc, int) or max_nproc < 0:
+            raise ValueError(f"max_nproc 必须为非负 int, 得 {max_nproc!r}")
+        if not isinstance(max_cpu_sec, int) or max_cpu_sec < 0:
+            raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
         # 流式后端仅 PTY: use_pty=False 暂无 stdio 流式实现 (run_streaming 走 portable-pty,
         # 保 ANSI/Traceback 保真 — 流式主要目的)。需独立 stderr 分流用 run(use_pty=False)。
         if not use_pty:
             raise ValueError("run_streaming 暂不支持 use_pty=False (无 stdio 流式后端; 用 run() 分流)")
         logger.debug(
-            "run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s",
+            "run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s",
             command,
             timeout_sec,
             cwd,
             task_id,
             inherit_env,
             use_pty,
+            max_nproc,
+            max_cpu_sec,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         it = self._native.execute_streaming(
@@ -174,6 +192,8 @@ class FusionSandboxExecutor:
             seatbelt,
             inherit_env,
             use_pty,
+            max_nproc,
+            max_cpu_sec,
         )
         for frame in it:
             # L-PY-02: 严格键 (旧 .get(default) 吞 serde bug, 缺字段静默成功看像 blocked)

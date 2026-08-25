@@ -71,6 +71,13 @@ pub struct SandboxConfig {
     /// false=stdio 子进程管道 (stdout/stderr 独立捕获, FR-03 双工; 丢失 PTY 保真)。
     /// 诊断 Slicer 在 stdio 模式直接吃 stderr; PTY 模式吃合并 stdout 的 tail。
     pub use_pty: bool,
+    /// Issue #3: 进程数上限 (RLIMIT_NPROC, 经 ulimit -u 注入)。默认 1024 — 够 cargo/node/python
+    /// 工具链链式 spawn, 拦 fork bomb 并发扩散 (spread-limit; 真正终止靠 timeout watchdog kill 进程树)。
+    /// 0=不限 NPROC (受信场景 opt-out)。Darwin 实测生效。
+    pub max_nproc: u32,
+    /// Issue #3: CPU 秒上限 (RLIMIT_CPU, 经 ulimit -t 注入)。默认 0=不限 (依赖 timeout_sec watchdog 兜底)。
+    /// >0 则到顶 SIGXCPU (CPU 死循环防御)。Darwin 实测生效。
+    pub max_cpu_sec: u32,
 }
 
 impl Default for SandboxConfig {
@@ -84,6 +91,8 @@ impl Default for SandboxConfig {
             seatbelt: false,
             inherit_env: false,
             use_pty: true,
+            max_nproc: 1024,
+            max_cpu_sec: 0,
         }
     }
 }
@@ -179,7 +188,9 @@ impl Sandbox {
             .context("openpty 失败")?;
 
         // Blocker 1 / 1.1: seatbelt=true → sandbox-exec 包装 (禁网 + 危险二进制 execve deny)
-        let mut cmd = seatbelt::build_command(&cfg.command, cfg.seatbelt);
+        // Issue #3: max_nproc/max_cpu_sec 经 wrap_rlimits 注入 ulimit 到 sh -c 脚本
+        let mut cmd =
+            seatbelt::build_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
@@ -190,7 +201,13 @@ impl Sandbox {
             .spawn_command(cmd)
             .context("spawn_command 失败")?;
         let pid = child.process_id();
-        debug!(?pid, seatbelt = cfg.seatbelt, "child spawned");
+        debug!(
+            ?pid,
+            seatbelt = cfg.seatbelt,
+            nproc = cfg.max_nproc,
+            cpu_sec = cfg.max_cpu_sec,
+            "child spawned"
+        );
 
         // 释放 slave — spawn 后不再需要
         drop(pair.slave);
@@ -306,7 +323,8 @@ impl Sandbox {
     /// 复用截断/OOM-cap/超时/SIGINT→SIGKILL 进程树杀语义 (与 PTY run() 等价)。
     async fn run_stdio(&self, cfg: SandboxConfig) -> Result<SandboxResult> {
         info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run (stdio, 分离 stdout/stderr)");
-        let mut cmd = seatbelt::build_std_command(&cfg.command, cfg.seatbelt);
+        let mut cmd =
+            seatbelt::build_std_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
         if let Some(cwd) = &cfg.cwd {
             cmd.current_dir(cwd);
         }
@@ -459,7 +477,8 @@ impl Sandbox {
             })
             .context("openpty 失败")?;
 
-        let mut cmd = seatbelt::build_command(&cfg.command, cfg.seatbelt);
+        let mut cmd =
+            seatbelt::build_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
@@ -470,7 +489,13 @@ impl Sandbox {
             .spawn_command(cmd)
             .context("spawn_command 失败")?;
         let pid = child.process_id();
-        debug!(?pid, seatbelt = cfg.seatbelt, "child spawned (streaming)");
+        debug!(
+            ?pid,
+            seatbelt = cfg.seatbelt,
+            nproc = cfg.max_nproc,
+            cpu_sec = cfg.max_cpu_sec,
+            "child spawned (streaming)"
+        );
         drop(pair.slave);
 
         // reader 线程 — 实时分块 (inner_tx) + 环形缓冲; EOF 时送最终完整累积 (inner_tx)
@@ -1257,6 +1282,8 @@ mod tests {
             seatbelt: false,
             inherit_env: false,
             use_pty: true,
+            max_nproc: 1024,
+            max_cpu_sec: 0,
         };
         let (mut rx, handle) = sb.run_streaming(cfg).unwrap();
         // 收首块 (含 "started"), 确认子进程已起
@@ -1376,5 +1403,89 @@ mod tests {
             "seatbelt 关闭时 rm 不应被拦, stdout={}",
             r.stdout
         );
+    }
+
+    // Issue #3: RLIMIT_NPROC/CPU 经 ulimit -u/-t 注入 — 子进程可观测生效 rlimit。
+    // Darwin RLIMIT_NPROC 是 per-UID spread-limiter (非 per-tree terminator): cargo 测试
+    // 运行器+系统守护已占大量 UID 进程槽, 低 nproc 直接令 sh 自身 fork python3 EAGAIN,
+    // fork-count 断言非确定。改测可观测 rlimit: setrlimit 跨 fork/exec 继承, python3
+    // resource.getrlimit 读回注入值 — 确定性证明注入端到端生效 (无 fork 依赖)。
+    #[test]
+    fn nproc_cpu_injection_observable() {
+        let sb = Sandbox::new();
+        let cfg = SandboxConfig {
+            command: "python3 -c 'import resource; print(\"NPROC\", resource.getrlimit(resource.RLIMIT_NPROC)[0]); print(\"CPU\", resource.getrlimit(resource.RLIMIT_CPU)[0])'".to_string(),
+            timeout_sec: 20.0,
+            // nproc=2048: 够 sh+python3 spawn (Darwin RLIMIT_NPROC per-UID, 系统占用高),
+            // 但值经 ulimit -u 注入后 setrlimit 跨 exec 继承, python3 读回确证注入生效。
+            // (低值 64 令 sh 自身 fork python3 EAGAIN — Darwin 平台限制)
+            max_nproc: 2048,
+            max_cpu_sec: 15,
+            ..Default::default()
+        };
+        let r = rt().block_on(sb.run(cfg));
+        let r = r.unwrap();
+        assert!(
+            !r.timed_out,
+            "rlimit 探测不应超时, timed_out=true stdout={}",
+            r.stdout
+        );
+        assert_eq!(
+            r.exit_code, 0,
+            "rlimit 探测应 exit 0, exit={} stdout={}",
+            r.exit_code, r.stdout
+        );
+        assert!(
+            r.stdout.contains("NPROC 2048"),
+            "子进程应观测到注入的 RLIMIT_NPROC=2048, stdout={}",
+            r.stdout
+        );
+        assert!(
+            r.stdout.contains("CPU 15"),
+            "子进程应观测到注入的 RLIMIT_CPU=15, stdout={}",
+            r.stdout
+        );
+    }
+
+    // Issue #3: 默认 max_nproc=1024 不影响正常工具链链式 spawn (cargo/python/node)
+    #[test]
+    fn default_nproc_allows_normal_chain() {
+        let sb = Sandbox::new();
+        let cfg = SandboxConfig {
+            command: "python3 -c 'print(\"chain-ok\")' && echo done".to_string(),
+            timeout_sec: 15.0,
+            // 默认 max_nproc=1024, max_cpu_sec=0 (via ..Default::default())
+            ..Default::default()
+        };
+        let r = rt().block_on(sb.run(cfg));
+        let r = r.unwrap();
+        assert_eq!(
+            r.exit_code, 0,
+            "默认 nproc 不应拦正常链, exit={}",
+            r.exit_code
+        );
+        assert!(r.stdout.contains("chain-ok"), "stdout={}", r.stdout);
+        assert!(r.stdout.contains("done"), "stdout={}", r.stdout);
+    }
+
+    // Issue #3: max_nproc=0 显式不限 — fork 满跑不被 nproc 限 (timeout 兜底)
+    #[test]
+    fn nproc_zero_no_limit() {
+        let sb = Sandbox::new();
+        let cfg = SandboxConfig {
+            command: "python3 -c 'print(\"no-rlimit-injected\")'".to_string(),
+            timeout_sec: 10.0,
+            max_nproc: 0,
+            max_cpu_sec: 0,
+            ..Default::default()
+        };
+        let r = rt().block_on(sb.run(cfg));
+        let r = r.unwrap();
+        assert_eq!(
+            r.exit_code, 0,
+            "nproc=0 正常命令应 exit 0, stdout={}",
+            r.stdout
+        );
+        assert!(r.stdout.contains("no-rlimit-injected"));
     }
 }

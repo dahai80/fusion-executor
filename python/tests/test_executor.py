@@ -250,6 +250,44 @@ def test_run_streaming_done_has_schema_fields(executor: FusionSandboxExecutor):
     assert result.duration_sec > 0.0
 
 
+# ── Issue #3: RLIMIT_NPROC/CPU 注入 (run + run_streaming 4-layer 端到端) ──
+# Darwin RLIMIT_NPROC per-UID spread-limiter: 低值令 sh 自身 fork python3 EAGAIN,
+# 故测可观测 rlimit (python resource.getrlimit 读回注入值), 确定性无 fork 依赖。
+
+
+def test_run_injects_rlimits(executor: FusionSandboxExecutor):
+    probe = 'python3 -c \'import resource; print("NPROC", resource.getrlimit(resource.RLIMIT_NPROC)[0]); print("CPU", resource.getrlimit(resource.RLIMIT_CPU)[0])\''
+    result = executor.run(probe, max_nproc=2048, max_cpu_sec=15)
+    assert result.exit_code == 0, f"probe 应 exit 0, stdout={result.stdout}"
+    assert "NPROC 2048" in result.stdout, f"应观测注入 NPROC=2048, stdout={result.stdout}"
+    assert "CPU 15" in result.stdout, f"应观测注入 CPU=15, stdout={result.stdout}"
+
+
+def test_run_rlimits_default_zero_cpu(executor: FusionSandboxExecutor):
+    probe = "python3 -c 'import resource; print(\"CPU\", resource.getrlimit(resource.RLIMIT_CPU)[0])'"
+    result = executor.run(probe)
+    assert result.exit_code == 0
+    # 默认 max_cpu_sec=0 → RLIMIT_CPU 上限应是 unlimited (0 或大数, 非有限值如 15)
+    cpu_val = result.stdout.split("CPU")[1].strip()
+    assert cpu_val in ("0", "9223372036854775807", "-1"), f"默认 CPU 应不限, 得 {cpu_val}"
+
+
+def test_run_rejects_negative_nproc(executor: FusionSandboxExecutor):
+    try:
+        executor.run("echo hi", max_nproc=-1)
+        raise AssertionError("max_nproc<0 应抛 ValueError")
+    except ValueError:
+        pass
+
+
+def test_run_streaming_injects_rlimits(executor: FusionSandboxExecutor):
+    probe = "python3 -c 'import resource; print(\"NPROC\", resource.getrlimit(resource.RLIMIT_NPROC)[0])'"
+    _chunks, result = _consume_stream(executor, probe, max_nproc=2048)
+    assert result is not None
+    assert result.exit_code == 0
+    assert "NPROC 2048" in result.stdout
+
+
 # ── 原生文件工具 (fe-tools) ──
 
 
