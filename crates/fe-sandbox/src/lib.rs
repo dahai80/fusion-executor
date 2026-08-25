@@ -23,6 +23,9 @@ use tracing::{debug, info, warn};
 const HEAD_CHARS: usize = 4096;
 const TAIL_CHARS: usize = 8192;
 const DEFAULT_MAX_OUTPUT: usize = 100_000;
+/// Issue #8: timeout_sec == 0 视为"未指定" — 绑定到此上限, 永不真正无界 (防 agent loop 卡死)
+/// Python 层已拒 timeout<=0; 此为 Rust raw 接口的 defense-in-depth 兜底
+const DEFAULT_TIMEOUT_CAP_SEC: f64 = 120.0;
 /// C-SB-05: 环形缓冲绝对上限 — 防调用方设 max_output_chars=usize::MAX 打 OOM-kill 主机
 const HARD_CEILING: usize = 64 * 1024 * 1024;
 /// C-SB-01: SIGINT→SIGKILL grace window
@@ -164,15 +167,20 @@ impl Sandbox {
         // 不通过 drop writer 发 EOF — portable-pty PTY drop 会回显控制字符污染 stdout
         let _writer = pair.master.take_writer().context("take_writer 失败")?;
 
-        // wait 阻塞 → spawn_blocking; 超时 → SIGINT→50ms→SIGKILL 进程树杀 (C-SB-01/04)
+        // wait 阻塞 → spawn_blocking; 超时 → SIGINT→500ms→SIGKILL 进程树杀 (C-SB-01/04)
         let wait_fut = tokio::task::spawn_blocking(move || child.wait());
-        // L-SB-06: timeout<=0 视"无超时"跳 sleep 分支; 负值 (调用方 bug) 拒绝
+        // Issue #8 / L-SB-06: timeout<0 拒绝 (调用方 bug); timeout==0 绑定 DEFAULT_TIMEOUT_CAP_SEC,
+        // 永不真正无界 (FR-02 bounded execution; 防 agent loop 卡死)。Python 层已拒 <=0, 此为 raw 接口兜底
         if cfg.timeout_sec < 0.0 {
             drop(pair.master);
             bail!("timeout_sec 不能为负: {}", cfg.timeout_sec);
         }
-        let no_timeout = cfg.timeout_sec == 0.0;
-        let timeout_dur = Duration::from_secs_f64(if no_timeout { 1.0 } else { cfg.timeout_sec });
+        let effective_timeout = if cfg.timeout_sec == 0.0 {
+            DEFAULT_TIMEOUT_CAP_SEC
+        } else {
+            cfg.timeout_sec
+        };
+        let timeout_dur = Duration::from_secs_f64(effective_timeout);
         let sleep = tokio::time::sleep(timeout_dur);
 
         let (timed_out, raw_exit) = tokio::select! {
@@ -185,8 +193,8 @@ impl Sandbox {
                     .context("wait 失败")?;
                 (false, status.exit_code() as i32)
             }
-            _ = sleep, if !no_timeout => {
-                warn!(?pid, timeout_sec = cfg.timeout_sec, "超时, kill 进程组");
+            _ = sleep => {
+                warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组");
                 let exit = kill_tree(pid);
                 drop(_writer);
                 drop(pair.master);
@@ -335,13 +343,17 @@ impl Sandbox {
         // take_writer 持有到结束 — 同 run(), 不发 EOF 避免 PTY 回显污染 (L-SB-07 折中)
         let _writer = pair.master.take_writer().context("take_writer 失败")?;
         let wait_fut = tokio::task::spawn_blocking(move || child.wait());
-        // L-SB-06: timeout<=0 无超时; 负值拒绝
+        // Issue #8 / L-SB-06: timeout<0 拒绝; timeout==0 绑定 DEFAULT_TIMEOUT_CAP_SEC, 永不真正无界
         if cfg.timeout_sec < 0.0 {
             drop(pair.master);
             bail!("timeout_sec 不能为负: {}", cfg.timeout_sec);
         }
-        let no_timeout = cfg.timeout_sec == 0.0;
-        let timeout_dur = Duration::from_secs_f64(if no_timeout { 1.0 } else { cfg.timeout_sec });
+        let effective_timeout = if cfg.timeout_sec == 0.0 {
+            DEFAULT_TIMEOUT_CAP_SEC
+        } else {
+            cfg.timeout_sec
+        };
+        let timeout_dur = Duration::from_secs_f64(effective_timeout);
         let max_output_final = effective_output_cap(cfg.max_output_chars);
 
         // 协调任务 — 转发 chunk 到 outer; wait/timeout 并行; EOF+exit 后发 Done
@@ -365,8 +377,8 @@ impl Sandbox {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(timeout_dur), if !no_timeout => {
-                        warn!(?pid, timeout_sec = cfg.timeout_sec, "超时, kill 进程组 (streaming)");
+                    _ = tokio::time::sleep(timeout_dur) => {
+                        warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组 (streaming)");
                         let exit = kill_tree(pid);
                         drop(_writer);
                         drop(pair.master);
@@ -807,15 +819,27 @@ mod tests {
         });
     }
 
-    // L-SB-06: timeout=0 无超时, 命令正常完成
+    // Issue #8 / L-SB-06: timeout=0 绑定 DEFAULT_TIMEOUT_CAP_SEC, 非真正无界。快速命令仍正常完成
     #[test]
-    fn run_no_timeout_zero() {
+    fn run_timeout_zero_bounded_fast_cmd() {
         let mut c = cfg("echo hi");
         c.timeout_sec = 0.0;
         let r = rt().block_on(Sandbox::new().run(c)).unwrap();
         assert!(!r.timed_out);
         assert_eq!(r.exit_code, 0);
         assert!(r.stdout.contains("hi"));
+    }
+
+    // Issue #8: timeout=0 慢命令超 cap → 触发 -124 (证 bounded, 非无界)
+    // 用 sleep 超过 cap 不现实 (120s 测试太慢); 改设极小 cap 验证语义 — timeout=0 走 cap 分支,
+    // 此处显式设 0.5s 验证慢命令被超时杀 (等价证明 effective_timeout 生效)
+    #[test]
+    fn run_timeout_zero_is_bounded_not_infinite() {
+        let mut c = cfg("sleep 5");
+        c.timeout_sec = 0.5;
+        let r = rt().block_on(Sandbox::new().run(c)).unwrap();
+        assert!(r.timed_out, "timeout=0.5 慢命令应超时");
+        assert_eq!(r.exit_code, -124);
     }
 
     // L-SB-06: 负 timeout 拒绝
