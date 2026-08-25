@@ -101,6 +101,9 @@ pub struct Diagnostics {
 /// max_consecutive_failures: 连续失败上限 (达此值触发回滚); file_damage_check: 检测文件毁损触发回滚。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackPolicy {
+    /// Issue #12.3 / A4: 此字段在 wire 上接受 (调用方表达策略意图), 但 Rust 永不读 —
+    /// 连续失败计数归 caller 自愈循环 (Executor 无状态, PRD §重构 明确; 接入需跨请求状态违反 NFR)。
+    /// DEFERRED-BY-DESIGN: 保留供未来 stateful 扩展, 勿当生效字段。Python 侧标 deprecated=True。
     #[serde(default = "default_max_failures")]
     pub max_consecutive_failures: u32,
     #[serde(default = "default_true")]
@@ -910,6 +913,38 @@ mod tests {
             // 文件保持损坏 (未回滚)
             let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
             assert_eq!(content, "broken\n", "无 policy 文件应保持改动: {content}");
+        });
+    }
+
+    // Issue #12.3 / A4: max_consecutive_failures 是 DEFERRED-BY-DESIGN 死字段 —
+    // Rust 永不读。设极高值 (99) 不应阻止单次执行的文件毁损回滚 (证字段被接受但忽略, 无状态)。
+    #[test]
+    fn max_consecutive_failures_ignored_stateless() {
+        rt().block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cwd = dir.path().to_str().unwrap().to_string();
+            make_git_repo(dir.path());
+            let cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\"";
+            let req = ExecutionRequest {
+                command: cmd.to_string(),
+                task_id: None,
+                cwd: Some(cwd.clone()),
+                timeout_sec: 15.0,
+                env_vars: None,
+                enable_rollback_snapshot: true,
+                auto_rollback_policy: Some(RollbackPolicy {
+                    max_consecutive_failures: 99,
+                    file_damage_check: true,
+                }),
+                seatbelt: false,
+            };
+            let ex = Executor::new();
+            let res = ex.execute_async(req).await.unwrap();
+            assert_ne!(res.exit_code, 0, "应失败");
+            // 即使 max_consecutive_failures=99 (远超单次), 文件毁损仍立即回滚 — 字段不限制单次执行
+            assert!(res.auto_rolled_back, "max_consecutive_failures 不影响单次回滚 (死字段)");
+            let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
+            assert_eq!(content, "print('ok')\n", "回滚后应恢复: {content}");
         });
     }
 
