@@ -2,7 +2,7 @@
 //             + 外科补丁引擎 (PRD §DeepSeek 对比: Unified Diff 应用 + 函数级替换, 禁全文件重写)
 //
 // 工具:
-//   file_edit(path, old, new, cwd)  — 唯一匹配精确替换, 原子写
+//   file_edit(path, old, new, cwd, replace_all)  — 唯一匹配精确替换 (replace_all 全量), 原子写
 //   glob(pattern, cwd)              — 递归 glob 模式匹配, 返回相对路径
 //   grep(pattern, paths, cwd)       — 正则逐行搜索, 返回 file/line/content
 //   apply_patch(diff, cwd)          — Unified Diff 解析 + 应用 (diffy), 禁全文件清空
@@ -41,6 +41,10 @@ pub enum ToolsError {
     Regex(#[from] regex::Error),
     #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
+    #[error("multi_edit 第 {index} 项: {reason}")]
+    MultiEditItem { index: usize, reason: String },
+    #[error("notebook 编辑失败: {0}")]
+    Notebook(String),
 }
 
 // ── 结果类型 (serde, 4 层透传) ──
@@ -68,6 +72,32 @@ pub struct GrepMatch {
     pub path: String,
     pub line_number: u32,
     pub content: String,
+}
+
+// ── #6: replace_all / MultiEdit / NotebookEdit 扩展 ──
+
+/// MultiEdit 单条编辑 (serde, IPC/PyO3 透传)
+/// replace_all=false (默认): old_string 必须全文唯一 (Ambiguous 拒绝)
+/// replace_all=true: 替换该条所有匹配
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiEditItem {
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+/// notebook 编辑模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotebookEditMode {
+    /// 替换目标 cell 源 (需 cell_id 或 cell_number 定位)
+    #[default]
+    Replace,
+    /// 在目标 cell 后插入新 cell
+    Insert,
+    /// 删除目标 cell
+    Delete,
 }
 
 /// Tools 控制器 — 持有 SecurityGuard 复用, 无状态
@@ -99,12 +129,14 @@ impl Tools {
 
     /// file_edit — 唯一匹配 old_string → new_string 精确替换, 原子写
     /// (PRD FileEdit: 拒绝模糊编辑, old 必须全文唯一)
+    /// #6: replace_all=true → 替换全部匹配 (Claude Code FileEdit parity); false (默认) → 唯一匹配
     pub fn file_edit(
         &self,
         path: &str,
         old_string: &str,
         new_string: &str,
         cwd: Option<&str>,
+        replace_all: bool,
     ) -> Result<EditResult> {
         let abs = guard_path(&self.guard, path, cwd).map_err(|e| anyhow::anyhow!(e))?;
         if !abs.exists() {
@@ -156,7 +188,8 @@ impl Tools {
                 matches: 0,
             });
         }
-        if count > 1 {
+        // #6: replace_all=false → count>1 拒绝 (唯一匹配契约); true → 替换全部
+        if !replace_all && count > 1 {
             return Ok(EditResult {
                 ok: false,
                 path: Some(path.to_string()),
@@ -164,11 +197,282 @@ impl Tools {
                 matches: count as u32,
             });
         }
-        let updated = content.replacen(old_string, new_string, 1);
+        let updated = if replace_all {
+            content.replace(old_string, new_string)
+        } else {
+            content.replacen(old_string, new_string, 1)
+        };
         // 锁内写完 (atomic_write rename 到目标, 锁仍持 file fd — 保证此 RMW 期间他 Agent 阻塞)
         atomic_write(&abs, &updated)?;
         drop(lock);
-        info!(path = %abs.display(), "file_edit 替换成功");
+        info!(path = %abs.display(), replace_all, "file_edit 替换成功");
+        Ok(EditResult {
+            ok: true,
+            path: Some(path.to_string()),
+            error: None,
+            matches: count as u32,
+        })
+    }
+
+    /// multi_edit — 同一文件顺序批量编辑, 原子性 all-or-nothing (#6)
+    /// 顺序对内存 buffer 应用每项 (old→new, 支持 replace_all), 任一项失败 → 丢弃 buffer 不写盘, 文件保持编辑前状态
+    /// 单次 flock 包整个批次, 防并发编辑静默丢改动
+    pub fn multi_edit(
+        &self,
+        path: &str,
+        edits: &[MultiEditItem],
+        cwd: Option<&str>,
+    ) -> Result<EditResult> {
+        if edits.is_empty() {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some("edits 列表不能为空".to_string()),
+                matches: 0,
+            });
+        }
+        let abs = guard_path(&self.guard, path, cwd).map_err(|e| anyhow::anyhow!(e))?;
+        if !abs.exists() {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(format!("文件未找到: {}", path)),
+                matches: 0,
+            });
+        }
+        if let Err(e) = check_size(&abs) {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(e.to_string()),
+                matches: 0,
+            });
+        }
+        let lock = match FileLock::exclusive(&abs) {
+            Ok(l) => l,
+            Err(e) => {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(path.to_string()),
+                    error: Some(format!("获取文件锁失败: {}", e)),
+                    matches: 0,
+                });
+            }
+        };
+        let mut buffer = FileLock::read_data_to_string(&abs)
+            .with_context(|| format!("读取 {} 失败", abs.display()))?;
+        let mut total_matches: u32 = 0;
+        // 顺序应用每项编辑; 任一项失败 → 立即 return, 不写盘 (buffer 丢弃), lock drop 释放
+        for (i, item) in edits.iter().enumerate() {
+            if item.old_string.is_empty() {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(path.to_string()),
+                    error: Some(format!("multi_edit 第 {} 项: old_string 不能为空", i)),
+                    matches: total_matches,
+                });
+            }
+            let count = buffer.matches(&item.old_string).count();
+            if count == 0 {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(path.to_string()),
+                    error: Some(format!("multi_edit 第 {} 项: old_string 未匹配", i)),
+                    matches: total_matches,
+                });
+            }
+            if !item.replace_all && count > 1 {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(path.to_string()),
+                    error: Some(format!(
+                        "multi_edit 第 {} 项: old_string 非唯一匹配 (命中 {} 处)",
+                        i, count
+                    )),
+                    matches: total_matches,
+                });
+            }
+            buffer = if item.replace_all {
+                buffer.replace(&item.old_string, &item.new_string)
+            } else {
+                buffer.replacen(&item.old_string, &item.new_string, 1)
+            };
+            total_matches += count as u32;
+        }
+        // 全部项成功 → 一次原子写盘
+        atomic_write(&abs, &buffer)?;
+        drop(lock);
+        info!(path = %abs.display(), edits = edits.len(), "multi_edit 批量替换成功");
+        Ok(EditResult {
+            ok: true,
+            path: Some(path.to_string()),
+            error: None,
+            matches: total_matches,
+        })
+    }
+
+    /// notebook_edit — Jupyter .ipynb 单元格编辑 (#6)
+    /// 按 cell_id (nbformat v4+) 或 cell_number (0-based 索引) 定位, edit_mode=replace/insert/delete
+    /// serde_json 解析/回写, 保持 nbformat 4.x 合规; new_source 为替换/插入的新单元格源码
+    pub fn notebook_edit(
+        &self,
+        path: &str,
+        cell_id: Option<&str>,
+        cell_number: Option<i64>,
+        new_source: &str,
+        edit_mode: NotebookEditMode,
+        cwd: Option<&str>,
+    ) -> Result<EditResult> {
+        let abs = guard_path(&self.guard, path, cwd).map_err(|e| anyhow::anyhow!(e))?;
+        if !abs.exists() {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(format!("文件未找到: {}", path)),
+                matches: 0,
+            });
+        }
+        // 仅接受 .ipynb 扩展名
+        if abs.extension().and_then(|e| e.to_str()) != Some("ipynb") {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some("notebook_edit 仅支持 .ipynb 文件".to_string()),
+                matches: 0,
+            });
+        }
+        if let Err(e) = check_size(&abs) {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(e.to_string()),
+                matches: 0,
+            });
+        }
+        let lock = match FileLock::exclusive(&abs) {
+            Ok(l) => l,
+            Err(e) => {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(path.to_string()),
+                    error: Some(format!("获取文件锁失败: {}", e)),
+                    matches: 0,
+                });
+            }
+        };
+        let raw = FileLock::read_data_to_string(&abs)
+            .with_context(|| format!("读取 {} 失败", abs.display()))?;
+        let mut nb: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("notebook 解析失败: {}", e))?;
+        let cells = nb
+            .get_mut("cells")
+            .and_then(|c| c.as_array_mut())
+            .ok_or_else(|| anyhow::anyhow!("notebook 缺少 cells 数组"))?;
+
+        let new_cell = serde_json::json!({
+            "cell_type": "code",
+            "metadata": {},
+            "source": source_to_lines(new_source),
+            "outputs": [],
+            "execution_count": serde_json::Value::Null,
+        });
+
+        let locate = |cells: &Vec<serde_json::Value>| -> Result<usize> {
+            if let Some(id) = cell_id {
+                for (i, c) in cells.iter().enumerate() {
+                    if c.get("id").and_then(|v| v.as_str()) == Some(id) {
+                        return Ok(i);
+                    }
+                }
+                return Err(anyhow::anyhow!("未找到 cell_id={}", id));
+            }
+            if let Some(num) = cell_number {
+                if num < 0 || num as usize >= cells.len() {
+                    return Err(anyhow::anyhow!(
+                        "cell_number {} 越界 (共 {} 个单元格)",
+                        num,
+                        cells.len()
+                    ));
+                }
+                return Ok(num as usize);
+            }
+            Err(anyhow::anyhow!("需提供 cell_id 或 cell_number"))
+        };
+
+        match edit_mode {
+            NotebookEditMode::Replace => {
+                let idx = match locate(cells) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        drop(lock);
+                        return Ok(EditResult {
+                            ok: false,
+                            path: Some(path.to_string()),
+                            error: Some(e.to_string()),
+                            matches: 0,
+                        });
+                    }
+                };
+                cells[idx] = new_cell;
+            }
+            NotebookEditMode::Insert => {
+                let idx = match cell_number {
+                    Some(n) => {
+                        if n < 0 || n as usize > cells.len() {
+                            drop(lock);
+                            return Ok(EditResult {
+                                ok: false,
+                                path: Some(path.to_string()),
+                                error: Some(format!(
+                                    "cell_number {} 越界 (共 {} 个单元格, 插入允许 0..={})",
+                                    n,
+                                    cells.len(),
+                                    cells.len()
+                                )),
+                                matches: 0,
+                            });
+                        }
+                        n as usize
+                    }
+                    None => {
+                        // 无 cell_number 时, 有 cell_id → 定位后插其后; 否则追加末尾
+                        match locate(cells) {
+                            Ok(i) => i + 1,
+                            Err(_) => cells.len(),
+                        }
+                    }
+                };
+                cells.insert(idx, new_cell);
+            }
+            NotebookEditMode::Delete => {
+                let idx = match locate(cells) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        drop(lock);
+                        return Ok(EditResult {
+                            ok: false,
+                            path: Some(path.to_string()),
+                            error: Some(e.to_string()),
+                            matches: 0,
+                        });
+                    }
+                };
+                cells.remove(idx);
+            }
+        }
+
+        // 确保 nbformat 元数据合规
+        if nb.get("nbformat").is_none() {
+            nb["nbformat"] = serde_json::json!(4);
+        }
+        if nb.get("nbformat_minor").is_none() {
+            nb["nbformat_minor"] = serde_json::json!(5);
+        }
+        let out = serde_json::to_string_pretty(&nb)
+            .map_err(|e| anyhow::anyhow!("notebook 序列化失败: {}", e))?;
+        atomic_write(&abs, &out)?;
+        drop(lock);
+        info!(path = %abs.display(), mode = ?edit_mode, "notebook_edit 成功");
         Ok(EditResult {
             ok: true,
             path: Some(path.to_string()),
@@ -531,6 +835,27 @@ impl Tools {
     }
 
     // PLACEHOLDER: path helpers
+}
+
+/// source_to_lines — nbformat 单元格 source 规范: 字符串列表, 每行末尾含 \n (末行无)
+/// 单行源码 → ["整行"]; 多行 → 按 \n split, 保留行尾 \n
+fn source_to_lines(source: &str) -> Vec<String> {
+    if source.is_empty() {
+        return vec![];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    let bytes = source.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            lines.push(source[start..=i].to_string());
+            start = i + 1;
+        }
+    }
+    if start < source.len() {
+        lines.push(source[start..].to_string());
+    }
+    lines
 }
 
 /// 校验路径不落敏感区 + 不通过 .. 逃逸 cwd + 符号链接旁路防护
@@ -987,7 +1312,7 @@ mod tests {
         let tools = Tools::new();
         let cwd = dir.path().to_string_lossy().to_string();
         let r = tools
-            .file_edit("app.py", "x = 1", "x = 99", Some(&cwd))
+            .file_edit("app.py", "x = 1", "x = 99", Some(&cwd), false)
             .unwrap();
         assert!(r.ok);
         assert_eq!(r.matches, 1);
@@ -1002,7 +1327,7 @@ mod tests {
         let tools = Tools::new();
         let cwd = dir.path().to_string_lossy().to_string();
         let r = tools
-            .file_edit("a.txt", "missing", "x", Some(&cwd))
+            .file_edit("a.txt", "missing", "x", Some(&cwd), false)
             .unwrap();
         assert!(!r.ok);
         assert!(r.error.unwrap().contains("未匹配"));
@@ -1015,7 +1340,9 @@ mod tests {
         std::fs::write(&fp, "dup\ndup\n").unwrap();
         let tools = Tools::new();
         let cwd = dir.path().to_string_lossy().to_string();
-        let r = tools.file_edit("a.txt", "dup", "one", Some(&cwd)).unwrap();
+        let r = tools
+            .file_edit("a.txt", "dup", "one", Some(&cwd), false)
+            .unwrap();
         assert!(!r.ok);
         assert_eq!(r.matches, 2);
         // 内容未变
@@ -1027,7 +1354,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tools = Tools::new();
         let cwd = dir.path().to_string_lossy().to_string();
-        let r = tools.file_edit("nope.txt", "a", "b", Some(&cwd)).unwrap();
+        let r = tools
+            .file_edit("nope.txt", "a", "b", Some(&cwd), false)
+            .unwrap();
         assert!(!r.ok);
         assert!(r.error.unwrap().contains("未找到"));
     }
@@ -1214,12 +1543,16 @@ mod tests {
         std::fs::write(&fp, "").unwrap();
         let tools = Tools::new();
         let cwd = dir.path().to_string_lossy().to_string();
-        let r = tools.file_edit("empty.txt", "", "x", Some(&cwd)).unwrap();
+        let r = tools
+            .file_edit("empty.txt", "", "x", Some(&cwd), false)
+            .unwrap();
         assert!(!r.ok, "空 old_string 应被拒");
         assert!(r.error.unwrap().contains("不能为空"));
         // 非空文件空 old_string 也应拒
         std::fs::write(&fp, "content\n").unwrap();
-        let r = tools.file_edit("empty.txt", "", "x", Some(&cwd)).unwrap();
+        let r = tools
+            .file_edit("empty.txt", "", "x", Some(&cwd), false)
+            .unwrap();
         assert!(!r.ok, "空 old_string 应被拒 (非空文件同样)");
     }
 
@@ -1364,7 +1697,7 @@ mod tests {
         let tools = Tools::new();
         let cwd = dir.path().to_string_lossy().to_string();
         let r = tools
-            .file_edit("big.txt", "x = 1", "x = 2", Some(&cwd))
+            .file_edit("big.txt", "x = 1", "x = 2", Some(&cwd), false)
             .unwrap();
         assert!(!r.ok, "超 64MB 文件 file_edit 应被拒");
         assert!(r.error.unwrap().contains("超大小上限"), "应报 Oversize");
@@ -1427,11 +1760,11 @@ mod tests {
         let cwd_b = cwd.clone();
         let h = std::thread::spawn(move || {
             tools_a
-                .file_edit("race.txt", "A1", "A2", Some(&cwd_a))
+                .file_edit("race.txt", "A1", "A2", Some(&cwd_a), false)
                 .unwrap()
         });
         let rb = tools_b
-            .file_edit("race.txt", "B1", "B2", Some(&cwd_b))
+            .file_edit("race.txt", "B1", "B2", Some(&cwd_b), false)
             .unwrap();
         let ra = h.join().unwrap();
         assert!(ra.ok && rb.ok, "两并发 edit 都应成功: a={ra:?} b={rb:?}");
@@ -1457,7 +1790,7 @@ mod tests {
         let start = std::time::Instant::now();
         let h = std::thread::spawn(move || {
             tools
-                .file_edit("locked.txt", "v1", "v2", Some(&cwd2))
+                .file_edit("locked.txt", "v1", "v2", Some(&cwd2), false)
                 .unwrap()
         });
         // 持锁 300ms 后释放
@@ -1636,5 +1969,315 @@ mod tests {
         let segs = split_multi_file_diff(with_git);
         assert_eq!(segs.len(), 1);
         assert!(segs[0].starts_with("--- a/a.py"), "git 扩展头应被丢弃");
+    }
+
+    // ── #6: file_edit replace_all ──
+
+    #[test]
+    fn test_file_edit_replace_all_replaces_every_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("rep.py");
+        std::fs::write(&fp, "foo\nfoo\nfoo\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .file_edit("rep.py", "foo", "bar", Some(&cwd), true)
+            .unwrap();
+        assert!(r.ok, "replace_all 应全量替换: {r:?}");
+        assert_eq!(r.matches, 3);
+        assert_eq!(std::fs::read_to_string(&fp).unwrap(), "bar\nbar\nbar\n");
+    }
+
+    #[test]
+    fn test_file_edit_replace_all_false_still_rejects_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("rep.py");
+        std::fs::write(&fp, "foo\nfoo\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .file_edit("rep.py", "foo", "bar", Some(&cwd), false)
+            .unwrap();
+        assert!(!r.ok, "replace_all=false 多匹配应拒绝");
+        assert_eq!(r.matches, 2);
+        // 文件未被改动
+        assert_eq!(std::fs::read_to_string(&fp).unwrap(), "foo\nfoo\n");
+    }
+
+    #[test]
+    fn test_file_edit_replace_all_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("rep.py");
+        std::fs::write(&fp, "baz\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .file_edit("rep.py", "foo", "bar", Some(&cwd), true)
+            .unwrap();
+        assert!(!r.ok);
+        assert_eq!(r.matches, 0);
+    }
+
+    // ── #6: multi_edit 原子 all-or-nothing ──
+
+    #[test]
+    fn test_multi_edit_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("me.py");
+        std::fs::write(&fp, "a = 1\nb = 2\nc = 3\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let edits = vec![
+            MultiEditItem {
+                old_string: "a = 1".to_string(),
+                new_string: "a = 10".to_string(),
+                replace_all: false,
+            },
+            MultiEditItem {
+                old_string: "c = 3".to_string(),
+                new_string: "c = 30".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = tools.multi_edit("me.py", &edits, Some(&cwd)).unwrap();
+        assert!(r.ok, "multi_edit 全成功: {r:?}");
+        assert_eq!(r.matches, 2);
+        assert_eq!(
+            std::fs::read_to_string(&fp).unwrap(),
+            "a = 10\nb = 2\nc = 30\n"
+        );
+    }
+
+    #[test]
+    fn test_multi_edit_partial_failure_no_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("me.py");
+        std::fs::write(&fp, "a = 1\nb = 2\n").unwrap();
+        let original = std::fs::read_to_string(&fp).unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        // 第二项 old_string 不存在 → 整批失败, 文件保持原状
+        let edits = vec![
+            MultiEditItem {
+                old_string: "a = 1".to_string(),
+                new_string: "a = 10".to_string(),
+                replace_all: false,
+            },
+            MultiEditItem {
+                old_string: "MISSING".to_string(),
+                new_string: "x".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = tools.multi_edit("me.py", &edits, Some(&cwd)).unwrap();
+        assert!(!r.ok, "第二项未匹配应整批失败: {r:?}");
+        assert!(r.error.unwrap().contains("第 1 项"));
+        assert_eq!(
+            std::fs::read_to_string(&fp).unwrap(),
+            original,
+            "文件应保持编辑前状态"
+        );
+    }
+
+    #[test]
+    fn test_multi_edit_empty_list_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("me.py");
+        std::fs::write(&fp, "a = 1\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools.multi_edit("me.py", &[], Some(&cwd)).unwrap();
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("不能为空"));
+    }
+
+    #[test]
+    fn test_multi_edit_replace_all_per_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("me.py");
+        std::fs::write(&fp, "x\nx\ny\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let edits = vec![
+            MultiEditItem {
+                old_string: "x".to_string(),
+                new_string: "z".to_string(),
+                replace_all: true,
+            },
+            MultiEditItem {
+                old_string: "y".to_string(),
+                new_string: "w".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = tools.multi_edit("me.py", &edits, Some(&cwd)).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.matches, 3);
+        assert_eq!(std::fs::read_to_string(&fp).unwrap(), "z\nz\nw\n");
+    }
+
+    // ── #6: notebook_edit ──
+
+    fn write_minimal_nb(path: &Path) {
+        let nb = serde_json::json!({
+            "nbformat": 4,
+            "nbformat_minor": 5,
+            "metadata": {},
+            "cells": [
+                {"cell_type": "code", "metadata": {}, "source": ["print(1)\n"], "outputs": [], "execution_count": serde_json::Value::Null, "id": "cell-0"},
+                {"cell_type": "code", "metadata": {}, "source": ["print(2)\n"], "outputs": [], "execution_count": serde_json::Value::Null, "id": "cell-1"},
+            ],
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&nb).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_notebook_edit_replace_by_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("nb.ipynb");
+        write_minimal_nb(&fp);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .notebook_edit(
+                "nb.ipynb",
+                None,
+                Some(0),
+                "print(99)\n",
+                NotebookEditMode::Replace,
+                Some(&cwd),
+            )
+            .unwrap();
+        assert!(r.ok, "replace by number: {r:?}");
+        let nb: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fp).unwrap()).unwrap();
+        let cells = nb["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0]["source"][0].as_str().unwrap(), "print(99)\n");
+        assert_eq!(cells[1]["source"][0].as_str().unwrap(), "print(2)\n");
+    }
+
+    #[test]
+    fn test_notebook_edit_insert_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("nb.ipynb");
+        write_minimal_nb(&fp);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        // 在 cell-0 后插入新单元格
+        let r = tools
+            .notebook_edit(
+                "nb.ipynb",
+                Some("cell-0"),
+                None,
+                "import os\n",
+                NotebookEditMode::Insert,
+                Some(&cwd),
+            )
+            .unwrap();
+        assert!(r.ok);
+        let nb: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fp).unwrap()).unwrap();
+        let cells = nb["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[0]["id"].as_str().unwrap(), "cell-0");
+        assert_eq!(cells[1]["source"][0].as_str().unwrap(), "import os\n");
+        assert_eq!(cells[2]["id"].as_str().unwrap(), "cell-1");
+    }
+
+    #[test]
+    fn test_notebook_edit_delete_by_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("nb.ipynb");
+        write_minimal_nb(&fp);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .notebook_edit(
+                "nb.ipynb",
+                None,
+                Some(1),
+                "",
+                NotebookEditMode::Delete,
+                Some(&cwd),
+            )
+            .unwrap();
+        assert!(r.ok);
+        let nb: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fp).unwrap()).unwrap();
+        let cells = nb["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0]["id"].as_str().unwrap(), "cell-0");
+    }
+
+    #[test]
+    fn test_notebook_edit_missing_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("nb.ipynb");
+        write_minimal_nb(&fp);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .notebook_edit(
+                "nb.ipynb",
+                Some("no-such-id"),
+                None,
+                "x\n",
+                NotebookEditMode::Replace,
+                Some(&cwd),
+            )
+            .unwrap();
+        assert!(!r.ok, "缺失 cell_id 应失败: {r:?}");
+        assert!(r.error.unwrap().contains("未找到"));
+    }
+
+    #[test]
+    fn test_notebook_edit_number_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("nb.ipynb");
+        write_minimal_nb(&fp);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .notebook_edit(
+                "nb.ipynb",
+                None,
+                Some(99),
+                "x\n",
+                NotebookEditMode::Replace,
+                Some(&cwd),
+            )
+            .unwrap();
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("越界"));
+    }
+
+    #[test]
+    fn test_notebook_edit_rejects_non_ipynb() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("nb.txt");
+        std::fs::write(&fp, "not a notebook").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .notebook_edit(
+                "nb.txt",
+                None,
+                Some(0),
+                "x\n",
+                NotebookEditMode::Replace,
+                Some(&cwd),
+            )
+            .unwrap();
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains(".ipynb"));
+    }
+
+    #[test]
+    fn test_source_to_lines_handles_multiline() {
+        assert!(source_to_lines("").is_empty());
+        assert_eq!(source_to_lines("one"), vec!["one"]);
+        assert_eq!(source_to_lines("a\nb\n"), vec!["a\n", "b\n"]);
+        assert_eq!(source_to_lines("a\nb"), vec!["a\n", "b"]);
     }
 }

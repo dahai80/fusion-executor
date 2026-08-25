@@ -610,18 +610,20 @@ impl PyExecutor {
         })
     }
 
-    /// file_edit(path, old_string, new_string, cwd=None) -> NativeEditResult
-    /// 唯一匹配 old_string → new_string 精确替换, 原子写
+    /// file_edit(path, old_string, new_string, cwd=None, replace_all=False) -> NativeEditResult
+    /// 唯一匹配 old_string → new_string 精确替换 (replace_all=True 全量), 原子写
+    #[pyo3(signature = (path, old_string, new_string, cwd=None, replace_all=false))]
     fn file_edit(
         &self,
         path: String,
         old_string: String,
         new_string: String,
         cwd: Option<String>,
+        replace_all: bool,
     ) -> PyEditResult {
         match self
             .inner
-            .file_edit(&path, &old_string, &new_string, cwd.as_deref())
+            .file_edit(&path, &old_string, &new_string, cwd.as_deref(), replace_all)
         {
             Ok(r) => r.into(),
             Err(e) => {
@@ -630,6 +632,103 @@ impl PyExecutor {
                     ok: false,
                     path: Some(path),
                     error: Some(format!("file_edit 失败: {e}")),
+                    matches: 0,
+                }
+            }
+        }
+    }
+
+    /// multi_edit(path, edits, cwd=None) -> NativeEditResult
+    /// 同文件顺序批量编辑, 原子 all-or-nothing
+    fn multi_edit(
+        &self,
+        py: Python<'_>,
+        path: String,
+        edits: &Bound<'_, PyAny>,
+        cwd: Option<String>,
+    ) -> PyEditResult {
+        let edits_json = py
+            .import("json")
+            .and_then(|json| json.call_method1("dumps", (edits,)))
+            .and_then(|s| s.extract::<String>());
+        let parsed: Vec<fe_core::tools::MultiEditItem> = match edits_json {
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "multi_edit edits 反序列化失败");
+                    return PyEditResult {
+                        ok: false,
+                        path: Some(path),
+                        error: Some(format!("multi_edit edits 解析失败: {e}")),
+                        matches: 0,
+                    };
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "multi_edit JSON 序列化失败");
+                return PyEditResult {
+                    ok: false,
+                    path: Some(path),
+                    error: Some(format!("multi_edit edits 序列化失败: {e}")),
+                    matches: 0,
+                };
+            }
+        };
+        match self.inner.multi_edit(&path, &parsed, cwd.as_deref()) {
+            Ok(r) => r.into(),
+            Err(e) => {
+                tracing::warn!(error = %e, "multi_edit 失败");
+                PyEditResult {
+                    ok: false,
+                    path: Some(path),
+                    error: Some(format!("multi_edit 失败: {e}")),
+                    matches: 0,
+                }
+            }
+        }
+    }
+
+    /// notebook_edit(path, cell_id=None, cell_number=None, new_source, edit_mode="replace", cwd=None) -> NativeEditResult
+    /// Jupyter .ipynb 单元格编辑 (replace/insert/delete)
+    #[pyo3(signature = (path, new_source, cell_id=None, cell_number=None, edit_mode="replace", cwd=None))]
+    fn notebook_edit(
+        &self,
+        path: String,
+        new_source: String,
+        cell_id: Option<String>,
+        cell_number: Option<i64>,
+        edit_mode: &str,
+        cwd: Option<String>,
+    ) -> PyEditResult {
+        let mode = match serde_json::from_value::<fe_core::tools::NotebookEditMode>(
+            serde_json::Value::String(edit_mode.to_string()),
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, mode = edit_mode, "notebook_edit edit_mode 无效");
+                return PyEditResult {
+                    ok: false,
+                    path: Some(path),
+                    error: Some(format!("edit_mode 无效: {e}")),
+                    matches: 0,
+                };
+            }
+        };
+        match self.inner.notebook_edit(
+            &path,
+            cell_id.as_deref(),
+            cell_number,
+            &new_source,
+            mode,
+            cwd.as_deref(),
+        ) {
+            Ok(r) => r.into(),
+            Err(e) => {
+                tracing::warn!(error = %e, "notebook_edit 失败");
+                PyEditResult {
+                    ok: false,
+                    path: Some(path),
+                    error: Some(format!("notebook_edit 失败: {e}")),
                     matches: 0,
                 }
             }

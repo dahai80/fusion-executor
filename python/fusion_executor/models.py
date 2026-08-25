@@ -107,6 +107,21 @@ class GrepMatch(BaseModel):
     content: str
 
 
+class MultiEditItem(BaseModel):
+    model_config = _STRICT
+    old_string: str
+    new_string: str
+    replace_all: bool = Field(default=False, description="True=替换全部匹配; False=唯一匹配 (默认)")
+
+
+class NotebookEditMode(BaseModel):
+    model_config = _STRICT
+    mode: str = Field(
+        default="replace",
+        description="单元格编辑模式: replace | insert | delete",
+    )
+
+
 class TelemetrySample(BaseModel):
     model_config = _STRICT
     ts_ms: int = Field(description="采样时间戳 (毫秒, 调用方纪元)")

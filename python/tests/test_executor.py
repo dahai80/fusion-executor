@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ from fusion_executor import (
     FusionSandboxExecutor,
     GlobEntry,
     GrepMatch,
+    MultiEditItem,
     RollbackPolicy,
     TelemetrySample,
 )
@@ -360,6 +362,147 @@ def test_replace_function_not_found(executor: FusionSandboxExecutor, tmp_path):
     assert "未找到" in r.error
 
 
+# ── Issue #6: replace_all / MultiEdit 原子批改 / NotebookEdit ──
+
+
+def test_file_edit_replace_all_replaces_every_occurrence(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "dup.txt"
+    fp.write_text("foo\nfoo\nfoo\n")
+    r = executor.file_edit("dup.txt", "foo", "bar", cwd=str(tmp_path), replace_all=True)
+    assert isinstance(r, EditResult)
+    assert r.ok
+    assert r.matches == 3
+    assert fp.read_text() == "bar\nbar\nbar\n"
+
+
+def test_file_edit_replace_all_false_default_preserves_unique_check(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "ambig.txt"
+    fp.write_text("x\nx\n")
+    r = executor.file_edit("ambig.txt", "x", "y", cwd=str(tmp_path))
+    assert not r.ok
+    assert r.matches == 2
+    assert fp.read_text() == "x\nx\n"
+
+
+def test_multi_edit_all_succeed_atomic(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "app.py"
+    fp.write_text("a = 1\nb = 2\nc = 3\n")
+    r = executor.multi_edit(
+        "app.py",
+        [
+            {"old_string": "a = 1", "new_string": "a = 11"},
+            {"old_string": "c = 3", "new_string": "c = 33"},
+        ],
+        cwd=str(tmp_path),
+    )
+    assert isinstance(r, EditResult)
+    assert r.ok
+    assert r.matches == 2
+    assert fp.read_text() == "a = 11\nb = 2\nc = 33\n"
+
+
+def test_multi_edit_partial_failure_no_write(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "app.py"
+    original = "a = 1\nb = 2\n"
+    fp.write_text(original)
+    r = executor.multi_edit(
+        "app.py",
+        [
+            {"old_string": "a = 1", "new_string": "a = 11"},
+            {"old_string": "ghost", "new_string": "x"},  # 第 2 项未匹配 → 全回滚
+        ],
+        cwd=str(tmp_path),
+    )
+    assert not r.ok
+    assert "第 2" in r.error or "未匹配" in r.error
+    assert fp.read_text() == original, "部分失败: 文件未被修改 (all-or-nothing)"
+
+
+def test_multi_edit_per_item_replace_all(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "m.txt"
+    fp.write_text("p\np\nq\n")
+    r = executor.multi_edit(
+        "m.txt",
+        [MultiEditItem(old_string="p", new_string="P", replace_all=True)],
+        cwd=str(tmp_path),
+    )
+    assert r.ok
+    assert r.matches == 2
+    assert fp.read_text() == "P\nP\nq\n"
+
+
+def _write_minimal_nb(path, n_cells: int = 2) -> None:
+    cells = [
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [f"# cell {i}\n"],
+        }
+        for i in range(n_cells)
+    ]
+    path.write_text(
+        json.dumps(
+            {
+                "nbformat": 4,
+                "nbformat_minor": 5,
+                "metadata": {},
+                "cells": cells,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def test_notebook_edit_replace_by_number(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "nb.ipynb"
+    _write_minimal_nb(fp, 2)
+    r = executor.notebook_edit("nb.ipynb", "# replaced\n", cell_number=0, edit_mode="replace", cwd=str(tmp_path))
+    assert isinstance(r, EditResult)
+    assert r.ok
+    nb = json.loads(fp.read_text())
+    assert nb["cells"][0]["source"] == ["# replaced\n"]
+    assert nb["cells"][1]["source"] == ["# cell 1\n"]
+    assert len(nb["cells"]) == 2
+
+
+def test_notebook_edit_insert_by_id(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "nb.ipynb"
+    _write_minimal_nb(fp, 1)
+    r = executor.notebook_edit("nb.ipynb", "# inserted\n", cell_id=None, edit_mode="insert", cwd=str(tmp_path))
+    assert r.ok
+    nb = json.loads(fp.read_text())
+    assert len(nb["cells"]) == 2
+    assert nb["cells"][1]["source"] == ["# inserted\n"]
+
+
+def test_notebook_edit_delete_by_number(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "nb.ipynb"
+    _write_minimal_nb(fp, 2)
+    r = executor.notebook_edit("nb.ipynb", "", cell_number=0, edit_mode="delete", cwd=str(tmp_path))
+    assert r.ok
+    nb = json.loads(fp.read_text())
+    assert len(nb["cells"]) == 1
+    assert nb["cells"][0]["source"] == ["# cell 1\n"]
+
+
+def test_notebook_edit_missing_id_degrades(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "nb.ipynb"
+    _write_minimal_nb(fp, 1)
+    original = fp.read_text()
+    r = executor.notebook_edit("nb.ipynb", "x", cell_number=9, edit_mode="replace", cwd=str(tmp_path))
+    assert not r.ok
+    assert fp.read_text() == original, "无效 cell_number → 不修改文件 (降级返回)"
+
+
+def test_notebook_edit_rejects_non_ipynb(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "notnb.txt"
+    fp.write_text("hello\n")
+    r = executor.notebook_edit("notnb.txt", "x", cell_number=0, cwd=str(tmp_path))
+    assert not r.ok
+
+
 def _rpc_once(sock: str, req: dict) -> dict:
     import json
     import socket
@@ -413,6 +556,54 @@ def test_glob_over_uds_roundtrip(uds_server: str, tmp_path):
     )
     paths = sorted(e["path"] for e in resp["result"])
     assert paths == ["a.py", "b.py"]
+
+
+def test_multi_edit_over_uds_roundtrip(uds_server: str, tmp_path):
+    fp = tmp_path / "app.py"
+    fp.write_text("a = 1\nb = 2\n")
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "executor.multi_edit",
+            "params": {
+                "path": "app.py",
+                "edits": [
+                    {"old_string": "a = 1", "new_string": "a = 11", "replace_all": False},
+                    {"old_string": "b = 2", "new_string": "b = 22"},
+                ],
+                "cwd": str(tmp_path),
+            },
+        },
+    )
+    assert resp["result"]["ok"] is True
+    assert resp["result"]["matches"] == 2
+    assert fp.read_text() == "a = 11\nb = 22\n"
+
+
+def test_notebook_edit_over_uds_roundtrip(uds_server: str, tmp_path):
+    fp = tmp_path / "nb.ipynb"
+    _write_minimal_nb(fp, 1)
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "executor.notebook_edit",
+            "params": {
+                "path": "nb.ipynb",
+                "new_source": "# uds replaced\n",
+                "cell_id": None,
+                "cell_number": 0,
+                "edit_mode": "replace",
+                "cwd": str(tmp_path),
+            },
+        },
+    )
+    assert resp["result"]["ok"] is True
+    nb = json.loads(fp.read_text())
+    assert nb["cells"][0]["source"] == ["# uds replaced\n"]
 
 
 # ── 自动回滚 (FR-04 auto policy) ──

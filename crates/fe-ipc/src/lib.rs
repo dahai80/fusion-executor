@@ -1075,8 +1075,12 @@ async fn handle_method(
             let new_string = param_str(&params, "new_string")
                 .ok_or((ERR_INVALID_REQ, "缺少 new_string".to_string()))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str());
+            let replace_all = params
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let r = executor
-                .file_edit(&path, &old_string, &new_string, cwd)
+                .file_edit(&path, &old_string, &new_string, cwd, replace_all)
                 .map_err(|e| (ERR_INTERNAL, format!("file_edit 失败: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
@@ -1127,6 +1131,40 @@ async fn handle_method(
             let r = executor
                 .replace_function(&path, &fn_name, &new_body, cwd)
                 .map_err(|e| (ERR_INTERNAL, format!("replace_function 失败: {}", e)))?;
+            Ok(serde_json::to_value(&r).unwrap_or(json!({})))
+        }
+        "executor.multi_edit" => {
+            let path =
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+            let edits_val = params
+                .get("edits")
+                .ok_or((ERR_INVALID_REQ, "缺少 edits 数组".to_string()))?;
+            let edits: Vec<fe_core::tools::MultiEditItem> =
+                serde_json::from_value(edits_val.clone())
+                    .map_err(|e| (ERR_INVALID_REQ, format!("edits 解析失败: {}", e)))?;
+            let cwd = params.get("cwd").and_then(|c| c.as_str());
+            let r = executor
+                .multi_edit(&path, &edits, cwd)
+                .map_err(|e| (ERR_INTERNAL, format!("multi_edit 失败: {}", e)))?;
+            Ok(serde_json::to_value(&r).unwrap_or(json!({})))
+        }
+        "executor.notebook_edit" => {
+            let path =
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+            let cell_id = params.get("cell_id").and_then(|v| v.as_str());
+            let cell_number = params.get("cell_number").and_then(|v| v.as_i64());
+            let new_source = param_str(&params, "new_source")
+                .ok_or((ERR_INVALID_REQ, "缺少 new_source".to_string()))?;
+            let edit_mode: fe_core::tools::NotebookEditMode =
+                match params.get("edit_mode").and_then(|v| v.as_str()) {
+                    Some(m) => serde_json::from_value(serde_json::Value::String(m.to_string()))
+                        .map_err(|e| (ERR_INVALID_REQ, format!("edit_mode 解析失败: {}", e)))?,
+                    None => fe_core::tools::NotebookEditMode::Replace,
+                };
+            let cwd = params.get("cwd").and_then(|c| c.as_str());
+            let r = executor
+                .notebook_edit(&path, cell_id, cell_number, &new_source, edit_mode, cwd)
+                .map_err(|e| (ERR_INTERNAL, format!("notebook_edit 失败: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         _ => Err((

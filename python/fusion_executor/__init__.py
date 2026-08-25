@@ -9,6 +9,7 @@ from .models import (
     GlobEntry,
     GrepMatch,
     GuiResult,
+    MultiEditItem,
     RollbackPolicy,
     TelemetrySample,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "GlobEntry",
     "GrepMatch",
     "GuiResult",
+    "MultiEditItem",
     "RollbackPolicy",
     "Subscription",
     "TelemetrySample",

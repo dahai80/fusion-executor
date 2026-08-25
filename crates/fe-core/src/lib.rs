@@ -19,7 +19,7 @@ use fe_rollback::RollbackManager;
 use fe_sandbox::{Sandbox, SandboxConfig};
 use fe_security::{SecurityGuard, SecurityVerdict};
 use fe_telemetry::{start_stream as start_telemetry, TelemetryConfig, TelemetrySample};
-use fe_tools::{EditResult, GlobEntry, GrepMatch, Tools};
+use fe_tools::{EditResult, GlobEntry, GrepMatch, MultiEditItem, NotebookEditMode, Tools};
 
 pub use fe_diagnostics as diagnostics;
 pub use fe_gui as gui;
@@ -33,6 +33,7 @@ pub use fe_telemetry::{
 pub use fe_tools as tools;
 pub use fe_tools::{
     EditResult as ToolsEditResult, GlobEntry as ToolsGlobEntry, GrepMatch as ToolsGrepMatch,
+    MultiEditItem as ToolsMultiEditItem, NotebookEditMode as ToolsNotebookEditMode,
 };
 
 // BLOCKING_RT — 多线程 N worker (CPU 核心数, 下限 2), 并发执行 sandbox/telemetry/IPC 任务
@@ -359,15 +360,41 @@ impl Executor {
         self.gui.execute(action)
     }
 
-    /// 原生文件工具 — file_edit (PRD FileEdit 本地化)
+    /// 原生文件工具 — file_edit (PRD FileEdit 本地化, #6 replace_all)
     pub fn file_edit(
         &self,
         path: &str,
         old_string: &str,
         new_string: &str,
         cwd: Option<&str>,
+        replace_all: bool,
     ) -> Result<EditResult> {
-        self.tools.file_edit(path, old_string, new_string, cwd)
+        self.tools
+            .file_edit(path, old_string, new_string, cwd, replace_all)
+    }
+
+    /// 原生文件工具 — multi_edit 同文件原子批量编辑 (#6)
+    pub fn multi_edit(
+        &self,
+        path: &str,
+        edits: &[MultiEditItem],
+        cwd: Option<&str>,
+    ) -> Result<EditResult> {
+        self.tools.multi_edit(path, edits, cwd)
+    }
+
+    /// 原生文件工具 — notebook_edit Jupyter .ipynb 单元格编辑 (#6)
+    pub fn notebook_edit(
+        &self,
+        path: &str,
+        cell_id: Option<&str>,
+        cell_number: Option<i64>,
+        new_source: &str,
+        edit_mode: NotebookEditMode,
+        cwd: Option<&str>,
+    ) -> Result<EditResult> {
+        self.tools
+            .notebook_edit(path, cell_id, cell_number, new_source, edit_mode, cwd)
     }
 
     /// 原生文件工具 — glob (PRD GlobTool 本地化)

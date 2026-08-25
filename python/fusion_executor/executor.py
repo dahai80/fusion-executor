@@ -16,6 +16,7 @@ from .models import (
     GlobEntry,
     GrepMatch,
     GuiResult,
+    MultiEditItem,
     RollbackPolicy,
     TelemetrySample,
 )
@@ -262,9 +263,10 @@ class FusionSandboxExecutor:
         new_string: str,
         *,
         cwd: str | None = None,
+        replace_all: bool = False,
     ) -> EditResult:
-        logger.debug("file_edit path=%r cwd=%s", path, cwd)
-        native = self._native.file_edit(path, old_string, new_string, cwd)
+        logger.debug("file_edit path=%r cwd=%s replace_all=%s", path, cwd, replace_all)
+        native = self._native.file_edit(path, old_string, new_string, cwd, replace_all)
         result = EditResult(
             ok=native.ok,
             path=native.path,
@@ -272,6 +274,54 @@ class FusionSandboxExecutor:
             matches=native.matches,
         )
         logger.info("file_edit done ok=%s matches=%s path=%s", result.ok, result.matches, result.path)
+        return result
+
+    def multi_edit(
+        self,
+        path: str,
+        edits: list[MultiEditItem | dict],
+        *,
+        cwd: str | None = None,
+    ) -> EditResult:
+        logger.debug("multi_edit path=%r cwd=%s edits=%s", path, cwd, len(edits))
+        items = [e if isinstance(e, MultiEditItem) else MultiEditItem.model_validate(e) for e in edits]
+        payload = [item.model_dump() for item in items]
+        native = self._native.multi_edit(path, payload, cwd)
+        result = EditResult(
+            ok=native.ok,
+            path=native.path,
+            error=native.error,
+            matches=native.matches,
+        )
+        logger.info("multi_edit done ok=%s matches=%s path=%s", result.ok, result.matches, result.path)
+        return result
+
+    def notebook_edit(
+        self,
+        path: str,
+        new_source: str,
+        *,
+        cell_id: str | None = None,
+        cell_number: int | None = None,
+        edit_mode: str = "replace",
+        cwd: str | None = None,
+    ) -> EditResult:
+        logger.debug(
+            "notebook_edit path=%r cell_id=%s cell_number=%s mode=%s cwd=%s",
+            path,
+            cell_id,
+            cell_number,
+            edit_mode,
+            cwd,
+        )
+        native = self._native.notebook_edit(path, new_source, cell_id, cell_number, edit_mode, cwd)
+        result = EditResult(
+            ok=native.ok,
+            path=native.path,
+            error=native.error,
+            matches=native.matches,
+        )
+        logger.info("notebook_edit done ok=%s mode=%s path=%s", result.ok, edit_mode, result.path)
         return result
 
     def glob(self, pattern: str, *, cwd: str | None = None) -> list[GlobEntry]:
