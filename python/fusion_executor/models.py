@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+# Blocker 11 (审计 schema 同步): 全模型 extra="forbid" — Rust serde struct ↔
+# Pydantic 字段失配时 fail-loud (旧 extra="ignore" 静默丢未知字段, Rust 改字段名/
+# serde bug 时 Pydantic 侧空字段假成功)。严格校验破 silent-schema-drift。
+_STRICT = ConfigDict(extra="forbid")
 
 
 class Diagnostics(BaseModel):
+    model_config = _STRICT
     error_type: str | None = None
     file_path: str | None = None
     line_number: int | None = None
@@ -12,6 +18,7 @@ class Diagnostics(BaseModel):
 
 
 class RollbackPolicy(BaseModel):
+    model_config = _STRICT
     # L-PY-03: max_consecutive_failures 死字段 (Rust 从不读, CLAUDE.md 明说 caller
     # owns 连续失败计数)。A4 决策: 保留 (跨层级联 — 测试发送它, fe-rollback wire
     # 含它), 但标记 deprecated 告诫调用方勿依赖。Rule 7: 单一真源, 不模糊。
@@ -24,6 +31,7 @@ class RollbackPolicy(BaseModel):
 
 
 class ExecutionRequest(BaseModel):
+    model_config = _STRICT
     command: str
     task_id: str | None = None
     cwd: str | None = None
@@ -31,9 +39,13 @@ class ExecutionRequest(BaseModel):
     env_vars: dict[str, str] | None = None
     enable_rollback_snapshot: bool = True
     auto_rollback_policy: RollbackPolicy | None = None
+    seatbelt: bool = Field(
+        default=False, description="macOS seatbelt 运行时隔离 (sandbox-exec 禁网 + 危险二进制 execve deny)"
+    )
 
 
 class ExecutionResult(BaseModel):
+    model_config = _STRICT
     exit_code: int = Field(description="0=成功, -124=超时, -1=拦截/内部异常")
     stdout: str = ""
     stderr: str = ""
@@ -49,6 +61,7 @@ class ExecutionResult(BaseModel):
 
 
 class GuiResult(BaseModel):
+    model_config = _STRICT
     ok: bool = False
     node_tree: str | None = None
     screenshot_png_b64: str | None = None
@@ -58,6 +71,7 @@ class GuiResult(BaseModel):
 
 
 class EditResult(BaseModel):
+    model_config = _STRICT
     ok: bool = False
     path: str | None = None
     error: str | None = None
@@ -65,17 +79,20 @@ class EditResult(BaseModel):
 
 
 class GlobEntry(BaseModel):
+    model_config = _STRICT
     path: str
     is_dir: bool = False
 
 
 class GrepMatch(BaseModel):
+    model_config = _STRICT
     path: str
     line_number: int
     content: str
 
 
 class TelemetrySample(BaseModel):
+    model_config = _STRICT
     ts_ms: int = Field(description="采样时间戳 (毫秒, 调用方纪元)")
     cpu_pct: float = Field(description="进程 CPU 占用百分比 (单核倍数)")
     mem_mb: float = Field(description="进程常驻内存 (MB)")

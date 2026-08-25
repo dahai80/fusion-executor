@@ -18,8 +18,10 @@ use std::path::Path;
 use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tree_sitter::Parser;
+
+use fe_security::SecurityGuard;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Diagnostics {
@@ -42,12 +44,14 @@ pub struct Slicer {
     go_panic_re: Regex,
     swift_re: Regex,
     go_compile_re: Regex,
+    guard: SecurityGuard,
 }
 
 impl Slicer {
     pub fn new() -> Self {
         info!("Slicer::new() — 编译 8 语言 traceback 正则");
         Self {
+            guard: SecurityGuard::new(),
             // Python: Traceback ... File "path", line N ... <Type>Error: msg
             // (?ms): m=^按行锚, s=.跨行。.*File 贪心取最深 (最后) File 帧 — M-DIAG-01
             // 配合 tail_lines 保标记行后, 深 traceback 多帧保留时取最接近根因的栈帧。
@@ -273,11 +277,40 @@ impl Slicer {
     }
 
     /// 填充 code_snippet — 读文件, 报错行上下 20 行, 报错行标 >
+    /// Blocker 2 (finding 3.3): traceback file_path 经 SecurityGuard 校验敏感路径 + .. 逃逸
+    /// 防止私钥经诊断通道泄 LLM (攻击者构造 traceback 引用 ~/.ssh/id_rsa → enrich 读取 → 入 prompt)
     fn enrich(&self, mut d: Diagnostics, cwd: Option<&str>) -> Diagnostics {
         let (Some(path), Some(line)) = (d.file_path.as_ref(), d.line_number) else {
             return d;
         };
+        // 敏感路径 + .. 逃逸校验 (复用 fe-security)
+        // is_sensitive_path 只检 / ~ 前缀; .. 相对逃逸单独拦
+        if Path::new(path)
+            .components()
+            .any(|comp| comp == std::path::Component::ParentDir)
+        {
+            warn!(path = %path, "诊断 file_path 含 .. 组件, 拒绝读取");
+            return d;
+        }
         let abs = resolve_path(path, cwd);
+        // 校验 abs 的父目录非敏感 (canonicalize 解符号链接)
+        let check_dir = Path::new(&abs)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| abs.clone());
+        // 先字面校验 (快速), 再 canonicalize 校验 (防符号链接旁路)
+        let v_lit = self.guard.validate_cwd(&check_dir);
+        if !v_lit.allowed {
+            warn!(path = %abs, reason = v_lit.reason, "诊断 file_path 敏感 (字面), 拒绝读取");
+            return d;
+        }
+        if let Ok(canonical) = Path::new(&check_dir).canonicalize() {
+            let v_can = self.guard.validate_cwd(&canonical.to_string_lossy());
+            if !v_can.allowed {
+                warn!(path = %abs, reason = v_can.reason, "诊断 file_path 敏感 (符号链接解析), 拒绝读取");
+                return d;
+            }
+        }
         let snippet = read_snippet(&abs, line).unwrap_or_else(|e| {
             debug!(path = %abs, "snippet 读取失败: {}", e);
             String::new()
@@ -362,7 +395,15 @@ fn resolve_path(path: &str, cwd: Option<&str>) -> String {
 }
 
 /// 读文件, 报错行上下 20 行, 报错行前标 > (PRD 格式)
+/// Blocker 8 (finding 3.5): 64MB 上限防爆 OOM
+const SNIPPET_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 fn read_snippet(path: &str, err_line: u32) -> Result<String> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > SNIPPET_FILE_MAX_BYTES {
+            warn!(path = %path, size = meta.len(), "snippet 文件超 64MB 上限, 跳过");
+            return Ok(String::new());
+        }
+    }
     let content =
         std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("读取 {} 失败: {}", path, e))?;
     let lines: Vec<&str> = content.lines().collect();
@@ -594,6 +635,45 @@ mod tests {
         );
         assert_eq!(d.file_path.as_deref(), Some("main.go"));
         assert_eq!(d.line_number, Some(8));
+    }
+
+    // Blocker 2 finding 3.3: 诊断通道敏感路径防护 — enrich 不读敏感文件
+    #[test]
+    fn enrich_rejects_sensitive_path() {
+        // traceback 引用 /etc/shadow → enrich 应拒, code_snippet 不填
+        let out = "Traceback (most recent call last):\n  File \"/etc/shadow\", line 3, in <module>\n    x = 1\nTypeError: bad";
+        let d = s().slice(out, None);
+        assert_eq!(d.error_type.as_deref(), Some("TypeError"));
+        assert_eq!(d.file_path.as_deref(), Some("/etc/shadow"));
+        // 敏感文件不读 — code_snippet 应为 None
+        assert!(
+            d.code_snippet.is_none() || d.code_snippet.as_deref().unwrap().is_empty(),
+            "敏感文件 /etc/shadow 不应被读取: {:?}",
+            d.code_snippet
+        );
+    }
+
+    #[test]
+    fn enrich_rejects_dotdot_escape() {
+        // traceback file_path 含 .. → enrich 应拒
+        let out = "Traceback (most recent call last):\n  File \"../../etc/shadow\", line 3, in <module>\n    x = 1\nTypeError: bad";
+        let d = s().slice(out, None);
+        assert!(
+            d.code_snippet.is_none() || d.code_snippet.as_deref().unwrap().is_empty(),
+            "含 .. 的 file_path 不应被读取: {:?}",
+            d.code_snippet
+        );
+    }
+
+    #[test]
+    fn enrich_rejects_ssh_key() {
+        let out = "Traceback (most recent call last):\n  File \"~/.ssh/id_rsa\", line 3, in <module>\n    x = 1\nTypeError: bad";
+        let d = s().slice(out, None);
+        assert!(
+            d.code_snippet.is_none() || d.code_snippet.as_deref().unwrap().is_empty(),
+            "私钥 ~/.ssh/id_rsa 不应被读取: {:?}",
+            d.code_snippet
+        );
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

@@ -198,6 +198,35 @@ def test_run_streaming_diagnostics_on_error(executor: FusionSandboxExecutor):
     assert result.diagnostics.error_type == "ValueError"
 
 
+def test_seatbelt_blocks_dangerous_execve(executor: FusionSandboxExecutor, tmp_path):
+    # Blocker 1: seatbelt=True 应 deny 危险二进制 execve (sandbox-exec process-exec)。
+    # python 白名单 carrier 调 os.execve('/bin/rm') — 非安全白名单拦截 (过 layer 1),
+    # 交运行时层: seatbelt on → "Operation not permitted"; off → rm 真执行 (ENOENT)。
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import os\n"
+        "try:\n"
+        '    os.execve("/bin/rm", ["rm", "/nonexistent_seatbelt_probe"], {})\n'
+        "except OSError as e:\n"
+        '    print(f"execve_blocked errno={e.errno} msg={e.strerror}")\n'
+    )
+    cmd = f"python3 {probe}; echo probe_exit=$?"
+    r_off = executor.run(cmd, seatbelt=False)
+    assert not r_off.blocked_by_security
+    assert "execve_blocked" not in r_off.stdout, "seatbelt off rm 应真执行非 deny"
+    r_on = executor.run(cmd, seatbelt=True)
+    assert not r_on.blocked_by_security
+    assert "execve_blocked" in r_on.stdout, "seatbelt on 应 deny /bin/rm execve"
+
+
+def test_seatbelt_allows_whitelisted_echo(executor: FusionSandboxExecutor):
+    # seatbelt=True 不影响白名单命令正常执行 (allow default)。
+    result = executor.run("echo seatbelt_ok", seatbelt=True)
+    assert result.exit_code == 0
+    assert not result.blocked_by_security
+    assert "seatbelt_ok" in result.stdout
+
+
 def test_run_populates_schema_fields(executor: FusionSandboxExecutor):
     result = executor.run("echo hi", task_id="task-abc")
     assert result.task_id == "task-abc"
@@ -587,3 +616,233 @@ def test_run_streaming_non_str_command_raises_typeerror(executor: FusionSandboxE
 def test_run_streaming_non_positive_timeout_raises_valueerror(executor: FusionSandboxExecutor):
     with pytest.raises(ValueError, match="timeout_sec 必须为正数"):
         list(executor.run_streaming("echo hi", timeout_sec=0))
+
+
+# ── Blocker 10 (审计 §2.9 跨租户泄漏) stdio per-sub scope ──
+
+
+def test_subscribe_invalid_scope_raises_valueerror(uds_server: str):
+    ex = FusionSandboxExecutor(sock_path=uds_server)
+    with pytest.raises(ValueError, match="scope 须为"):
+        ex.subscribe(["stdio"], scope="bogus")
+
+
+def test_subscribe_own_conn_default_blocks_cross_connection(uds_server: str):
+    # 连接 A 默认订阅 stdio (own_conn), 连接 B execute_stream → A 不应收 B 的 stdio。
+    import json as _json
+    import socket as _socket
+
+    # 连接 A: 默认 scope 订阅
+    sa = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sa.settimeout(8.0)
+    sa.connect(uds_server)
+    sa.sendall(
+        (
+            _json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "executor.subscribe", "params": {"channels": ["stdio"]}},
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+    buf_a = b""
+    while b"\n" not in buf_a:
+        buf_a += sa.recv(4096)
+    resp = _json.loads(buf_a.split(b"\n", 1)[0].decode("utf-8"))
+    assert resp["result"]["ok"] is True
+    # 连接 B: execute_stream echo
+    sb = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sb.settimeout(8.0)
+    sb.connect(uds_server)
+    sb.sendall(
+        (
+            _json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "executor.execute_stream",
+                    "params": {"command": "echo hi", "enable_rollback_snapshot": False},
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+    # B 读到 done
+    buf_b = b""
+    b_done = False
+    deadline_b = __import__("time").time() + 5.0
+    while __import__("time").time() < deadline_b:
+        chunk = sb.recv(8192)
+        if not chunk:
+            break
+        buf_b += chunk
+        for line in buf_b.split(b"\n"):
+            if line.strip():
+                v = _json.loads(line.decode("utf-8"))
+                if v.get("id") == 7 and v.get("result", {}).get("type") == "done":
+                    b_done = True
+        if b_done:
+            break
+    # A 等一小窗确认无跨连接推送
+    import time as _t
+
+    _t.sleep(0.3)
+    a_got_stdio = False
+    sa.settimeout(0.5)
+    try:
+        while True:
+            chunk = sa.recv(4096)
+            if not chunk:
+                break
+            for line in chunk.split(b"\n"):
+                if line.strip():
+                    v = _json.loads(line.decode("utf-8"))
+                    if (
+                        v.get("id") is None
+                        and v.get("method") == "executor.event"
+                        and v["params"]["channel"] == "stdio"
+                    ):
+                        a_got_stdio = True
+    except (TimeoutError, OSError):
+        pass
+    assert b_done, "B 应收到自己 done 帧"
+    assert not a_got_stdio, "默认 own_conn 应拦截跨连接 stdio (审计 §2.9)"
+    sa.close()
+    sb.close()
+
+
+def test_subscribe_task_ids_whitelist_receives_matched(uds_server: str):
+    # scope=["t1"] 订阅, execute_stream task_id="t1" → 收推送; task_id="t2" → 不收。
+    import json as _json
+    import socket as _socket
+    import time as _t
+
+    sa = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sa.settimeout(8.0)
+    sa.connect(uds_server)
+    sa.sendall(
+        (
+            _json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "executor.subscribe",
+                    "params": {"channels": ["stdio"], "task_ids": ["t1"]},
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+    buf = b""
+    while b"\n" not in buf:
+        buf += sa.recv(4096)
+    assert _json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))["result"]["ok"] is True
+    # B: task_id="t1" (匹配)
+    sb = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sb.settimeout(8.0)
+    sb.connect(uds_server)
+    sb.sendall(
+        (
+            _json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "executor.execute_stream",
+                    "params": {"command": "echo match", "task_id": "t1", "enable_rollback_snapshot": False},
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+    a_got = False
+    deadline = _t.time() + 5.0
+    sa.settimeout(1.0)
+    while _t.time() < deadline:
+        try:
+            chunk = sa.recv(8192)
+        except (TimeoutError, OSError):
+            break
+        if not chunk:
+            break
+        for line in chunk.split(b"\n"):
+            if line.strip():
+                v = _json.loads(line.decode("utf-8"))
+                if v.get("id") is None and v.get("method") == "executor.event" and v["params"]["channel"] == "stdio":
+                    a_got = True
+        if a_got:
+            break
+    assert a_got, "task_ids 白名单匹配应收到 stdio 推送"
+    sa.close()
+    sb.close()
+
+
+# ── 审计 §3.11/§3.13/§3.15 Python 收尾回归 ──
+
+
+def test_telemetry_stream_strict_rejects_missing_field(executor: FusionSandboxExecutor):
+    # 3.11: telemetry_stream 用 model_validate (旧 frame.get("ts_ms", 0) 默认 0 吞缺失字段)。
+    # 注入缺 ts_ms 的坏帧 → model_validate 应抛 ValidationError (fail-loud, 非假数据)。
+    from pydantic import ValidationError
+
+    bad_frame = {"cpu_pct": 1.0, "mem_mb": 2.0}  # 缺必填 ts_ms
+    with pytest.raises(ValidationError):
+        TelemetrySample.model_validate(bad_frame)
+    # 额外字段也应被 _STRICT extra=forbid 拒
+    with pytest.raises(ValidationError):
+        TelemetrySample.model_validate({"ts_ms": 1, "cpu_pct": 1.0, "mem_mb": 2.0, "bogus": 9})
+
+
+def test_subscribe_idle_timeout_configurable(uds_server: str):
+    # 3.13: idle_timeout 参数可配 (旧版硬编 15s recv 超时)。None=无超时。
+    # 订阅 telemetry (10Hz), idle_timeout=None, 应持续收帧 (不 15s 后误断)。
+    import time as _t
+
+    ex = FusionSandboxExecutor(sock_path=uds_server)
+    sub = ex.subscribe(["telemetry"], interval_ms=20, idle_timeout=None)
+    assert sub.subscription_id is not None
+    # 收 3 帧 — None 超时不限, 10Hz(20ms) 下秒级回
+    got = 0
+    deadline = _t.time() + 5.0
+    for _ in sub:
+        got += 1
+        if got >= 3 or _t.time() > deadline:
+            break
+    sub.unsubscribe()
+    assert got >= 3, f"idle_timeout=None 应持续收帧, 实得 {got}"
+
+
+def test_subscribe_idle_timeout_short_stops_stream(uds_server: str):
+    # 3.13: 短 idle_timeout — 无推送时 recv 超时 → __next__ 抛 StopIteration (流尾)。
+    # 订阅 screenshot 慢通道 (1s), idle_timeout=0.2 → 0.2s 无帧 → StopIteration。
+    import time as _t
+
+    ex = FusionSandboxExecutor(sock_path=uds_server)
+    sub = ex.subscribe(["screenshot"], screenshot_interval_ms=5000, idle_timeout=0.2)
+    t0 = _t.time()
+    with pytest.raises(StopIteration):
+        next(sub)
+    elapsed = _t.time() - t0
+    assert elapsed < 1.0, f"短 idle_timeout 应秒级停, 实耗 {elapsed:.2f}s"
+    sub.close()
+
+
+def test_serve_passes_resolved_path_not_raw_none(monkeypatch, tmp_path):
+    # 3.15: serve() 解析 path (env/default) 后传 Rust, 非 None。验证路径解析优先级:
+    # 显式 sock_path > env > default。仅验 Python 侧路径选择逻辑 (不真启 server)。
+    sp = str(tmp_path / "explicit.sock")
+    captured = {}
+
+    class _FakeNative:
+        def serve(self, path):
+            captured["path"] = path
+            raise KeyboardInterrupt  # 立即跳出, 不阻塞
+
+    ex = FusionSandboxExecutor()
+    ex._native = _FakeNative()
+    monkeypatch.delenv("FUSION_EXECUTOR_SOCK", raising=False)
+    with pytest.raises(KeyboardInterrupt):
+        ex.serve(sp)
+    assert captured["path"] == sp, "serve 应传解析后 path 非原始 sock_path"

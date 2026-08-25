@@ -333,11 +333,12 @@ def test_subscribe_telemetry_yields_event_frames(server: str):
 
 
 def test_subscribe_stdio_broadcasts_across_connections(server: str):
-    # 连接 A 订阅 stdio (后台线程读), 连接 B 经 UDS execute_stream → A 收到 stdio 推送
+    # 连接 A 订阅 stdio (scope=all 跨连接收), 连接 B 经 UDS execute_stream → A 收到 stdio 推送
+    # Blocker 10: 默认 own_conn 已隔离跨连接; 显式 all 才全广播。
     import threading
 
     ex_a = FusionSandboxExecutor(sock_path=server)
-    sub = ex_a.subscribe(["stdio"])
+    sub = ex_a.subscribe(["stdio"], scope="all")
     assert sub.subscription_id is not None
     a_frames: list[dict] = []
     stop = threading.Event()

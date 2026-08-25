@@ -1,73 +1,75 @@
 # fusion-executor
 
-受控执行沙箱 + macOS OS 级控制中枢。安全地运行 shell 命令 (Security Guard + PTY Sandbox)、驱动原生 GUI (Computer Use via Accessibility API)、失败回滚 (Git 快照)。替代 Claude SDK BashTool/FileEdit + Docker 沙箱, 但原生 — 无 Docker, macOS 进程隔离 + Git 快照, 初始化 <5ms。
+> **Language / 语言**: **English** | [中文](README_CN.md)
 
-Rust 核心 + PyO3/maturin Python 绑定。Fusion monorepo 第一个 maturin/PyO3 工程 (其余 23 个 Python 工程用 setuptools)。
+Controlled execution sandbox + macOS OS-level control hub. Runs shell commands safely (Security Guard + PTY Sandbox), drives native GUI (Computer Use via Accessibility API), and rolls back on failure (Git snapshots). Replaces the Claude SDK BashTool/FileEdit + Docker sandbox, but native — no Docker, macOS process isolation + Git snapshots, init <5ms.
 
-**状态: v1.5 进行中 — 诊断切片扩语言 (TS/Go) + GUI 更多动作 + 双向 IPC server-push** — 安全 + 沙箱 + 诊断切片 + Git 回滚 + UDS JSON-RPC IPC 服务 + macOS GUI (AXUIElement + CoreGraphics + CGEvent 按键合成 + 修饰键组合 + scroll/drag/wait + double_click/right_click/hover + 窗口控制 close/minimize/zoom/resize) + 实时 stdio 流式传输 (NDJSON chunk/done) + 截图 width/height metadata + 原生文件工具 (file_edit/glob/grep 本地化替代 Claude SDK FileEdit/Glob/Grep) + 外科补丁引擎 (Unified Diff apply + 函数级替换, 禁全文件重写) + Data Schema §4.1 补齐 (task_id/command/duration_sec) + 自动回滚 (FR-04 可选策略, git status 毁损检测触发) + 实时遥测 (10Hz CPU/内存 UDS 广播, GPU 调用方注入) + 加固 (criterion 基准 + 覆盖率 95%) + v1.5 诊断切片扩 8 语言 (Python/TS/Node/Bun/Rust/Go-panic/Swift/Go-compile, 真实 tsc/go E2E 验证) + v1.5 GUI 更多动作 (double_click/right_click/hover/window_*, 16 GuiAction 变体, 0 新增 unsafe) + v1.5 双向 IPC server-push (BroadcastHub 三通道 telemetry/stdio/screenshot 订阅广播, Executor 无状态, 0 新增 unsafe)。120 Rust + 64 Python 测试全绿。
+Rust core + PyO3/maturin Python bindings. First maturin/PyO3 project in the Fusion monorepo (the other 23 Python projects use setuptools).
 
-## 架构
+**Status: v1.5 complete — diagnostics-slicer language expansion (TS/Go) + more GUI actions + bidirectional IPC server-push** — security + sandbox + diagnostics slicer + Git rollback + UDS JSON-RPC IPC service + macOS GUI (AXUIElement + CoreGraphics + CGEvent key synthesis + modifier combos + scroll/drag/wait + double_click/right_click/hover + window control close/minimize/zoom/resize) + live stdio streaming (NDJSON chunk/done) + screenshot width/height metadata + native file tools (file_edit/glob/grep — native replacement for Claude SDK FileEdit/Glob/Grep) + surgical patch engine (Unified Diff apply + function-level replace, full-rewrite forbidden) + Data Schema §4.1 backfill (task_id/command/duration_sec) + auto-rollback (FR-04 optional policy, git-status damage detection triggers) + live telemetry (10Hz CPU/mem UDS broadcast, GPU caller-injected) + hardening (criterion benches + 95% coverage) + v1.5 diagnostics slicer expanded to 8 languages (Python/TS/Node/Bun/Rust/Go-panic/Swift/Go-compile, real tsc/go E2E verified) + v1.5 more GUI actions (double_click/right_click/hover/window_*, 16 GuiAction variants, 0 new unsafe) + v1.5 bidirectional IPC server-push (BroadcastHub three-channel telemetry/stdio/screenshot subscribe-broadcast, Executor stays stateless, 0 new unsafe). 120 Rust + 70 Python tests green.
 
-10-crate Cargo workspace (resolver 2), 一个 PyO3 绑定 crate 由 maturin 构建。
+## Architecture
+
+10-crate Cargo workspace (resolver 2), one PyO3 binding crate built by maturin.
 
 ```
 fusion-executor/
-├── Cargo.toml              # workspace 根 (镜像 fusion-design)
-├── pyproject.toml          # maturin 构建后端, fusion_executor Python 包
+├── Cargo.toml              # workspace root (mirrors fusion-design)
+├── pyproject.toml          # maturin build backend, fusion_executor Python package
 ├── crates/
-│   ├── fe-core/            # 编排器: Executor pipeline, BLOCKING_RT
-│   ├── fe-security/        # Security Guard: 正则黑名单 + 分词器 + 白名单
-│   ├── fe-sandbox/         # PTY 子进程, 超时, 截断, OOM 上限
+│   ├── fe-core/            # orchestrator: Executor pipeline, BLOCKING_RT
+│   ├── fe-security/        # Security Guard: regex blocklist + tokenizer + whitelist
+│   ├── fe-sandbox/         # PTY subprocess, timeout, truncation, OOM cap
 │   ├── fe-gui/             # macOS Computer Use: AXUIElement + CoreGraphics (P4)
-│   ├── fe-rollback/        # git 快照/回滚 (P2) + 自动回滚 guard (v1.4)
-│   ├── fe-diagnostics/     # Traceback 正则 + tree-sitter 切片 (P2)
-│   ├── fe-ipc/             # UDS JSON-RPC 2.0 服务 (P3) + 双向 server-push BroadcastHub (v1.5 #14)
-│   ├── fe-tools/           # 原生文件工具: file_edit/glob/grep + 补丁引擎 (v1.3)
-│   ├── fe-telemetry/       # 实时遥测: 10Hz CPU/内存采样流 (v1.4)
-│   └── fe-pyo3/            # PyO3 绑定; maturin target → fusion_executor._native
+│   ├── fe-rollback/        # git snapshot/rollback (P2) + auto-rollback guard (v1.4)
+│   ├── fe-diagnostics/     # Traceback regex + tree-sitter slicer (P2)
+│   ├── fe-ipc/             # UDS JSON-RPC 2.0 server (P3) + bidirectional server-push BroadcastHub (v1.5 #14)
+│   ├── fe-tools/           # native file tools: file_edit/glob/grep + patch engine (v1.3)
+│   ├── fe-telemetry/       # live telemetry: 10Hz CPU/mem sampling stream (v1.4)
+│   └── fe-pyo3/            # PyO3 bindings; maturin target → fusion_executor._native
 ├── python/
-│   └── fusion_executor/    # Pydantic v2 模型 + FusionSandboxExecutor 薄封装
+│   └── fusion_executor/    # Pydantic v2 models + FusionSandboxExecutor thin wrapper
 └── python/tests/           # pytest
 ```
 
-核心 pipeline (fe-core): `validate(command)` → 若拦截返回 `exit_code=-1` → 否则 `sandbox.run()` → 返回 `ExecutionResult`。
+Core pipeline (fe-core): `validate(command)` → if blocked return `exit_code=-1` → else `sandbox.run()` → return `ExecutionResult`.
 
-### 关键约束
+### Key Constraints
 
-- `[workspace.lints.rust] unsafe_code = "deny"` — 7 crate 禁用 unsafe; fe-gui crate 级 `#![allow(unsafe_code)]` (3 处审计 FFI: AXIsProcessTrusted + AXValueGetValue ×2, rustc 1.96 `unsafe_extern_blocks` 强制)。
-- `extension-module` 不在 workspace 默认 features (否则 `cargo test` 无法链接 libpython); maturin 通过 `pyproject features=["pyo3/extension-module"]` 注入。
-- PTY 合并 stdout+stderr → 全入 stdout (stderr 空); traceback 在尾部可读。
-- 退出码: 0=成功, -124=超时, -1=拦截/内部异常。
+- `[workspace.lints.rust] unsafe_code = "deny"` — 7 crates forbid unsafe; fe-gui crate-level `#![allow(unsafe_code)]` (3 audited FFI blocks: AXIsProcessTrusted + AXValueGetValue ×2, forced by rustc 1.96 `unsafe_extern_blocks`).
+- `extension-module` is NOT in the workspace default features (otherwise `cargo test` cannot link libpython); maturin injects it via `pyproject features=["pyo3/extension-module"]`.
+- PTY merges stdout+stderr → all into stdout (stderr empty); traceback is readable at the tail.
+- Exit codes: 0=success, -124=timeout, -1=blocked/internal error.
 
-## 构建
+## Build
 
 ```bash
-cd /Users/dahai/fusion && source .venv/bin/activate   # 共享 venv (Python 3.14)
-pip install maturin                                     # 首次
+cd /Users/dahai/fusion && source .venv/bin/activate   # shared venv (Python 3.14)
+pip install maturin                                     # first time
 cd fusion-executor
-maturin develop --release          # 编辑安装进共享 venv → fusion_executor._native
+maturin develop --release          # editable install into shared venv → fusion_executor._native
 ```
 
-## 测试
+## Test
 
 ```bash
 cd /Users/dahai/fusion && source .venv/bin/activate && cd fusion-executor
 
-# Rust (workspace — extension-module 默认关, cargo test 可链接 libpython)
+# Rust (workspace — extension-module off by default, cargo test can link libpython)
 cargo test --workspace
-cargo test -p fe-sandbox                # 单 crate
+cargo test -p fe-sandbox                # single crate
 cargo test -p fe-security
 
 # Python
 pytest python/tests
-pytest python/tests/test_executor.py::test_run_echo -v   # 单测试
+pytest python/tests/test_executor.py::test_run_echo -v   # single test
 
-# 冒烟
+# Smoke
 python -c "from fusion_executor import FusionSandboxExecutor; print(repr(FusionSandboxExecutor().run('echo hi').stdout))"
 
-# 启动 UDS server + 订阅广播 (v1.5 #14)
-python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"   # 另一终端
-# 另一终端: 订阅 telemetry 推送
+# Start UDS server + subscribe broadcast (v1.5 #14)
+python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"   # another terminal
+# another terminal: subscribe to telemetry push
 python -c "from fusion_executor import FusionSandboxExecutor; s=FusionSandboxExecutor().subscribe(['telemetry'], interval_ms=100); [print(next(s)) for _ in range(3)]; s.unsubscribe()"
 ```
 
@@ -80,11 +82,11 @@ ruff check .          # Python
 ruff format .         # Python
 ```
 
-## CLI 用法
+## CLI Usage
 
 ```bash
 fusion-executor "echo hi" --cwd /tmp --timeout 10
-fusion-executor "echo hi" -v          # 详细 JSON 输出
+fusion-executor "echo hi" -v          # verbose JSON output
 ```
 
 ## Python API
@@ -94,75 +96,75 @@ from fusion_executor import FusionSandboxExecutor, ExecutionResult
 
 ex = FusionSandboxExecutor()
 
-# 同步执行 (脚本最简)
+# Sync execution (simplest for scripts)
 r: ExecutionResult = ex.run("echo hi")
-assert r.exit_code == 0  # 0=成功, -124=超时, -1=拦截/内部异常
+assert r.exit_code == 0  # 0=success, -124=timeout, -1=blocked/internal error
 assert r.stdout == "hi\n"
 assert not r.blocked_by_security
 
-# 安全拦截
+# Security block
 r = ex.run("rm -rf /")
 assert r.blocked_by_security and r.exit_code == -1
 
-# 超时
+# Timeout
 r = ex.run("python3 -c 'while True: pass'", timeout=1.0)
 assert r.timed_out and r.exit_code == -124
 
-# 诊断切片 — 失败命令返回结构化 Diagnostics (exit_code != 0 时)
+# Diagnostics slicer — failing commands return structured Diagnostics (when exit_code != 0)
 r = ex.run("python3 -c \"raise ValueError('boom')\"")
 assert r.diagnostics.error_type == "ValueError"
 assert r.diagnostics.raw_trace is not None
 
-# Git 快照 + 回滚 (caller-driven; executor 无状态)
+# Git snapshot + rollback (caller-driven; executor is stateless)
 snap = ex.snapshot_create(cwd="/path/to/repo")  # git stash create → SHA
 ex.rollback(snap, cwd="/path/to/repo")  # git checkout -- . && git stash apply <id>
 
-# 异步 (asyncio 调用者)
+# Async (asyncio callers)
 r = await ex.run_async("echo hi", task_id="t1", cwd="/tmp", timeout=30.0)
 
-# 双向 server-push 订阅 (v1.5 #14 — 需运行中的 serve())
-# 三通道: telemetry (10Hz CPU/内存) / stdio (跨连接命令流) / screenshot (周期截图)
+# Bidirectional server-push subscription (v1.5 #14 — requires a running serve())
+# Three channels: telemetry (10Hz CPU/mem) / stdio (cross-connection command stream) / screenshot (periodic capture)
 sub = ex.subscribe(["telemetry", "stdio"], interval_ms=100, screenshot_interval_ms=1000)
-for params in sub:  # __next__ yield executor.event 帧的 params (dict)
+for params in sub:  # __next__ yields the params (dict) of executor.event frames
     print(params["channel"], params["data"])
-sub.unsubscribe()  # 或 sub.close()
+sub.unsubscribe()  # or sub.close()
 ```
 
-`run` 签名: `run(command, *, task_id=None, cwd=None, timeout=30.0, env_vars=None, enable_rollback_snapshot=True) -> ExecutionResult`。
+`run` signature: `run(command, *, task_id=None, cwd=None, timeout=30.0, env_vars=None, enable_rollback_snapshot=True) -> ExecutionResult`.
 
-`ExecutionResult` 字段: `exit_code, stdout, stderr, task_id, command, duration_sec, timed_out, blocked_by_security, security_reason, snapshot_id, diagnostics`。
+`ExecutionResult` fields: `exit_code, stdout, stderr, task_id, command, duration_sec, timed_out, blocked_by_security, security_reason, snapshot_id, diagnostics`.
 
-### 原生文件工具 + 外科补丁引擎 (v1.3)
+## Native File Tools + Surgical Patch Engine (v1.3)
 
-替代 Claude SDK FileEdit/Glob/Grep — 原生 Rust 实现, 经 fe-security 路径守卫 (拒绝逃逸 cwd / 越敏感目录), 原子写 (`.fe-tmp-{pid}` + rename)。
+Replaces the Claude SDK FileEdit/Glob/Grep — native Rust implementation, guarded by the fe-security path guard (rejects cwd escape / sensitive-dir access), atomic write (`.fe-tmp-{pid}` + rename).
 
 ```python
 from fusion_executor import FusionSandboxExecutor, EditResult, GlobEntry, GrepMatch
 
 ex = FusionSandboxExecutor()
 
-# file_edit — 唯一匹配精确替换 (>1 匹配拒绝, 避免误改)
+# file_edit — unique-match exact replace (>1 match rejected, avoids accidental edits)
 r: EditResult = ex.file_edit("app.py", "x = 1", "x = 99", cwd="/repo")
 assert r.ok and r.matches == 1
 
-# glob — 通配符匹配, 返回相对 cwd 路径
+# glob — wildcard match, returns paths relative to cwd
 entries: list[GlobEntry] = ex.glob("**/*.py", cwd="/repo")
 
-# grep — 正则搜文件/目录 (递归, 跳二进制, 1000 命中上限)
+# grep — regex search over files/dirs (recursive, skips binary, 1000-hit cap)
 hits: list[GrepMatch] = ex.grep(r"^import\s", ["app.py"], cwd="/repo")
 
-# apply_patch — Unified Diff 应用 (diffy); 禁全文件重写 (new_range 全删 → 拒绝)
+# apply_patch — Unified Diff apply (diffy); full rewrite forbidden (new_range all-delete → reject)
 r = ex.apply_patch("--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,2 @@\n-x\n+x\n+y\n", cwd="/repo")
 
-# replace_function — 函数级替换 (tree-sitter AST 定位, py/js/ts/rs); 无语法 → 正则兜底
+# replace_function — function-level replace (tree-sitter AST locate, py/js/ts/rs); no grammar → regex fallback
 r = ex.replace_function("mod.py", "old_fn", "def old_fn():\n    return 99\n", cwd="/repo")
 ```
 
-`EditResult{ok, path, error, matches}`; `GlobEntry{path, is_dir}`; `GrepMatch{path, line_number, content}`。replace_function 找不到函数 → `ok=False, error="未找到函数 ..."`。
+`EditResult{ok, path, error, matches}`; `GlobEntry{path, is_dir}`; `GrepMatch{path, line_number, content}`. replace_function not finding the function → `ok=False, error="function not found: ..."`.
 
-### 实时 stdio 流式传输 (v1.2)
+## Live stdio Streaming (v1.2)
 
-`run_streaming` 生成器逐帧 yield — chunk 字符串先出, done 帧末尾出 `ExecutionResult`。底层经 4 层 (fe-sandbox `run_streaming` → fe-core `execute_streaming` → fe-pyo3 `NativeStreamIterator` → Python 生成器)。
+The `run_streaming` generator yields frame by frame — chunk strings first, the done frame yields an `ExecutionResult` at the end. Wired through 4 layers (fe-sandbox `run_streaming` → fe-core `execute_streaming` → fe-pyo3 `NativeStreamIterator` → Python generator).
 
 ```python
 from fusion_executor import FusionSandboxExecutor, ExecutionResult
@@ -175,22 +177,22 @@ for frame in ex.run_streaming("echo hi", enable_rollback_snapshot=False):
         print(f"chunk: {frame!r}", end="")
 ```
 
-帧格式 (`ExecutionStreamEvent`, serde tag="type"):
-- chunk: `{"type":"chunk","data":"..."}` (逐行 stdout)
-- done: `{"type":"done", exit_code:..., stdout:..., diagnostics:...}` (ExecutionResult 字段扁平化进同对象, 非嵌套)
+Frame format (`ExecutionStreamEvent`, serde tag="type"):
+- chunk: `{"type":"chunk","data":"..."}` (line-by-line stdout)
+- done: `{"type":"done", exit_code:..., stdout:..., diagnostics:...}` (ExecutionResult fields flattened into the same object, not nested)
 
-拦截 (安全违规) → 仅单帧 done, 无 chunk。超时 → done 帧 `timed_out=True, exit_code=-124`。失败命令 → done 帧含 `diagnostics`。
+Blocked (security violation) → only a single done frame, no chunks. Timeout → done frame `timed_out=True, exit_code=-124`. Failing command → done frame includes `diagnostics`.
 
-### 自动回滚 (v1.4 — FR-04 可选策略)
+## Auto-rollback (v1.4 — FR-04 optional policy)
 
-`run()` / `run_streaming()` 接受可选 `auto_rollback: RollbackPolicy`。启用后, 命令失败 (`exit_code != 0`) 且检测到工作区文件改动 (`git status --porcelain` 非空) 时, 自动 `rollback(本次快照)`, 标记 `result.auto_rolled_back=True`。Executor 仍无状态 — guard 生命周期限单次执行, 不跨请求累积失败计数 (连续失败计数归 caller 自愈循环)。
+`run()` / `run_streaming()` accept an optional `auto_rollback: RollbackPolicy`. When enabled, if a command fails (`exit_code != 0`) AND workspace file changes are detected (`git status --porcelain` non-empty), it auto-`rollback(本次快照)`s and marks `result.auto_rolled_back=True`. The Executor stays stateless — the guard lifetime is limited to a single execution and does not accumulate failure counts across requests (consecutive-failure counting belongs to the caller's self-healing loop).
 
 ```python
 from fusion_executor import FusionSandboxExecutor, RollbackPolicy
 
 ex = FusionSandboxExecutor()
 policy = RollbackPolicy(max_consecutive_failures=3, file_damage_check=True)
-# 命令写坏 app.py 后失败 → 自动回滚恢复 git 基线
+# command corrupts app.py then fails → auto-rollback restores the git baseline
 r = ex.run(
     "python3 -c \"open('app.py','w').write('broken'); raise ValueError(1)\"",
     cwd="/repo",
@@ -199,11 +201,11 @@ r = ex.run(
 assert r.exit_code != 0 and r.auto_rolled_back
 ```
 
-`RollbackPolicy{max_consecutive_failures=3 (保留字段), file_damage_check=True}`。无快照 (`enable_rollback_snapshot=False`) → guard 跳过。非 git repo → 毁损检测失败视为 0 改动, 不回滚。
+`RollbackPolicy{max_consecutive_failures=3 (reserved field), file_damage_check=True}`. No snapshot (`enable_rollback_snapshot=False`) → guard skips. Non-git repo → damage detection failure treated as 0 changes, no rollback.
 
-### 实时遥测 (v1.4 — GPU/CPU UDS 广播)
+## Live Telemetry (v1.4 — GPU/CPU UDS broadcast)
 
-`telemetry_stream()` 生成器逐帧 yield `TelemetrySample` — 10Hz (可调 `interval_ms`) 进程 CPU/内存采样。GPU 字段默认 None (executor 不跑模型, 无 GPU 句柄), 由调用方注入。`max_samples>0` 达此值自动结束; 丢弃迭代器则采样任务自动停止 (通道关闭)。Executor 无状态: 每次调用独立流。
+The `telemetry_stream()` generator yields `TelemetrySample` frame by frame — 10Hz (adjustable `interval_ms`) process CPU/mem sampling. GPU fields default to None (the executor runs no model, has no GPU handle) and are caller-injected. `max_samples>0` ends the stream when reached; dropping the iterator stops the sampling task automatically (channel closes). The Executor is stateless: each call is an independent stream.
 
 ```python
 from fusion_executor import FusionSandboxExecutor, TelemetrySample
@@ -211,141 +213,140 @@ from fusion_executor import FusionSandboxExecutor, TelemetrySample
 ex = FusionSandboxExecutor()
 for s in ex.telemetry_stream(interval_ms=100, max_samples=50):
     print(f"t={s.ts_ms}ms cpu={s.cpu_pct:.1f}% mem={s.mem_mb:.1f}MB")
-    # s.gpu_pct / s.gpu_mem_mb 默认 None (serde skip, 调用方注入)
+    # s.gpu_pct / s.gpu_mem_mb default None (serde skip, caller-injected)
 ```
 
-`TelemetrySample{ts_ms (毫秒, 调用方纪元), cpu_pct (单核倍数), mem_mb (常驻内存 MB), gpu_pct?, gpu_mem_mb?, task_id?}`。底层 fe-telemetry `start_stream(cfg, rt::Handle)` 在 `BLOCKING_RT` 上 spawn sysinfo 采样任务; 4 层 wiring (fe-telemetry → fe-core → fe-ipc `executor.telemetry_stream` 多帧 → fe-pyo3 `NativeTelemetryIterator` → Python 生成器)。
+`TelemetrySample{ts_ms (milliseconds, caller epoch), cpu_pct (single-core multiples), mem_mb (resident memory MB), gpu_pct?, gpu_mem_mb?, task_id?}`. Underlying fe-telemetry `start_stream(cfg, rt::Handle)` spawns the sysinfo sampling task on `BLOCKING_RT`; 4-layer wiring (fe-telemetry → fe-core → fe-ipc `executor.telemetry_stream` multi-frame → fe-pyo3 `NativeTelemetryIterator` → Python generator).
 
-### 双向 server-push 订阅 (v1.5 #14 — fusion-studio §5 120Hz 看板广播)
+## Bidirectional server-push subscription (v1.5 #14)
 
-`subscribe()` 开一条 UDS 连接订阅广播通道 — 一次订阅, server 持续推送 notification 帧, 客户端可在此连接上并发发别的请求 (duplex)。区别于 `telemetry_stream`/`execute_stream` (请求发起, 单流即停): 订阅是 **server 主动推**, 多连接共享同一源 (扇出)。
+`subscribe()` opens a UDS connection to subscribe to a broadcast channel — one subscription, the server continuously pushes notification frames, and the client can concurrently send other requests on the same connection (duplex). Unlike `telemetry_stream`/`execute_stream` (request-initiated, single stream then stops): subscription is **server-pushed**, multiple connections share the same source (fan-out).
 
 ```python
 from fusion_executor import FusionSandboxExecutor
 
 ex = FusionSandboxExecutor()
-# 三通道: telemetry (10Hz CPU/内存) / stdio (跨连接命令 chunk+done) / screenshot (周期截图)
+# Three channels: telemetry (10Hz CPU/mem) / stdio (cross-connection command chunk+done) / screenshot (periodic capture)
 sub = ex.subscribe(["telemetry", "stdio"], interval_ms=100, screenshot_interval_ms=1000)
 print(sub.subscription_id)  # "sub-N"
 for params in sub:
     print(params["channel"], params["data"])
     if ...:
         break
-sub.unsubscribe()  # 或 sub.close()
+sub.unsubscribe()  # or sub.close()
 ```
 
-三通道源 (fe-ipc `BroadcastHub` 内 lazy 启停, 0 订阅自退):
-- **telemetry** — 单一 `executor.telemetry_stream` 扇出给所有 telemetry 订阅 (10Hz 默认, `interval_ms` 可调)。
-- **stdio** — `execute`/`execute_stream` 处理器扇出 chunk/done 给所有 stdio 订阅 (**跨连接**: A 订阅, B 跑命令, A 收推送)。
-- **screenshot** — 周期 `gui_action(Screenshot)` 采样扇出 (`screenshot_interval_ms` 默认 1000, 慢于 telemetry); TCC 未授权 → 帧 `data.ok=false`/error, 不崩 (走 fe-gui safe wrapper)。
+The three broadcast sources (fe-ipc `BroadcastHub` lazy start/stop, 0 subscribers self-exit):
+- **telemetry** — single `executor.telemetry_stream` fan-out to all telemetry subscribers (10Hz default, `interval_ms` adjustable).
+- **stdio** — `execute`/`execute_stream` handlers fan out chunk/done to all stdio subscribers (**cross-connection**: A subscribes, B runs a command, A receives the push).
+- **screenshot** — periodic `gui_action(Screenshot)` sampling fan-out (`screenshot_interval_ms` default 1000, slower than telemetry); TCC-untrusted → frame `data.ok=false`/error, no crash (via fe-gui safe wrapper).
 
-推帧格式 (server 主动, **无 id** — JSON-RPC notification 约定; 客户端按有无 `id` 区分响应 vs 推送):
+Push frame format (server-initiated, **no id** — JSON-RPC notification convention; the client distinguishes response vs push by presence of `id`):
 - `{"jsonrpc":"2.0","method":"executor.event","params":{"subscription_id":"sub-1","channel":"telemetry","data":{...}}}`
 
-`Subscription` 纯 Python UDS 客户端 — 连接运行中的 `serve()` socket; `__next__` 过滤 `executor.event` 帧匹配本 sub_id, 跳过非 event 帧; `unsubscribe()` 发 unsubscribe + 关 socket。`SUB_CHANNELS = ("telemetry", "stdio", "screenshot")` — 未知通道 `ValueError`。fe-ipc 0 新增 unsafe (截图复用 fe-gui safe wrapper); fe-core Executor 保持无状态 (广播扇出是 IPC broker 关注点, 非 executor 状态)。
+`Subscription` is a pure-Python UDS client — connects to the running `serve()` socket; `__next__` filters `executor.event` frames matching this sub_id, skips non-event frames; `unsubscribe()` sends unsubscribe + closes the socket. `SUB_CHANNELS = ("telemetry", "stdio", "screenshot")` — unknown channel → `ValueError`. fe-ipc adds 0 new unsafe (screenshot reuses fe-gui safe wrapper); fe-core Executor stays stateless (broadcast fan-out is an IPC-broker concern, not executor state).
 
-## IPC 服务 (UDS JSON-RPC)
+## IPC Service (UDS JSON-RPC)
 
-启动 UDS JSON-RPC 2.0 服务器 — 供 fusion-code (TypeScript) / fusion-studio (Swift) 经 Unix Domain Socket 调用:
+Start a UDS JSON-RPC 2.0 server — for fusion-code (TypeScript) / fusion-studio (Swift) to call over a Unix Domain Socket:
 
 ```bash
 python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"
 # Socket: /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK)
 ```
 
-协议: 换行分隔 JSON-RPC 2.0, 错误码 -32700/-32600/-32601/-32603 + 扩展 -32010(安全)/-32011(超时)/-32012(回滚)/-32013(AX)。方法 `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`/`telemetry_stream`/`subscribe`/`unsubscribe`/`shutdown`。
+Protocol: newline-delimited JSON-RPC 2.0, error codes -32700/-32600/-32601/-32603 + extensions -32010(security)/-32011(timeout)/-32012(rollback)/-32013(AX). Methods: `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`/`telemetry_stream`/`subscribe`/`unsubscribe`/`shutdown`.
 
-`executor.execute_stream` 流式: 多帧 (chunk/done) 共用同一 id, 换行分隔逐帧写出 —
+`executor.execute_stream` streaming: multi-frame (chunk/done) sharing one id, newline-delimited frame by frame —
 - chunk: `{"jsonrpc":"2.0","id":id,"result":{"type":"chunk","data":"..."}}`
-- done: `{"jsonrpc":"2.0","id":id,"result":{"type":"done","result":{...ExecutionResult}}}` (UDS 路径 done 嵌套在 `result.result`, 与 PyO3 路径扁平不同 — 两条路径分离, 各自消费者读对应形状)
+- done: `{"jsonrpc":"2.0","id":id,"result":{"type":"done","result":{...ExecutionResult}}}` (the UDS path nests done under `result.result`, DIFFERENT shape from the flattened PyO3 path — the two paths are deliberately separate, each consumer reads its own shape)
 
-`executor.telemetry_stream` 流式: 多帧 sample 共用同一 id, 换行分隔逐帧写出 —
-- sample: `{"jsonrpc":"2.0","id":id,"result":{"type":"sample","sample":{...TelemetrySample}}}` (params `interval_ms`(默认 100)/`max_samples`(默认 0=无限); GPU 字段 None 时 serde skip 省略)
+`executor.telemetry_stream` streaming: multi-frame sample sharing one id, newline-delimited frame by frame —
+- sample: `{"jsonrpc":"2.0","id":id,"result":{"type":"sample","sample":{...TelemetrySample}}}` (params `interval_ms` (default 100) / `max_samples` (default 0 = infinite); GPU fields omitted via serde skip when None)
 
-`executor.subscribe` / `executor.unsubscribe` (v1.5 #14 双向 server-push) — 见上「双向 server-push 订阅」小节。subscribe 响应 `{ok:true, subscription_id:"sub-N"}`, 之后 server 持续推 notification 帧 (无 id, `method:"executor.event"`); 连接 duplex, 可并发发别的请求。params `channels`(`["telemetry","stdio","screenshot"]`)/`interval_ms`(默认 100)/`screenshot_interval_ms`(默认 1000)。
+`executor.subscribe` / `executor.unsubscribe` (v1.5 #14 bidirectional server-push) — see the "Bidirectional server-push subscription" section above. subscribe response `{ok:true, subscription_id:"sub-N"}`, then the server continuously pushes notification frames (no id, `method:"executor.event"`); the connection is duplex, other requests can be sent concurrently. params `channels` (`["telemetry","stdio","screenshot"]`) / `interval_ms` (default 100) / `screenshot_interval_ms` (default 1000).
 
-fusion-code TS 客户端 sketch 见 `docs/ipc-client-typescript.md`; fusion-studio 用现有 `IPCClient.swift udsCall` 指向同一 socket。
+The fusion-code TS client sketch is in `docs/ipc-client-typescript.md`; fusion-studio uses the existing `IPCClient.swift udsCall` pointed at the same socket.
 
-## 状态
+## Status
 
-- **P1 — 骨架 + 安全 + 沙箱** ✅ 完成
-  - fe-security: 正则黑名单 + 分词器链式绕过防御 + 白名单 (38 单元测试)
-  - fe-sandbox: PTY 执行 + 超时 kill + 截断 + OOM 环形缓冲 (9 单元测试)
+- **P1 — Skeleton + Security + Sandbox** ✅ complete
+  - fe-security: regex blocklist + tokenizer chain-bypass defense + whitelist (38 unit tests)
+  - fe-sandbox: PTY exec + timeout kill + truncation + OOM ring buffer (9 unit tests)
   - fe-core: validate → sandbox → return pipeline
-  - fe-pyo3: `execute_sync` 绑定; `maturin develop` 可用; `FusionSandboxExecutor.run("echo hi")` 工作
-  - 退出闸门: 真实执行 echo/python; 拦截 `rm -rf /`/sudo 链/ncat; 1s 超时杀无限循环 (exit -124)
-- **P2 — 诊断 + 回滚** ✅ 完成
-  - fe-diagnostics: 8 语言 (Python/TS/Node/Bun/Rust/Go/Swift/Go-compile) traceback 正则提取 + 上下 20 行代码切片, 报错行标 `>` (12 单元测试)
-  - fe-rollback: git CLI 快照/回滚 — `snapshot_create` (stash create/HEAD) + `rollback` (checkout + stash apply) + `rollback_file` 单文件 (3 单元测试)
-  - fe-core: pipeline 加快照 (exec 前, 非致命) + 诊断切片 (exit_code!=0 时) + `snapshot_create_async`/`rollback_async` 公开
-  - fe-pyo3: `NativeDiagnostics` + `diagnostics` 字段 + `snapshot_create`/`rollback` 方法; env_vars/enable_rollback_snapshot 透传
-  - 退出闸门: `run("python3 -c 'raise ValueError'")` → `diagnostics.error_type == "ValueError"`; rollback 往返恢复被破坏文件
-- **P3 — IPC 服务** ✅ 完成
-  - fe-ipc: UDS JSON-RPC 2.0 server — `tokio::net::UnixListener` + 换行分隔 + per-connection spawn; socket `/tmp/fusion-executor.sock` (override `FUSION_EXECUTOR_SOCK`), unlink 旧 sock + chmod 0o666
-  - 方法: `executor.health`/`execute`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`(P4 stub)/`shutdown`; 错误码 -32700/-32600/-32601/-32603 + 扩展 -32010..-32013
-  - fe-pyo3: `NativeExecutor.serve(sock_path=None)` 绑定; `FusionSandboxExecutor.serve()` wrapper 永驻
-  - 4 Rust 单元测试 (health/unknown -32601/malformed -32700/UDS execute) + 5 Python IPC 测试 (health/execute/diagnostics/unknown/snapshot+rollback 往返)
-  - 退出闸门: 外部 raw-socket client 经 UDS 调 `executor.execute` echo → `exit_code=0 stdout="hi\n"`; fusion-code-style TS client sketch 见 `docs/ipc-client-typescript.md`; fusion-studio 用现有 `IPCClient.swift udsCall` 指向 `/tmp/fusion-executor.sock`
-- **P4 — macOS GUI** ✅ 完成
-  - fe-gui: `accessibility` 0.2 安全封装 (AXUIElement 树/聚焦/点击/键入/inspect) + 3 处审计 unsafe FFI (AXIsProcessTrusted + AXValueGetValue ×2); CoreGraphics `CGDisplay::screenshot` → PNG base64 (Layer B 视觉兜底)
+  - fe-pyo3: `execute_sync` binding; `maturin develop` works; `FusionSandboxExecutor.run("echo hi")` works
+  - Exit gate: real exec of echo/python; blocks `rm -rf /`/sudo chain/ncat; 1s timeout kills infinite loop (exit -124)
+- **P2 — Diagnostics + Rollback** ✅ complete
+  - fe-diagnostics: 8 languages (Python/TS/Node/Bun/Rust/Go/Swift/Go-compile) traceback regex extraction + ±20-line code slice, error line marked `>` (12 unit tests)
+  - fe-rollback: git CLI snapshot/rollback — `snapshot_create` (stash create/HEAD) + `rollback` (checkout + stash apply) + `rollback_file` single-file (3 unit tests)
+  - fe-core: pipeline adds snapshot (pre-exec, non-fatal) + diagnostics slice (when exit_code!=0) + public `snapshot_create_async`/`rollback_async`
+  - fe-pyo3: `NativeDiagnostics` + `diagnostics` field + `snapshot_create`/`rollback` methods; env_vars/enable_rollback_snapshot passed through
+  - Exit gate: `run("python3 -c 'raise ValueError'")` → `diagnostics.error_type == "ValueError"`; rollback round-trip restores a corrupted file
+- **P3 — IPC Service** ✅ complete
+  - fe-ipc: UDS JSON-RPC 2.0 server — `tokio::net::UnixListener` + newline-delimited + per-connection spawn; socket `/tmp/fusion-executor.sock` (override `FUSION_EXECUTOR_SOCK`), unlink stale sock + chmod 0o666
+  - Methods: `executor.health`/`execute`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`(P4 stub)/`shutdown`; error codes -32700/-32600/-32601/-32603 + extensions -32010..-32013
+  - fe-pyo3: `NativeExecutor.serve(sock_path=None)` binding; `FusionSandboxExecutor.serve()` wrapper runs forever
+  - 4 Rust unit tests (health/unknown -32601/malformed -32700/UDS execute) + 5 Python IPC tests (health/execute/diagnostics/unknown/snapshot+rollback round-trip)
+  - Exit gate: external raw-socket client calls `executor.execute` echo over UDS → `exit_code=0 stdout="hi\n"`; fusion-code-style TS client sketch in `docs/ipc-client-typescript.md`; fusion-studio uses existing `IPCClient.swift udsCall` pointed at `/tmp/fusion-executor.sock`
+- **P4 — macOS GUI** ✅ complete
+  - fe-gui: `accessibility` 0.2 safe wrapper (AXUIElement tree/focus/click/type/inspect) + 3 audited unsafe FFI blocks (AXIsProcessTrusted + AXValueGetValue ×2); CoreGraphics `CGDisplay::screenshot` → PNG base64 (Layer B vision fallback)
   - GuiAction (tag=kind, snake_case): `focus_app`/`click`/`type_text`/`key_press`/`screenshot`/`inspect_tree`; GuiResult{ok, node_tree, screenshot_png_b64, error}
-  - fe-core: `gui: GuiController` 字段 + `gui_action()` 方法; fe-ipc `executor.gui_action` 活 (非 stub); fe-pyo3 `NativeGuiResult` + `gui_action(action)` (json.dumps → serde 反序列化)
+  - fe-core: `gui: GuiController` field + `gui_action()` method; fe-ipc `executor.gui_action` live (not stub); fe-pyo3 `NativeGuiResult` + `gui_action(action)` (json.dumps → serde deserialize)
   - Python: `GuiResult` Pydantic + `FusionSandboxExecutor.gui_action(action: dict) -> GuiResult`
-  - 6 Rust 单元测试 + 6 Python 测试 (model 往返/key_press 降级/坏 kind 降级/screenshot TCC-skip/UDS 往返/坏 kind UDS -32600)
-  - 退出闸门: trusted 机 `gui_action({"kind":"screenshot"})` → 3.2MB PNG; `gui_action({"kind":"key_press","key":"Tab"})` → ok=False unsupported (v1, v1.1 修复)。GUI 测试 TCC 手动 (AX Accessibility + Screen Recording)
-- **P5 — 加固** ✅ 完成
-  - criterion 基准: `Executor::new` = 735µs (<5ms NFR ✓); `truncate_output` ~1.75GB/s (100K=3.9µs / 1M=412µs / 10M=5.7ms); `validate` 10k 复合命令 = 317ns (正则快路径拦截 rm -rf)
-  - `truncate_output` 改 pub 供 bench; `ClickCandidate` type alias 消 clippy `type_complexity`; fe-gui `as u32` 冗余转换移除
-  - Python 覆盖率 95% (>80% NFR ✓): cli.py 96% (in-process `main()` 测试) / executor.py 90% / models.py 100% / __init__.py 100%; 32 Python 测试 (+6 CLI +1 async +1 rollback-no-cwd)
-  - clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat 通知, 非 fe 代码); `cargo fmt --check` + `ruff check/format` 净; `maturin develop --release` 构建
-  - 退出闸门: 67 Rust + 32 Python 测试全绿; NFR 全达标
-- **v1 完成** ✅
-- **v1.1 — KeyPress 支持** ✅ 完成
-  - fe-gui `key_press`: CGEvent 合成 keydown + keyup, post `CGEventTapLocation::HID`; `resolve_keycode` 键名 (大小写不敏感 + 别名: enter=return, esc=escape, up=up_arrow, cmd=command...) → `core_graphics::event::KeyCode` 常量 (40+ 键: Return/Tab/Space/Delete/Forward_delete/Escape/方向键/Home/End/PageUp-Down/Help/F1-F20/Command/Shift/Option/Control/Function/Caps_lock/Mute/Volume)
-  - core-graphics 0.24 safe wrapper 封装了 unsafe FFI (CGEventSource::new / CGEvent::new_keyboard_event / post) — 本函数零手写 unsafe block, 复用 fe-gui crate 级 `#![allow(unsafe_code)]` scope
-  - 未知键名 → `ok:false` + `unknown-key: ...` 错误含已知键名列表 (不 panic, trusted-independent)
-  - +2 Rust 单元测试 (resolve_keycode 映射/未知键 None) + KeyPress 降级测试改写; +1 Python 测试 (keypress_when_trusted, TCC-skip)
-  - 退出闸门: trusted 机 `gui_action({"kind":"key_press","key":"Tab"})` → ok=True (keydown+keyup posted); `{"key":"return"}` → ok=True; 未知键 → ok=False unknown-key。69 Rust + 33 Python 测试全绿
-- **v1.2 — 流式 + 修饰键 + 截图尺寸** ✅ 完成
-  - 实时 stdio 流式传输 (4 层): fe-sandbox `run_streaming` (mpsc `StreamEvent::Chunk{data}`/`Done(SandboxResult)`) → fe-core `execute_streaming` async (校验→快照→`run_streaming`→spawn 任务转发 chunk, Done 时跑诊断切片映射 ExecutionResult; `ExecutionStreamEvent` serde tag="type") → fe-ipc `executor.execute_stream` (多帧 NDJSON, id 复用, chunk `{type,data}`/done `{type,result:{ExecutionResult}}`) → fe-pyo3 `NativeStreamIterator` (`__iter__`/`__next__` via `py.detach` + BLOCKING_RT 收帧 + serde→json.loads) → Python `run_streaming` 生成器
-  - 修饰键组合 (KeyPress): `key` 单键名 + `modifiers` 数组 (cmd/ctrl/alt/shift/fn); 顺序合成 — keydown modifiers→keydown key→keyup key→keyup modifiers (CGEvent flags); 单键仅, 无和弦
-  - 截图尺寸 metadata: `GuiResult` 加 `screenshot_width`/`screenshot_height` (u32, PNG 像素); fe-gui 从 `CGImageRef` 宽高填充
-  - +12 Rust 测试 (fe-core execute_streaming 4: echo/blocked/timeout/diagnostics; fe-ipc 2: stream chunks/done over UDS, blocked single frame) + 5 Python 测试 (streaming echo/blocked/timeout/diagnostics, UDS stream)
-  - 退出闸门: 81 Rust + 40 Python 测试全绿; clippy/fmt/ruff 净; maturin 构建
-- **v1.3 — Data Schema 补齐 + 原生文件工具 + 外科补丁引擎** ✅ 完成
-  - Data Schema §4.1 补齐 (Gap #1): `ExecutionResult` 加 `task_id`/`command`/`duration_sec` 字段, 4 层贯穿 (fe-core serde struct → fe-pyo3 `NativeExecutionResult` → Python `ExecutionResult` Pydantic → fe-ipc done 帧回填)。`blocked_with` 带回 task_id/command; 拦截结果 `duration_sec=0.0`
-  - fe-tools 新 crate (Gap #2): `file_edit` (唯一匹配精确替换, >1 拒绝, 原子写) / `glob` (通配符, 相对 cwd 路径, 规范化 base 修相对路径 bug) / `grep` (正则, 递归 walkdir, 跳二进制, 1000 上限)。依赖 fe-security `validate_cwd` 路径守卫 (拒逃逸 cwd / 越敏感目录)
-  - 外科补丁引擎 (Gap #3, fe-tools): `apply_patch` (diffy Unified Diff apply; 全文件重写启发式 `new_range.start==0 && end==0` → 拒绝; target 从 `patch.modified()`/`original()` 取 `a/`/`b/` 前缀) + `replace_function` (tree-sitter AST 定位函数节点 — 栈式前序遍历修 tree-sitter 0.25 `Node::children(&mut cursor)` 借用问题, 无 `descendants()`; py/js/ts/tsx/rs 语法, 无则正则兜底; 字节切片替换 `[..span.start]+new_body+[span.end..]`)
-  - 4 层接线: fe-core `tools: Tools` 字段 + 5 wrapper 方法 (`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`); fe-ipc `executor.file_edit`/`glob`/`grep`/`apply_patch`/`replace_function` 5 arm; fe-pyo3 `NativeEditResult`/`NativeGlobEntry`/`NativeGrepMatch` pyclass + 5 `#[pymethods]`; Python `EditResult`/`GlobEntry`/`GrepMatch` Pydantic + `FusionSandboxExecutor` 5 方法
-  - clippy 修 `ExecutionStreamEvent::Done(ExecutionResult)` → `Done(Box<ExecutionResult>)` (large_enum_variant, Done 264B vs Chunk 24B; serde 对 Box 透明, 序列化不变)
-  - +13 fe-tools Rust 单元测试 (file_edit 唯一/无匹配/歧义/未找到, glob, grep 命中/递归, apply_patch 简单/未找到, replace_function python/未找到/rust, guard_path 逃逸) + 12 Python 测试 (file_edit 唯一/歧义, glob, grep, apply_patch, replace_function python/未找到, file_edit/glob UDS 往返 subprocess 模式)
-  - 退出闸门: 94 Rust + 52 Python 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat); fmt/ruff 净; maturin 构建
-- **v1.4 — 自动回滚 + 实时遥测 + GUI scroll/drag/wait** ✅ 完成
-  - 自动回滚 (FR-04 可选策略, fe-core `AutoRollbackGuard` + fe-rollback): `RollbackPolicy{max_consecutive_failures (保留字段), file_damage_check}`; 命令失败 + `git status --porcelain` 非空 → `rollback(本次快照)` + `result.auto_rolled_back=True`; guard 限单次执行 (Executor 无状态, 连续失败计数归 caller); 4 层 wiring (fe-core `execute_async`/`execute_streaming` 构造 guard → fe-pyo3 `auto_rollback_policy` dict→serde → Python `RollbackPolicy` Pydantic + `run()`/`run_streaming()` kwargs); fe-rollback HEAD 基线 bug 修 (stash SHA != HEAD 时 stash apply, 相等则 skip)
-  - 实时遥测 (fe-telemetry 新 crate): `TelemetrySample{ts_ms,cpu_pct,mem_mb,gpu_pct?,gpu_mem_mb?,task_id?}` + `TelemetryConfig{interval_ms=100(10Hz),max_samples=0(无限)}`; `start_stream(cfg, rt::Handle)` 在 `BLOCKING_RT` 上 spawn sysinfo 采样任务 (`refresh_processes_specifics(pid, mem+cpu)`, 首帧 sleep 后采); 通道关闭/max_samples 达则停; GPU 默认 None (调用方注入), serde `skip_serializing_if`; 4 层 wiring (fe-core `telemetry_stream(cfg)` → fe-ipc `executor.telemetry_stream` 多帧 sample → fe-pyo3 `NativeTelemetryIterator` `__next__` block_on(rx.recv) → Python `telemetry_stream()` 生成器 yield `TelemetrySample`); never-type fallback 修 (显式 `TelemetrySample` 类型标注)
-  - GUI scroll/drag/wait (fe-gui CGEvent 合成): `scroll` (dx/dy 像素, CGEvent scrollWheel 单位轴) / `drag` (from x,y → to x,y, mouseMove+leftMouseDown+move+leftMouseUp) / `wait` (seconds 睡眠, 测试辅助); +14 Rust 单元测试 + 14 Python GUI 测试
-  - +3 fe-telemetry Rust 单元测试 (stream 产样/通道关闭停止/序列化) +1 fe-core +1 fe-ipc (UDS telemetry 3 帧) +5 Python auto-rollback 测试 +3 Python telemetry 测试 (native iter/wrapper/UDS)
-  - 退出闸门: 105 Rust + 60 Python 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat); fmt/ruff 净; maturin 构建
-- **v1.5 进行中**
-  - **#12 — 诊断切片扩语言 (TS/Go)** ✅ 完成
-    - fe-diagnostics `Slicer` 正则 4→9 覆盖 8 语言: 新增 `ts_re` (tsc 括号 `file.ts(l,c): error TSxxxx:`) / `ts_dash_re` (tsc watch `file.ts:l:c - error TSxxxx:`) / `bun_re` (Bun 小写 `error:` + 裸 `at`) / `go_panic_re` (`(?s)` 跨行 `panic: ... goroutine ... \tfile.go:line`, 取末栈帧) / `go_compile_re` (`file.go:l:c: msg` 无 `error:` 关键字)。新增 `extract_ts`/`extract_bun`/`extract_go_panic`/`extract_go_compile` 方法; `slice()` 排序 ts→python→node→bun→rust→go_panic→swift→go_compile (按扩展名/关键字互不冲突)。零新依赖 (纯文本行切片)
-    - fe-security 白名单 +`go` +`tsc` (否则真实 `go build`/`tsc --noEmit` 被 Stage-2 拦截无 E2E)
-    - +5 fe-diagnostics 单元测试 +1 白名单测试。真实工具链 E2E: tsc 7.0.2 `TS2322`/`bad.ts`/line 2 ✓; `go build` `compile error`/`main.go`/line 6 ✓; `go run` panic `panic.go`/line 7 ✓。诊断自动经 execute→ExecutionResult.diagnostics 流通 (exit_code!=0), 无 4 层 wiring
-  - **#13 — GUI 更多动作** ✅ 完成
-    - fe-gui `GuiAction` 9→16 变体: 新增 `double_click` (ax_label/ax_position, CGEvent 2× LeftMouseDown/Up, 第二击 `EventField::MOUSE_EVENT_CLICK_STATE=2`) / `right_click` (ax_label/ax_position, CGEvent RightMouseDown/Up + `CGMouseButton::Right`) / `hover` (ax_position, CGEvent MouseMoved 无按键) / `window_close` / `window_minimize` / `window_zoom` (bundle_id, AX 按钮属性 `kAXCloseButtonAttribute`/`kAXMinimizeButtonAttribute`/`kAXZoomButtonAttribute` → `press()`) / `window_resize` (bundle_id + width/height, 拖右下角 resize 把手 — 读 AXPosition+AXSize 算坐标, 复用 `drag()` CGEvent; 非 AXValueCreate 设 AXSize 避免新增 unsafe block, 留在既定 3 处 unsafe scope 内)
-    - `resolve_click_position` helper 共用 click/double_click/right_click (ax_position 优先, 否则 ax_label→AX 树定位读 AXPosition; 无二者报错)
-    - **4 层 auto-flow**: fe-core/fe-ipc/fe-pyo3 在 GuiAction enum 级反序列化后 dispatch — 新变体零 wiring 自动流通 (仅 fe-gui 改 enum+execute+方法+测试); Python `gui_action(action: dict)` 通用无 per-variant 逻辑
-    - **0 新增 unsafe**: 全走 accessibility 0.2 safe wrapper (attribute/press) + core-graphics 0.24 safe wrapper (CGEvent/set_integer_value_field); 复用 fe-gui crate 级 `#![allow(unsafe_code)]` scope
-    - +5 fe-gui Rust 单元测试 (serde 往返/snake_case/window 降级/pointer 降级/no-target) +2 Python 测试 (new_variants_degrade CI 路径 / pointer_variants_when_trusted TCC 路径; `_ax_access_trusted()` 探测分离 TCC Accessibility 与 Screen Recording 两权限)
-    - 退出闸门: trusted 机 hover/double_click/right_click 带坐标 → `ok=True` (CGEvent posted); window_* 需真实 GUI 会话 (AX 窗口树) 沙箱内降级。116 Rust + 62 Python 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6); fmt/ruff 净; maturin 构建
-  - **#14 — 双向 IPC server-push (订阅/广播)** ✅ 完成
-    - fe-ipc `BroadcastHub` (Arc 共享) — IPC broker 关注点, **fe-core Executor 保持无状态** (广播扇出不进 executor)。registry: sub_id → Subscriber{conn_id, channels, tx}; conn/sub counter AtomicU64; telemetry_task/screenshot_task `Mutex<Option<JoinHandle>>` lazy 启停 (0 订阅自退, 下次 subscribe 重启; 源方法取 `&self` 非 `self: Arc<Self>` — 避免自移后 `.take()`)
-    - 连接 DUPLEX: `handle_conn` 拆 read_task (分发请求) + push_task (写 server-push 帧) 共享 `Arc<AsyncMutex<OwnedWriteHalf>>` (锁下行写原子); 每连接 `mpsc::channel<Value>(128)` push 帧 + oneshot close
-    - 三广播源: **telemetry** (单一 `executor.telemetry_stream` 扇出, 10Hz 默认 `interval_ms=100`) / **stdio** (execute/execute_stream 处理器调 `hub.broadcast_stdio()` 扇出 chunk/done — **跨连接** A 订阅 B 跑命令 A 收推送) / **screenshot** (周期 `gui_action(Screenshot)` 采样 `spawn_blocking`, `screenshot_interval_ms=1000` 慢于 telemetry; TCC 未授权 → 帧 data.ok=false 不崩, 复用 fe-gui safe wrapper)
-    - 推帧格式: `{"jsonrpc":"2.0","method":"executor.event","params":{"subscription_id":"sub-N","channel":..,"data":..}}` — **无 id** (notification 约定), 客户端按有无 id 区分响应 vs 推送。`collect_targets(channel)` 锁外 try_send (快照 sub_id+tx 后释放锁)
-    - fe-ipc **0 新增 unsafe** (截图复用 fe-gui safe wrapper, crate 仍 `unsafe_code="deny"`)。fe-pyo3 无改动 — server-push 需运行中 server, 纯 Python UDS 客户端 `Subscription` 连接 `serve()` socket
-    - Python `Subscription` 纯 Python UDS 客户端: `_open()` 连接+发 subscribe+读响应设 `_sub_id`; `__next__` 过滤 `executor.event` 帧匹配 sub_id, 跳过非 event 帧; `unsubscribe()` 发 unsubscribe+关 socket; `SUB_CHANNELS=("telemetry","stdio","screenshot")` 未知通道 `ValueError`。`FusionSandboxExecutor.subscribe(channels, *, sock_path, interval_ms, screenshot_interval_ms) -> Subscription`
-    - +7 fe-ipc Rust 单元测试 (subscribe telemetry 推帧/missing channels -32600/unsubscribe 停推/stdio 跨连接广播 + 原有 health/unknown/malformed/execute/stream) +3 Python 测试 (subscribe telemetry 推帧/stdio 跨连接广播/未知通道 ValueError); 测试用 `UnixStream::into_split()` → `(OwnedReadHalf, OwnedWriteHalf)` 避借用后移
-    - 退出闸门: 120 Rust + 64 Python (6 skip TCC) 测试全绿; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6); fmt/ruff 净; maturin 构建
-- **v1.5 完成** (#12 诊断切片扩语言 + #13 GUI 更多动作 + #14 双向 IPC server-push) — 120 Rust + 64 Python (6 skip TCC) 测试全绿; 10 crates; clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat); `cargo fmt --check` + `ruff check/format` 净; `maturin develop --release` 构建。零新增 unsafe (#13/#14 均走 safe wrapper)。下一步: v1.6 或按需。
-
+  - 6 Rust unit tests + 6 Python tests (model roundtrip/key_press degrade/bad-kind degrade/screenshot TCC-skip/UDS roundtrip/bad-kind UDS -32600)
+  - Exit gate: trusted machine `gui_action({"kind":"screenshot"})` → 3.2MB PNG; `gui_action({"kind":"key_press","key":"Tab"})` → ok=False unsupported (v1, fixed in v1.1). GUI tests are TCC-manual (AX Accessibility + Screen Recording)
+- **P5 — Hardening** ✅ complete
+  - criterion benches: `Executor::new` = 735µs (<5ms NFR ✓); `truncate_output` ~1.75GB/s (100K=3.9µs / 1M=412µs / 10M=5.7ms); `validate` 10k compound command = 317ns (regex fast-path blocks rm -rf)
+  - `truncate_output` made pub for bench; `ClickCandidate` type alias fixes clippy `type_complexity`; fe-gui redundant `as u32` conversions removed
+  - Python coverage 95% (>80% NFR ✓): cli.py 96% (in-process `main()` tests) / executor.py 90% / models.py 100% / __init__.py 100%; 32 Python tests (+6 CLI +1 async +1 rollback-no-cwd)
+  - clippy `--all-targets -D warnings` clean (only upstream block v0.1.6 future-incompat notice, not fe code); `cargo fmt --check` + `ruff check/format` clean; `maturin develop --release` builds
+  - Exit gate: 67 Rust + 32 Python tests green; all NFRs met
+- **v1 complete** ✅
+- **v1.1 — KeyPress support** ✅ complete
+  - fe-gui `key_press`: CGEvent synthesis keydown + keyup, post `CGEventTapLocation::HID`; `resolve_keycode` maps key names (case-insensitive + aliases: enter=return, esc=escape, up=up_arrow, cmd=command...) → `core_graphics::event::KeyCode` constants (40+ keys: Return/Tab/Space/Delete/Forward_delete/Escape/arrows/Home/End/PageUp-Down/Help/F1-F20/Command/Shift/Option/Control/Function/Caps_lock/Mute/Volume)
+  - core-graphics 0.24 safe wrapper encapsulates the unsafe FFI (CGEventSource::new / CGEvent::new_keyboard_event / post) — zero hand-written unsafe blocks in this function, reuses the fe-gui crate-level `#![allow(unsafe_code)]` scope
+  - Unknown key name → `ok:false` + `unknown-key: ...` error listing known key names (no panic, trusted-independent)
+  - +2 Rust unit tests (resolve_keycode mapping / unknown key None) + KeyPress degrade test rewritten; +1 Python test (keypress_when_trusted, TCC-skip)
+  - Exit gate: trusted machine `gui_action({"kind":"key_press","key":"Tab"})` → ok=True (keydown+keyup posted); `{"key":"return"}` → ok=True; unknown key → ok=False unknown-key. 69 Rust + 33 Python tests green
+- **v1.2 — Streaming + Modifiers + Screenshot dimensions** ✅ complete
+  - Live stdio streaming (4 layers): fe-sandbox `run_streaming` (mpsc `StreamEvent::Chunk{data}`/`Done(SandboxResult)`) → fe-core `execute_streaming` async (validate→snapshot→`run_streaming`→spawn task forwards chunks, on Done runs diagnostics slice and maps to ExecutionResult; `ExecutionStreamEvent` serde tag="type") → fe-ipc `executor.execute_stream` (multi-frame NDJSON, id reused, chunk `{type,data}`/done `{type,result:{ExecutionResult}}`) → fe-pyo3 `NativeStreamIterator` (`__iter__`/`__next__` via `py.detach` + BLOCKING_RT receives frames + serde→json.loads) → Python `run_streaming` generator
+  - Modifier combos (KeyPress): `key` single key name + `modifiers` array (cmd/ctrl/alt/shift/fn); sequential synthesis — keydown modifiers→keydown key→keyup key→keyup modifiers (CGEvent flags); single key only, no chord
+  - Screenshot dimension metadata: `GuiResult` adds `screenshot_width`/`screenshot_height` (u32, PNG pixels); fe-gui fills from `CGImageRef` width/height
+  - +12 Rust tests (fe-core execute_streaming 4: echo/blocked/timeout/diagnostics; fe-ipc 2: stream chunks/done over UDS, blocked single frame) + 5 Python tests (streaming echo/blocked/timeout/diagnostics, UDS stream)
+  - Exit gate: 81 Rust + 40 Python tests green; clippy/fmt/ruff clean; maturin builds
+- **v1.3 — Data Schema backfill + Native File Tools + Surgical Patch Engine** ✅ complete
+  - Data Schema §4.1 backfill (Gap #1): `ExecutionResult` adds `task_id`/`command`/`duration_sec` fields, threaded through 4 layers (fe-core serde struct → fe-pyo3 `NativeExecutionResult` → Python `ExecutionResult` Pydantic → fe-ipc done frame backfill). `blocked_with` carries task_id/command; blocked result `duration_sec=0.0`
+  - fe-tools new crate (Gap #2): `file_edit` (unique-match exact replace, >1 rejected, atomic write) / `glob` (wildcard, relative-to-cwd paths, canonicalized-base fix for the relative-path bug) / `grep` (regex, recursive walkdir, skips binary, 1000 cap). Depends on fe-security `validate_cwd` path guard (rejects cwd escape / sensitive dirs)
+  - Surgical Patch Engine (Gap #3, fe-tools): `apply_patch` (diffy Unified Diff apply; full-rewrite heuristic `new_range.start==0 && end==0` → reject; target taken from `patch.modified()`/`original()` with `a/`/`b/` prefix stripped) + `replace_function` (tree-sitter AST locates function node — stack-based preorder traversal fixes the tree-sitter 0.25 `Node::children(&mut cursor)` borrow issue, no `descendants()`; py/js/ts/tsx/rs grammars, regex fallback otherwise; byte-slice replace `[..span.start]+new_body+[span.end..]`)
+  - 4-layer wiring: fe-core `tools: Tools` field + 5 wrapper methods (`file_edit`/`glob`/`grep`/`apply_patch`/`replace_function`); fe-ipc `executor.file_edit`/`glob`/`grep`/`apply_patch`/`replace_function` 5 arms; fe-pyo3 `NativeEditResult`/`NativeGlobEntry`/`NativeGrepMatch` pyclasses + 5 `#[pymethods]`; Python `EditResult`/`GlobEntry`/`GrepMatch` Pydantic + `FusionSandboxExecutor` 5 methods
+  - clippy fix `ExecutionStreamEvent::Done(ExecutionResult)` → `Done(Box<ExecutionResult>)` (large_enum_variant, Done 264B vs Chunk 24B; serde transparent over Box, serialization unchanged)
+  - +13 fe-tools Rust unit tests (file_edit unique/no-match/ambiguous/not-found, glob, grep hit/recursive, apply_patch simple/not-found, replace_function python/not-found/rust, guard_path escape) + 12 Python tests (file_edit unique/ambiguous, glob, grep, apply_patch, replace_function python/not-found, file_edit/glob UDS round-trip subprocess pattern)
+  - Exit gate: 94 Rust + 52 Python tests green; clippy `--all-targets -D warnings` clean (only upstream block v0.1.6 future-incompat); fmt/ruff clean; maturin builds
+- **v1.4 — Auto-rollback + Live Telemetry + GUI scroll/drag/wait** ✅ complete
+  - Auto-rollback (FR-04 optional policy, fe-core `AutoRollbackGuard` + fe-rollback): `RollbackPolicy{max_consecutive_failures (reserved field), file_damage_check}`; command failure + `git status --porcelain` non-empty → `rollback(本次快照)` + `result.auto_rolled_back=True`; guard limited to a single execution (Executor stateless, consecutive-failure counting belongs to caller); 4-layer wiring (fe-core `execute_async`/`execute_streaming` construct guard → fe-pyo3 `auto_rollback_policy` dict→serde → Python `RollbackPolicy` Pydantic + `run()`/`run_streaming()` kwargs); fe-rollback HEAD-baseline bug fix (when stash SHA != HEAD → stash apply; when equal → skip)
+  - Live telemetry (fe-telemetry new crate): `TelemetrySample{ts_ms,cpu_pct,mem_mb,gpu_pct?,gpu_mem_mb?,task_id?}` + `TelemetryConfig{interval_ms=100(10Hz),max_samples=0(infinite)}`; `start_stream(cfg, rt::Handle)` spawns sysinfo sampling task on `BLOCKING_RT` (`refresh_processes_specifics(pid, mem+cpu)`, first frame sleeps then samples); channel close / max_samples reached → stop; GPU defaults None (caller-injected), serde `skip_serializing_if`; 4-layer wiring (fe-core `telemetry_stream(cfg)` → fe-ipc `executor.telemetry_stream` multi-frame sample → fe-pyo3 `NativeTelemetryIterator` `__next__` block_on(rx.recv) → Python `telemetry_stream()` generator yields `TelemetrySample`); never-type fallback fix (explicit `TelemetrySample` type annotation)
+  - GUI scroll/drag/wait (fe-gui CGEvent synthesis): `scroll` (dx/dy pixels, CGEvent scrollWheel unit axis) / `drag` (from x,y → to x,y, mouseMove+leftMouseDown+move+leftMouseUp) / `wait` (seconds sleep, test helper); +14 Rust unit tests + 14 Python GUI tests
+  - +3 fe-telemetry Rust unit tests (stream produces samples / channel close stops / serialize) +1 fe-core +1 fe-ipc (UDS telemetry 3 frames) +5 Python auto-rollback tests +3 Python telemetry tests (native iter/wrapper/UDS)
+  - Exit gate: 105 Rust + 60 Python tests green; clippy `--all-targets -D warnings` clean (only upstream block v0.1.6 future-incompat); fmt/ruff clean; maturin builds
+- **v1.5 complete**
+  - **#12 — Diagnostics-slicer language expansion (TS/Go)** ✅ complete
+    - fe-diagnostics `Slicer` regexes 4→9 covering 8 languages: added `ts_re` (tsc paren form `file.ts(l,c): error TSxxxx:`) / `ts_dash_re` (tsc watch `file.ts:l:c - error TSxxxx:`) / `bun_re` (Bun lowercase `error:` + bare `at`) / `go_panic_re` (`(?s)` cross-line `panic: ... goroutine ... \tfile.go:line`, takes last stack frame) / `go_compile_re` (`file.go:l:c: msg` no `error:` keyword). Added `extract_ts`/`extract_bun`/`extract_go_panic`/`extract_go_compile` methods; `slice()` ordering ts→python→node→bun→rust→go_panic→swift→go_compile (isolated by extension/keyword, no conflicts). Zero new deps (pure-text line slicing)
+    - fe-security whitelist +`go` +`tsc` (otherwise real `go build`/`tsc --noEmit` blocked by Stage-2, no E2E)
+    - +5 fe-diagnostics unit tests +1 whitelist test. Real toolchain E2E: tsc 7.0.2 `TS2322`/`bad.ts`/line 2 ✓; `go build` `compile error`/`main.go`/line 6 ✓; `go run` panic `panic.go`/line 7 ✓. Diagnostics flow automatically through execute→ExecutionResult.diagnostics (when exit_code!=0), no 4-layer wiring
+  - **#13 — More GUI actions** ✅ complete
+    - fe-gui `GuiAction` 9→16 variants: added `double_click` (ax_label/ax_position, CGEvent 2× LeftMouseDown/Up, second click `EventField::MOUSE_EVENT_CLICK_STATE=2`) / `right_click` (ax_label/ax_position, CGEvent RightMouseDown/Up + `CGMouseButton::Right`) / `hover` (ax_position, CGEvent MouseMoved no button) / `window_close` / `window_minimize` / `window_zoom` (bundle_id, AX button attrs `kAXCloseButtonAttribute`/`kAXMinimizeButtonAttribute`/`kAXZoomButtonAttribute` → `press()`) / `window_resize` (bundle_id + width/height, drag the bottom-right resize handle — read AXPosition+AXSize to compute coords, reuse `drag()` CGEvent; not AXValueCreate set AXSize, avoids a new unsafe block, stays within the 3 audited unsafe scopes)
+    - `resolve_click_position` helper shared by click/double_click/right_click (ax_position first; otherwise ax_label→AX tree locate reads AXPosition; neither present → error)
+    - **4-layer auto-flow**: fe-core/fe-ipc/fe-pyo3 dispatch after deserializing the GuiAction enum — new variants flow through with zero wiring (only fe-gui changes enum+execute+methods+tests); Python `gui_action(action: dict)` is generic with no per-variant logic
+    - **0 new unsafe**: all via accessibility 0.2 safe wrapper (attribute/press) + core-graphics 0.24 safe wrapper (CGEvent/set_integer_value_field); reuses fe-gui crate-level `#![allow(unsafe_code)]` scope
+    - +5 fe-gui Rust unit tests (serde roundtrip/snake_case/window degrade/pointer degrade/no-target) +2 Python tests (new_variants_degrade CI path / pointer_variants_when_trusted TCC path; `_ax_access_trusted()` probe separates the TCC Accessibility and Screen Recording permissions)
+    - Exit gate: trusted machine hover/double_click/right_click with coords → `ok=True` (CGEvent posted); window_* needs a real GUI session (AX window tree) and degrades in-sandbox. 116 Rust + 62 Python tests green; clippy `--all-targets -D warnings` clean (only upstream block v0.1.6); fmt/ruff clean; maturin builds
+  - **#14 — Bidirectional IPC server-push (subscribe/broadcast)** ✅ complete
+    - fe-ipc `BroadcastHub` (Arc-shared) — an IPC-broker concern, **fe-core Executor stays stateless** (broadcast fan-out does not enter the executor). registry: sub_id → Subscriber{conn_id, channels, tx}; conn/sub counters AtomicU64; telemetry_task/screenshot_task `Mutex<Option<JoinHandle>>` lazy start/stop (0 subscribers self-exit, next subscribe restarts; source methods take `&self` not `self: Arc<Self>` — avoids use-after-move on `.take()`)
+    - Connection DUPLEX: `handle_conn` split into read_task (dispatch requests) + push_task (write server-push frames) sharing `Arc<AsyncMutex<OwnedWriteHalf>>` (lock for atomic line writes); per-connection `mpsc::channel<Value>(128)` push frames + oneshot close
+    - Three broadcast sources: **telemetry** (single `executor.telemetry_stream` fan-out, 10Hz default `interval_ms=100`) / **stdio** (execute/execute_stream handlers call `hub.broadcast_stdio()` to fan out chunk/done — **cross-connection** A subscribes, B runs a command, A receives the push) / **screenshot** (periodic `gui_action(Screenshot)` sampling via `spawn_blocking`, `screenshot_interval_ms=1000` slower than telemetry; TCC-untrusted → frame data.ok=false, no crash, reuses fe-gui safe wrapper)
+    - Push frame format: `{"jsonrpc":"2.0","method":"executor.event","params":{"subscription_id":"sub-N","channel":..,"data":..}}` — **no id** (notification convention), client distinguishes response vs push by presence of id. `collect_targets(channel)` try_send outside the lock (snapshot sub_id+tx then release the lock)
+    - fe-ipc **0 new unsafe** (screenshot reuses fe-gui safe wrapper, crate keeps `unsafe_code="deny"`). fe-pyo3 unchanged — server-push needs a running server, pure-Python UDS client `Subscription` connects to the `serve()` socket
+    - Python `Subscription` pure-Python UDS client: `_open()` connects+sends subscribe+reads response sets `_sub_id`; `__next__` filters `executor.event` frames matching sub_id, skips non-event frames; `unsubscribe()` sends unsubscribe+closes socket; `SUB_CHANNELS=("telemetry","stdio","screenshot")` unknown channel → `ValueError`. `FusionSandboxExecutor.subscribe(channels, *, sock_path, interval_ms, screenshot_interval_ms) -> Subscription`
+    - +7 fe-ipc Rust unit tests (subscribe telemetry push frames/missing channels -32600/unsubscribe stops push/stdio cross-connection broadcast + existing health/unknown/malformed/execute/stream) +3 Python tests (subscribe telemetry push frames/stdio cross-connection broadcast/unknown channel ValueError); tests use `UnixStream::into_split()` → `(OwnedReadHalf, OwnedWriteHalf)` to avoid borrow-after-move
+    - Exit gate: 120 Rust + 70 Python (6 skip TCC) tests green; clippy `--all-targets -D warnings` clean (only upstream block v0.1.6); fmt/ruff clean; maturin builds
+- **v1.5 complete** (#12 diagnostics-slicer language expansion + #13 more GUI actions + #14 bidirectional IPC server-push) — 120 Rust + 70 Python (6 skip TCC) tests green; 10 crates; clippy `--all-targets -D warnings` clean (only upstream block v0.1.6 future-incompat); `cargo fmt --check` + `ruff check/format` clean; `maturin develop --release` builds. Zero new unsafe (#13/#14 both use safe wrappers). Next: v1.6 or as needed.

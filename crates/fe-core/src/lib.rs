@@ -35,12 +35,19 @@ pub use fe_tools::{
     EditResult as ToolsEditResult, GlobEntry as ToolsGlobEntry, GrepMatch as ToolsGrepMatch,
 };
 
-// BLOCKING_RT — 多线程 1 worker，避免 asyncio 调用者嵌套 runtime panic
-// 模式源自 fusion-design/crates/fd-ai-adapter/src/lib.rs:251-257
-// P-CORE-01: 显式 worker_threads(1) 对齐注释 (Runtime::new() 实为 num_cpus)
+// BLOCKING_RT — 多线程 N worker (CPU 核心数, 下限 2), 并发执行 sandbox/telemetry/IPC 任务
+// 审计 Blocker 5 / 1.2: 原 worker_threads(1) 全局串行 → execute + telemetry + IPC 请求互相阻塞
+// 解法: worker_threads(N) 提升并行度。仍是单一全局 runtime (LazyLock), 不会嵌套 runtime panic
+// (asyncio 调用方在 Python 侧, 此 runtime 独立; N 提升只增线程池大小, 无嵌套问题)
+// 模式源自 fusion-design/crates/fd-ai-adapter/src/lib.rs
 pub static BLOCKING_RT: LazyLock<Runtime> = LazyLock::new(|| {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let workers = workers.max(2);
+    info!(workers, "BLOCKING_RT 初始化多线程 runtime");
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(workers)
         .enable_all()
         .build()
         .expect("failed to build BLOCKING_RT")
@@ -66,6 +73,10 @@ pub struct ExecutionRequest {
     pub enable_rollback_snapshot: bool,
     #[serde(default)]
     pub auto_rollback_policy: Option<RollbackPolicy>,
+    /// Blocker 1 / 1.1: macOS seatbelt 运行时隔离 — sandbox-exec 包装子进程 (禁网 + 危险二进制 execve deny)。
+    /// 默认 false — 调用方显式开启; 透传 SandboxConfig.seatbelt。
+    #[serde(default)]
+    pub seatbelt: bool,
 }
 
 fn default_timeout() -> f64 {
@@ -440,8 +451,9 @@ impl Executor {
             env,
             timeout_sec: req.timeout_sec,
             max_output_chars: 100_000,
+            seatbelt: req.seatbelt,
         };
-        info!("execute_async — 沙箱执行");
+        info!(seatbelt = req.seatbelt, "execute_async — 沙箱执行");
         let sb = self.sandbox.run(sb_cfg).await?;
 
         // 诊断切片 — exit_code != 0 且非拦截/超时时填充 (PRD §4.2)
@@ -575,8 +587,9 @@ impl Executor {
             env,
             timeout_sec: req.timeout_sec,
             max_output_chars: 100_000,
+            seatbelt: req.seatbelt,
         };
-        info!("execute_streaming — 沙箱流式执行");
+        info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg)?;
 
         let slicer = self.slicer.clone();
@@ -695,6 +708,7 @@ mod tests {
                 env_vars: None,
                 enable_rollback_snapshot: false,
                 auto_rollback_policy: None,
+                seatbelt: false,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut combined = String::new();
@@ -726,6 +740,7 @@ mod tests {
                 env_vars: None,
                 enable_rollback_snapshot: false,
                 auto_rollback_policy: None,
+                seatbelt: false,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut frames = 0;
@@ -756,6 +771,7 @@ mod tests {
                 env_vars: None,
                 enable_rollback_snapshot: false,
                 auto_rollback_policy: None,
+                seatbelt: false,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -783,6 +799,7 @@ mod tests {
                 env_vars: None,
                 enable_rollback_snapshot: false,
                 auto_rollback_policy: None,
+                seatbelt: false,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -832,6 +849,7 @@ mod tests {
                 env_vars: None,
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: Some(RollbackPolicy::default()),
+                seatbelt: false,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -858,6 +876,7 @@ mod tests {
                 env_vars: None,
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: Some(RollbackPolicy::default()),
+                seatbelt: false,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -882,6 +901,7 @@ mod tests {
                 env_vars: None,
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: None,
+                seatbelt: false,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -914,6 +934,7 @@ mod tests {
                 env_vars: None,
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: Some(RollbackPolicy::default()),
+                seatbelt: false,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();

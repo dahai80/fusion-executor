@@ -23,16 +23,134 @@
 //            不变量由 test_stash_list_stays_empty_across_rollback_cycles 守护.
 
 use anyhow::{Context, Result};
+use fe_security::SecurityGuard;
+use fs2::FileExt;
+use std::fs::OpenOptions;
 use tokio::process::Command;
 use tracing::{info, warn};
 
+/// FNV-1a 64-bit (无外部 hash 依赖, 稳定跨节点)。repo 路径 → 16-hex 标识。
+fn fnv1a_64(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", h)
+}
+
+/// 仓库稳定标识 (审计 2.7c / Blocker 9): 跨节点 NFS 共享 cwd 时, 各节点看到的
+/// `.git` 目录物理路径一致 → canonicalize 后 FNV 哈希一致。节点 A 快照含 repo:<hash>,
+/// 节点 B 回滚前比对 — 不匹配则拒绝 (防盲回滚到错误内容)。无 .git / 解析失败 → ""。
+async fn repo_id(cwd: &str) -> String {
+    // git rev-parse --git-common-dir: 对 worktree 返公共 .git, 对 bare repo 返自身。
+    // canonicalize 该路径 → NFS 各节点同物理路径得同哈希。
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .await;
+    let git_dir = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return String::new(),
+    };
+    if git_dir.is_empty() {
+        return String::new();
+    }
+    // 相对路径 (worktree 内常见 "gitdir: ..." 或 ".git") → 以 cwd 为基解析
+    let base = std::path::Path::new(cwd);
+    let p = std::path::Path::new(&git_dir);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    };
+    match std::fs::canonicalize(&resolved) {
+        Ok(canonical) => fnv1a_64(&canonical.to_string_lossy()),
+        Err(_) => fnv1a_64(&resolved.to_string_lossy()),
+    }
+}
+
+/// 进程级锁 (审计 2.7a / Blocker 9): 同 cwd 的 snapshot_create/rollback 互斥,
+/// 防 Agent A reset → Agent B reset(no-op) → A apply → B apply 双应用冲突。
+/// BSD flock 关联 fd, drop File → close fd → 自动释放。锁文件 `<git_dir>/fe-rollback.lock`。
+struct RepoLock {
+    // 持 fd 即持锁 (同 fe-tools FileLock 模式); 字段不读, 存在 = 锁生命周期。
+    #[allow(dead_code)]
+    file: std::fs::File,
+}
+
+impl RepoLock {
+    fn acquire(cwd: &str) -> Result<Self> {
+        let git_dir = std::path::Path::new(cwd).join(".git");
+        if !git_dir.exists() {
+            // 非 worktree repo (bare) 或 .git 缺 — 锁无意义, 返空锁占位 (no-op)。
+            // 调用方仅靠 is_repo 守卫; 此处不拦 (validate_cwd + is_repo 已前置于)。
+            return Ok(RepoLock {
+                file: OpenOptions::new()
+                    .read(true)
+                    .open("/dev/null")
+                    .context("打开 /dev/null 占位锁失败")?,
+            });
+        }
+        let lock_path = git_dir.join("fe-rollback.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .with_context(|| format!("打开回滚锁失败: {}", lock_path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("获取回滚锁失败 (另一回滚进行中): {}", lock_path.display()))?;
+        info!(cwd, lock = %lock_path.display(), "回滚进程锁已获取");
+        Ok(RepoLock { file })
+    }
+}
+
 /// 回滚管理器 — git CLI shell
-pub struct RollbackManager;
+pub struct RollbackManager {
+    guard: SecurityGuard,
+}
 
 impl RollbackManager {
     pub fn new() -> Self {
         info!("RollbackManager::new()");
-        Self
+        Self {
+            guard: SecurityGuard::new(),
+        }
+    }
+
+    /// cwd 校验 (审计 Blocker 4 / 1.3): 回滚路径接 fe-security
+    /// 拒绝: 空 cwd / .. 组件 / 敏感路径 (/etc /System ~/.ssh ...)
+    /// canonicalize 后再校验, 防符号链接旁路
+    fn validate_cwd(&self, cwd: &str) -> Result<()> {
+        if cwd.trim().is_empty() {
+            warn!("空 cwd, 拒绝回滚 (防越权 reset)");
+            anyhow::bail!("cwd 为空, 拒绝执行回滚操作");
+        }
+        if std::path::Path::new(cwd)
+            .components()
+            .any(|comp| comp == std::path::Component::ParentDir)
+        {
+            warn!(cwd, "cwd 含 .. 组件, 拒绝 (逃逸嫌疑)");
+            anyhow::bail!("cwd 含 .. 组件, 拒绝: {}", cwd);
+        }
+        let v_lit = self.guard.validate_cwd(cwd);
+        if !v_lit.allowed {
+            let reason = v_lit.reason.unwrap_or_default();
+            warn!(cwd, %reason, "cwd 字面量校验拦截");
+            anyhow::bail!("cwd 校验失败: {}", reason);
+        }
+        if let Ok(canonical) = std::fs::canonicalize(cwd) {
+            let v_can = self.guard.validate_cwd(&canonical.to_string_lossy());
+            if !v_can.allowed {
+                let reason = v_can.reason.unwrap_or_default();
+                warn!(cwd = %canonical.display(), %reason, "cwd canonicalize 校验拦截 (符号链接旁路)");
+                anyhow::bail!("cwd 校验失败 (符号链接解析): {}", reason);
+            }
+        }
+        Ok(())
     }
 
     async fn git(cwd: &str, args: &[&str]) -> Result<String> {
@@ -81,32 +199,59 @@ impl RollbackManager {
     ///   "head:<SHA>" 工作区干净, 基线 = HEAD
     ///   "stash:<SHA>,base:<HEAD>" 有改动, stash SHA + 基线 HEAD (rollback 用 reset --hard <base>)
     pub async fn snapshot_create(&self, cwd: &str) -> Result<String> {
+        self.validate_cwd(cwd)?;
         if !Self::is_repo(cwd).await {
             info!(cwd, "非 git repo, 跳过快照");
             return Ok(String::new());
         }
+        // Blocker 9 (审计 2.7a): 进程级锁防并发双应用冲突。
+        let _lock = RepoLock::acquire(cwd)?;
         let head = Self::git(cwd, &["rev-parse", "HEAD"]).await?;
         let stash = Self::git(cwd, &["stash", "create"]).await?;
+        // Blocker 9 (审计 2.7c): repo:<hash> 标识 — 跨节点回滚前比对。
+        let repo = repo_id(cwd).await;
+        let repo_tag = if repo.is_empty() {
+            String::new()
+        } else {
+            format!(",repo:{}", repo)
+        };
         if stash.is_empty() {
             info!(cwd, %head, "无改动, 快照 = head 基线");
-            return Ok(format!("head:{}", head));
+            return Ok(format!("head:{}{}", head, repo_tag));
         }
-        let id = format!("stash:{},base:{}", stash, head);
-        info!(cwd, %id, "快照创建 = stash + 基线");
+        let id = format!("stash:{},base:{}{}", stash, head, repo_tag);
+        info!(cwd, %id, "快照创建 = stash + 基线 + repo 标识");
         Ok(id)
     }
 
-    /// 解析 snapshot_id 为 (kind, stash_sha, baseline)
-    /// kind: "head" | "stash"
-    fn parse_snapshot(id: &str) -> Option<(&'static str, Option<&str>, Option<&str>)> {
+    /// 从 "core[,repo:<hash>]" 分离 core 与 repo tag。
+    /// repo:<hash> 仅出现在末尾 (snapshot_create 追加), 故 rsplit_once ",repo:" 安全。
+    /// 返回 (core: &str, repo: Option<&str>); 无 repo tag → core=原串, repo=None。
+    fn split_repo_tag(s: &str) -> (&str, Option<&str>) {
+        match s.rsplit_once(",repo:") {
+            Some((core, repo)) => (core, Some(repo)),
+            None => (s, None),
+        }
+    }
+
+    /// 解析 snapshot_id 为 (kind, stash_sha, baseline, repo_tag)
+    /// kind: "head" | "stash"; repo_tag: Option<&str> (Blocker 9 新增, 可缺)
+    #[allow(clippy::type_complexity)]
+    fn parse_snapshot(
+        id: &str,
+    ) -> Option<(&'static str, Option<&str>, Option<&str>, Option<&str>)> {
         if let Some(rest) = id.strip_prefix("head:") {
-            return Some(("head", None, Some(rest)));
+            // head:<SHA>[,repo:<hash>]
+            let (sha, repo) = Self::split_repo_tag(rest);
+            let sha = if sha.is_empty() { None } else { Some(sha) };
+            return Some(("head", None, sha, repo));
         }
         if let Some(rest) = id.strip_prefix("stash:") {
-            // stash:<SHA>,base:<HEAD>
-            let (stash, base) = rest.split_once(",base:").unwrap_or((rest, ""));
+            // stash:<SHA>,base:<HEAD>[,repo:<hash>]
+            let (core, repo) = Self::split_repo_tag(rest);
+            let (stash, base) = core.split_once(",base:").unwrap_or((core, ""));
             let base = if base.is_empty() { None } else { Some(base) };
-            return Some(("stash", Some(stash), base));
+            return Some(("stash", Some(stash), base, repo));
         }
         None
     }
@@ -116,23 +261,41 @@ impl RollbackManager {
     /// stash 快照: git reset --hard <baseline> + git stash apply <SHA> (C-RB-02, 恢复快照)
     /// ref 经 is_valid_ref 校验 (C-RB-03); 不用 -- (ref 位 -- 把 ref 当 pathspec → no-op)
     pub async fn rollback(&self, snapshot_id: &str, cwd: &str) -> Result<bool> {
+        self.validate_cwd(cwd)?;
         if !Self::is_repo(cwd).await {
             warn!(cwd, "非 git repo, 无法回滚");
             return Ok(false);
         }
+        // Blocker 9 (审计 2.7b): 空 snapshot_id — 旧版 checkout -- . 静默清空 WIP。
+        // cwd 实是 repo (竞态: snapshot_create 返空因 git 临时不可用), 此处 fail-loud
+        // 拒绝, 不丢用户工作。调用方应重试 snapshot_create 或显式决定。
         if snapshot_id.is_empty() {
-            warn!(cwd, "空 snapshot_id, 仅 reset 工作区");
-            // 无基线 → 仅丢弃工作区改动 (保守: 不 reset --hard HEAD 避误删已暂存)
-            Self::git(cwd, &["checkout", "--", "."]).await?;
-            return Ok(true);
+            warn!(cwd, "空 snapshot_id, 拒绝回滚 (防静默清空 WIP, 审计 2.7b)");
+            return Ok(false);
         }
-        let (kind, stash, base) = match Self::parse_snapshot(snapshot_id) {
+        // Blocker 9 (审计 2.7a): 进程级锁防并发回滚双应用冲突。
+        let _lock = RepoLock::acquire(cwd)?;
+        let (kind, stash, base, repo_tag) = match Self::parse_snapshot(snapshot_id) {
             Some(v) => v,
             None => {
                 warn!(%snapshot_id, cwd, "无法解析 snapshot_id, 跳过回滚");
                 return Ok(false);
             }
         };
+        // Blocker 9 (审计 2.7c): repo:<hash> 比对 — 快照含 repo 标识时, cwd 仓库哈希须匹配。
+        // 不匹配 = 节点 A 快照传到节点 B / cwd 被换 → 拒绝 (防盲回滚到错误内容)。
+        if let Some(expected) = repo_tag {
+            let actual = repo_id(cwd).await;
+            if actual.is_empty() {
+                warn!(cwd, %expected, "cwd repo 标识不可解析, 拒绝 (无法验证跨节点一致性)");
+                return Ok(false);
+            }
+            if actual != expected {
+                warn!(cwd, %expected, %actual, "snapshot_id repo 标识不匹配 cwd, 拒绝 (跨节点防盲回滚)");
+                return Ok(false);
+            }
+            info!(cwd, %expected, "repo 标识匹配, 允许回滚");
+        }
         match kind {
             "head" => {
                 // C-RB-02: 单步 reset --hard <baseline> (替代 checkout -- . + stash apply)
@@ -193,6 +356,7 @@ impl RollbackManager {
     /// 单文件回滚 — git checkout -- <path> (PRD "单文件 checkout")
     /// C-RB-03: -- 隔离 pathspec (path 形如 --foo 不被当 flag; path 是 pathspec 位, -- 正确)
     pub async fn rollback_file(&self, path: &str, cwd: &str) -> Result<bool> {
+        self.validate_cwd(cwd)?;
         if !Self::is_repo(cwd).await {
             warn!(cwd, "非 git repo, 无法回滚单文件");
             return Ok(false);
@@ -420,14 +584,28 @@ mod tests {
     // parse_snapshot + is_valid_ref 单元
     #[test]
     fn parse_snapshot_and_ref_validation() {
-        let (k, s, b) = RollbackManager::parse_snapshot("head:abc123").unwrap();
+        let (k, s, b, repo) = RollbackManager::parse_snapshot("head:abc123").unwrap();
         assert_eq!(k, "head");
         assert!(s.is_none());
         assert_eq!(b, Some("abc123"));
-        let (k, s, b) = RollbackManager::parse_snapshot("stash:st1,base:he2").unwrap();
+        assert!(repo.is_none(), "无 repo 标识应 None");
+        let (k, s, b, repo) = RollbackManager::parse_snapshot("stash:st1,base:he2").unwrap();
         assert_eq!(k, "stash");
         assert_eq!(s, Some("st1"));
         assert_eq!(b, Some("he2"));
+        assert!(repo.is_none());
+        // Blocker 9: 含 repo:<hash> 四元组
+        let (k, _s, b, repo) =
+            RollbackManager::parse_snapshot("head:abc123,repo:deadbeef").unwrap();
+        assert_eq!(k, "head");
+        assert_eq!(b, Some("abc123"));
+        assert_eq!(repo, Some("deadbeef"));
+        let (k, s, b, repo) =
+            RollbackManager::parse_snapshot("stash:st1,base:he2,repo:cafe").unwrap();
+        assert_eq!(k, "stash");
+        assert_eq!(s, Some("st1"));
+        assert_eq!(b, Some("he2"));
+        assert_eq!(repo, Some("cafe"));
         assert!(RollbackManager::parse_snapshot("garbage").is_none());
         assert!(RollbackManager::parse_snapshot("--foo").is_none());
         // is_valid_ref
@@ -463,5 +641,173 @@ mod tests {
         RollbackManager::git(cwd, &["stash", "list"])
             .await
             .unwrap_or_default()
+    }
+
+    // ── Blocker 4 (审计 1.3): 回滚路径接 fe-security ──
+
+    #[tokio::test]
+    async fn snapshot_rejects_empty_cwd() {
+        let mgr = RollbackManager::new();
+        let err = mgr.snapshot_create("").await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("空"), "空 cwd 应拒: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_dotdot_cwd() {
+        let mgr = RollbackManager::new();
+        let err = mgr.snapshot_create("/tmp/foo/../bar").await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains(".."), "含 .. 的 cwd 应拒: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_sensitive_cwd() {
+        let mgr = RollbackManager::new();
+        let err = mgr.snapshot_create("/etc").await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("敏感"), "敏感路径 /etc 应拒: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_sensitive_cwd() {
+        let dir = tmp_repo("sens");
+        let cwd = dir.to_str().unwrap();
+        fs::write(dir.join("app.py"), "v1\n").unwrap();
+        git_commit(&dir, &["add", "app.py"], "base");
+        let mgr = RollbackManager::new();
+        let snap = mgr.snapshot_create(cwd).await.unwrap();
+        assert!(!snap.is_empty());
+        // /etc → validate_cwd 先拒 (敏感路径), is_repo 不会执行, 返回 Err
+        let err = mgr.rollback(&snap, "/etc").await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("敏感"), "/etc 应被 validate_cwd 拒: {}", msg);
+        // /tmp/正常 repo → validate 通过, 回滚成功
+        assert!(
+            mgr.rollback(&snap, cwd).await.unwrap(),
+            "正常 repo 应可回滚"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rollback_file_rejects_empty_cwd() {
+        let mgr = RollbackManager::new();
+        let err = mgr.rollback_file("a.py", "").await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("空"), "空 cwd 应拒: {}", msg);
+    }
+
+    // ── Blocker 9 (审计 2.7): 跨节点 registry + 进程锁 ──
+
+    // 2.7b: 空 snapshot_id fail-loud (旧版 checkout -- . 静默清空 WIP)
+    #[tokio::test]
+    async fn rollback_rejects_empty_snapshot_id_fail_loud() {
+        let dir = tmp_repo("empty-id");
+        let cwd = dir.to_str().unwrap();
+        fs::write(dir.join("app.py"), "v1\n").unwrap();
+        git_commit(&dir, &["add", "app.py"], "base");
+        // WIP 改动待保留
+        fs::write(dir.join("app.py"), "WIP-重要工作\n").unwrap();
+        let mgr = RollbackManager::new();
+        // 空 snapshot_id → 拒绝 (返 false), 不静默清空 WIP
+        let ok = mgr.rollback("", cwd).await.unwrap();
+        assert!(!ok, "空 snapshot_id 应拒绝回滚");
+        // WIP 未被破坏
+        assert_eq!(
+            fs::read_to_string(dir.join("app.py")).unwrap(),
+            "WIP-重要工作\n",
+            "空 id 回滚拒绝时 WIP 应保留"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 2.7c: repo:<hash> 标识不匹配 → 拒绝 (跨节点防盲回滚)
+    // 模拟: snapshot 含 repo:<hash> 但 cwd 仓库的 hash 不同 (伪造 snapshot_id)
+    #[tokio::test]
+    async fn rollback_rejects_repo_tag_mismatch() {
+        let dir = tmp_repo("repo-mismatch");
+        let cwd = dir.to_str().unwrap();
+        fs::write(dir.join("app.py"), "v1\n").unwrap();
+        git_commit(&dir, &["add", "app.py"], "base");
+        let mgr = RollbackManager::new();
+        // 真 snapshot (含正确 repo 标识)
+        let snap = mgr.snapshot_create(cwd).await.unwrap();
+        assert!(snap.contains(",repo:"), "snapshot 应含 repo 标识: {}", snap);
+        // 正确 snapshot → 可回滚
+        fs::write(dir.join("app.py"), "WORSE\n").unwrap();
+        assert!(
+            mgr.rollback(&snap, cwd).await.unwrap(),
+            "正确 repo 标识应可回滚"
+        );
+        // 伪造: 替换 repo:<hash> 为假哈希 → 拒绝
+        let fake = "head:deadbeefdeadbeef,repo:0000000000000000".to_string();
+        fs::write(dir.join("app.py"), "WORSE2\n").unwrap();
+        let ok = mgr.rollback(&fake, cwd).await.unwrap();
+        assert!(!ok, "repo 标识不匹配应拒绝回滚");
+        // 文件未被回滚 (仍是 WORSE2)
+        assert_eq!(
+            fs::read_to_string(dir.join("app.py")).unwrap(),
+            "WORSE2\n",
+            "repo 不匹配拒绝时工作区应不动"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 2.7c: 无 repo 标识的旧 snapshot_id (向后兼容) → 放行 (不比对)
+    #[tokio::test]
+    async fn rollback_allows_legacy_snapshot_without_repo_tag() {
+        let dir = tmp_repo("legacy");
+        let cwd = dir.to_str().unwrap();
+        fs::write(dir.join("app.py"), "v1\n").unwrap();
+        git_commit(&dir, &["add", "app.py"], "base");
+        let mgr = RollbackManager::new();
+        // 取真实 HEAD SHA 构造无 repo 标识的 legacy id
+        let head = RollbackManager::git(cwd, &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        let legacy = format!("head:{}", head);
+        assert!(
+            !legacy.contains(",repo:"),
+            "legacy id 无 repo 标识: {}",
+            legacy
+        );
+        // 新提交前进基线
+        fs::write(dir.join("app.py"), "v2\n").unwrap();
+        git_commit(&dir, &["add", "app.py"], "v2");
+        // legacy id 无 repo 标识 → 放行 (向后兼容, 不比对)
+        assert!(
+            mgr.rollback(&legacy, cwd).await.unwrap(),
+            "无 repo 标识的 legacy id 应放行"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("app.py")).unwrap(),
+            "v1\n",
+            "legacy 回滚恢复到基线 v1"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 2.7a: 进程锁 — 并发 snapshot_create + rollback 串行化 (锁文件落盘)
+    #[tokio::test]
+    async fn process_lock_file_created_and_released() {
+        let dir = tmp_repo("lock");
+        let cwd = dir.to_str().unwrap();
+        fs::write(dir.join("app.py"), "v1\n").unwrap();
+        git_commit(&dir, &["add", "app.py"], "base");
+        let mgr = RollbackManager::new();
+        // snapshot_create 持锁期间锁文件应存在 (acquire 后立即检查)
+        let snap = mgr.snapshot_create(cwd).await.unwrap();
+        assert!(!snap.is_empty());
+        // snapshot_create 返回后锁已释放 (drop), 但锁文件本身保留 (create=true)
+        let lock_path = dir.join(".git").join("fe-rollback.lock");
+        assert!(lock_path.exists(), "锁文件应保留在 .git/fe-rollback.lock");
+        // rollback 应能再次获取锁 (前次已释放)
+        fs::write(dir.join("app.py"), "WORSE\n").unwrap();
+        assert!(
+            mgr.rollback(&snap, cwd).await.unwrap(),
+            "锁释放后 rollback 应成功"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

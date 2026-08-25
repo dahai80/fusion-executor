@@ -45,6 +45,7 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
         auto_rollback: RollbackPolicy | None = None,
+        seatbelt: bool = False,
     ) -> ExecutionResult:
         # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
         if not isinstance(command, str):
@@ -69,6 +70,7 @@ class FusionSandboxExecutor:
             env_vars,
             enable_rollback_snapshot,
             policy_dict,
+            seatbelt,
         )
         diag = None
         if native.diagnostics is not None:
@@ -121,6 +123,7 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
         auto_rollback: RollbackPolicy | None = None,
+        seatbelt: bool = False,
     ) -> Iterator[str | ExecutionResult]:
         # M-PY-01: 同 run() 前置校验
         if not isinstance(command, str):
@@ -137,6 +140,7 @@ class FusionSandboxExecutor:
             env_vars,
             enable_rollback_snapshot,
             policy_dict,
+            seatbelt,
         )
         for frame in it:
             # L-PY-02: 严格键 (旧 .get(default) 吞 serde bug, 缺字段静默成功看像 blocked)
@@ -297,14 +301,10 @@ class FusionSandboxExecutor:
         logger.debug("telemetry_stream interval_ms=%s max_samples=%s", interval_ms, max_samples)
         it = self._native.telemetry_stream(interval_ms, max_samples)
         for count, frame in enumerate(it, start=1):
-            sample = TelemetrySample(
-                ts_ms=frame.get("ts_ms", 0),
-                cpu_pct=frame.get("cpu_pct", 0.0),
-                mem_mb=frame.get("mem_mb", 0.0),
-                gpu_pct=frame.get("gpu_pct"),
-                gpu_mem_mb=frame.get("gpu_mem_mb"),
-                task_id=frame.get("task_id"),
-            )
+            # 3.11: 严格 model_validate (旧 frame.get("ts_ms", 0) 默认 0 — Rust 改字段名/
+            # serde bug 时静默吞缺失字段, ts_ms=0/cpu=0 假数据进融合)。Blocker 11 _STRICT
+            # extra=forbid; 缺必填 ts_ms/cpu_pct/mem_mb → ValidationError fail-loud。
+            sample = TelemetrySample.model_validate(frame)
             logger.debug("telemetry sample #%s cpu=%.1f%% mem=%.1fMB", count, sample.cpu_pct, sample.mem_mb)
             yield sample
 
@@ -315,8 +315,17 @@ class FusionSandboxExecutor:
         sock_path: str | None = None,
         interval_ms: int | None = None,
         screenshot_interval_ms: int | None = None,
+        scope: str | list[str] = "own_conn",
+        idle_timeout: float | None = None,
     ) -> Subscription:
-        logger.info("subscribe channels=%s sock=%s interval_ms=%s", channels, sock_path, interval_ms)
+        logger.info(
+            "subscribe channels=%s sock=%s interval_ms=%s scope=%s idle_timeout=%s",
+            channels,
+            sock_path,
+            interval_ms,
+            scope,
+            idle_timeout,
+        )
         # M-PY-03: 空通道列表显式拒 (旧版 bad 检查空列表无 bad 项 → 过 → 开订阅无通道
         # 兴趣 → 永不收推送 → __next__ 阻塞 15s 后 TimeoutError 非 StopIteration)
         if not channels:
@@ -324,8 +333,14 @@ class FusionSandboxExecutor:
         bad = [c for c in channels if c not in SUB_CHANNELS]
         if bad:
             raise ValueError(f"未知通道: {bad}, 可选 {list(SUB_CHANNELS)}")
+        # scope 仅对 stdio 通道生效 (Blocker 10, 破审计 §2.9 跨租户泄漏):
+        #   "all" → 全广播; ["id1",..] → task_id 白名单; "own_conn" (默认) → 仅本连接命令
+        if scope not in ("all", "own_conn") and not isinstance(scope, list):
+            raise ValueError("scope 须为 'all' | 'own_conn' | task_id 列表")
+        # 3.13: idle_timeout None = 无超时 (长流消费者); 数值 = recv 超时秒数 (旧版硬编 15s,
+        # 慢推送 >15s → 误 StopIteration)。订阅握手必用有限超时, 之后再切 idle_timeout。
         path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
-        sub = Subscription(path, channels, interval_ms, screenshot_interval_ms)
+        sub = Subscription(path, channels, interval_ms, screenshot_interval_ms, scope, idle_timeout)
         sub._open()
         return sub
 
@@ -334,6 +349,9 @@ class FusionSandboxExecutor:
         # 句柄, SIGINT/SIGTERM 不解 socket 残留。改信号处理 + try/finally 清理:
         # 注册 SIGINT/SIGTERM → 触发 KeyboardInterrupt 跳出 serve_blocking, finally
         # os.unlink 残留 socket。serve_blocking 阻塞 recv, 信号在主线程中断。
+        # 3.15: 解析 path (env/default) 后统一传给 Rust — 旧版传原始 sock_path (可能 None),
+        # 与 finally 清理用的 path (env 解析) 不同源, 虽 Rust 亦解析 env 凑巧一致, 但显式
+        # 传 path 消除隐式 env 依赖, 清理与监听严格同一路径。
         path = sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
         logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (信号可停)", path)
         old_int = signal.getsignal(signal.SIGINT)
@@ -342,7 +360,7 @@ class FusionSandboxExecutor:
         signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
         try:
-            self._native.serve(sock_path)
+            self._native.serve(path)
         except KeyboardInterrupt:
             raised = True
             logger.info("serve 收到停机信号, 关闭服务器")
@@ -366,17 +384,23 @@ class Subscription:
         channels: list[str],
         interval_ms: int | None,
         screenshot_interval_ms: int | None,
+        scope: str | list[str] = "own_conn",
+        idle_timeout: float | None = None,
     ) -> None:
         self._sock_path = sock_path
         self._channels = channels
         self._interval_ms = interval_ms
         self._screenshot_interval_ms = screenshot_interval_ms
+        self._scope = scope
+        # 3.13: idle_timeout None = 流期间无 recv 超时 (长流消费者不误断); 握手用固定 15s。
+        self._idle_timeout = idle_timeout
         self._sock: socket.socket | None = None
         self._sub_id: str | None = None
         self._buf = b""
 
     def _open(self) -> None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # 握手阶段固定 15s 超时 (subscribe 响应应秒级回)
         sock.settimeout(15.0)
         sock.connect(self._sock_path)
         self._sock = sock
@@ -385,6 +409,11 @@ class Subscription:
             params["interval_ms"] = self._interval_ms
         if self._screenshot_interval_ms is not None:
             params["screenshot_interval_ms"] = self._screenshot_interval_ms
+        # Blocker 10: stdio 作用域透传 (all=true / task_ids=[..] / 默认 own_conn)
+        if self._scope == "all":
+            params["all"] = True
+        elif isinstance(self._scope, list):
+            params["task_ids"] = self._scope
         req = {"jsonrpc": "2.0", "id": 1, "method": "executor.subscribe", "params": params}
         sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
         resp = self._read_json()
@@ -392,7 +421,11 @@ class Subscription:
             err = resp.get("error") if resp else None
             raise RuntimeError(f"subscribe 失败: {err}")
         self._sub_id = resp["result"]["subscription_id"]
-        logger.info("subscribe ok sub_id=%s channels=%s", self._sub_id, self._channels)
+        # 3.13: 握手成功后切到 idle_timeout (None=阻塞无超时, 或用户设的秒数)
+        sock.settimeout(self._idle_timeout)
+        logger.info(
+            "subscribe ok sub_id=%s channels=%s idle_timeout=%s", self._sub_id, self._channels, self._idle_timeout
+        )
 
     def _read_json(self) -> dict | None:
         assert self._sock is not None

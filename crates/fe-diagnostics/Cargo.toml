@@ -13,6 +13,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 regex.workspace = true
 tracing.workspace = true
+fe-security.workspace = true
 tree-sitter.workspace = true
 tree-sitter-python.workspace = true
 tree-sitter-javascript.workspace = true

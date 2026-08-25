@@ -23,6 +23,7 @@ tree-sitter-typescript.workspace = true
 tree-sitter-rust.workspace = true
 fe-security.workspace = true
 tempfile = "3"
+fs2.workspace = true
 
 [lints]
 workspace = true

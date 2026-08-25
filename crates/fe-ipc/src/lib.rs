@@ -20,7 +20,7 @@
 //   通道源 (hub 内 lazy 启停, 0 订阅自退):
 //     telemetry — 单一 executor.telemetry_stream 扇出给所有 telemetry 订阅 (10Hz 默认)。
 //     screenshot — 周期 executor.gui_action(Screenshot), TCC 未授权 → 帧 data.ok=false 不崩。
-//     stdio — execute/execute_stream 处理器扇出 chunk/done 给所有 stdio 订阅 (跨连接广播)。
+//     stdio — execute/execute_stream 处理器扇出 chunk/done, 按 per-sub scope 过滤 (Blocker 10, 默认 own_conn)。
 //   unsubscribe {subscription_id} → 停该订阅; 连接断开 → 清该连接所有订阅。
 
 use std::collections::{HashMap, HashSet};
@@ -63,15 +63,42 @@ const DEFAULT_SCREENSHOT_INTERVAL_MS: u64 = 1000;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// 并发连接上限 — 防 accept 无限累积 DoS (C-IPC-05)
 const MAX_CONNECTIONS: usize = 64;
+/// 审计 2.11: 并发 **执行** 上限 — 连接信号量限连接非限执行 (64 连接各跑 cargo build = 64 并发子进程超额)。
+/// 独立执行信号量限真实子进程并发, 与连接数解耦。8 核机 16 并发重命令留 2x 余量。
+const MAX_CONCURRENT_EXECS: usize = 16;
 /// 单连接 idle 读超时 — 防 slowloris 占连接不读 (C-IPC-05)
 const IDLE_READ_TIMEOUT_SECS: u64 = 30;
 /// 截图 b64 帧上限 (4MB) — 超此降级去 png_b64 防 N 订阅内存堆积 (P-IPC-03)
 const MAX_SCREENSHOT_B64_BYTES: usize = 4 * 1024 * 1024;
 
+/// stdio 订阅作用域 (审计 2.9 / Blocker 10) — per-sub 过滤防跨租户泄漏。
+/// 默认 OwnConn: 仅收本连接发起命令的 stdio (多租户隔离基线)。
+/// All: 收全部 (向后兼容 dashboard 场景, 显式 opt-in)。
+/// Tasks: 仅收白名单 task_id 的 stdio (跨连接精确订阅)。
+#[derive(Clone)]
+enum StdioScope {
+    All,
+    OwnConn(u64),
+    Tasks(HashSet<String>),
+}
+
+impl StdioScope {
+    /// 命令 (task_id + 发起连接 conn_id) 是否落本作用域。
+    /// source_conn = 命令发起连接 conn_id; scope 内 OwnConn 存订阅者自身 conn_id。
+    fn allows(&self, task_id: Option<&str>, source_conn: u64) -> bool {
+        match self {
+            StdioScope::All => true,
+            StdioScope::OwnConn(c) => *c == source_conn,
+            StdioScope::Tasks(set) => task_id.map(|t| set.contains(t)).unwrap_or(false),
+        }
+    }
+}
+
 /// 订阅者 — 一条连接可能持多个订阅, 共享该连接的 push tx
 struct Subscriber {
     conn_id: u64,
     channels: HashSet<String>,
+    scope: StdioScope,
     tx: mpsc::Sender<Value>,
 }
 
@@ -107,11 +134,12 @@ impl BroadcastHub {
     }
 
     /// 注册订阅 — 返回 subscription_id。channels 去重存小写。
-    /// interval_ms/screenshot_interval_ms 透传给源任务 (M-IPC-01)。
+    /// scope = stdio 作用域 (Blocker 10); interval_ms/screenshot_interval_ms 透传源任务 (M-IPC-01)。
     fn subscribe(
         self: &Arc<Self>,
         conn_id: u64,
         channels: HashSet<String>,
+        scope: StdioScope,
         tx: mpsc::Sender<Value>,
         interval_ms: u64,
         screenshot_interval_ms: u64,
@@ -126,6 +154,7 @@ impl BroadcastHub {
                 Subscriber {
                     conn_id,
                     channels,
+                    scope,
                     tx,
                 },
             );
@@ -217,7 +246,7 @@ impl BroadcastHub {
                 break;
             }
             let data = serde_json::to_value(&sample).unwrap_or(json!({}));
-            for (sub_id, tx) in targets {
+            for (sub_id, _scope, tx) in targets {
                 let frame = notification(sub_id.clone(), CH_TELEMETRY, data.clone());
                 if tx.try_send(frame).is_err() {
                     warn!(%sub_id, "遥测帧满通道被丢 (P-IPC-01)");
@@ -280,7 +309,7 @@ impl BroadcastHub {
                     json!({"ok": false, "error": format!("screenshot 任务失败: {e}")})
                 }
             };
-            for (sub_id, tx) in targets {
+            for (sub_id, _scope, tx) in targets {
                 let frame = notification(sub_id.clone(), CH_SCREENSHOT, data.clone());
                 if tx.try_send(frame).is_err() {
                     warn!(%sub_id, "截图帧满通道被丢 (P-IPC-01)");
@@ -289,19 +318,28 @@ impl BroadcastHub {
         }
     }
 
-    /// 收集某通道所有 (sub_id, tx) — 锁内快照, 锁外发送
-    fn collect_targets(&self, channel: &str) -> Vec<(String, mpsc::Sender<Value>)> {
+    /// 收集某通道所有 (sub_id, tx, scope) — 锁内快照, 锁外发送
+    fn collect_targets(&self, channel: &str) -> Vec<(String, StdioScope, mpsc::Sender<Value>)> {
         let reg = self.registry.lock().unwrap();
         reg.iter()
             .filter(|(_, s)| s.channels.contains(channel))
-            .map(|(id, s)| (id.clone(), s.tx.clone()))
+            .map(|(id, s)| (id.clone(), s.scope.clone(), s.tx.clone()))
             .collect()
     }
 
-    /// stdio 广播 — execute/execute_stream 处理器调, 扇出给所有 stdio 订阅
-    fn broadcast_stdio(&self, data: Value) {
+    /// stdio 广播 — execute/execute_stream 处理器调, 扇出给**通过 scope 过滤**的 stdio 订阅。
+    /// source_conn = 发起该命令的连接 conn_id (OwnConn 过滤用); data 含 task_id (Tasks 过滤用)。
+    /// Blocker 10 (审计 2.9): 旧版无过滤全广播 = 跨租户泄漏 (Agent A 见 Agent B stdout)。
+    fn broadcast_stdio(&self, data: Value, source_conn: u64) {
+        let task_id = data
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let targets = self.collect_targets(CH_STDIO);
-        for (sub_id, tx) in targets {
+        for (sub_id, scope, tx) in targets {
+            if !scope.allows(task_id.as_deref(), source_conn) {
+                continue;
+            }
             let frame = notification(sub_id.clone(), CH_STDIO, data.clone());
             if tx.try_send(frame).is_err() {
                 warn!(%sub_id, "stdio 帧满通道被丢 (P-IPC-01)");
@@ -453,6 +491,8 @@ async fn accept_loop(
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    // 审计 2.11: 执行信号量 — 限并发 **执行** (子进程) 非并发连接。全 server 共享, 与连接信号量解耦。
+    let exec_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_EXECS));
     loop {
         tokio::select! {
             biased;
@@ -473,8 +513,9 @@ async fn accept_loop(
                         };
                         let ex = executor.clone();
                         let h = hub.clone();
+                        let es = exec_sem.clone();
                         tokio::spawn(async move {
-                            handle_conn(stream, ex, h).await;
+                            handle_conn(stream, ex, h, es).await;
                             drop(permit);
                         });
                     }
@@ -490,7 +531,12 @@ async fn accept_loop(
 ///   push_task: 读 push_rx, server-push notification 写 locked writer
 ///   共享 writer = Arc<AsyncMutex<OwnedWriteHalf>>, 行写原子 (锁内 write_all)
 ///   连接断开 → 清订阅 + close push_task
-async fn handle_conn(stream: UnixStream, executor: Arc<Executor>, hub: Arc<BroadcastHub>) {
+async fn handle_conn(
+    stream: UnixStream,
+    executor: Arc<Executor>,
+    hub: Arc<BroadcastHub>,
+    exec_sem: Arc<Semaphore>,
+) {
     let conn_id = hub.next_conn_id();
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(AsyncMutex::new(writer));
@@ -532,14 +578,18 @@ async fn handle_conn(stream: UnixStream, executor: Arc<Executor>, hub: Arc<Broad
     });
 
     // read_task — 逐行分发 (带 1MB 上限 + idle 超时, C-IPC-04/C-IPC-05)
+    // 审计 2.12: 旧版 execute_stream/telemetry_stream 在 read_task 循环内 inline await,
+    // 流式期间不读下一行 → 单连接 subscribe 后 execute_stream 响应被阻到流结束。
+    // 解法: 每请求 spawn 独立任务 (单连接请求并发多路复用), read_task 持续读下一行不阻塞。
+    // 响应/流式帧写共享 Arc<AsyncMutex<Writer>> (锁内 write_all 原子), 跨任务写安全。
     let mut reader = BufReader::new(reader);
     let read_hub = hub.clone();
     let read_exec = executor.clone();
     let read_push_tx = push_tx.clone();
     let read_writer = writer.clone();
     let read_close = close_tx;
-    let mut read_active = true;
-    while read_active {
+    let mut req_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    loop {
         let line = match read_capped_line(&mut reader).await {
             Ok(Some(l)) => l,
             Ok(None) => break,
@@ -580,89 +630,123 @@ async fn handle_conn(stream: UnixStream, executor: Arc<Executor>, hub: Arc<Broad
             }
         };
         let req_id = parsed.get("id").cloned().unwrap_or(Value::Null);
-        let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let method = parsed
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
         let params = parsed.get("params").cloned().unwrap_or(Value::Null);
 
-        if method == "executor.execute_stream" {
-            if let Err(e) =
-                handle_execute_stream(&read_writer, req_id, params, &read_exec, &read_hub).await
-            {
-                warn!(error = %e, "execute_stream 写帧失败");
-                read_active = false;
-            }
-            continue;
-        }
-        if method == "executor.telemetry_stream" {
-            if let Err(e) = handle_telemetry_stream(&read_writer, req_id, params, &read_exec).await
-            {
-                warn!(error = %e, "telemetry_stream 写帧失败");
-                read_active = false;
-            }
-            continue;
-        }
-        if method == "executor.subscribe" {
-            handle_subscribe(
-                &read_writer,
-                req_id,
-                params,
-                conn_id,
-                &read_hub,
-                &read_push_tx,
-            )
-            .await;
-            continue;
-        }
-        if method == "executor.unsubscribe" {
-            handle_unsubscribe(&read_writer, req_id, params, &read_hub).await;
-            continue;
-        }
-
-        let resp = match handle_method(method, params, &read_exec, &read_hub).await {
-            Ok(r) => ok_resp(req_id, r),
-            Err((code, msg)) => err_resp(req_id, code, &msg),
-        };
-        let data = serde_json::to_string(&resp)
-            .unwrap_or_else(|_| err_str(Value::Null, ERR_INTERNAL, "响应序列化失败"))
-            + "\n";
-        let mut w = read_writer.lock().await;
-        if w.write_all(data.as_bytes()).await.is_err() {
-            read_active = false;
-        }
+        // 2.12: 每请求 spawn 任务, read_task 不阻塞。共享 writer 锁保证行写原子。
+        let w = read_writer.clone();
+        let ex = read_exec.clone();
+        let h = read_hub.clone();
+        let ptx = read_push_tx.clone();
+        let es = exec_sem.clone();
+        let handle = tokio::spawn(async move {
+            dispatch_request(&w, req_id, method, params, &ex, &h, conn_id, &ptx, &es).await;
+        });
+        req_tasks.push(handle);
     }
-    // 连接断开 — 清订阅 + 关 push_task
+    // 连接断开 — 等所有在飞请求任务收尾 (它们持 writer 锁写响应), 清订阅, 关 push_task
+    for t in req_tasks {
+        let _ = t.await;
+    }
     hub.drop_conn(conn_id);
     let _ = read_close.send(());
     let _ = push_handle.await;
 }
 
+/// 单请求分发 — 从 read_task spawn 调用 (审计 2.12 单连接请求多路复用)。
+/// execute 类方法 (execute/execute_stream) 取 exec_sem permit 限并发子进程 (审计 2.11)。
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_request(
+    writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
+    id: Value,
+    method: String,
+    params: Value,
+    executor: &Arc<Executor>,
+    hub: &Arc<BroadcastHub>,
+    conn_id: u64,
+    push_tx: &mpsc::Sender<Value>,
+    exec_sem: &Arc<Semaphore>,
+) {
+    if method == "executor.execute_stream" {
+        if let Err(e) =
+            handle_execute_stream(writer, id, params, executor, hub, conn_id, exec_sem).await
+        {
+            warn!(error = %e, "execute_stream 写帧失败");
+        }
+        return;
+    }
+    if method == "executor.telemetry_stream" {
+        if let Err(e) = handle_telemetry_stream(writer, id, params, executor).await {
+            warn!(error = %e, "telemetry_stream 写帧失败");
+        }
+        return;
+    }
+    if method == "executor.subscribe" {
+        handle_subscribe(writer, id, params, conn_id, hub, push_tx).await;
+        return;
+    }
+    if method == "executor.unsubscribe" {
+        handle_unsubscribe(writer, id, params, hub).await;
+        return;
+    }
+
+    let resp = match handle_method(&method, params, executor, hub, conn_id, exec_sem).await {
+        Ok(r) => ok_resp(id, r),
+        Err((code, msg)) => err_resp(id, code, &msg),
+    };
+    let data = serde_json::to_string(&resp)
+        .unwrap_or_else(|_| err_str(Value::Null, ERR_INTERNAL, "响应序列化失败"))
+        + "\n";
+    let mut w = writer.lock().await;
+    let _ = w.write_all(data.as_bytes()).await;
+}
+
 /// 带 1MB 上限 + idle 超时的行读 (C-IPC-04/C-IPC-05)。
 /// Ok(Some(line)) — 一行 (不含换行); Ok(None) — EOF; Err(code) — 超限 ERR_PARSE / 超时 ERR_INTERNAL。
+/// 审计 Blocker 7 / 2.10: 原 read_until 无界缓冲到换行才查上限 → 无换行洪水 OOM。
+/// 解法: fill_buf+consume 分块, 每次 extend 前查 buf.len()+take > MAX_LINE_BYTES 即拒 (in-loop cap, fail-loud)。
 async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<String>, i64> {
     let mut buf = Vec::with_capacity(4096);
     loop {
-        let read_fut = reader.read_until(b'\n', &mut buf);
-        let n = match tokio::time::timeout(Duration::from_secs(IDLE_READ_TIMEOUT_SECS), read_fut)
-            .await
-        {
-            Ok(r) => r.map_err(|_| ERR_INTERNAL)?,
-            Err(_) => return Err(ERR_INTERNAL),
-        };
-        if n == 0 {
+        let fill_fut = reader.fill_buf();
+        let slice =
+            match tokio::time::timeout(Duration::from_secs(IDLE_READ_TIMEOUT_SECS), fill_fut).await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(_)) => return Err(ERR_INTERNAL),
+                Err(_) => return Err(ERR_INTERNAL),
+            };
+        if slice.is_empty() {
             return Ok(None);
         }
-        if buf.len() > MAX_LINE_BYTES {
-            warn!(len = buf.len(), "请求行超 1MB, 拒连");
+        let nl = slice.iter().position(|&b| b == b'\n');
+        let take = match nl {
+            Some(i) => i + 1,
+            None => slice.len(),
+        };
+        if buf.len() + take > MAX_LINE_BYTES {
+            warn!(
+                len = buf.len() + take,
+                max = MAX_LINE_BYTES,
+                "请求行超 1MB, 拒连 (in-loop cap, 无换行洪水防护)"
+            );
             return Err(ERR_PARSE);
         }
-        if buf.last() == Some(&b'\n') {
+        buf.extend_from_slice(&slice[..take]);
+        reader.consume(take);
+        if nl.is_some() {
             let line = String::from_utf8_lossy(&buf[..buf.len() - 1])
                 .trim_end_matches('\r')
                 .to_string();
             return Ok(Some(line));
         }
-        // 无换行继续读 (但 buf.len() 已限, 不会无界增长)
+        // 无换行继续读 (buf.len()+take 已限, 不会无界增长)
     }
 }
 
@@ -698,9 +782,23 @@ async fn handle_subscribe(
         .get("screenshot_interval_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_SCREENSHOT_INTERVAL_MS);
+    // stdio 作用域 (Blocker 10, 破审计 §2.9 跨租户泄漏):
+    //   all=true → All (全广播); task_ids=[...] → Tasks 白名单; 默认 → OwnConn(仅本连接命令)
+    let scope = if params.get("all").and_then(|v| v.as_bool()).unwrap_or(false) {
+        StdioScope::All
+    } else if let Some(arr) = params.get("task_ids").and_then(|v| v.as_array()) {
+        let set: HashSet<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        StdioScope::Tasks(set)
+    } else {
+        StdioScope::OwnConn(conn_id)
+    };
     let sub_id = hub.subscribe(
         conn_id,
         channels,
+        scope,
         push_tx.clone(),
         interval_ms,
         screenshot_interval_ms,
@@ -756,6 +854,8 @@ async fn handle_execute_stream(
     params: Value,
     executor: &Arc<Executor>,
     hub: &Arc<BroadcastHub>,
+    conn_id: u64,
+    exec_sem: &Arc<Semaphore>,
 ) -> Result<()> {
     let req: ExecutionRequest = match serde_json::from_value(params) {
         Ok(r) => r,
@@ -771,6 +871,12 @@ async fn handle_execute_stream(
         }
     };
     let task_id = req.task_id.clone();
+    // 审计 2.11: 取执行 permit — 限并发子进程 (非连接)。持 permit 跨整流式生命周期
+    // (execute_streaming 启子进程 → chunk/done 全程), drop 时释放供下一执行。
+    let _exec_permit = exec_sem
+        .acquire()
+        .await
+        .map_err(|e| anyhow::anyhow!("exec_sem 已关闭: {e}"))?;
     let (mut rx, handle) = match executor.execute_streaming(req).await {
         Ok(p) => p,
         Err(e) => {
@@ -787,16 +893,22 @@ async fn handle_execute_stream(
     while let Some(ev) = rx.recv().await {
         let result = match ev {
             fe_core::ExecutionStreamEvent::Chunk { data } => {
-                hub.broadcast_stdio(json!({"task_id": task_id, "event": "chunk", "data": data}));
+                hub.broadcast_stdio(
+                    json!({"task_id": task_id, "event": "chunk", "data": data}),
+                    conn_id,
+                );
                 json!({"type": "chunk", "data": data})
             }
             fe_core::ExecutionStreamEvent::Done(r) => {
                 let result_val = serde_json::to_value(&r).unwrap_or(json!({}));
-                hub.broadcast_stdio(json!({
-                    "task_id": task_id,
-                    "event": "done",
-                    "result": result_val.clone(),
-                }));
+                hub.broadcast_stdio(
+                    json!({
+                        "task_id": task_id,
+                        "event": "done",
+                        "result": result_val.clone(),
+                    }),
+                    conn_id,
+                );
                 json!({"type": "done", "result": result_val})
             }
         };
@@ -853,6 +965,8 @@ async fn handle_method(
     params: Value,
     executor: &Arc<Executor>,
     hub: &Arc<BroadcastHub>,
+    conn_id: u64,
+    exec_sem: &Arc<Semaphore>,
 ) -> Result<Value, (i64, String)> {
     match method {
         "executor.health" => Ok(json!({
@@ -864,16 +978,24 @@ async fn handle_method(
             let req: ExecutionRequest = serde_json::from_value(params)
                 .map_err(|e| (ERR_INVALID_REQ, format!("params 无效: {}", e)))?;
             let task_id = req.task_id.clone();
+            // 审计 2.11: 取执行 permit 限并发子进程 (非连接)。execute_async 启子进程, permit 持到返回。
+            let _exec_permit = exec_sem
+                .acquire()
+                .await
+                .map_err(|e| (ERR_INTERNAL, format!("exec_sem 已关闭: {e}")))?;
             let r: ExecutionResult = executor
                 .execute_async(req)
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("execute 失败: {}", e)))?;
             let val = serde_json::to_value(&r).unwrap_or(json!({}));
-            hub.broadcast_stdio(json!({
-                "task_id": task_id,
-                "event": "done",
-                "result": val.clone(),
-            }));
+            hub.broadcast_stdio(
+                json!({
+                    "task_id": task_id,
+                    "event": "done",
+                    "result": val.clone(),
+                }),
+                conn_id,
+            );
             Ok(val)
         }
         "executor.snapshot_create" => {
@@ -898,12 +1020,16 @@ async fn handle_method(
             Ok(json!({"ok": true}))
         }
         "executor.diagnostics" => {
-            let stderr = param_str(&params, "stderr")
+            // 审计 3.9: PTY 合并 stdout+stderr → traceback 在 stdout (stderr 恒空, 见 fe-sandbox
+            // SandboxResult.stderr 文档)。旧版仅读 params.stderr → 切片器拿空串无诊断。
+            // 优先 stdout (PTY 合并流), 回退 stderr/output (stdio-only 后端或旧客户端向后兼容)。
+            let output = param_str(&params, "stdout")
+                .or_else(|| param_str(&params, "stderr"))
                 .or_else(|| param_str(&params, "output"))
                 .unwrap_or_default();
             let cwd = params.get("cwd").and_then(|c| c.as_str());
             let slicer = fe_core::diagnostics::Slicer::new();
-            let d: Diagnostics = slicer.slice(&stderr, cwd).into();
+            let d: Diagnostics = slicer.slice(&output, cwd).into();
             Ok(serde_json::to_value(&d).unwrap_or(json!({})))
         }
         "executor.gui_action" => {
@@ -1330,19 +1456,21 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_broadcasts_across_connections() {
-        // 连接 A 订阅 stdio, 连接 B execute_stream → A 应收到 stdio chunk/done 推送
+        // 连接 A 订阅 stdio (scope=all 跨连接收), 连接 B execute_stream → A 收推送
+        // Blocker 10: 默认 own_conn 已隔离跨连接; 显式 all 才全广播。
         let sock = tmp_sock("stdio-bcast");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
-        // 连接 A: subscribe stdio
+        // 连接 A: subscribe stdio, all=true
         let sa = UnixStream::connect(&sock).await.unwrap();
         let (rha, mut writer_a) = sa.into_split();
         let mut reader_a = BufReader::new(rha);
-        let _ = writer_a.write_all(
-            br#"{"jsonrpc":"2.0","id":1,"method":"executor.subscribe","params":{"channels":["stdio"]}}
+        let _ = writer_a
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"executor.subscribe","params":{"channels":["stdio"],"all":true}}
 "#,
-        )
-        .await;
+            )
+            .await;
         let resp = read_line(&mut reader_a).await.unwrap();
         assert_eq!(resp["result"]["ok"], true);
         let sub_id = resp["result"]["subscription_id"]
@@ -1439,6 +1567,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_capped_line_rejects_no_newline_flood() {
+        // Blocker 7 / 2.10: 无换行洪水 (2MB 无 \n) 应 in-loop 拒连 ERR_PARSE, 不 OOM 不无界缓冲
+        let blob = vec![b'A'; MAX_LINE_BYTES + 100];
+        let mut reader = BufReader::new(std::io::Cursor::new(blob));
+        let res = read_capped_line(&mut reader).await;
+        assert_eq!(
+            res,
+            Err(ERR_PARSE),
+            "无换行洪水应回 ERR_PARSE 非 OOM/缓冲到换行"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_chunked_under_limit_succeeds() {
+        // 分块读: 多次 fill_buf (无换行累积) 到恰 <1MB 后给换行 → 仍 Ok
+        let mut blob = vec![b'A'; MAX_LINE_BYTES - 10];
+        blob.push(b'\n');
+        let mut reader = BufReader::new(std::io::Cursor::new(blob));
+        let res = read_capped_line(&mut reader).await;
+        assert!(res.is_ok(), "恰 <1MB 行应成功: {res:?}");
+        let line = res.unwrap().unwrap();
+        assert_eq!(line.len(), MAX_LINE_BYTES - 10);
+    }
+
+    #[tokio::test]
     async fn socket_permissions_are_owner_only() {
         // C-IPC-01: socket 权限 0o600 (仅 owner)
         let sock = tmp_sock("perm");
@@ -1503,6 +1656,154 @@ mod tests {
         );
         wr.write_all(unsub.as_bytes()).await.unwrap();
         let _ = read_line(&mut reader).await;
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // ── Blocker 10 (审计 §2.9 跨租户泄漏) per-sub scope 过滤 ──
+
+    #[tokio::test]
+    async fn stdio_own_conn_default_blocks_cross_connection() {
+        // 连接 A 默认订阅 stdio (own_conn), 连接 B execute_stream → A 不应收 B 的 stdio。
+        // 这是跨租户隔离基线 (审计 §2.9: 旧版全广播致 Agent A 见 Agent B stdout)。
+        let sock = tmp_sock("stdio-ownconn");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        // 连接 A: subscribe stdio (无 scope 字段 → 默认 own_conn)
+        let sa = UnixStream::connect(&sock).await.unwrap();
+        let (rha, mut writer_a) = sa.into_split();
+        let mut reader_a = BufReader::new(rha);
+        let _ = writer_a
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"executor.subscribe","params":{"channels":["stdio"]}}
+"#,
+            )
+            .await;
+        let resp = read_line(&mut reader_a).await.unwrap();
+        assert_eq!(resp["result"]["ok"], true);
+        // 连接 B: execute_stream echo
+        let sb = UnixStream::connect(&sock).await.unwrap();
+        let (rhb, mut writer_b) = sb.into_split();
+        let mut reader_b = BufReader::new(rhb);
+        let _ = writer_b
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":7,"method":"executor.execute_stream","params":{"command":"echo hi","enable_rollback_snapshot":false}}
+"#,
+            )
+            .await;
+        // B 读到自己 done 帧 (确认命令执行了)
+        let mut b_done = false;
+        let mut a_got_stdio = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
+        let mut buf_b = Vec::new();
+        let mut buf_a = Vec::new();
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                r = async {
+                    buf_b.clear();
+                    let n = reader_b.read_until(b'\n', &mut buf_b).await.unwrap();
+                    if n == 0 { return None; }
+                    let line = String::from_utf8_lossy(&buf_b).trim().to_string();
+                    serde_json::from_str::<Value>(&line).ok()
+                } => {
+                    if let Some(v) = r {
+                        if v["id"] == 7 && v["result"]["type"] == "done" { b_done = true; }
+                    } else { break; }
+                }
+                r = async {
+                    buf_a.clear();
+                    let n = reader_a.read_until(b'\n', &mut buf_a).await.unwrap();
+                    if n == 0 { return None; }
+                    let line = String::from_utf8_lossy(&buf_a).trim().to_string();
+                    serde_json::from_str::<Value>(&line).ok()
+                } => {
+                    if let Some(v) = r {
+                        if v.get("id").is_none() && v["method"] == "executor.event"
+                            && v["params"]["channel"] == "stdio" {
+                            a_got_stdio = true;
+                        }
+                    } else { break; }
+                }
+            }
+            if b_done {
+                // 命令已完成, 给 A 一小窗确认无推送后退出
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                break;
+            }
+        }
+        assert!(b_done, "B 应收到自己 done 帧");
+        assert!(!a_got_stdio, "默认 own_conn 应拦截跨连接 stdio (审计 §2.9)");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn stdio_task_ids_whitelist_receives_matched() {
+        // 连接 A 订阅 stdio task_ids=["t1"], 连接 B execute_stream task_id="t1" → A 收推送。
+        let sock = tmp_sock("stdio-taskids");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        // 连接 A: subscribe stdio, task_ids=["t1"]
+        let sa = UnixStream::connect(&sock).await.unwrap();
+        let (rha, mut writer_a) = sa.into_split();
+        let mut reader_a = BufReader::new(rha);
+        let _ = writer_a
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"executor.subscribe","params":{"channels":["stdio"],"task_ids":["t1"]}}
+"#,
+            )
+            .await;
+        let resp = read_line(&mut reader_a).await.unwrap();
+        assert_eq!(resp["result"]["ok"], true);
+        // 连接 B: execute_stream echo, task_id="t1"
+        let sb = UnixStream::connect(&sock).await.unwrap();
+        let (rhb, mut writer_b) = sb.into_split();
+        let mut reader_b = BufReader::new(rhb);
+        let _ = writer_b
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":7,"method":"executor.execute_stream","params":{"command":"echo hi","task_id":"t1","enable_rollback_snapshot":false}}
+"#,
+            )
+            .await;
+        let mut b_done = false;
+        let mut a_stdio = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let mut buf_b = Vec::new();
+        let mut buf_a = Vec::new();
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                r = async {
+                    buf_b.clear();
+                    let n = reader_b.read_until(b'\n', &mut buf_b).await.unwrap();
+                    if n == 0 { return None; }
+                    serde_json::from_str::<Value>(String::from_utf8_lossy(&buf_b).trim()).ok()
+                } => {
+                    if let Some(v) = r {
+                        if v["id"] == 7 && v["result"]["type"] == "done" { b_done = true; }
+                    } else { break; }
+                }
+                r = async {
+                    buf_a.clear();
+                    let n = reader_a.read_until(b'\n', &mut buf_a).await.unwrap();
+                    if n == 0 { return None; }
+                    serde_json::from_str::<Value>(String::from_utf8_lossy(&buf_a).trim()).ok()
+                } => {
+                    if let Some(v) = r {
+                        if v.get("id").is_none() && v["method"] == "executor.event"
+                            && v["params"]["channel"] == "stdio" {
+                            a_stdio = true;
+                        }
+                    } else { break; }
+                }
+            }
+            if b_done && a_stdio {
+                break;
+            }
+        }
+        assert!(b_done, "B 应收到自己 done 帧");
+        assert!(a_stdio, "task_ids 白名单匹配应收到 stdio 推送");
         let _ = std::fs::remove_file(&sock);
     }
 }

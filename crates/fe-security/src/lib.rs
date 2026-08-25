@@ -138,6 +138,7 @@ const WHITELIST: &[&str] = &[
 const MAX_COMMAND_LEN: usize = 1_000_000;
 
 /// Security Guard — 两级校验
+#[derive(Clone)]
 pub struct SecurityGuard {
     blocklist: Vec<(Regex, &'static str)>,
     whitelist: HashSet<&'static str>,
@@ -365,6 +366,29 @@ impl SecurityGuard {
                 }
                 Ok(())
             }
+            // Blocker 2 finding 1.4: 读工具 cat/grep/head/tail/less/more 源参数无校验
+            // — 私钥 /etc/shadow 直泄。读源 (非选项参数) 落敏感区 → 拒绝
+            "cat" | "grep" | "head" | "tail" | "less" | "more" | "bat" | "rg" => {
+                for a in args.iter() {
+                    if a.starts_with('-') {
+                        continue;
+                    }
+                    if self.is_sensitive_path(a) {
+                        return Err(format!(
+                            "{} 读源位于敏感路径: {} (禁止读取私钥/系统文件)",
+                            binary, a
+                        ));
+                    }
+                    // .. 逃逸嫌疑 — 路径含 .. 组件拒绝 (绕过 cwd)
+                    if std::path::Path::new(a)
+                        .components()
+                        .any(|comp| comp == std::path::Component::ParentDir)
+                    {
+                        return Err(format!("{} 路径含 .. 组件, 拒绝逃逸嫌疑: {}", binary, a));
+                    }
+                }
+                Ok(())
+            }
             "git" => self.validate_git_argv(args),
             _ => Ok(()),
         }
@@ -568,6 +592,52 @@ mod tests {
 
     fn guard() -> SecurityGuard {
         SecurityGuard::new()
+    }
+
+    // ── Blocker 2: 读源敏感路径防护 (finding 1.4) ──
+
+    #[test]
+    fn blocks_cat_sensitive_path() {
+        let v = guard().validate("cat /etc/shadow");
+        assert!(!v.allowed, "cat /etc/shadow 应被拦截");
+        assert!(v.reason.as_deref().unwrap().contains("敏感路径"));
+    }
+
+    #[test]
+    fn blocks_cat_ssh_key() {
+        let v = guard().validate("cat ~/.ssh/id_rsa");
+        assert!(!v.allowed, "cat 私钥应被拦截");
+    }
+
+    #[test]
+    fn blocks_grep_sensitive_source() {
+        let v = guard().validate("grep root /etc/passwd");
+        assert!(!v.allowed, "grep /etc/passwd 应被拦截");
+    }
+
+    #[test]
+    fn blocks_head_sensitive() {
+        let v = guard().validate("head /etc/master.passwd");
+        assert!(!v.allowed, "head 敏感文件应被拦截");
+    }
+
+    #[test]
+    fn blocks_cat_dotdot_escape() {
+        let v = guard().validate("cat ../../etc/shadow");
+        assert!(!v.allowed, "cat 含 .. 逃逸应被拦截");
+        assert!(v.reason.as_deref().unwrap().contains(".."));
+    }
+
+    #[test]
+    fn allows_cat_normal_file() {
+        let v = guard().validate("cat app.py");
+        assert!(v.allowed, "cat 普通文件应放行");
+    }
+
+    #[test]
+    fn blocks_less_sensitive() {
+        let v = guard().validate("less /etc/sudoers");
+        assert!(!v.allowed, "less 敏感文件应被拦截");
     }
 
     // ── 正则黑名单 (Stage 1) ──

@@ -360,6 +360,7 @@ impl PyExecutor {
         env_vars: Option<std::collections::HashMap<String, String>>,
         enable_rollback_snapshot: Option<bool>,
         auto_rollback_policy: Option<Bound<'_, PyAny>>,
+        seatbelt: Option<bool>,
     ) -> PyResult<PyExecutionResult> {
         // L-PYO3-02: policy 入参无效应 fail-loud (旧版 warn+None 静默吞错, 调用方以为开了回滚实则没开)
         let policy = match auto_rollback_policy {
@@ -389,6 +390,7 @@ impl PyExecutor {
             env_vars,
             enable_rollback_snapshot: enable_rollback_snapshot.unwrap_or(true),
             auto_rollback_policy: policy,
+            seatbelt: seatbelt.unwrap_or(false),
         };
         // M-PYO3-02: 内部错误 fail-loud (旧版伪造 exit_code=-1 ExecutionResult, 调用方无法区分
         // 安全拦截与 executor bug; execute 仅在 sandbox 内部异常返 Err, 应上抛)
@@ -458,7 +460,11 @@ impl PyExecutor {
                 };
             }
         };
-        match self.inner.gui_action(gui_action) {
+        // 2.2: 释 GIL 执行 — gui_action 含 Wait (thread::sleep 最多 60s) + AX/CGEvent 阻塞调用。
+        // 旧版持 GIL → wait(60) 冻结 Python 解释器 60s (其他 Agent run_async 无法调度)。
+        // py.detach 释 GIL 期间 Python 线程可跑; self.inner 是 Rust 结构体非 Python 对象, 借用安全。
+        let result = py.detach(|| self.inner.gui_action(gui_action));
+        match result {
             Ok(r) => r.into(),
             Err(e) => {
                 tracing::warn!(error = %e, "gui_action 执行失败");
@@ -488,6 +494,7 @@ impl PyExecutor {
         env_vars: Option<std::collections::HashMap<String, String>>,
         enable_rollback_snapshot: Option<bool>,
         auto_rollback_policy: Option<Bound<'_, PyAny>>,
+        seatbelt: Option<bool>,
     ) -> PyResult<PyStreamIterator> {
         let policy = match auto_rollback_policy {
             None => None,
@@ -516,6 +523,7 @@ impl PyExecutor {
             env_vars,
             enable_rollback_snapshot: enable_rollback_snapshot.unwrap_or(true),
             auto_rollback_policy: policy,
+            seatbelt: seatbelt.unwrap_or(false),
         };
         // L-PYO3-01: execute_streaming async → 释 GIL 后在 BLOCKING_RT block_on (旧版持 GIL
         // 整个 spawn + 校验期间, 阻塞 Python 线程; detach 后 Python 可并发跑其他协程)

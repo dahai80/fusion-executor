@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -32,6 +33,8 @@ pub enum ToolsError {
     NoMatch,
     #[error("禁止全文件重写 (diff 清空原内容) — 仅允许外科补丁")]
     FullRewriteForbidden,
+    #[error("文件超大小上限 ({size} > {max} bytes) — 防 OOM, 拒绝整文件读")]
+    Oversize { size: u64, max: u64 },
     #[error("函数 {0} 未找到")]
     FunctionNotFound(String),
     #[error("正则编译失败: {0}")]
@@ -86,6 +89,14 @@ impl Tools {
         }
     }
 
+    /// 复制 guard (SecurityGuard Clone) — 测试用, 生产单实例无状态共享
+    #[cfg(test)]
+    pub(crate) fn clone_guard(&self) -> Self {
+        Self {
+            guard: self.guard.clone(),
+        }
+    }
+
     /// file_edit — 唯一匹配 old_string → new_string 精确替换, 原子写
     /// (PRD FileEdit: 拒绝模糊编辑, old 必须全文唯一)
     pub fn file_edit(
@@ -113,7 +124,28 @@ impl Tools {
                 matches: 0,
             });
         }
-        let content = std::fs::read_to_string(&abs)
+        // Blocker 8 / 3.5: 预检大小防 OOM (锁前查 metadata, 锁内不重复 stat)
+        if let Err(e) = check_size(&abs) {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(e.to_string()),
+                matches: 0,
+            });
+        }
+        // Blocker 8 / 3.4: flock LOCK_EX 包 RMW, 防并发编辑静默丢改动
+        let lock = match FileLock::exclusive(&abs) {
+            Ok(l) => l,
+            Err(e) => {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(path.to_string()),
+                    error: Some(format!("获取文件锁失败: {}", e)),
+                    matches: 0,
+                });
+            }
+        };
+        let content = FileLock::read_data_to_string(&abs)
             .with_context(|| format!("读取 {} 失败", abs.display()))?;
         let count = content.matches(old_string).count();
         if count == 0 {
@@ -133,7 +165,9 @@ impl Tools {
             });
         }
         let updated = content.replacen(old_string, new_string, 1);
+        // 锁内写完 (atomic_write rename 到目标, 锁仍持 file fd — 保证此 RMW 期间他 Agent 阻塞)
         atomic_write(&abs, &updated)?;
+        drop(lock);
         info!(path = %abs.display(), "file_edit 替换成功");
         Ok(EditResult {
             ok: true,
@@ -166,6 +200,7 @@ impl Tools {
         };
         debug!(pattern = %full_pattern, "glob 匹配中");
         let mut out = Vec::new();
+        let mut skipped_ignored = 0u32;
         for entry in
             glob::glob(&full_pattern).map_err(|e| anyhow::anyhow!("glob 模式无效: {}", e))?
         {
@@ -176,6 +211,11 @@ impl Tools {
                     continue;
                 }
             };
+            // 审计 3.6: 跳过忽略目录内命中 (.venv/node_modules/target/...) — 避免扫出 10 万条目
+            if is_in_ignored_dir(&p) {
+                skipped_ignored += 1;
+                continue;
+            }
             // L-TOOLS-01: 绝对路径模式 (如 /etc/**, ~/.ssh/*) 可越过 cwd 落敏感区
             // 每条命中取父目录经 validate_cwd 校验敏感前缀, 命中则跳过
             let check_target = if p.is_dir() {
@@ -197,8 +237,22 @@ impl Tools {
                 .map(|r| r.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| p.to_string_lossy().into_owned());
             out.push(GlobEntry { path: rel, is_dir });
+            // 审计 3.6: 结果上限 — 超限截断, 避免单帧 10MB+ 经 UDS 传输 OOM
+            if out.len() >= GLOB_RESULT_CAP {
+                warn!(
+                    cap = GLOB_RESULT_CAP,
+                    skipped_ignored, "glob 命中超上限, 截断"
+                );
+                break;
+            }
         }
-        info!(count = out.len(), "glob 完成");
+        if skipped_ignored > 0 {
+            debug!(
+                skipped_ignored,
+                "glob 跳过忽略目录内命中 (.venv/node_modules/...)"
+            );
+        }
+        info!(count = out.len(), skipped_ignored, "glob 完成");
         Ok(out)
     }
 
@@ -221,17 +275,29 @@ impl Tools {
         let cwd_abs = std::fs::canonicalize(base).unwrap_or_else(|_| PathBuf::from(base));
         let mut out = Vec::new();
         for raw in paths {
+            if out.len() >= GREP_GLOBAL_HIT_CAP {
+                warn!(cap = GREP_GLOBAL_HIT_CAP, "grep 全局命中超上限, 停扫");
+                break;
+            }
             let abs = guard_path(&self.guard, raw, cwd).map_err(|e| anyhow::anyhow!(e))?;
             if abs.is_file() {
-                grep_file(&abs, &abs, &cwd_abs, &re, &mut out)?;
+                grep_file(&abs, &abs, &cwd_abs, &re, &mut out, GREP_GLOBAL_HIT_CAP)?;
             } else if abs.is_dir() {
+                // 审计 3.7: 加 max_depth 防 .venv 深递归 + 跳过忽略目录 + 全局命中 cap
+                // 旧版 walkdir 无 max_depth, 仅跳点文件 → 扫 .venv/site-packages 10 万文件 OOM
                 for ent in walkdir::WalkDir::new(&abs)
+                    .max_depth(GREP_MAX_DEPTH)
                     .into_iter()
+                    .filter_entry(|e| !is_ignored_walkdir_entry(e))
                     .filter_map(|e| e.ok())
                     .filter(|e| e.file_type().is_file())
                 {
+                    if out.len() >= GREP_GLOBAL_HIT_CAP {
+                        warn!(cap = GREP_GLOBAL_HIT_CAP, "grep 全局命中超上限, 停扫");
+                        break;
+                    }
                     let fp = ent.path();
-                    // 跳过隐藏目录/文件 + 二进制嫌疑 (含 \0)
+                    // 跳过隐藏文件 (目录已 filter_entry 拦, 此处拦文件名 . 开头)
                     if fp
                         .file_name()
                         .map(|n| n.to_string_lossy().starts_with('.'))
@@ -239,7 +305,8 @@ impl Tools {
                     {
                         continue;
                     }
-                    grep_file(fp, &abs, &cwd_abs, &re, &mut out)?;
+                    let remaining = GREP_GLOBAL_HIT_CAP - out.len();
+                    grep_file(fp, &abs, &cwd_abs, &re, &mut out, remaining)?;
                 }
             } else {
                 warn!(path = %abs.display(), "grep 路径不存在, 跳过");
@@ -250,8 +317,10 @@ impl Tools {
     }
 
     /// apply_patch — Unified Diff 解析 + 应用 (diffy crate)
-    /// 禁全文件重写: 若 patch 的某 hunk 删除原文件全部行且无新增 → 拒绝 (FullRewriteForbidden)
-    /// diff 文本含 --- /+++ 头, 多文件 patch: 逐文件解析, 仅应用 cwd 内文件
+    /// 禁全文件重写: 该文件全部 hunks 删除行数合计 >= 原文件总行数 → 拒绝 (FullRewriteForbidden)
+    /// 审计 3.8: 多文件 diff 须按文件切分 (diffy 0.4 from_str 拒多文件 "multiple '---' lines"),
+    ///   逐文件解析+应用, 否则第二文件 hunk 静默丢失; 全重写判据须聚合该文件全部 hunk 合计删除行
+    ///   (旧版 per-hunk 判据可被拆 hunk 各删 original/2 绕过 → 聚合后合计 = original 仍拦)
     pub fn apply_patch(&self, diff: &str, cwd: Option<&str>) -> Result<EditResult> {
         let base = cwd.unwrap_or(".");
         let cwd_v = self.guard.validate_cwd(base);
@@ -261,75 +330,129 @@ impl Tools {
             )));
         }
         let cwd_abs = std::fs::canonicalize(base).unwrap_or_else(|_| PathBuf::from(base));
-        let patch =
-            diffy::Patch::from_str(diff).map_err(|e| anyhow::anyhow!("diff 解析失败: {}", e))?;
 
-        // diffy apply 需原文件; 从 patch 头取目标路径
-        // diffy Patch 无 path() — 用 modified()(+++ 头) 优先, 回退 original()(--- 头)
-        let target = patch
-            .modified()
-            .or_else(|| patch.original())
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "patch-target".to_string());
-        let target_path = target
-            .strip_prefix("b/")
-            .or_else(|| target.strip_prefix("a/"))
-            .unwrap_or(&target)
-            .to_string();
-        let abs = guard_path(&self.guard, &target_path, cwd).map_err(|e| anyhow::anyhow!(e))?;
-        if !abs.exists() {
+        // 审计 3.8(a): diffy 0.4 Patch::from_str 拒多文件 (parse.rs "multiple '---' lines")。
+        // 先按 --- 头切分为单文件 diff 片段, 再逐片段 from_str + apply, 否则第二文件丢失。
+        let file_diffs = split_multi_file_diff(diff);
+        if file_diffs.is_empty() {
             return Ok(EditResult {
                 ok: false,
-                path: Some(target_path.clone()),
-                error: Some(format!("文件未找到: {}", target_path)),
+                path: None,
+                error: Some("diff 为空或无有效 --- 文件头".to_string()),
                 matches: 0,
             });
         }
-        let original = std::fs::read_to_string(&abs)
-            .with_context(|| format!("读取 {} 失败", abs.display()))?;
 
-        // C-TOOLS-02: 旧启发式只拦 "删全部 + 新增 0"; "删全部 + 新增全部" 绕过
-        // 新判据: hunk new 范围从 0 起, end >= 原文件行数 → 该 hunk 重写整文件 → 拒绝
-        let original_lines = original.lines().count();
-
-        // 多文件 patch: 逐 hunk-file 处理
-        // C-TOOLS-02: 全文件重写判据 — hunk 删除行数 >= 原文件总行数 即重写整文件 → 拒绝
-        // (外科补丁必留 context 行, removed < original_lines; 删全部无论新增 0 或 N 都是重写)
-        // 旧版只拦 "删全部+新增0" 且依赖 new_range().start()==0 (diffy 1-based, 永假) → 漏判
         let mut total_hunks = 0u32;
-        for (idx, pf) in patch.hunks().iter().enumerate() {
-            let (_added, removed) = count_hunk_lines(pf);
-            if removed > 0 && (removed as usize) >= original_lines {
+        let mut first_path: Option<String> = None;
+        for (file_idx, fd) in file_diffs.iter().enumerate() {
+            let patch = match diffy::Patch::from_str(fd) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(EditResult {
+                        ok: false,
+                        path: first_path.clone(),
+                        error: Some(format!("diff 第 {} 文件解析失败: {}", file_idx + 1, e)),
+                        matches: total_hunks,
+                    });
+                }
+            };
+            // diffy Patch 无 path() — 用 modified()(+++ 头) 优先, 回退 original()(--- 头)
+            let target = patch
+                .modified()
+                .or_else(|| patch.original())
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "patch-target".to_string());
+            let target_path = target
+                .strip_prefix("b/")
+                .or_else(|| target.strip_prefix("a/"))
+                .unwrap_or(&target)
+                .to_string();
+            if first_path.is_none() {
+                first_path = Some(target_path.clone());
+            }
+            let abs = guard_path(&self.guard, &target_path, cwd).map_err(|e| anyhow::anyhow!(e))?;
+            if !abs.exists() {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(target_path.clone()),
+                    error: Some(format!("文件未找到: {}", target_path)),
+                    matches: total_hunks,
+                });
+            }
+            // Blocker 8 / 3.5: 预检大小防 OOM
+            if let Err(e) = check_size(&abs) {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(target_path.clone()),
+                    error: Some(e.to_string()),
+                    matches: total_hunks,
+                });
+            }
+            // Blocker 8 / 3.4: flock LOCK_EX 包 RMW
+            let lock = match FileLock::exclusive(&abs) {
+                Ok(l) => l,
+                Err(e) => {
+                    return Ok(EditResult {
+                        ok: false,
+                        path: Some(target_path.clone()),
+                        error: Some(format!("获取文件锁失败: {}", e)),
+                        matches: total_hunks,
+                    });
+                }
+            };
+            let original = FileLock::read_data_to_string(&abs)
+                .with_context(|| format!("读取 {} 失败", abs.display()))?;
+            let original_lines = original.lines().count();
+
+            // 审计 3.8(b): 全重写判据聚合该文件全部 hunk 合计删除行 —
+            // 旧版 per-hunk (removed >= original_lines) 可被拆 2 hunk 各删 original/2 绕过;
+            // 聚合后合计删除行 >= original_lines 即重写整文件 → 拒绝 (外科补丁留 context, 合计 < original)。
+            let mut file_removed = 0u32;
+            let mut file_hunks = 0u32;
+            for pf in patch.hunks() {
+                let (_added, removed) = count_hunk_lines(pf);
+                file_removed += removed;
+                file_hunks += 1;
+            }
+            if file_removed > 0 && (file_removed as usize) >= original_lines {
                 return Ok(EditResult {
                     ok: false,
                     path: Some(target_path.clone()),
                     error: Some(
-                        "禁止全文件重写 (hunk 删除原文件全部行) — 仅允许外科补丁".to_string(),
+                        "禁止全文件重写 (该文件 hunk 合计删除原文件全部行) — 仅允许外科补丁"
+                            .to_string(),
                     ),
-                    matches: idx as u32,
-                });
-            }
-            total_hunks += 1;
-        }
-
-        let updated = diffy::apply(&original, &patch)
-            .map_err(|e| anyhow::anyhow!("patch 应用失败: {}", e))?;
-        // 安全校验: 确认输出文件仍 cwd 内 (防止 patch 改路径)
-        if let Ok(canonical) = abs.canonicalize() {
-            if !canonical.starts_with(&cwd_abs) {
-                return Ok(EditResult {
-                    ok: false,
-                    path: Some(target_path),
-                    error: Some("patch 目标逃逸 cwd".to_string()),
                     matches: total_hunks,
                 });
             }
+
+            let updated = diffy::apply(&original, &patch)
+                .map_err(|e| anyhow::anyhow!("patch 应用失败 ({}): {}", target_path, e))?;
+            // 安全校验: 确认输出文件仍 cwd 内 (防止 patch 改路径)
+            if let Ok(canonical) = abs.canonicalize() {
+                if !canonical.starts_with(&cwd_abs) {
+                    return Ok(EditResult {
+                        ok: false,
+                        path: Some(target_path),
+                        error: Some("patch 目标逃逸 cwd".to_string()),
+                        matches: total_hunks,
+                    });
+                }
+            }
+            atomic_write(&abs, &updated)?;
+            drop(lock);
+            total_hunks += file_hunks;
+            info!(path = %abs.display(), hunks = file_hunks, "apply_patch 文件成功");
         }
-        atomic_write(&abs, &updated)?;
-        info!(path = %abs.display(), hunks = total_hunks, "apply_patch 成功");
+        info!(
+            files = file_diffs.len(),
+            hunks = total_hunks,
+            "apply_patch 全部成功"
+        );
         Ok(EditResult {
             ok: true,
-            path: Some(target_path),
+            path: first_path,
             error: None,
             matches: total_hunks,
         })
@@ -355,7 +478,28 @@ impl Tools {
                 matches: 0,
             });
         }
-        let content = std::fs::read_to_string(&abs)
+        // Blocker 8 / 3.5: 预检大小防 OOM (replace_function 尤甚: 读全文件 + 全量 parse)
+        if let Err(e) = check_size(&abs) {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(e.to_string()),
+                matches: 0,
+            });
+        }
+        // Blocker 8 / 3.4: flock LOCK_EX 包 RMW
+        let lock = match FileLock::exclusive(&abs) {
+            Ok(l) => l,
+            Err(e) => {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(path.to_string()),
+                    error: Some(format!("获取文件锁失败: {}", e)),
+                    matches: 0,
+                });
+            }
+        };
+        let content = FileLock::read_data_to_string(&abs)
             .with_context(|| format!("读取 {} 失败", abs.display()))?;
         let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
         let span = locate_function(&content, ext, fn_name)?;
@@ -376,6 +520,7 @@ impl Tools {
         updated.push_str(new_body);
         updated.push_str(&content[span.end..]);
         atomic_write(&abs, &updated)?;
+        drop(lock);
         info!(path = %abs.display(), fn = fn_name, "replace_function 成功");
         Ok(EditResult {
             ok: true,
@@ -388,8 +533,14 @@ impl Tools {
     // PLACEHOLDER: path helpers
 }
 
-/// 校验路径不落敏感区 + 不通过 .. 逃逸 cwd
-/// (复用 fe_security::SecurityGuard 的敏感路径集, 经 validate_cwd 做前缀匹配)
+/// 校验路径不落敏感区 + 不通过 .. 逃逸 cwd + 符号链接旁路防护
+/// (复用 fe_security::SecurityGuard 的敏感路径集)
+///
+/// Blocker 3 (finding 3.1/3.2) 修复:
+/// - 旧版 .. 检查仅在 `if let Some(cwd)` 内 → cwd=None 全跳过, 可写任意文件
+/// - 旧版敏感校验用字面 abs 字符串前缀匹配 → 符号链接 (cwd/symlink/evil 指向 /etc) 旁路
+///
+/// 新版: .. 组件无条件拒绝; 敏感 + 逃逸校验走 canonicalize (解符号链接) 后 starts_with
 fn guard_path(
     guard: &SecurityGuard,
     raw: &str,
@@ -406,40 +557,68 @@ fn guard_path(
             None => p.to_path_buf(),
         }
     };
-    // 拒绝 .. 逃逸 (相对路径越过 cwd)
-    // L-TOOLS-03: 旧版 canonicalize 失败则静默放行 (fail-open) — 中间目录缺失即绕过
-    // 改 fail-closed: 路径含 .. 组件即拒绝 (不依赖 canonicalize 成功)
-    if let Some(c) = cwd {
-        let cwd_abs = std::fs::canonicalize(c).unwrap_or_else(|_| PathBuf::from(c));
-        // 路径含 .. 组件 → 可能逃逸, 拒绝 (不论 canonicalize 成败)
-        if abs
-            .components()
-            .any(|comp| comp == std::path::Component::ParentDir)
-        {
-            return Err(ToolsError::PathBlocked(format!(
-                "路径含 .. 组件, 拒绝逃逸嫌疑: {} (cwd={})",
-                raw, c
-            )));
-        }
-        // 无 .. 组件: canonicalize 成功则校验 starts_with, 失败 (文件/目录尚不存在) 放行
-        // (新文件在 cwd 内创建合法, canonicalize 失败不代表逃逸)
-        if let Ok(canonical) = abs.canonicalize() {
-            if !canonical.starts_with(&cwd_abs) {
-                return Err(ToolsError::PathBlocked(format!(
-                    "路径逃逸 cwd: {} (cwd={})",
-                    raw, c
-                )));
+    // 3.1: .. 组件无条件拒绝 (cwd=None 也拦) — 不依赖 canonicalize, fail-closed
+    if abs
+        .components()
+        .any(|comp| comp == std::path::Component::ParentDir)
+    {
+        return Err(ToolsError::PathBlocked(format!(
+            "路径含 .. 组件, 拒绝逃逸嫌疑: {} (cwd={:?})",
+            raw, cwd
+        )));
+    }
+    // 3.2: 敏感路径 + cwd 逃逸校验走 canonicalize (解符号链接)
+    // abs 本身存在 → canonicalize(abs) 校验 starts_with cwd (目录输入如 "." 或文件目标)
+    // abs 不存在 → canonicalize(abs 的父目录) (新文件在 cwd 内创建合法)
+    let cwd_abs = cwd.and_then(|c| std::fs::canonicalize(c).ok());
+    let (escape_check, sensitive_check) = match abs.canonicalize() {
+        Ok(canonical) => (canonical.clone(), canonical),
+        Err(_) => {
+            // abs 不存在 — 取父目录 canonicalize (符号链接在父段)
+            match abs.parent().and_then(|p| p.canonicalize().ok()) {
+                Some(canonical_parent) => (
+                    canonical_parent.join(abs.file_name().unwrap_or_default()),
+                    canonical_parent,
+                ),
+                None => {
+                    // 父目录也不存在 — 字面校验 (.. 已拦, 无符号链接旁路)
+                    let lit = abs.to_string_lossy().into_owned();
+                    let lit_parent = abs
+                        .parent()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| lit.clone());
+                    if let Some(cwd_abs) = &cwd_abs {
+                        if !Path::new(&lit).starts_with(cwd_abs)
+                            && !Path::new(&lit_parent).starts_with(cwd_abs)
+                        {
+                            return Err(ToolsError::PathBlocked(format!(
+                                "路径逃逸 cwd: {} (cwd={:?})",
+                                raw, cwd
+                            )));
+                        }
+                    }
+                    let v = guard.validate_cwd(&lit_parent);
+                    if !v.allowed {
+                        return Err(ToolsError::PathBlocked(
+                            v.reason.unwrap_or_else(|| "敏感路径".to_string()),
+                        ));
+                    }
+                    return Ok(abs);
+                }
             }
         }
-    }
-    // 敏感路径校验 — 复用 validate_cwd 做目录前缀匹配 (对文件取父目录)
-    let check_target = if abs.is_dir() {
-        abs.to_string_lossy().into_owned()
-    } else {
-        abs.parent()
-            .map(|d| d.to_string_lossy().into_owned())
-            .unwrap_or_else(|| abs.to_string_lossy().into_owned())
     };
+    // cwd 逃逸: canonicalize 后必须 starts_with cwd 规范化
+    if let Some(cwd_abs) = &cwd_abs {
+        if !escape_check.starts_with(cwd_abs) {
+            return Err(ToolsError::PathBlocked(format!(
+                "路径逃逸 cwd (符号链接解析): {} (cwd={:?})",
+                raw, cwd
+            )));
+        }
+    }
+    // 敏感前缀: canonicalize 后是否落敏感区
+    let check_target = sensitive_check.to_string_lossy().into_owned();
     let v = guard.validate_cwd(&check_target);
     if !v.allowed {
         return Err(ToolsError::PathBlocked(
@@ -457,6 +636,112 @@ fn expand_tilde(path: &str) -> String {
     } else {
         path.to_string()
     }
+}
+
+/// 写工具文件大小上限 (Blocker 8 / 3.5) — 64MB, 防 1GB 生成文件 read_to_string OOM
+const WRITE_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// glob/grep 结果上限 — 防 .venv/node_modules 扫出 10 万条目 OOM (审计 3.6/3.7)
+/// 5000 条够定位代码, 超限截断 + warn (调用方拉全量应走专用索引工具)
+const GLOB_RESULT_CAP: usize = 5000;
+const GREP_GLOBAL_HIT_CAP: usize = 2000;
+/// grep 递归最大深度 (审计 3.7) — 防 .venv 深符号链接网无限递归; 20 层够覆盖任何源码树
+const GREP_MAX_DEPTH: usize = 20;
+
+/// 默认忽略目录名 (审计 3.6/3.7) — 同 .gitignore 常见项 + Apple Silicon 构建产物
+/// glob/grep 递归时跳过这些目录, 避免扫 .venv site-packages (数万符号链接) / node_modules
+const IGNORED_DIRS: &[&str] = &[
+    ".venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".next",
+    ".cache",
+    "venv",
+    ".tox",
+    "site-packages",
+];
+
+/// 路径是否落在忽略目录内 (任一路径组件匹配 IGNORED_DIRS)
+fn is_in_ignored_dir(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .map(|n| IGNORED_DIRS.contains(&n))
+            .unwrap_or(false)
+    })
+}
+
+/// walkdir filter_entry 判定 — 目录名匹配 IGNORED_DIRS 则不递归进 (剪枝整棵子树)
+fn is_ignored_walkdir_entry(entry: &walkdir::DirEntry) -> bool {
+    entry.file_type().is_dir()
+        && entry
+            .file_name()
+            .to_str()
+            .map(|n| IGNORED_DIRS.contains(&n))
+            .unwrap_or(false)
+}
+
+/// 预检文件大小 — 超上限返 Oversize 错 (fail-loud), 不静默截断
+/// (写工具需读全文件做 RMW, 超大文件该用专用 diff 工具, 非 LLM 整文件重写)
+fn check_size(path: &Path) -> std::result::Result<(), ToolsError> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > WRITE_FILE_MAX_BYTES {
+            warn!(path = %path.display(), size = meta.len(), max = WRITE_FILE_MAX_BYTES, "文件超 64MB 上限, 拒绝整文件读");
+            return Err(ToolsError::Oversize {
+                size: meta.len(),
+                max: WRITE_FILE_MAX_BYTES,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// RAII 排他锁 — 持 sidecar lockfile 的 fd (LOCK_EX), drop 自动 unlock (fs2 FileExt)
+/// Blocker 8 / 3.4: file_edit/apply_patch/replace_function 全是 RMW, 无锁则两 Agent 并发改同文件后写覆盖前写, 静默丢改动
+/// 关键: 锁 sidecar `<data>.fe-flock` (稳定 inode, 永不被 rename), 非锁 data 文件本身 —
+///   atomic_write 用 temp+rename 换 data inode, 若锁 data 旧 inode 则并发方锁到新 inode → 形同未锁 (丢改动根因)
+///   sidecar 永不 rename, 两方争同一锁 → 真·串行。lockfile 0 字节, create-if-absent, 永不删 (删亦生 inode-swap 竞态)
+struct FileLock {
+    // 持 fd 即持锁: BSD flock(2) 关联打开 fd, close 最后 fd 时内核自动释放。
+    // 字段不被读 — 存在本身 = 锁的生命周期, drop FileLock → drop File → close fd → 解锁。
+    #[allow(dead_code)]
+    file: std::fs::File,
+}
+
+impl FileLock {
+    /// 锁 `<data_path>.fe-flock` sidecar (data_path 为数据文件绝对路径)
+    fn exclusive(data_path: &Path) -> std::result::Result<Self, ToolsError> {
+        let lock_path = sidecar_lock_path(data_path);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(ToolsError::Io)?;
+        file.lock_exclusive().map_err(ToolsError::Io)?;
+        debug!(lock = %lock_path.display(), data = %data_path.display(), "flock LOCK_EX 获取 (sidecar)");
+        Ok(Self { file })
+    }
+
+    /// 从数据文件 (非锁文件) 读全内容 — 锁已持, 读 data_path 安全
+    fn read_data_to_string(data_path: &Path) -> std::io::Result<String> {
+        std::fs::read_to_string(data_path)
+    }
+}
+
+/// sidecar 锁文件路径: `<data>.fe-flock`
+fn sidecar_lock_path(data_path: &Path) -> PathBuf {
+    let mut s = data_path.to_string_lossy().into_owned();
+    s.push_str(".fe-flock");
+    PathBuf::from(s)
 }
 
 /// 原子写 — NamedTempFile 随机名 + persist 原子 rename
@@ -525,13 +810,25 @@ fn locate_function(content: &str, ext: &str, fn_name: &str) -> Result<Option<Byt
     let kind = match function_node_kind(ext) {
         Some(k) => k,
         None => {
-            // 无 grammar — 回退正则 (def/fn 签名行起, 到下一同缩进定义前)
-            return Ok(locate_function_regex(content, ext, fn_name));
+            // 审计 3.12: 无 grammar 正则回退 — locate_function_regex 结束边界找下一行
+            // def/fn/function/export, 命中目标函数内部嵌套定义 → span 提前结束, 只换前几行,
+            // 余下旧函数体 + 嵌套定义残留 → 文件语法损坏。无 AST 边界不可靠, fail-loud 拒绝。
+            warn!(ext = ext, fn_name = %fn_name, "replace_function 无 grammar (ext={ext}), 拒绝正则回退 (边界不可靠, 损坏文件)");
+            return Err(anyhow::anyhow!(
+                "replace_function 不支持 .{ext} 文件 — 无 tree-sitter grammar, \
+                 正则回退边界不可靠会损坏文件; 改用 file_edit 或 apply_patch"
+            ));
         }
     };
     let mut parser = match parser_for_ext(ext) {
         Some(p) => p,
-        None => return Ok(locate_function_regex(content, ext, fn_name)),
+        None => {
+            // 同上: parser 构建失败 (set_language 失败) 也 fail-loud
+            warn!(ext = ext, fn_name = %fn_name, "replace_function parser 构建失败, 拒绝回退");
+            return Err(anyhow::anyhow!(
+                "replace_function .{ext} parser 构建失败, 拒绝正则回退 (边界不可靠)"
+            ));
+        }
     };
     let tree = parser
         .parse(content, None)
@@ -565,44 +862,6 @@ fn locate_function(content: &str, ext: &str, fn_name: &str) -> Result<Option<Byt
     Ok(found)
 }
 
-/// 无 grammar 回退: 正则定位函数起止 (粗略, 限 def/fn/function 关键字)
-fn locate_function_regex(content: &str, ext: &str, fn_name: &str) -> Option<ByteSpan> {
-    let pat = match ext {
-        "py" => format!(r"(?m)^[ \t]*def\s+{}\b", regex::escape(fn_name)),
-        "js" | "ts" | "tsx" => format!(
-            r"(?m)^[ \t]*(?:export\s+)?(?:async\s+)?function\s+{}\b",
-            regex::escape(fn_name)
-        ),
-        "rs" => format!(
-            r"(?m)^[ \t]*(?:pub\s+)?(?:async\s+)?fn\s+{}\b",
-            regex::escape(fn_name)
-        ),
-        _ => return None,
-    };
-    let re = Regex::new(&pat).ok()?;
-    let m = re.find(content)?;
-    let start = m.start();
-    // 结束: 下一个同缩进顶层定义, 或文件尾 (粗略)
-    let after = &content[m.end()..];
-    let indent = content[start..m.start() + 1].matches(' ').count();
-    let _ = indent;
-    // 找下一个非空同级或更低缩进的定义行
-    let end = after
-        .lines()
-        .skip(1)
-        .find(|l| {
-            let trimmed = l.trim_start();
-            !trimmed.is_empty()
-                && (trimmed.starts_with("def ")
-                    || trimmed.starts_with("fn ")
-                    || trimmed.starts_with("function ")
-                    || trimmed.starts_with("export "))
-        })
-        .map(|l| m.end() + after[..after.find(l).unwrap_or(after.len())].len())
-        .unwrap_or(content.len());
-    Some(ByteSpan { start, end })
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ByteSpan {
     start: usize,
@@ -623,16 +882,51 @@ fn count_hunk_lines(hunk: &diffy::Hunk<'_, str>) -> (u32, u32) {
     (added, removed)
 }
 
-/// grep 单文件 — 正则逐行, 跳过二进制 (含 \0), 单文件限 1000 命中
+/// 按 `--- ` 文件头切分多文件 unified diff 为单文件 diff 片段 (审计 3.8)。
+///
+/// diffy 0.4 `Patch::from_str` 在第二个 `--- ` 行报 "multiple '---' lines" 拒多文件。
+/// 真实 `git diff` 多文件工作流含多对 `--- /+++` 头, 须先切分再逐片段 from_str。
+///
+/// 切分规则: 按行扫描, 每个 `--- ` 行起一个新文件片段 (含该 `--- ` 行 + 其后所有行,
+/// 直到下一个 `--- ` 行前)。跳过 `diff --git`/`index` 等 git 扩展头 (它们在首 `--- ` 前)。
+/// 单文件 diff (无第二个 `--- `) → 返回 1 元素 Vec。
+fn split_multi_file_diff(diff: &str) -> Vec<String> {
+    let lines: Vec<&str> = diff.lines().collect();
+    let mut segments: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in &lines {
+        if line.starts_with("--- ") {
+            // 新文件片段起点: 把已积累的片段推入, 开新片段
+            if let Some(seg) = current.take() {
+                segments.push(seg);
+            }
+            current = Some(String::new());
+        }
+        if let Some(seg) = current.as_mut() {
+            seg.push_str(line);
+            seg.push('\n');
+        }
+        // diff --git / index 等 git 扩展头在首个 --- 前, current=None 时被丢弃 (符合预期)
+    }
+    if let Some(seg) = current {
+        segments.push(seg);
+    }
+    segments
+}
+
+/// grep 单文件 — 正则逐行, 跳过二进制 (含 \0), 单文件限 1000 命中 + 受全局余量约束
 /// P-SB-01: 旧版 std::fs::read 整文件入内存 — 超大文件 (GB 级) OOM
 /// 改用 metadata 先查大小, 超 64MB 跳过 (grep 非二进制探测工具, 大文件该用专用索引)
+/// 审计 3.7: global_remaining = 全局命中余量 (GREP_GLOBAL_HIT_CAP - 已收), 取 min(单文件 1000, 余量)
 const GREP_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const GREP_PER_FILE_CAP: usize = 1000;
 fn grep_file(
     fp: &Path,
     root: &Path,
     cwd_abs: &Path,
     re: &Regex,
     out: &mut Vec<GrepMatch>,
+    global_remaining: usize,
 ) -> Result<()> {
     // P-SB-01: metadata 限大小, 超限跳过 (避 OOM)
     if let Ok(meta) = std::fs::metadata(fp) {
@@ -659,6 +953,8 @@ fn grep_file(
         .or_else(|_| fp.strip_prefix(root))
         .map(|r| r.to_string_lossy().into_owned())
         .unwrap_or_else(|_| fp.to_string_lossy().into_owned());
+    // 单文件上限取 min(单文件 cap, 全局余量) — 防单文件吃满全局额度后又叠加其他文件
+    let file_cap = GREP_PER_FILE_CAP.min(global_remaining);
     let mut hits = 0u32;
     for (i, line) in text.lines().enumerate() {
         if re.is_match(line) {
@@ -668,8 +964,8 @@ fn grep_file(
                 content: line.to_string(),
             });
             hits += 1;
-            if hits >= 1000 {
-                warn!(path = %fp.display(), "grep 单文件命中超 1000, 截断");
+            if hits as usize >= file_cap {
+                warn!(path = %fp.display(), cap = file_cap, "grep 单文件命中超上限, 截断");
                 break;
             }
         }
@@ -1004,6 +1300,37 @@ mod tests {
         assert!(err.contains(".."), "错误应提及 .. 组件");
     }
 
+    // Blocker 3 finding 3.1: cwd=None 时 .. 检查不应跳过 (旧版在 if let Some(cwd) 内)
+    #[test]
+    fn test_guard_path_rejects_dotdot_no_cwd() {
+        let guard = SecurityGuard::new();
+        // 绝对路径含 .. (cwd=None, 旧版全跳过 .. 检查)
+        let res = guard_path(&guard, "/tmp/../../etc/evil.txt", None);
+        assert!(res.is_err(), "cwd=None 含 .. 组件也应被拒");
+        assert!(res.unwrap_err().to_string().contains(".."));
+    }
+
+    // Blocker 3 finding 3.2: 符号链接旁路 — cwd 内符号链接指向敏感区应被 canonicalize 拦截
+    #[test]
+    fn test_guard_path_rejects_symlink_to_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = SecurityGuard::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        // 在 cwd 内造符号链接指向 /etc (敏感)
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("etc_link");
+            std::os::unix::fs::symlink("/etc", &link).unwrap();
+            let target = "etc_link/passwd";
+            let res = guard_path(&guard, target, Some(&cwd));
+            assert!(
+                res.is_err(),
+                "符号链接指向敏感区应被 canonicalize 拦截: {:?}",
+                res
+            );
+        }
+    }
+
     // P-SB-01: 超 64MB 文件 grep 应跳过 (避 OOM)
     #[test]
     fn test_grep_skips_oversize_file() {
@@ -1020,5 +1347,294 @@ mod tests {
             .grep("anything", &["big.txt".to_string()], Some(&cwd))
             .unwrap();
         assert!(ms.is_empty(), "超 64MB 文件应被跳过: {:?}", ms);
+    }
+
+    // ── Blocker 8 / 3.5: 写工具大小上限 ──
+
+    // file_edit 超 64MB 应被拒 (非 OOM, fail-loud)
+    #[test]
+    fn test_file_edit_rejects_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("big.txt");
+        std::fs::write(&fp, "x = 1\n").unwrap();
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&fp).unwrap();
+            f.set_len(WRITE_FILE_MAX_BYTES + 1024).unwrap();
+        }
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools
+            .file_edit("big.txt", "x = 1", "x = 2", Some(&cwd))
+            .unwrap();
+        assert!(!r.ok, "超 64MB 文件 file_edit 应被拒");
+        assert!(r.error.unwrap().contains("超大小上限"), "应报 Oversize");
+        // 内容未变 (x = 1 仍在, 末尾稀疏空洞)
+        let s = std::fs::read_to_string(&fp).unwrap();
+        assert!(s.starts_with("x = 1"), "拒绝时不应改动文件");
+    }
+
+    // replace_function 超 64MB 应被拒
+    #[test]
+    fn test_replace_function_rejects_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("big.py");
+        std::fs::write(&fp, "def old():\n    return 1\n").unwrap();
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&fp).unwrap();
+            f.set_len(WRITE_FILE_MAX_BYTES + 1024).unwrap();
+        }
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools
+            .replace_function("big.py", "old", "def old():\n    return 9\n", Some(&cwd))
+            .unwrap();
+        assert!(!r.ok, "超 64MB 文件 replace_function 应被拒");
+        assert!(r.error.unwrap().contains("超大小上限"));
+    }
+
+    // apply_patch 超 64MB 应被拒
+    #[test]
+    fn test_apply_patch_rejects_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("big.py");
+        std::fs::write(&fp, "line1\nline2\n").unwrap();
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&fp).unwrap();
+            f.set_len(WRITE_FILE_MAX_BYTES + 1024).unwrap();
+        }
+        let diff = "--- a/big.py\n+++ b/big.py\n@@ -1,2 +1,2 @@\n line1\n-line2\n+LINE2\n";
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools.apply_patch(diff, Some(&cwd)).unwrap();
+        assert!(!r.ok, "超 64MB 文件 apply_patch 应被拒");
+        assert!(r.error.unwrap().contains("超大小上限"));
+    }
+
+    // ── Blocker 8 / 3.4: flock RMW 串行化 ──
+
+    // 并发两线程 file_edit 同文件 — flock 保证两改动都落地 (无静默丢)
+    #[test]
+    fn test_file_edit_flock_serializes_concurrent_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("race.txt");
+        // 两个唯一锚点, 各替换一处
+        std::fs::write(&fp, "A1\nB1\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let tools_a = tools.clone_guard();
+        let tools_b = tools.clone_guard();
+        let cwd_a = cwd.clone();
+        let cwd_b = cwd.clone();
+        let h = std::thread::spawn(move || {
+            tools_a
+                .file_edit("race.txt", "A1", "A2", Some(&cwd_a))
+                .unwrap()
+        });
+        let rb = tools_b
+            .file_edit("race.txt", "B1", "B2", Some(&cwd_b))
+            .unwrap();
+        let ra = h.join().unwrap();
+        assert!(ra.ok && rb.ok, "两并发 edit 都应成功: a={ra:?} b={rb:?}");
+        let after = std::fs::read_to_string(&fp).unwrap();
+        assert!(
+            after.contains("A2") && after.contains("B2"),
+            "两改动都应落地: {after}"
+        );
+    }
+
+    // 持锁时他方阻塞 (非立即覆盖) — 模拟: 主线程持锁, 子线程 edit 应等到锁释放
+    #[test]
+    fn test_file_edit_blocks_until_lock_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("locked.txt");
+        std::fs::write(&fp, "v1\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        // 主线程先持锁
+        let _hold = FileLock::exclusive(&fp).unwrap();
+        let tools = Tools::new();
+        let fp2 = fp.clone();
+        let cwd2 = cwd.clone();
+        let start = std::time::Instant::now();
+        let h = std::thread::spawn(move || {
+            tools
+                .file_edit("locked.txt", "v1", "v2", Some(&cwd2))
+                .unwrap()
+        });
+        // 持锁 300ms 后释放
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(_hold);
+        let r = h.join().unwrap();
+        let elapsed = start.elapsed();
+        assert!(r.ok, "锁释放后 edit 应成功: {r:?}");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "edit 应阻塞到锁释放 (实耗 {elapsed:?})"
+        );
+        let _ = fp2;
+    }
+
+    // ── 审计 3.6/3.7/3.8/3.12 回归 ──
+
+    // 3.6: glob 应跳过忽略目录 (.venv/node_modules/...) — 旧版扫 .venv 10 万条目
+    #[test]
+    fn test_glob_skips_ignored_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.py"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join(".venv").join("lib")).unwrap();
+        std::fs::write(dir.path().join(".venv").join("lib").join("fake.py"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules").join("dep.py"), "").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let paths: Vec<String> = tools
+            .glob("**/*.py", Some(&cwd))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(paths, vec!["real.py"], "glob 应只返忽略目录外的命中");
+    }
+
+    // 3.6: glob 结果上限 — 超 GLOB_RESULT_CAP 截断不 OOM
+    #[test]
+    fn test_glob_caps_results() {
+        let dir = tempfile::tempdir().unwrap();
+        // 造 GLOB_RESULT_CAP + 50 个文件
+        for i in 0..(GLOB_RESULT_CAP + 50) {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "").unwrap();
+        }
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools.glob("*.txt", Some(&cwd)).unwrap();
+        assert_eq!(r.len(), GLOB_RESULT_CAP, "glob 应截断到上限");
+    }
+
+    // 3.7: grep 递归应跳过忽略目录 — 旧版扫 node_modules 百万命中
+    #[test]
+    fn test_grep_skips_ignored_dirs_recursive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "needle here\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".venv").join("lib")).unwrap();
+        std::fs::write(
+            dir.path().join(".venv").join("lib").join("dep.py"),
+            "needle venv\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules").join("x.py"), "needle nm\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let ms = tools
+            .grep("needle", &[".".to_string()], Some(&cwd))
+            .unwrap();
+        // 仅 a.py 命中, .venv/node_modules 跳过
+        assert_eq!(ms.len(), 1, "grep 应跳过忽略目录: {:?}", ms);
+        assert!(ms[0].path.contains("a.py"));
+    }
+
+    // 3.7: grep 全局命中上限 — 多文件累计超 GREP_GLOBAL_HIT_CAP 停扫
+    // (单文件先触 per-file cap GREP_PER_FILE_CAP=1000, 故须多文件累计触全局)
+    #[test]
+    fn test_grep_global_cap_stops_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        // 3 文件各 GREP_PER_FILE_CAP(1000) 命中: 前 2 文件填满全局 2000, 第 3 跳过
+        let content: String = (0..GREP_PER_FILE_CAP).map(|_| "hit hit\n").collect();
+        for name in ["a.py", "b.py", "c.py"] {
+            std::fs::write(dir.path().join(name), &content).unwrap();
+        }
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let ms = tools.grep("hit", &[".".to_string()], Some(&cwd)).unwrap();
+        assert_eq!(
+            ms.len(),
+            GREP_GLOBAL_HIT_CAP,
+            "grep 多文件累计应截断到全局上限, 实得 {}",
+            ms.len()
+        );
+    }
+
+    // 3.8: 多文件 diff 两个文件都应应用 — 旧版 diffy from_str 拒多文件, 第二文件丢失
+    #[test]
+    fn test_apply_patch_multi_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.py");
+        let f2 = dir.path().join("b.py");
+        std::fs::write(&f1, "ctx1\nold1\nctx1b\n").unwrap();
+        std::fs::write(&f2, "ctx2\nold2\nctx2b\n").unwrap();
+        let diff = "--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n ctx1\n-old1\n+new1\n ctx1b\n--- a/b.py\n+++ b/b.py\n@@ -1,3 +1,3 @@\n ctx2\n-old2\n+new2\n ctx2b\n";
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools.apply_patch(diff, Some(&cwd)).unwrap();
+        assert!(r.ok, "多文件 apply_patch 应成功: {:?}", r.error);
+        assert_eq!(r.matches, 2, "两个文件各 1 hunk = 2 hunks");
+        assert_eq!(std::fs::read_to_string(&f1).unwrap(), "ctx1\nnew1\nctx1b\n");
+        assert_eq!(std::fs::read_to_string(&f2).unwrap(), "ctx2\nnew2\nctx2b\n");
+    }
+
+    // 3.8(b): 拆 2 hunk 各删 original/2 绕过 per-hunk 判据 — 聚合合计应拦
+    #[test]
+    fn test_apply_patch_split_hunk_full_rewrite_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("app.py");
+        // 4 行文件: 2 hunk 各删 2 (合计 4 = original_lines=4)
+        // 各 hunk removed(2) < 4 绕 per-hunk, 聚合 file_removed(4) >= 4 → 拒
+        std::fs::write(&fp, "line1\nline2\nline3\nline4\n").unwrap();
+        let diff = "--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,1 @@\n-line1\n-line2\n+X\n@@ -3,2 +2,1 @@\n-line3\n-line4\n+Y\n";
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools.apply_patch(diff, Some(&cwd)).unwrap();
+        assert!(!r.ok, "拆 hunk 全重写应被聚合判据拦: {:?}", r.error);
+        assert!(r.error.unwrap().contains("全文件重写"));
+        // 文件未变
+        assert_eq!(
+            std::fs::read_to_string(&fp).unwrap(),
+            "line1\nline2\nline3\nline4\n"
+        );
+    }
+
+    // 3.12: replace_function 无 grammar (.go) 应 fail-loud 拒绝 (非破损正则回退)
+    // locate_function 无 grammar → 返回 Err (非 Ok{ok:false}), 调用方见 Result
+    #[test]
+    fn test_replace_function_no_grammar_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("main.go");
+        std::fs::write(&fp, "func foo() {\n    return 1\n}\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools.replace_function(
+            "main.go",
+            "foo",
+            "func foo() {\n    return 9\n}\n",
+            Some(&cwd),
+        );
+        let err = r.err().unwrap().to_string();
+        assert!(
+            err.contains("不支持") || err.contains("grammar"),
+            "应说明不支持/无 grammar: {err}"
+        );
+        // 文件未变 (未被破损正则损坏)
+        assert_eq!(
+            std::fs::read_to_string(&fp).unwrap(),
+            "func foo() {\n    return 1\n}\n"
+        );
+    }
+
+    // split_multi_file_diff 单元: 单文件 → 1 元素; 多文件 → N 元素; git 扩展头丢弃
+    #[test]
+    fn test_split_multi_file_diff() {
+        let single = "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-x\n+y\n";
+        assert_eq!(split_multi_file_diff(single).len(), 1);
+
+        let multi = "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-x\n+y\n--- a/b.py\n+++ b/b.py\n@@ -1,1 +1,1 @@\n-p\n+q\n";
+        let segs = split_multi_file_diff(multi);
+        assert_eq!(segs.len(), 2);
+        assert!(segs[0].starts_with("--- a/a.py"));
+        assert!(segs[1].starts_with("--- a/b.py"));
+
+        // git 扩展头 (diff --git/index) 在首 --- 前 → 丢弃
+        let with_git = "diff --git a/a.py b/a.py\nindex 123..456\n--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-x\n+y\n";
+        let segs = split_multi_file_diff(with_git);
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].starts_with("--- a/a.py"), "git 扩展头应被丢弃");
     }
 }

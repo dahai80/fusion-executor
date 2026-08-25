@@ -13,6 +13,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+fe-security.workspace = true
+fs2.workspace = true
 
 [lints]
 workspace = true
