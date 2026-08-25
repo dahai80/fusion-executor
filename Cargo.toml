@@ -72,6 +72,9 @@ tree-sitter-rust = "0.23"
 glob = "0.3"
 walkdir = "2"
 diffy = "0.4"
+# Issue #7 ripgrep parity: .gitignore-aware 遍历 (ignore) + include/exclude glob 过滤 (globset)
+ignore = "0.4"
+globset = "0.4"
 # 文件锁 (Blocker 8 / 3.4) — RMW 事务性, 防并发编辑静默丢改动; 安全封装免 unsafe
 fs2 = "0.4"
 

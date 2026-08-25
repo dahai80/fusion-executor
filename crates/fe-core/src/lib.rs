@@ -19,7 +19,10 @@ use fe_rollback::RollbackManager;
 use fe_sandbox::{Sandbox, SandboxConfig};
 use fe_security::{SecurityGuard, SecurityVerdict};
 use fe_telemetry::{start_stream as start_telemetry, TelemetryConfig, TelemetrySample};
-use fe_tools::{EditResult, GlobEntry, GrepMatch, MultiEditItem, NotebookEditMode, Tools};
+use fe_tools::{
+    EditResult, GlobEntry, GrepMatch, GrepOptions, GrepOutput, MultiEditItem, NotebookEditMode,
+    Tools,
+};
 
 pub use fe_diagnostics as diagnostics;
 pub use fe_gui as gui;
@@ -33,7 +36,9 @@ pub use fe_telemetry::{
 pub use fe_tools as tools;
 pub use fe_tools::{
     EditResult as ToolsEditResult, GlobEntry as ToolsGlobEntry, GrepMatch as ToolsGrepMatch,
-    MultiEditItem as ToolsMultiEditItem, NotebookEditMode as ToolsNotebookEditMode,
+    GrepOptions as ToolsGrepOptions, GrepOutput as ToolsGrepOutput,
+    GrepOutputMode as ToolsGrepOutputMode, MultiEditItem as ToolsMultiEditItem,
+    NotebookEditMode as ToolsNotebookEditMode,
 };
 
 // BLOCKING_RT — 多线程 N worker (CPU 核心数, 下限 2), 并发执行 sandbox/telemetry/IPC 任务
@@ -410,6 +415,17 @@ impl Executor {
         cwd: Option<&str>,
     ) -> Result<Vec<GrepMatch>> {
         self.tools.grep(pattern, paths, cwd)
+    }
+
+    /// #7 ripgrep parity — grep 带选项: 输出模式 / 上下文 / 多行 / glob 过滤
+    pub fn grep_with_opts(
+        &self,
+        pattern: &str,
+        paths: &[String],
+        cwd: Option<&str>,
+        opts: &GrepOptions,
+    ) -> Result<GrepOutput> {
+        self.tools.grep_with_opts(pattern, paths, cwd, opts)
     }
 
     /// 外科补丁引擎 — apply_patch (PRD §DeepSeek Unified Diff 应用)

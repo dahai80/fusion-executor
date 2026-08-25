@@ -13,6 +13,7 @@ from fusion_executor import (
     FusionSandboxExecutor,
     GlobEntry,
     GrepMatch,
+    GrepOutput,
     MultiEditItem,
     RollbackPolicy,
     TelemetrySample,
@@ -334,6 +335,74 @@ def test_grep_matches_lines(executor: FusionSandboxExecutor, tmp_path):
     assert ms[1].line_number == 3
 
 
+def test_grep_with_opts_files_with_matches(executor: FusionSandboxExecutor, tmp_path):
+    (tmp_path / "a.py").write_text("TODO fix\n")
+    (tmp_path / "b.py").write_text("nope\n")
+    (tmp_path / "c.py").write_text("TODO again\n")
+    out = executor.grep_with_opts("TODO", ["."], {"output_mode": "files_with_matches"}, cwd=str(tmp_path))
+    assert isinstance(out, GrepOutput)
+    assert out.output_mode == "files_with_matches"
+    assert out.matches == []
+    assert sorted(out.files) == ["a.py", "c.py"]
+
+
+def test_grep_with_opts_count_mode(executor: FusionSandboxExecutor, tmp_path):
+    (tmp_path / "a.py").write_text("todo\ntodo\ntodo\n")
+    out = executor.grep_with_opts("todo", ["a.py"], {"output_mode": "count"}, cwd=str(tmp_path))
+    assert len(out.counts) == 1
+    assert out.counts[0].path == "a.py"
+    assert out.counts[0].count == 3
+
+
+def test_grep_with_opts_context(executor: FusionSandboxExecutor, tmp_path):
+    (tmp_path / "a.py").write_text("l1\nl2\nl3\nMARK\nl5\nl6\nl7\n")
+    out = executor.grep_with_opts("MARK", ["a.py"], {"before": 2, "after": 1}, cwd=str(tmp_path))
+    assert len(out.matches) == 1
+    m = out.matches[0]
+    assert m.line_number == 4
+    assert m.content == "MARK"
+    assert m.context_before == ["l2", "l3"]
+    assert m.context_after == ["l5"]
+
+
+def test_grep_with_opts_multiline(executor: FusionSandboxExecutor, tmp_path):
+    (tmp_path / "a.py").write_text("foo\nmiddle\nbar\n")
+    out = executor.grep_with_opts("foo.*bar", ["a.py"], {"multiline": True}, cwd=str(tmp_path))
+    assert len(out.matches) == 1
+    assert out.matches[0].line_number == 1
+    assert out.matches[0].content == "foo\nmiddle\nbar"
+
+
+def test_grep_with_opts_glob_filter(executor: FusionSandboxExecutor, tmp_path):
+    (tmp_path / "a.py").write_text("MARK\n")
+    (tmp_path / "b.rs").write_text("MARK\n")
+    (tmp_path / "c.txt").write_text("MARK\n")
+    inc = executor.grep_with_opts(
+        "MARK",
+        ["."],
+        {"output_mode": "files_with_matches", "glob_include": ["*.py"]},
+        cwd=str(tmp_path),
+    )
+    assert inc.files == ["a.py"]
+    exc = executor.grep_with_opts(
+        "MARK",
+        ["."],
+        {"output_mode": "files_with_matches", "glob_exclude": ["*.rs"]},
+        cwd=str(tmp_path),
+    )
+    assert sorted(exc.files) == ["a.py", "c.txt"]
+
+
+def test_glob_gitignore_aware(executor: FusionSandboxExecutor, tmp_path):
+    (tmp_path / ".gitignore").write_text("ignored.py\n")
+    (tmp_path / "ignored.py").write_text("x\n")
+    (tmp_path / "kept.py").write_text("y\n")
+    entries = executor.glob("*.py", cwd=str(tmp_path))
+    paths = [e.path for e in entries]
+    assert "kept.py" in paths
+    assert "ignored.py" not in paths
+
+
 def test_apply_patch_simple(executor: FusionSandboxExecutor, tmp_path):
     fp = tmp_path / "app.py"
     fp.write_text("line1\nline2\nline3\n")
@@ -556,6 +625,27 @@ def test_glob_over_uds_roundtrip(uds_server: str, tmp_path):
     )
     paths = sorted(e["path"] for e in resp["result"])
     assert paths == ["a.py", "b.py"]
+
+
+def test_grep_with_opts_over_uds_roundtrip(uds_server: str, tmp_path):
+    (tmp_path / "a.py").write_text("TODO fix\n")
+    (tmp_path / "b.py").write_text("TODO again\n")
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "executor.grep_with_opts",
+            "params": {
+                "pattern": "TODO",
+                "paths": ["."],
+                "opts": {"output_mode": "files_with_matches"},
+                "cwd": str(tmp_path),
+            },
+        },
+    )
+    assert resp["result"]["output_mode"] == "files_with_matches"
+    assert sorted(resp["result"]["files"]) == ["a.py", "b.py"]
 
 
 def test_multi_edit_over_uds_roundtrip(uds_server: str, tmp_path):

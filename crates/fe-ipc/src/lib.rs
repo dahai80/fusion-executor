@@ -1111,6 +1111,30 @@ async fn handle_method(
                 .map_err(|e| (ERR_INTERNAL, format!("grep 失败: {}", e)))?;
             Ok(serde_json::to_value(&matches).unwrap_or(json!({})))
         }
+        "executor.grep_with_opts" => {
+            let pattern = param_str(&params, "pattern")
+                .ok_or((ERR_INVALID_REQ, "缺少 pattern".to_string()))?;
+            let paths: Vec<String> = params
+                .get("paths")
+                .and_then(|p| p.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .ok_or((ERR_INVALID_REQ, "缺少 paths 数组".to_string()))?;
+            let cwd = params.get("cwd").and_then(|c| c.as_str());
+            // #7: opts 子对象 serde 反序列化 (字段全 #[serde(default)], 缺省=默认)
+            let opts: fe_core::tools::GrepOptions = match params.get("opts") {
+                Some(v) => serde_json::from_value(v.clone())
+                    .map_err(|e| (ERR_INVALID_REQ, format!("opts 解析失败: {}", e)))?,
+                None => fe_core::tools::GrepOptions::default(),
+            };
+            let out = executor
+                .grep_with_opts(&pattern, &paths, cwd, &opts)
+                .map_err(|e| (ERR_INTERNAL, format!("grep_with_opts 失败: {}", e)))?;
+            Ok(serde_json::to_value(&out).unwrap_or(json!({})))
+        }
         "executor.apply_patch" => {
             let diff =
                 param_str(&params, "diff").ok_or((ERR_INVALID_REQ, "缺少 diff".to_string()))?;

@@ -67,11 +67,74 @@ pub struct GlobEntry {
 }
 
 /// grep 单条命中
+/// #7: context_before/context_after (内容模式 -A/-B/-C 上下文行), 默认空 (无上下文)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GrepMatch {
     pub path: String,
     pub line_number: u32,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_before: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_after: Vec<String>,
+}
+
+// ── #7: ripgrep parity — grep 输出模式 / 选项 / 结果 ──
+
+/// grep 输出模式 (ripgrep parity)
+/// content (默认): 逐行命中 + 可选上下文; files_with_matches (-l): 仅文件名; count (-c): 每文件命中数
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GrepOutputMode {
+    #[default]
+    Content,
+    FilesWithMatches,
+    Count,
+}
+
+/// grep 文件命中计数 (count 模式)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrepFileCount {
+    pub path: String,
+    pub count: u32,
+}
+
+/// grep 选项 (#7 ripgrep parity)
+/// output_mode: content|files_with_matches|count
+/// after/before/context: -A/-B/-C 上下文行 (仅 content 模式生效)
+/// multiline: 跨行匹配 (RegexBuilder multi_line + 整文件 buffer)
+/// glob_include/glob_exclude: -g include/exclude glob 过滤文件路径 (globset)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrepOptions {
+    #[serde(default)]
+    pub output_mode: GrepOutputMode,
+    #[serde(default)]
+    pub after: u32,
+    #[serde(default)]
+    pub before: u32,
+    #[serde(default)]
+    pub context: u32,
+    #[serde(default)]
+    pub multiline: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub glob_include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub glob_exclude: Vec<String>,
+}
+
+/// grep 聚合结果 (#7: 三种输出模式统一返回)
+/// content 模式 → matches 有值, files/counts 空
+/// files_with_matches 模式 → files 有值 (去重排序), matches/counts 空
+/// count 模式 → counts 有值 (每文件命中数), matches/files 空
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrepOutput {
+    pub output_mode: GrepOutputMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<GrepMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub counts: Vec<GrepFileCount>,
 }
 
 // ── #6: replace_all / MultiEdit / NotebookEdit 扩展 ──
@@ -493,35 +556,53 @@ impl Tools {
             )));
         }
         let cwd_abs = std::fs::canonicalize(base).unwrap_or_else(|_| PathBuf::from(base));
-        let full_pattern = if Path::new(pattern).is_absolute() {
-            pattern.to_string()
-        } else {
-            format!(
-                "{}/{}",
-                cwd_abs.to_string_lossy().trim_end_matches('/'),
-                pattern
-            )
-        };
-        debug!(pattern = %full_pattern, "glob 匹配中");
+        // #7: gitignore-aware 遍历 — ignore::WalkBuilder 读 .gitignore + 隐藏文件 + IGNORED_DIRS 基线
+        // 旧版 glob::glob 直接匹配文件系统, 不读 .gitignore → 命中 .gitignore'd 文件 (如 dist/产物)
+        let pat = globset::Glob::new(pattern)
+            .map_err(|e| anyhow::anyhow!("glob 模式无效: {}", e))?
+            .compile_matcher();
         let mut out = Vec::new();
         let mut skipped_ignored = 0u32;
-        for entry in
-            glob::glob(&full_pattern).map_err(|e| anyhow::anyhow!("glob 模式无效: {}", e))?
-        {
-            let p = match entry {
-                Ok(p) => p,
+        let mut builder = ignore::WalkBuilder::new(&cwd_abs);
+        builder
+            .hidden(false) // 显式: 不自动跳隐藏 (旧版仅跳 IGNORED_DIRS, 调用方可能要 .github/...)
+            .ignore(true) // 读 .gitignore
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(true)
+            .parents(true)
+            .follow_links(false)
+            // 非 git 仓库也遵循 .gitignore (默认 require_git=true 仅 git 仓生效; fusion 子项目多为独立仓)
+            .require_git(false);
+        // IGNORED_DIRS 作硬基线 (即使无 .gitignore 也跳 .venv/node_modules — 防 10 万条目 OOM)
+        builder.add_custom_ignore_filename(".venv");
+        for entry in builder.build() {
+            let ent = match entry {
+                Ok(e) => e,
                 Err(e) => {
-                    warn!(error = %e, "glob 单项读取失败, 跳过");
+                    debug!(error = %e, "glob 遍历单项失败, 跳过");
                     continue;
                 }
             };
-            // 审计 3.6: 跳过忽略目录内命中 (.venv/node_modules/target/...) — 避免扫出 10 万条目
-            if is_in_ignored_dir(&p) {
+            let p = ent.path();
+            // 跳 cwd 根自身 (WalkBuilder 含根)
+            if p == cwd_abs.as_path() {
+                continue;
+            }
+            // IGNORED_DIRS 硬基线 (add_custom_ignore_filename 仅按文件名, 此处兜底目录组件)
+            if is_in_ignored_dir(p) {
                 skipped_ignored += 1;
                 continue;
             }
-            // L-TOOLS-01: 绝对路径模式 (如 /etc/**, ~/.ssh/*) 可越过 cwd 落敏感区
-            // 每条命中取父目录经 validate_cwd 校验敏感前缀, 命中则跳过
+            let rel = p
+                .strip_prefix(&cwd_abs)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| p.to_string_lossy().into_owned());
+            // glob 模式匹配相对路径 (同旧版 **/*.py 语义)
+            if !pat.is_match(&rel) {
+                continue;
+            }
+            // L-TOOLS-01: 命中父目录经 validate_cwd 校验敏感前缀
             let check_target = if p.is_dir() {
                 p.to_string_lossy().into_owned()
             } else {
@@ -535,13 +616,7 @@ impl Tools {
                 continue;
             }
             let is_dir = p.is_dir();
-            // 相对 cwd 的路径 (无 cwd 则相对 ".")
-            let rel = p
-                .strip_prefix(&cwd_abs)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| p.to_string_lossy().into_owned());
             out.push(GlobEntry { path: rel, is_dir });
-            // 审计 3.6: 结果上限 — 超限截断, 避免单帧 10MB+ 经 UDS 传输 OOM
             if out.len() >= GLOB_RESULT_CAP {
                 warn!(
                     cap = GLOB_RESULT_CAP,
@@ -551,24 +626,49 @@ impl Tools {
             }
         }
         if skipped_ignored > 0 {
-            debug!(
-                skipped_ignored,
-                "glob 跳过忽略目录内命中 (.venv/node_modules/...)"
-            );
+            debug!(skipped_ignored, "glob 跳过忽略目录内命中");
         }
         info!(count = out.len(), skipped_ignored, "glob 完成");
         Ok(out)
     }
 
-    /// grep — 正则逐行搜索, paths 为文件或目录列表 (目录则 walkdir 递归)
-    /// 返回每条命中 (相对路径, 行号, 内容); 限制单文件 1000 行命中防爆
+    /// grep — 正则逐行搜索 (content 模式, 旧版兼容入口)
+    /// paths 为文件或目录列表 (目录则递归); 返回每条命中 (相对路径, 行号, 内容)
     pub fn grep(
         &self,
         pattern: &str,
         paths: &[String],
         cwd: Option<&str>,
     ) -> Result<Vec<GrepMatch>> {
-        let re = Regex::new(pattern)?;
+        let out = self.grep_run(pattern, paths, cwd, &GrepOptions::default())?;
+        Ok(out.matches)
+    }
+
+    /// grep_with_opts — #7 ripgrep parity: 输出模式 / 上下文 / 多行 / glob 过滤
+    pub fn grep_with_opts(
+        &self,
+        pattern: &str,
+        paths: &[String],
+        cwd: Option<&str>,
+        opts: &GrepOptions,
+    ) -> Result<GrepOutput> {
+        self.grep_run(pattern, paths, cwd, opts)
+    }
+
+    /// grep 核心实现 — 统一 content/files_with_matches/count 三模式
+    fn grep_run(
+        &self,
+        pattern: &str,
+        paths: &[String],
+        cwd: Option<&str>,
+        opts: &GrepOptions,
+    ) -> Result<GrepOutput> {
+        let re = regex::RegexBuilder::new(pattern)
+            .multi_line(opts.multiline)
+            // 多行模式: . 匹配换行 (ripgrep -U 语义, 跨行块匹配)
+            .dot_matches_new_line(opts.multiline)
+            .build()
+            .map_err(|e| anyhow::anyhow!(ToolsError::Regex(e)))?;
         let base = cwd.unwrap_or(".");
         let cwd_v = self.guard.validate_cwd(base);
         if !cwd_v.allowed {
@@ -576,32 +676,46 @@ impl Tools {
                 cwd_v.reason.unwrap_or_else(|| "cwd 敏感".to_string()),
             )));
         }
-        let cwd_abs = std::fs::canonicalize(base).unwrap_or_else(|_| PathBuf::from(base));
-        let mut out = Vec::new();
+        // #7 gap 5: glob include/exclude (-g) — globset 过滤文件路径
+        let include_set = build_globset(&opts.glob_include)?;
+        let exclude_set = build_globset(&opts.glob_exclude)?;
+        let mut matches: Vec<GrepMatch> = Vec::new();
+        let mut files_with_matches: Vec<String> = Vec::new();
+        let mut counts: Vec<GrepFileCount> = Vec::new();
+        // 全局命中计数 (content 模式用; files/count 模式按文件计, 不受此 cap)
+        let mut global_hits = 0usize;
         for raw in paths {
-            if out.len() >= GREP_GLOBAL_HIT_CAP {
-                warn!(cap = GREP_GLOBAL_HIT_CAP, "grep 全局命中超上限, 停扫");
-                break;
-            }
             let abs = guard_path(&self.guard, raw, cwd).map_err(|e| anyhow::anyhow!(e))?;
+            // 规范化遍历根 (解 ./ 尾缀 + 符号链接), 与 walkdir 产出的 entry 前缀一致
+            let root = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
             if abs.is_file() {
-                grep_file(&abs, &abs, &cwd_abs, &re, &mut out, GREP_GLOBAL_HIT_CAP)?;
+                if !path_passes_glob(&abs, &root, &include_set, &exclude_set) {
+                    continue;
+                }
+                let n = grep_file(
+                    &abs,
+                    &abs,
+                    &root,
+                    &re,
+                    &mut matches,
+                    GREP_GLOBAL_HIT_CAP - global_hits,
+                    opts,
+                )?;
+                global_hits += n as usize;
+                if n > 0 {
+                    record_output(opts, &abs, &root, n, &mut files_with_matches, &mut counts);
+                }
             } else if abs.is_dir() {
-                // 审计 3.7: 加 max_depth 防 .venv 深递归 + 跳过忽略目录 + 全局命中 cap
-                // 旧版 walkdir 无 max_depth, 仅跳点文件 → 扫 .venv/site-packages 10 万文件 OOM
-                for ent in walkdir::WalkDir::new(&abs)
+                // 审计 3.7: max_depth 防 .venv 深递归 + 跳过忽略目录 + 全局命中 cap
+                // #7: glob include/exclude 过滤 + (默认 gitignore 由调用方传 .gitignore'd 外的目录)
+                for ent in walkdir::WalkDir::new(&root)
                     .max_depth(GREP_MAX_DEPTH)
                     .into_iter()
                     .filter_entry(|e| !is_ignored_walkdir_entry(e))
                     .filter_map(|e| e.ok())
                     .filter(|e| e.file_type().is_file())
                 {
-                    if out.len() >= GREP_GLOBAL_HIT_CAP {
-                        warn!(cap = GREP_GLOBAL_HIT_CAP, "grep 全局命中超上限, 停扫");
-                        break;
-                    }
                     let fp = ent.path();
-                    // 跳过隐藏文件 (目录已 filter_entry 拦, 此处拦文件名 . 开头)
                     if fp
                         .file_name()
                         .map(|n| n.to_string_lossy().starts_with('.'))
@@ -609,15 +723,41 @@ impl Tools {
                     {
                         continue;
                     }
-                    let remaining = GREP_GLOBAL_HIT_CAP - out.len();
-                    grep_file(fp, &abs, &cwd_abs, &re, &mut out, remaining)?;
+                    if !path_passes_glob(fp, &root, &include_set, &exclude_set) {
+                        continue;
+                    }
+                    if opts.output_mode == GrepOutputMode::Content
+                        && global_hits >= GREP_GLOBAL_HIT_CAP
+                    {
+                        warn!(cap = GREP_GLOBAL_HIT_CAP, "grep 全局命中超上限, 停扫");
+                        break;
+                    }
+                    let remaining = GREP_GLOBAL_HIT_CAP.saturating_sub(global_hits);
+                    let n = grep_file(fp, &root, &root, &re, &mut matches, remaining, opts)?;
+                    global_hits += n as usize;
+                    if n > 0 {
+                        record_output(opts, fp, &root, n, &mut files_with_matches, &mut counts);
+                    }
                 }
             } else {
                 warn!(path = %abs.display(), "grep 路径不存在, 跳过");
             }
         }
-        info!(matches = out.len(), "grep 完成");
-        Ok(out)
+        files_with_matches.sort();
+        files_with_matches.dedup();
+        info!(
+            mode = ?opts.output_mode,
+            matches = matches.len(),
+            files = files_with_matches.len(),
+            count_files = counts.len(),
+            "grep 完成"
+        );
+        Ok(GrepOutput {
+            output_mode: opts.output_mode,
+            matches,
+            files: files_with_matches,
+            counts,
+        })
     }
 
     /// apply_patch — Unified Diff 解析 + 应用 (diffy crate)
@@ -1013,6 +1153,92 @@ fn is_ignored_walkdir_entry(entry: &walkdir::DirEntry) -> bool {
             .unwrap_or(false)
 }
 
+// ── #7 ripgrep parity helpers ──
+
+/// 构建 globset (None = 不过滤); 空列表 → None (跳过编译, 全通过)
+fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut b = globset::GlobSetBuilder::new();
+    for p in patterns {
+        b.add(globset::Glob::new(p).map_err(|e| anyhow::anyhow!("glob 过滤模式无效: {}", e))?);
+    }
+    Ok(Some(
+        b.build()
+            .map_err(|e| anyhow::anyhow!("globset 构建失败: {}", e))?,
+    ))
+}
+
+/// 文件路径是否通过 include/exclude glob 过滤 (#7 gap 5, -g)
+/// include 非空: 必须匹配任一 include (白名单); exclude 非空: 匹配任一则排除
+/// 匹配相对遍历根的路径 (同 glob 语义); 单文件输入 (rel 空) → 用 file_name 匹配
+/// 无 include → 默认通过; 任一 exclude 命中 → 拒
+fn path_passes_glob(
+    fp: &Path,
+    root: &Path,
+    include: &Option<globset::GlobSet>,
+    exclude: &Option<globset::GlobSet>,
+) -> bool {
+    let rel = rel_for_glob(fp, root);
+    if let Some(ex) = exclude {
+        if ex.is_match(&rel) {
+            return false;
+        }
+    }
+    if let Some(inc) = include {
+        return inc.is_match(&rel);
+    }
+    true
+}
+
+/// 按输出模式记录命中文件 (#7 gap 2)
+/// content 模式不调此 (matches 在 grep_file 内填); files/count 在此聚合
+fn record_output(
+    opts: &GrepOptions,
+    fp: &Path,
+    root: &Path,
+    hits: u32,
+    files: &mut Vec<String>,
+    counts: &mut Vec<GrepFileCount>,
+) {
+    let rel = rel_for_record(fp, root);
+    match opts.output_mode {
+        GrepOutputMode::FilesWithMatches => files.push(rel),
+        GrepOutputMode::Count => counts.push(GrepFileCount {
+            path: rel,
+            count: hits,
+        }),
+        GrepOutputMode::Content => {}
+    }
+}
+
+/// glob 过滤用的相对路径: strip_prefix(root), 空/失败 → file_name (单文件语义)
+fn rel_for_glob(fp: &Path, root: &Path) -> String {
+    if let Ok(r) = fp.strip_prefix(root) {
+        let s = r.to_string_lossy().into_owned();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    fp.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| fp.to_string_lossy().into_owned())
+}
+
+/// 记录用的相对路径 (display): strip_prefix(root), 失败 → file_name (避绝对路径泄漏)
+fn rel_for_record(fp: &Path, root: &Path) -> String {
+    if let Ok(r) = fp.strip_prefix(root) {
+        let s = r.to_string_lossy().into_owned();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    fp.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| fp.to_string_lossy().into_owned())
+}
+
 /// 预检文件大小 — 超上限返 Oversize 错 (fail-loud), 不静默截断
 /// (写工具需读全文件做 RMW, 超大文件该用专用 diff 工具, 非 LLM 整文件重写)
 fn check_size(path: &Path) -> std::result::Result<(), ToolsError> {
@@ -1245,6 +1471,8 @@ fn split_multi_file_diff(diff: &str) -> Vec<String> {
 /// 审计 3.7: global_remaining = 全局命中余量 (GREP_GLOBAL_HIT_CAP - 已收), 取 min(单文件 1000, 余量)
 const GREP_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const GREP_PER_FILE_CAP: usize = 1000;
+/// 返回该文件命中数 (0 = 无命中); content 模式才填充 out (含上下文)
+#[allow(clippy::too_many_arguments)]
 fn grep_file(
     fp: &Path,
     root: &Path,
@@ -1252,25 +1480,26 @@ fn grep_file(
     re: &Regex,
     out: &mut Vec<GrepMatch>,
     global_remaining: usize,
-) -> Result<()> {
+    opts: &GrepOptions,
+) -> Result<u32> {
     // P-SB-01: metadata 限大小, 超限跳过 (避 OOM)
     if let Ok(meta) = std::fs::metadata(fp) {
         if meta.len() > GREP_FILE_MAX_BYTES {
             warn!(path = %fp.display(), size = meta.len(), "grep 文件超 64MB 上限, 跳过");
-            return Ok(());
+            return Ok(0);
         }
     }
     let bytes = match std::fs::read(fp) {
         Ok(b) => b,
         Err(e) => {
             debug!(path = %fp.display(), error = %e, "grep 读文件失败, 跳过");
-            return Ok(());
+            return Ok(0);
         }
     };
     // 二进制嫌疑 → 跳过 (限前 8KB 探测, 避全扫描)
     let probe = &bytes[..bytes.len().min(8192)];
     if probe.contains(&0u8) {
-        return Ok(());
+        return Ok(0);
     }
     let text = String::from_utf8_lossy(&bytes);
     let rel = fp
@@ -1278,24 +1507,70 @@ fn grep_file(
         .or_else(|_| fp.strip_prefix(root))
         .map(|r| r.to_string_lossy().into_owned())
         .unwrap_or_else(|_| fp.to_string_lossy().into_owned());
-    // 单文件上限取 min(单文件 cap, 全局余量) — 防单文件吃满全局额度后又叠加其他文件
-    let file_cap = GREP_PER_FILE_CAP.min(global_remaining);
-    let mut hits = 0u32;
-    for (i, line) in text.lines().enumerate() {
-        if re.is_match(line) {
-            out.push(GrepMatch {
-                path: rel.clone(),
-                line_number: (i + 1) as u32,
-                content: line.to_string(),
-            });
+    // #7 gap 4: 多行模式 — 整文件 buffer 匹配, 行号 = 匹配起点所在行
+    if opts.multiline {
+        let mut hits = 0u32;
+        let file_cap = GREP_PER_FILE_CAP.min(global_remaining) as u32;
+        for m in re.find_iter(&text) {
+            if hits >= file_cap {
+                warn!(path = %fp.display(), cap = file_cap, "grep 多行单文件命中超上限, 截断");
+                break;
+            }
+            // 行号 = 匹配起点之前 '\n' 数 + 1
+            let line_number = text[..m.start()].matches('\n').count() as u32 + 1;
+            let content = m.as_str().to_string();
+            if opts.output_mode == GrepOutputMode::Content {
+                out.push(GrepMatch {
+                    path: rel.clone(),
+                    line_number,
+                    content,
+                    context_before: Vec::new(),
+                    context_after: Vec::new(),
+                });
+            }
             hits += 1;
-            if hits as usize >= file_cap {
+        }
+        return Ok(hits);
+    }
+    // #7 gap 3: 上下文 -A/-B/-C (-C = min(A,B) 同时取 before/after)
+    let lines: Vec<&str> = text.lines().collect();
+    let before = opts.before.max(opts.context) as usize;
+    let after = opts.after.max(opts.context) as usize;
+    let file_cap = GREP_PER_FILE_CAP.min(global_remaining) as u32;
+    let mut hits = 0u32;
+    for (i, line) in lines.iter().enumerate() {
+        if re.is_match(line) {
+            hits += 1;
+            if opts.output_mode == GrepOutputMode::Content {
+                let cb: Vec<String> = if before > 0 {
+                    lines[i.saturating_sub(before)..i]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let ca: Vec<String> = if after > 0 {
+                    let end = (i + 1 + after).min(lines.len());
+                    lines[(i + 1)..end].iter().map(|s| s.to_string()).collect()
+                } else {
+                    Vec::new()
+                };
+                out.push(GrepMatch {
+                    path: rel.clone(),
+                    line_number: (i + 1) as u32,
+                    content: line.to_string(),
+                    context_before: cb,
+                    context_after: ca,
+                });
+            }
+            if hits >= file_cap {
                 warn!(path = %fp.display(), cap = file_cap, "grep 单文件命中超上限, 截断");
                 break;
             }
         }
     }
-    Ok(())
+    Ok(hits)
 }
 
 #[cfg(test)]
@@ -1410,6 +1685,164 @@ mod tests {
         let cwd = dir.path().to_string_lossy().to_string();
         let ms = tools.grep("TODO", &[".".to_string()], Some(&cwd)).unwrap();
         assert_eq!(ms.len(), 2);
+    }
+
+    // ── #7 ripgrep parity ──
+
+    #[test]
+    fn test_grep_files_with_matches_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "TODO fix\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), "no match here\n").unwrap();
+        std::fs::write(dir.path().join("c.py"), "TODO again\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let out = tools
+            .grep_with_opts(
+                "TODO",
+                &[".".to_string()],
+                Some(&cwd),
+                &GrepOptions {
+                    output_mode: GrepOutputMode::FilesWithMatches,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.output_mode, GrepOutputMode::FilesWithMatches);
+        assert!(out.matches.is_empty());
+        assert_eq!(out.files.len(), 2);
+        assert!(out.files.contains(&"a.py".to_string()));
+        assert!(out.files.contains(&"c.py".to_string()));
+    }
+
+    #[test]
+    fn test_grep_count_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "todo\ntodo\ntodo\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let out = tools
+            .grep_with_opts(
+                "todo",
+                &["a.py".to_string()],
+                Some(&cwd),
+                &GrepOptions {
+                    output_mode: GrepOutputMode::Count,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.counts.len(), 1);
+        assert_eq!(out.counts[0].path, "a.py");
+        assert_eq!(out.counts[0].count, 3);
+    }
+
+    #[test]
+    fn test_grep_context_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "l1\nl2\nl3\nMARK\nl5\nl6\nl7\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let out = tools
+            .grep_with_opts(
+                "MARK",
+                &["a.py".to_string()],
+                Some(&cwd),
+                &GrepOptions {
+                    before: 2,
+                    after: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.matches.len(), 1);
+        let m = &out.matches[0];
+        assert_eq!(m.line_number, 4);
+        assert_eq!(m.content, "MARK");
+        assert_eq!(m.context_before, vec!["l2".to_string(), "l3".to_string()]);
+        assert_eq!(m.context_after, vec!["l5".to_string()]);
+    }
+
+    #[test]
+    fn test_grep_multiline_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        // 多行块匹配: foo ... bar 跨行
+        std::fs::write(dir.path().join("a.py"), "foo\nmiddle\nbar\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let out = tools
+            .grep_with_opts(
+                "foo.*bar",
+                &["a.py".to_string()],
+                Some(&cwd),
+                &GrepOptions {
+                    multiline: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.matches.len(), 1);
+        // 行号 = 匹配起点 (foo 所在行)
+        assert_eq!(out.matches[0].line_number, 1);
+        assert_eq!(out.matches[0].content, "foo\nmiddle\nbar");
+    }
+
+    #[test]
+    fn test_grep_glob_include_exclude() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "MARK\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "MARK\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "MARK\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        // include *.py → 只 a.py
+        let out = tools
+            .grep_with_opts(
+                "MARK",
+                &[".".to_string()],
+                Some(&cwd),
+                &GrepOptions {
+                    output_mode: GrepOutputMode::FilesWithMatches,
+                    glob_include: vec!["*.py".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.files, vec!["a.py".to_string()]);
+        // exclude *.rs → a.py + c.txt
+        let out = tools
+            .grep_with_opts(
+                "MARK",
+                &[".".to_string()],
+                Some(&cwd),
+                &GrepOptions {
+                    output_mode: GrepOutputMode::FilesWithMatches,
+                    glob_exclude: vec!["*.rs".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.files.len(), 2);
+        assert!(out.files.contains(&"a.py".to_string()));
+        assert!(out.files.contains(&"c.txt".to_string()));
+    }
+
+    #[test]
+    fn test_glob_gitignore_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        // 写 .gitignore 排除 ignored.py
+        std::fs::write(dir.path().join(".gitignore"), "ignored.py\n").unwrap();
+        std::fs::write(dir.path().join("ignored.py"), "x\n").unwrap();
+        std::fs::write(dir.path().join("kept.py"), "y\n").unwrap();
+        let tools = Tools::new();
+        let entries = tools.glob("*.py", Some(&cwd)).unwrap();
+        let paths: Vec<String> = entries.into_iter().map(|e| e.path).collect();
+        assert!(paths.contains(&"kept.py".to_string()));
+        assert!(
+            !paths.contains(&"ignored.py".to_string()),
+            "gitignore 应排除 ignored.py"
+        );
     }
 
     // ── apply_patch ──
