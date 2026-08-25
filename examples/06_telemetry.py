@@ -23,10 +23,7 @@ def main() -> None:
     for sample in ex.telemetry_stream(interval_ms=100, max_samples=8):
         count += 1
         gpu = f" gpu={sample.gpu_pct}%" if sample.gpu_pct is not None else ""
-        print(
-            f"  #{count:2d} ts_ms={sample.ts_ms} "
-            f"cpu={sample.cpu_pct:5.1f}% mem={sample.mem_mb:6.1f}MB{gpu}"
-        )
+        print(f"  #{count:2d} ts_ms={sample.ts_ms} cpu={sample.cpu_pct:5.1f}% mem={sample.mem_mb:6.1f}MB{gpu}")
 
     if count != 8:
         raise SystemExit(f"expected 8 samples, got {count}")
