@@ -4,7 +4,7 @@
 // 不持有 GPU 句柄)。10Hz 采样 → mpsc<telemetry::TelemetrySample> 流。
 // Executor 不跨请求累积状态: 每次 telemetry_stream() 返回独立流 + JoinHandle。
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -61,18 +61,36 @@ pub fn start_stream(
     let handle = rt.spawn(async move {
         let mut sys = sysinfo::System::new();
         let pid = sysinfo::Pid::from_u32(std::process::id());
-        let interval = Duration::from_millis(cfg.interval_ms.max(10));
+        // L-TEL-03: 0 = 未指定用默认 100ms; <10 提至 10ms 防 CPU 霸占 (warn 显式, 非静默夹紧)
+        let interval_ms = if cfg.interval_ms == 0 {
+            100
+        } else if cfg.interval_ms < 10 {
+            tracing::warn!(
+                requested = cfg.interval_ms,
+                "interval_ms < 10, 提升至 10ms 防 CPU 霸占"
+            );
+            10
+        } else {
+            cfg.interval_ms
+        };
+        let interval = Duration::from_millis(interval_ms);
         let mut count: u64 = 0;
-        info!(interval_ms = cfg.interval_ms, "遥测采样启动");
+        info!(interval_ms, "遥测采样启动");
         let kind = sysinfo::ProcessRefreshKind::new().with_memory().with_cpu();
+        // L-TEL-02: 命令前先刷新一次建基线, 首帧 sleep+刷新即得真实 delta
+        // (旧版无基线刷新, 首帧 cpu_usage 恒 0.0 — sysinfo 需两次刷新间隔才准)
+        sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), false, kind);
         loop {
-            // sysinfo cpu_usage 需两次刷新间隔才准; 首帧先 sleep 再采
             tokio::time::sleep(interval).await;
             sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), false, kind);
             let cpu_pct = sys.process(pid).map(|p| p.cpu_usage()).unwrap_or(0.0);
             let mem_bytes = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
             let mem_mb = (mem_bytes as f64) / (1024.0 * 1024.0);
-            let ts_ms = cfg.interval_ms.saturating_mul(count);
+            // L-TEL-01: 墙钟时间戳 (旧版 interval_ms*count 假计数, 非真实时刻)
+            let ts_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             let sample = TelemetrySample {
                 ts_ms,
                 cpu_pct,
@@ -114,8 +132,12 @@ mod tests {
         assert_eq!(samples.len(), 3, "应产出 3 帧");
         assert!(samples[0].cpu_pct >= 0.0);
         assert!(samples[0].mem_mb > 0.0, "本进程内存非零");
-        assert_eq!(samples[0].ts_ms, 0);
-        assert_eq!(samples[2].ts_ms, 40, "第三帧 ts = 2*20");
+        // L-TEL-01: ts_ms 墙钟 (非假计数); 单调递增, 末帧 > 首帧 (≈2*20ms 间隔)
+        assert!(samples[0].ts_ms > 0, "墙钟时间戳非零");
+        assert!(
+            samples[2].ts_ms > samples[0].ts_ms,
+            "末帧 ts > 首帧 (单调递增)"
+        );
         assert!(samples[0].gpu_pct.is_none(), "默认 GPU 不注入");
     }
 

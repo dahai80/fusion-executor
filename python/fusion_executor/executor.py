@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
+import signal
 import socket
 from collections.abc import Iterator
 
@@ -38,18 +41,31 @@ class FusionSandboxExecutor:
         *,
         task_id: str | None = None,
         cwd: str | None = None,
-        timeout: float = 30.0,
+        timeout_sec: float = 30.0,
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
         auto_rollback: RollbackPolicy | None = None,
     ) -> ExecutionResult:
-        logger.debug("run command=%r timeout=%s cwd=%s task_id=%s", command, timeout, cwd, task_id)
+        # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
+        if not isinstance(command, str):
+            raise TypeError(f"command 必须为 str, 得 {type(command).__name__}")
+        if timeout_sec is not None and timeout_sec <= 0:
+            raise ValueError(f"timeout_sec 必须为正数, 得 {timeout_sec}")
+        if cwd is not None and not isinstance(cwd, str):
+            raise TypeError(f"cwd 必须为 str|None, 得 {type(cwd).__name__}")
+        if env_vars is not None:
+            if not isinstance(env_vars, dict):
+                raise TypeError(f"env_vars 必须为 dict|None, 得 {type(env_vars).__name__}")
+            for k, v in env_vars.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    raise TypeError(f"env_vars 键值均须 str, 得 ({type(k).__name__},{type(v).__name__})")
+        logger.debug("run command=%r timeout_sec=%s cwd=%s task_id=%s", command, timeout_sec, cwd, task_id)
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         native = self._native.execute_sync(
             command,
             task_id,
             cwd,
-            timeout,
+            timeout_sec,
             env_vars,
             enable_rollback_snapshot,
             policy_dict,
@@ -90,7 +106,10 @@ class FusionSandboxExecutor:
         return result
 
     async def run_async(self, command: str, **kw) -> ExecutionResult:
-        return self.run(command, **kw)
+        # C-PYO3-01: 旧版 return self.run(...) — 假异步, 同步阻塞事件循环 (run 内
+        # BLOCKING_RT.block_on 持 GIL, asyncio 事件循环卡死)。改 asyncio.to_thread
+        # 把同步 run 扔线程池, 事件循环可并发跑其他协程。
+        return await asyncio.to_thread(self.run, command, **kw)
 
     def run_streaming(
         self,
@@ -98,24 +117,30 @@ class FusionSandboxExecutor:
         *,
         task_id: str | None = None,
         cwd: str | None = None,
-        timeout: float = 30.0,
+        timeout_sec: float = 30.0,
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
         auto_rollback: RollbackPolicy | None = None,
     ) -> Iterator[str | ExecutionResult]:
-        logger.debug("run_streaming command=%r timeout=%s cwd=%s task_id=%s", command, timeout, cwd, task_id)
+        # M-PY-01: 同 run() 前置校验
+        if not isinstance(command, str):
+            raise TypeError(f"command 必须为 str, 得 {type(command).__name__}")
+        if timeout_sec is not None and timeout_sec <= 0:
+            raise ValueError(f"timeout_sec 必须为正数, 得 {timeout_sec}")
+        logger.debug("run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s", command, timeout_sec, cwd, task_id)
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         it = self._native.execute_streaming(
             command,
             task_id,
             cwd,
-            timeout,
+            timeout_sec,
             env_vars,
             enable_rollback_snapshot,
             policy_dict,
         )
         for frame in it:
-            ftype = frame.get("type")
+            # L-PY-02: 严格键 (旧 .get(default) 吞 serde bug, 缺字段静默成功看像 blocked)
+            ftype = frame["type"]
             if ftype == "chunk":
                 data = frame.get("data", "")
                 logger.debug("stream chunk len=%s", len(data))
@@ -134,6 +159,9 @@ class FusionSandboxExecutor:
                 return
 
     def _native_result(self, payload: dict) -> ExecutionResult:
+        # L-PY-02: 严格校验 (旧 .get(default) 吞缺失字段, Rust 改字段名/serde bug 时
+        # 静默返 exit_code=-1 成功命令看像 blocked/内部错误)。model_validate 抛
+        # ValidationError fail-loud; diagnostics 可选, 单独 build。
         diag = None
         nd = payload.get("diagnostics")
         if nd is not None:
@@ -144,20 +172,11 @@ class FusionSandboxExecutor:
                 code_snippet=nd.get("code_snippet"),
                 raw_trace=nd.get("raw_trace"),
             )
-        return ExecutionResult(
-            exit_code=payload.get("exit_code", -1),
-            stdout=payload.get("stdout", ""),
-            stderr=payload.get("stderr", ""),
-            task_id=payload.get("task_id"),
-            command=payload.get("command"),
-            duration_sec=payload.get("duration_sec", 0.0),
-            timed_out=payload.get("timed_out", False),
-            blocked_by_security=payload.get("blocked_by_security", False),
-            security_reason=payload.get("security_reason"),
-            snapshot_id=payload.get("snapshot_id"),
-            diagnostics=diag,
-            auto_rolled_back=payload.get("auto_rolled_back", False),
-        )
+        # type=done 帧: serde flatten Done 进外层, 含 type/exit_code/... 一次 model_validate
+        # 去掉 type 字段后校验 (type 是流标记非 ExecutionResult 字段)
+        fields = {k: v for k, v in payload.items() if k != "type"}
+        fields["diagnostics"] = diag
+        return ExecutionResult.model_validate(fields)
 
     def rollback(self, snapshot_id: str, cwd: str | None = None) -> bool:
         if cwd is None:
@@ -240,7 +259,17 @@ class FusionSandboxExecutor:
         return result
 
     def gui_action(self, action: dict) -> GuiResult:
-        logger.debug("gui_action action=%s", action)
+        # M-PY-02: 预校验 dict + kind 字段 (旧版接受 None/"string"/{} 全经 Rust 序列化
+        # 往返返中文错误串无结构化字段)。仅拒绝类型错 + 缺 kind; 未知 kind 放行让
+        # Rust 降级 (ok=false, 保留 test_gui_action_bad_kind_degrades 契约)。
+        if not isinstance(action, dict):
+            raise TypeError(f"action 必须为 dict, 得 {type(action).__name__}")
+        if "kind" not in action:
+            raise ValueError("action 缺 'kind' 字段")
+        kind = action["kind"]
+        if not isinstance(kind, str):
+            raise TypeError(f"action['kind'] 必须为 str, 得 {type(kind).__name__}")
+        logger.debug("gui_action kind=%s action=%s", kind, action)
         native = self._native.gui_action(action)
         result = GuiResult(
             ok=native.ok,
@@ -288,6 +317,10 @@ class FusionSandboxExecutor:
         screenshot_interval_ms: int | None = None,
     ) -> Subscription:
         logger.info("subscribe channels=%s sock=%s interval_ms=%s", channels, sock_path, interval_ms)
+        # M-PY-03: 空通道列表显式拒 (旧版 bad 检查空列表无 bad 项 → 过 → 开订阅无通道
+        # 兴趣 → 永不收推送 → __next__ 阻塞 15s 后 TimeoutError 非 StopIteration)
+        if not channels:
+            raise ValueError("channels 不能为空")
         bad = [c for c in channels if c not in SUB_CHANNELS]
         if bad:
             raise ValueError(f"未知通道: {bad}, 可选 {list(SUB_CHANNELS)}")
@@ -297,8 +330,33 @@ class FusionSandboxExecutor:
         return sub
 
     def serve(self, sock_path: str | None = None) -> None:
-        logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (永驻)", sock_path)
-        self._native.serve(sock_path)
+        # C-PYO3-02: 旧版裸 self._native.serve() — fe-pyo3 serve_blocking 无 shutdown
+        # 句柄, SIGINT/SIGTERM 不解 socket 残留。改信号处理 + try/finally 清理:
+        # 注册 SIGINT/SIGTERM → 触发 KeyboardInterrupt 跳出 serve_blocking, finally
+        # os.unlink 残留 socket。serve_blocking 阻塞 recv, 信号在主线程中断。
+        path = sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (信号可停)", path)
+        old_int = signal.getsignal(signal.SIGINT)
+        old_term = signal.getsignal(signal.SIGTERM)
+        raised = False
+        signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+        try:
+            self._native.serve(sock_path)
+        except KeyboardInterrupt:
+            raised = True
+            logger.info("serve 收到停机信号, 关闭服务器")
+        finally:
+            signal.signal(signal.SIGINT, old_int)
+            signal.signal(signal.SIGTERM, old_term)
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                    logger.info("serve 清理残留 socket %s", path)
+                except OSError as e:
+                    logger.warning("serve 清理 socket 失败 %s: %s", path, e)
+            if raised:
+                raise KeyboardInterrupt("serve 已停机")
 
 
 class Subscription:
@@ -339,7 +397,15 @@ class Subscription:
     def _read_json(self) -> dict | None:
         assert self._sock is not None
         while b"\n" not in self._buf:
-            chunk = self._sock.recv(4096)
+            # M-PY-04: 服务端停推 (telemetry panic/screenshot TCC 拒静默) → recv 15s
+            # 后 socket.timeout。旧版抛 TimeoutError 穿透 __next__, 调用方 for-loop
+            # 得 TimeoutError 非 StopIteration (混合语义)。捕获转 None → __next__ 抛
+            # StopIteration, 干净流尾。
+            try:
+                chunk = self._sock.recv(4096)
+            except TimeoutError:
+                logger.warning("subscription recv 超时, 当流结束")
+                return None
             if not chunk:
                 return None
             self._buf += chunk
@@ -395,3 +461,20 @@ class Subscription:
         if self._sock is not None:
             self._sock.close()
             self._sock = None
+
+    # C-PYO3-03: GC 无 unsubscribe = socket FD + 服务端订阅项泄漏。加 __del__ 尽力
+    # close (不保证 unsubscribe 成功, 仅关本地 socket; 服务端侧靠 tx 死通道自退);
+    # __enter__/__exit__ 支持 `with executor.subscribe(...) as sub:` 显式生命周期。
+    def __enter__(self) -> Subscription:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            self.unsubscribe()
+        except Exception:
+            logger.debug("__exit__ unsubscribe 异常, 降级 close")
+        self.close()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()

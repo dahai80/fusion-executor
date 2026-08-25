@@ -12,7 +12,14 @@ class Diagnostics(BaseModel):
 
 
 class RollbackPolicy(BaseModel):
-    max_consecutive_failures: int = Field(default=3, description="连续失败上限 (保留字段, 供 stateful 扩展)")
+    # L-PY-03: max_consecutive_failures 死字段 (Rust 从不读, CLAUDE.md 明说 caller
+    # owns 连续失败计数)。A4 决策: 保留 (跨层级联 — 测试发送它, fe-rollback wire
+    # 含它), 但标记 deprecated 告诫调用方勿依赖。Rule 7: 单一真源, 不模糊。
+    max_consecutive_failures: int = Field(
+        default=3,
+        deprecated=True,
+        description="连续失败上限 (DEPRECATED 保留字段, Rust 不读; 连续失败计数归调用方自愈循环)",
+    )
     file_damage_check: bool = Field(default=True, description="失败时检测文件毁损 (git status) 触发回滚")
 
 

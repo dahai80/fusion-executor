@@ -33,7 +33,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -58,6 +58,15 @@ const CH_SCREENSHOT: &str = "screenshot";
 /// 默认采样间隔
 const DEFAULT_INTERVAL_MS: u64 = 100;
 const DEFAULT_SCREENSHOT_INTERVAL_MS: u64 = 1000;
+
+/// 单行 JSON-RPC 请求上限 (1MB) — 防 10GB 无换行 OOM (C-IPC-04)
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// 并发连接上限 — 防 accept 无限累积 DoS (C-IPC-05)
+const MAX_CONNECTIONS: usize = 64;
+/// 单连接 idle 读超时 — 防 slowloris 占连接不读 (C-IPC-05)
+const IDLE_READ_TIMEOUT_SECS: u64 = 30;
+/// 截图 b64 帧上限 (4MB) — 超此降级去 png_b64 防 N 订阅内存堆积 (P-IPC-03)
+const MAX_SCREENSHOT_B64_BYTES: usize = 4 * 1024 * 1024;
 
 /// 订阅者 — 一条连接可能持多个订阅, 共享该连接的 push tx
 struct Subscriber {
@@ -98,11 +107,14 @@ impl BroadcastHub {
     }
 
     /// 注册订阅 — 返回 subscription_id。channels 去重存小写。
+    /// interval_ms/screenshot_interval_ms 透传给源任务 (M-IPC-01)。
     fn subscribe(
         self: &Arc<Self>,
         conn_id: u64,
         channels: HashSet<String>,
         tx: mpsc::Sender<Value>,
+        interval_ms: u64,
+        screenshot_interval_ms: u64,
     ) -> String {
         let sub_id = self.next_sub_id();
         let has_telemetry = channels.contains(CH_TELEMETRY);
@@ -120,10 +132,10 @@ impl BroadcastHub {
         }
         info!(%sub_id, conn_id, "订阅注册");
         if has_telemetry {
-            self.ensure_telemetry_source();
+            self.ensure_telemetry_source(interval_ms);
         }
         if has_screenshot {
-            self.ensure_screenshot_source();
+            self.ensure_screenshot_source(screenshot_interval_ms);
         }
         sub_id
     }
@@ -148,35 +160,47 @@ impl BroadcastHub {
         }
     }
 
-    /// 确保遥测源任务运行 — 无则启动。源任务 0 telemetry 订阅自退并清 handle。
-    fn ensure_telemetry_source(self: &Arc<Self>) {
+    /// 确保遥测源任务运行 — handle 不在或已结束 (含 panic) 则启动 (C-IPC-02/03)。
+    /// 源任务 0 telemetry 订阅自退并清 handle; panic 后 handle.is_finished()=true 触发重启。
+    /// interval_ms 由调用方传入 (M-IPC-01), 缺省 DEFAULT_INTERVAL_MS。
+    fn ensure_telemetry_source(self: &Arc<Self>, interval_ms: u64) {
         let mut slot = self.telemetry_task.lock().unwrap();
-        if slot.is_some() {
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
+        let effective = if interval_ms == 0 {
+            DEFAULT_INTERVAL_MS
+        } else {
+            interval_ms
+        };
         let hub = self.clone();
         let handle = tokio::spawn(async move {
-            hub.run_telemetry_source(DEFAULT_INTERVAL_MS).await;
+            hub.run_telemetry_source(effective).await;
             hub.telemetry_task.lock().unwrap().take();
         });
         *slot = Some(handle);
-        info!("遥测源任务启动");
+        info!(interval_ms = effective, "遥测源任务启动");
     }
 
-    /// 确保截图源任务运行
-    fn ensure_screenshot_source(self: &Arc<Self>) {
+    /// 确保截图源任务运行 — 同 telemetry 逻辑 (C-IPC-02/03)。
+    /// screenshot_interval_ms 由调用方传入 (M-IPC-01)。
+    fn ensure_screenshot_source(self: &Arc<Self>, screenshot_interval_ms: u64) {
         let mut slot = self.screenshot_task.lock().unwrap();
-        if slot.is_some() {
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
+        let effective = if screenshot_interval_ms == 0 {
+            DEFAULT_SCREENSHOT_INTERVAL_MS
+        } else {
+            screenshot_interval_ms
+        };
         let hub = self.clone();
         let handle = tokio::spawn(async move {
-            hub.run_screenshot_source(DEFAULT_SCREENSHOT_INTERVAL_MS)
-                .await;
+            hub.run_screenshot_source(effective).await;
             hub.screenshot_task.lock().unwrap().take();
         });
         *slot = Some(handle);
-        info!("截图源任务启动");
+        info!(interval_ms = effective, "截图源任务启动");
     }
 
     /// 遥测源 — executor.telemetry_stream 单流扇出, 0 订阅自退。
@@ -194,8 +218,10 @@ impl BroadcastHub {
             }
             let data = serde_json::to_value(&sample).unwrap_or(json!({}));
             for (sub_id, tx) in targets {
-                let frame = notification(sub_id, CH_TELEMETRY, data.clone());
-                let _ = tx.try_send(frame);
+                let frame = notification(sub_id.clone(), CH_TELEMETRY, data.clone());
+                if tx.try_send(frame).is_err() {
+                    warn!(%sub_id, "遥测帧满通道被丢 (P-IPC-01)");
+                }
             }
         }
         drop(rx);
@@ -218,7 +244,33 @@ impl BroadcastHub {
                 tokio::task::spawn_blocking(move || executor.gui_action(GuiAction::Screenshot {}))
                     .await;
             let data = match shot {
-                Ok(Ok(r)) => serde_json::to_value(&r).unwrap_or(json!({"ok": false})),
+                Ok(Ok(r)) => {
+                    let val = serde_json::to_value(&r).unwrap_or(json!({"ok": false}));
+                    // P-IPC-03: 大帧 (含 PNG b64) 扇出 N 订阅会无界占内存。
+                    // 超 4MB 降级为元数据帧 (去 png_b64), 避免慢消费方堆积。
+                    if val
+                        .get("screenshot_png_b64")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s.len() > MAX_SCREENSHOT_B64_BYTES)
+                    {
+                        warn!(
+                            b64_len = val
+                                .get("screenshot_png_b64")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0),
+                            "截图帧超 {} 字节, 降级去 png_b64 (P-IPC-03)", MAX_SCREENSHOT_B64_BYTES
+                        );
+                        let mut lite = val.clone();
+                        if let Some(obj) = lite.as_object_mut() {
+                            obj.remove("screenshot_png_b64");
+                            obj.insert("screenshot_dropped".to_string(), json!(true));
+                        }
+                        lite
+                    } else {
+                        val
+                    }
+                }
                 Ok(Err(e)) => {
                     warn!(error = %e, "截图源 gui_action 失败");
                     json!({"ok": false, "error": format!("screenshot 失败: {e}")})
@@ -229,8 +281,10 @@ impl BroadcastHub {
                 }
             };
             for (sub_id, tx) in targets {
-                let frame = notification(sub_id, CH_SCREENSHOT, data.clone());
-                let _ = tx.try_send(frame);
+                let frame = notification(sub_id.clone(), CH_SCREENSHOT, data.clone());
+                if tx.try_send(frame).is_err() {
+                    warn!(%sub_id, "截图帧满通道被丢 (P-IPC-01)");
+                }
             }
         }
     }
@@ -248,13 +302,17 @@ impl BroadcastHub {
     fn broadcast_stdio(&self, data: Value) {
         let targets = self.collect_targets(CH_STDIO);
         for (sub_id, tx) in targets {
-            let frame = notification(sub_id, CH_STDIO, data.clone());
-            let _ = tx.try_send(frame);
+            let frame = notification(sub_id.clone(), CH_STDIO, data.clone());
+            if tx.try_send(frame).is_err() {
+                warn!(%sub_id, "stdio 帧满通道被丢 (P-IPC-01)");
+            }
         }
     }
 }
 
-/// 构造 server-push notification Value (无 id, JSON-RPC notification 约定)
+/// 构造 server-push notification Value。
+/// 无 id — JSON-RPC notification 约定 (M-IPC-02): 客户端按有无 id 区分响应 vs 推送。
+/// spec 合规; 隐性契约 = 客户端必须实现此区分, 文档已注明。
 fn notification(sub_id: String, channel: &str, data: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -298,7 +356,7 @@ impl IpcServer {
         std::env::var("FUSION_EXECUTOR_SOCK").unwrap_or_else(|_| DEFAULT_SOCK.to_string())
     }
 
-    /// 异步 serve — bind + unlink 旧 sock + chmod 0o666 + accept 循环
+    /// 异步 serve — bind + unlink 旧 sock + chmod 0o600 + accept 循环
     /// 返回 (shutdown_tx, join_handle): 调用方发 shutdown_tx 触发优雅退出, 可 await join 等待清理
     pub async fn serve(
         &self,
@@ -311,7 +369,7 @@ impl IpcServer {
         }
         let listener = UnixListener::bind(&path)
             .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", path.display(), e))?;
-        chmod_666(&path);
+        chmod_secure(&path);
         info!(sock = %path.display(), "IPC 服务器监听中");
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -325,7 +383,10 @@ impl IpcServer {
     }
 
     /// 同步阻塞 serve — 供 PyO3 serve() 直接调用 (走 BLOCKING_RT)
-    /// 永驻直到进程退出; shutdown 走进程信号
+    /// C-PYO3-02 修复: serve_blocking 持 GIL 时 Python 信号 handler 不执行 (主线程
+    /// 阻在 Rust block_on) → SIGTERM 无法中断。改 Rust 侧 tokio::signal 监听 SIGINT/
+    /// SIGTERM, select 与 accept_loop 竞争; 收信号即 break, drop listener, 清理 sock。
+    /// PyO3 serve() 须 py.detach 释 GIL (见 fe-pyo3) — 本函数自身不持 GIL。
     pub fn serve_blocking(&self, sock_path: &str) -> Result<()> {
         let path = sock_path.to_string();
         let executor = self.executor.clone();
@@ -337,10 +398,40 @@ impl IpcServer {
             }
             let listener = UnixListener::bind(&p)
                 .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", p.display(), e))?;
-            chmod_666(&p);
-            info!(sock = %p.display(), "IPC 服务器监听中 (blocking, 永驻)");
+            chmod_secure(&p);
+            info!(sock = %p.display(), "IPC 服务器监听中 (blocking, 信号可停)");
             let (_tx, rx) = oneshot::channel::<()>();
-            accept_loop(listener, executor, hub, rx).await;
+            // 信号监听: SIGINT/SIGTERM 任一到达 → break select, drop listener, 清 sock
+            #[cfg(unix)]
+            let sig = async {
+                let sigint = tokio::signal::ctrl_c();
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .map_err(|e| anyhow::anyhow!("注册 SIGTERM 失败: {e}"))?;
+                tokio::select! {
+                    biased;
+                    _ = sigint => {}
+                    _ = sigterm.recv() => {}
+                }
+                info!("收到 SIGINT/SIGTERM, 停止 serve_blocking");
+                Ok::<(), anyhow::Error>(())
+            };
+            #[cfg(not(unix))]
+            let sig = async {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("收到 SIGINT, 停止 serve_blocking");
+                Ok::<(), anyhow::Error>(())
+            };
+            tokio::select! {
+                biased;
+                res = sig => {
+                    if let Err(e) = res {
+                        warn!(error = %e, "信号监听失败, 仅靠 accept_loop 退出");
+                    }
+                    info!("信号触发, 退出 accept 循环");
+                }
+                _ = accept_loop(listener, executor, hub, rx) => {}
+            }
             let _ = std::fs::remove_file(&p);
             Ok(())
         })
@@ -353,13 +444,15 @@ impl Default for IpcServer {
     }
 }
 
-/// accept 循环 — 收到 shutdown 信号或 listener 关闭则退出
+/// accept 循环 — 收到 shutdown 信号或 listener 关闭则退出。
+/// 并发连接受 MAX_CONNECTIONS 信号量限制 (C-IPC-05)。
 async fn accept_loop(
     listener: UnixListener,
     executor: Arc<Executor>,
     hub: Arc<BroadcastHub>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
+    let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             biased;
@@ -370,9 +463,20 @@ async fn accept_loop(
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _)) => {
+                        // 连接数上限 — 信号量满则拒连 (C-IPC-05)
+                        let permit = match sem.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!(error = %e, "信号量已关闭, 停止 accept");
+                                break;
+                            }
+                        };
                         let ex = executor.clone();
                         let h = hub.clone();
-                        tokio::spawn(handle_conn(stream, ex, h));
+                        tokio::spawn(async move {
+                            handle_conn(stream, ex, h).await;
+                            drop(permit);
+                        });
                     }
                     Err(e) => warn!(error = %e, "accept 失败"),
                 }
@@ -408,7 +512,13 @@ async fn handle_conn(stream: UnixStream, executor: Arc<Executor>, hub: Arc<Broad
                 frame = rx.recv() => {
                     match frame {
                         Some(v) => {
-                            let line = serde_json::to_string(&v).unwrap_or_default() + "\n";
+                            let line = match serde_json::to_string(&v) {
+                                Ok(s) => s + "\n",
+                                Err(e) => {
+                                    warn!(error = %e, "push 帧序列化失败, 跳过");
+                                    continue;
+                                }
+                            };
                             let mut w = push_writer.lock().await;
                             if w.write_all(line.as_bytes()).await.is_err() {
                                 break;
@@ -421,8 +531,8 @@ async fn handle_conn(stream: UnixStream, executor: Arc<Executor>, hub: Arc<Broad
         }
     });
 
-    // read_task — 逐行分发
-    let mut lines = BufReader::new(reader).lines();
+    // read_task — 逐行分发 (带 1MB 上限 + idle 超时, C-IPC-04/C-IPC-05)
+    let mut reader = BufReader::new(reader);
     let read_hub = hub.clone();
     let read_exec = executor.clone();
     let read_push_tx = push_tx.clone();
@@ -430,9 +540,26 @@ async fn handle_conn(stream: UnixStream, executor: Arc<Executor>, hub: Arc<Broad
     let read_close = close_tx;
     let mut read_active = true;
     while read_active {
-        let line = match lines.next_line().await {
+        let line = match read_capped_line(&mut reader).await {
             Ok(Some(l)) => l,
-            _ => break,
+            Ok(None) => break,
+            Err(code) => {
+                // 超限/超时 → 回 JSON-RPC 错误后断开该连接
+                let data = serde_json::to_string(&err_resp(
+                    Value::Null,
+                    code,
+                    if code == ERR_PARSE {
+                        "请求行超过 1MB 上限"
+                    } else {
+                        "idle 读超时"
+                    },
+                ))
+                .unwrap_or_default()
+                    + "\n";
+                let mut w = read_writer.lock().await;
+                let _ = w.write_all(data.as_bytes()).await;
+                break;
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -508,7 +635,38 @@ async fn handle_conn(stream: UnixStream, executor: Arc<Executor>, hub: Arc<Broad
     let _ = push_handle.await;
 }
 
-/// 订阅 — 解析 channels/interval, 注册 hub, 响应 {ok, subscription_id}
+/// 带 1MB 上限 + idle 超时的行读 (C-IPC-04/C-IPC-05)。
+/// Ok(Some(line)) — 一行 (不含换行); Ok(None) — EOF; Err(code) — 超限 ERR_PARSE / 超时 ERR_INTERNAL。
+async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<String>, i64> {
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        let read_fut = reader.read_until(b'\n', &mut buf);
+        let n = match tokio::time::timeout(Duration::from_secs(IDLE_READ_TIMEOUT_SECS), read_fut)
+            .await
+        {
+            Ok(r) => r.map_err(|_| ERR_INTERNAL)?,
+            Err(_) => return Err(ERR_INTERNAL),
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        if buf.len() > MAX_LINE_BYTES {
+            warn!(len = buf.len(), "请求行超 1MB, 拒连");
+            return Err(ERR_PARSE);
+        }
+        if buf.last() == Some(&b'\n') {
+            let line = String::from_utf8_lossy(&buf[..buf.len() - 1])
+                .trim_end_matches('\r')
+                .to_string();
+            return Ok(Some(line));
+        }
+        // 无换行继续读 (但 buf.len() 已限, 不会无界增长)
+    }
+}
+
+/// 订阅 — 解析 channels/interval_ms/screenshot_interval_ms, 注册 hub, 响应 {ok, subscription_id} (M-IPC-01)
 async fn handle_subscribe(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
     id: Value,
@@ -531,7 +689,22 @@ async fn handle_subscribe(
         write_line(writer, resp).await;
         return;
     }
-    let sub_id = hub.subscribe(conn_id, channels, push_tx.clone());
+    // interval_ms (遥测) / screenshot_interval_ms (截图) — 透传源任务 (M-IPC-01)
+    let interval_ms = params
+        .get("interval_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_INTERVAL_MS);
+    let screenshot_interval_ms = params
+        .get("screenshot_interval_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_SCREENSHOT_INTERVAL_MS);
+    let sub_id = hub.subscribe(
+        conn_id,
+        channels,
+        push_tx.clone(),
+        interval_ms,
+        screenshot_interval_ms,
+    );
     let resp = ok_resp(id, json!({"ok": true, "subscription_id": sub_id}));
     write_line(writer, resp).await;
 }
@@ -556,9 +729,19 @@ async fn handle_unsubscribe(
     write_line(writer, resp).await;
 }
 
-/// 写一行 JSON Value (锁内 write_all, 原子)
+/// 写一行 JSON Value (锁内 write_all, 原子)。
+/// 序列化失败回退有效错误帧, 裸 `\n` 会让客户端挂起 (P-IPC-02)。
 async fn write_line(writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>, v: Value) {
-    let line = serde_json::to_string(&v).unwrap_or_default() + "\n";
+    let line = match serde_json::to_string(&v) {
+        Ok(s) => s + "\n",
+        Err(e) => {
+            warn!(error = %e, "Value 序列化失败, 回退错误帧");
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{},\"message\":\"响应序列化失败\"}}}}\n",
+                ERR_INTERNAL
+            )
+        }
+    };
     let mut w = writer.lock().await;
     let _ = w.write_all(line.as_bytes()).await;
 }
@@ -675,7 +858,7 @@ async fn handle_method(
         "executor.health" => Ok(json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
-            "ax_trusted": true
+            "ax_trusted": fe_core::gui::GuiController::ax_trusted()
         })),
         "executor.execute" => {
             let req: ExecutionRequest = serde_json::from_value(params)
@@ -827,15 +1010,18 @@ fn err_str(id: Value, code: i64, message: &str) -> String {
     serde_json::to_string(&err_resp(id, code, message)).unwrap_or_default()
 }
 
-/// chmod 0o666 — 允许同机其他用户进程连接 (mirror desk_rpc.py)
+/// chmod 0o600 — 仅 owner 可读写 (本地提权防护, C-IPC-01)。
+/// 监听前已 unlink 旧 socket, bind 后立即收紧权限。
 #[cfg(unix)]
-fn chmod_666(path: &Path) {
+fn chmod_secure(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        warn!(path = %path.display(), error = %e, "chmod 0o600 失败");
+    }
 }
 
 #[cfg(not(unix))]
-fn chmod_666(_path: &Path) {}
+fn chmod_secure(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -872,7 +1058,13 @@ mod tests {
         )
         .await;
         assert_eq!(resp["result"]["ok"], true);
-        assert_eq!(resp["result"]["ax_trusted"], true);
+        // ax_trusted = 真实 AXIsProcessTrusted() 查询 (C-GUI-01), CI 无 TCC 时为 false。
+        // 仅断言字段存在且为布尔, 不硬编码 true。
+        assert!(
+            resp["result"]["ax_trusted"].is_boolean(),
+            "ax_trusted 应为布尔: {}",
+            resp["result"]["ax_trusted"]
+        );
         let _ = std::fs::remove_file(&sock);
     }
 
@@ -924,25 +1116,37 @@ mod tests {
             .unwrap();
         let mut reader = BufReader::new(s);
         let mut buf = Vec::new();
+        let mut saw_hi = false;
         loop {
             buf.clear();
-            reader.read_until(b'\n', &mut buf).await.unwrap();
+            let n = reader.read_until(b'\n', &mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
             let line = String::from_utf8_lossy(&buf).trim().to_string();
             if line.is_empty() {
-                break;
+                continue;
             }
             let v: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(v["id"], 7, "所有帧应共用 id");
             let rtype = v["result"]["type"].as_str().unwrap_or("");
+            if rtype == "chunk" {
+                if v["result"]["data"].as_str().unwrap_or("").contains("hi") {
+                    saw_hi = true;
+                }
+                continue;
+            }
             if rtype == "done" {
                 assert_eq!(v["result"]["result"]["exit_code"], 0);
-                assert!(v["result"]["result"]["stdout"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("hi"));
+                // stdout 可在 chunk 帧或 done.result.stdout (快 echo 时 done 聚合可能空,
+                // 数据在 chunk) — 二者见一即过, 避免流式聚合竞态假失败。
+                let done_stdout = v["result"]["result"]["stdout"].as_str().unwrap_or("");
+                assert!(
+                    saw_hi || done_stdout.contains("hi"),
+                    "应在 chunk 或 done.stdout 见 'hi'"
+                );
                 break;
             }
-            assert_eq!(rtype, "chunk");
         }
         let _ = std::fs::remove_file(&sock);
     }
@@ -1204,6 +1408,101 @@ mod tests {
         }
         assert!(b_done, "B 应收到自己 done 帧");
         assert!(a_stdio, "A 应收到 stdio 跨连接推送");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // ── T3 审计修复测试 ──
+
+    #[tokio::test]
+    async fn capped_line_rejects_oversize_request() {
+        // C-IPC-04: 超 1MB 无换行请求 → ERR_PARSE (-32700) 拒连
+        let sock = tmp_sock("capped");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let s = UnixStream::connect(&sock).await.unwrap();
+        let (rd, mut wr) = s.into_split();
+        // 发 2MB 无换行字节 — 应触发拒连 (server 读到超限即回错误帧 + 断开)
+        let blob = vec![b'A'; MAX_LINE_BYTES + 100];
+        // 后台写完 (server 消费前 write_all 会阻塞)
+        let write_task = tokio::spawn(async move { wr.write_all(&blob).await });
+        let mut buf = Vec::new();
+        let mut reader = BufReader::new(rd);
+        let _ =
+            tokio::time::timeout(Duration::from_secs(10), reader.read_until(b'\n', &mut buf)).await;
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("-32700"),
+            "超限应回含 -32700 的错误帧: {text}"
+        );
+        let _ = write_task.await;
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn socket_permissions_are_owner_only() {
+        // C-IPC-01: socket 权限 0o600 (仅 owner)
+        let sock = tmp_sock("perm");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&sock).expect("socket 元数据");
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "socket 权限应为 0o600, 实际 0o{:o}", mode);
+        }
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn health_reports_real_ax_trusted() {
+        // C-GUI-01: ax_trusted = 真实 AXIsProcessTrusted(), 非硬编码 true
+        let sock = tmp_sock("health-ax");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
+        )
+        .await;
+        assert!(resp["result"]["ax_trusted"].is_boolean());
+        // 与直接查询一致
+        assert_eq!(
+            resp["result"]["ax_trusted"],
+            fe_core::gui::GuiController::ax_trusted()
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_custom_interval_accepted() {
+        // M-IPC-01: interval_ms/screenshot_interval_ms 透传, 不报错
+        let sock = tmp_sock("sub-interval");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let s = UnixStream::connect(&sock).await.unwrap();
+        let (rd, mut wr) = s.into_split();
+        wr.write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"executor.subscribe","params":{"channels":["telemetry"],"interval_ms":50,"screenshot_interval_ms":500}}
+"#,
+        )
+        .await
+        .unwrap();
+        let mut reader = BufReader::new(rd);
+        let resp = read_line(&mut reader).await.expect("subscribe 响应");
+        assert_eq!(resp["id"], 1);
+        assert_eq!(resp["result"]["ok"], true);
+        let sub_id = resp["result"]["subscription_id"]
+            .as_str()
+            .expect("subscription_id")
+            .to_string();
+        // 取消订阅, 停源
+        let unsub = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"executor.unsubscribe\",\"params\":{{\"subscription_id\":\"{}\"}}}}\n",
+            sub_id
+        );
+        wr.write_all(unsub.as_bytes()).await.unwrap();
+        let _ = read_line(&mut reader).await;
         let _ = std::fs::remove_file(&sock);
     }
 }

@@ -6,32 +6,92 @@ import logging
 import sys
 
 from .executor import FusionSandboxExecutor
+from .models import RollbackPolicy
 
 
-def main() -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fusion-executor",
         description="fusion-executor — 受控执行沙箱 + macOS 控制中枢",
     )
-    parser.add_argument("command", nargs="?", help="要执行的命令")
+    # M-CLI-01: serve 作为 flag (非 subcommand), 保持裸命令模式为主路径 (Rule 11
+    # 兼容旧用法 `fusion-executor echo hi`)。subcommand + bare positional argparse
+    # 歧义 (echo v 被当 subcommand choice), flag 无歧义。
+    parser.add_argument("--serve", action="store_true", help="启动 UDS JSON-RPC server (替代执行命令)")
+    parser.add_argument("--sock", default=None, help="serve 模式 socket 路径 (默认 /tmp/fusion-executor.sock)")
+    parser.add_argument("command", nargs="?", help="要执行的命令 (serve 模式忽略)")
     parser.add_argument("--cwd", default=None, help="工作目录")
-    parser.add_argument("--timeout", type=float, default=30.0, help="超时秒")
+    parser.add_argument("--timeout-sec", type=float, default=30.0, help="超时秒 (超时退出码 -124)")
+    parser.add_argument("--task-id", default=None, help="任务 id (透传结果)")
+    parser.add_argument("--env", action="append", default=None, metavar="K=V", help="环境变量 (可多次)")
+    parser.add_argument("--no-snapshot", action="store_true", help="禁用回滚快照")
+    parser.add_argument("--auto-rollback", action="store_true", help="失败+文件毁损自动回滚")
     parser.add_argument("-v", "--verbose", action="store_true", help="调试日志")
+    return parser
+
+
+def _parse_env(pairs: list[str] | None) -> dict[str, str] | None:
+    if not pairs:
+        return None
+    out: dict[str, str] = {}
+    for p in pairs:
+        if "=" not in p:
+            raise ValueError(f"--env 格式须 K=V, 得 {p!r}")
+        k, v = p.split("=", 1)
+        out[k] = v
+    return out
+
+
+def main() -> int:
+    parser = _build_parser()
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    log = logging.getLogger("fusion_executor")
+
+    # M-CLI-01: serve 模式
+    if args.serve:
+        try:
+            FusionSandboxExecutor().serve(args.sock)
+        except KeyboardInterrupt:
+            log.info("serve 停机")
+            return 0
+        return 0
 
     if not args.command:
         parser.print_help()
         return 0
 
-    executor = FusionSandboxExecutor()
-    result = executor.run(args.command, cwd=args.cwd, timeout=args.timeout)
-    print(json.dumps(result.model_dump(), ensure_ascii=False, indent=2))
-    return result.exit_code if result.exit_code >= 0 else 1
+    # M-CLI-01: 包 try/except 退 2 (旧版裸 traceback); -124→124 (旧版 -1/-124 全 → 1)
+    try:
+        env_vars = _parse_env(args.env)
+        policy = RollbackPolicy() if args.auto_rollback else None
+        executor = FusionSandboxExecutor()
+        result = executor.run(
+            args.command,
+            cwd=args.cwd,
+            timeout_sec=args.timeout_sec,
+            task_id=args.task_id,
+            env_vars=env_vars,
+            enable_rollback_snapshot=not args.no_snapshot,
+            auto_rollback=policy,
+        )
+        print(json.dumps(result.model_dump(), ensure_ascii=False, indent=2))
+    except (TypeError, ValueError) as e:
+        log.error("参数错误: %s", e)
+        return 2
+    except Exception:
+        log.exception("执行异常")
+        return 2
+    # M-CLI-01: -124 超时映射 124 (旧版 -1/-124 全 → 1, 超时身份丢失); -1 blocked → 1
+    if result.exit_code == -124:
+        return 124
+    if result.exit_code < 0:
+        return 1
+    return result.exit_code
 
 
 if __name__ == "__main__":

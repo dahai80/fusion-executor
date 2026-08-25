@@ -210,6 +210,21 @@ impl PyStreamIterator {
             handle: Some(handle),
         }
     }
+
+    // C-PYO3-04: 提前 Drop (调用方未迭代到 done 就弃迭代器) → abort 协调任务,
+    // 避免后台任务泄漏。rx.take() 关通道, handle.abort() 停任务。
+    fn cleanup(&mut self) {
+        self.rx = None;
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+
+impl Drop for PyStreamIterator {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 #[pymethods]
@@ -264,6 +279,22 @@ impl PyStreamIterator {
 struct PyTelemetryIterator {
     rx: Option<tokio::sync::mpsc::Receiver<TelemetrySample>>,
     handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PyTelemetryIterator {
+    // C-PYO3-04: 同 PyStreamIterator — Drop abort 协调任务防泄漏
+    fn cleanup(&mut self) {
+        self.rx = None;
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+
+impl Drop for PyTelemetryIterator {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 #[pymethods]
@@ -329,71 +360,66 @@ impl PyExecutor {
         env_vars: Option<std::collections::HashMap<String, String>>,
         enable_rollback_snapshot: Option<bool>,
         auto_rollback_policy: Option<Bound<'_, PyAny>>,
-    ) -> PyExecutionResult {
+    ) -> PyResult<PyExecutionResult> {
+        // L-PYO3-02: policy 入参无效应 fail-loud (旧版 warn+None 静默吞错, 调用方以为开了回滚实则没开)
         let policy = match auto_rollback_policy {
-            Some(obj) => match py
-                .import("json")
-                .and_then(|json| json.call_method1("dumps", (&obj,)))
-                .and_then(|s| s.extract::<String>())
-                .ok()
-                .and_then(|s| serde_json::from_str::<RollbackPolicy>(&s).ok())
-            {
-                Some(p) => Some(p),
-                None => {
-                    tracing::warn!("auto_rollback_policy 入参无效, 忽略");
-                    None
-                }
-            },
             None => None,
+            Some(obj) => Some({
+                let json_str: String = py
+                    .import("json")
+                    .and_then(|json| json.call_method1("dumps", (&obj,)))
+                    .and_then(|s| s.extract::<String>())
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "auto_rollback_policy 转 JSON 失败: {e}"
+                        ))
+                    })?;
+                serde_json::from_str::<RollbackPolicy>(&json_str).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "auto_rollback_policy 反序列化失败: {e}"
+                    ))
+                })?
+            }),
         };
         let req = ExecutionRequest {
             command: command.clone(),
-            task_id: task_id.clone(),
+            task_id,
             cwd,
             timeout_sec: timeout_sec.unwrap_or(30.0),
             env_vars,
             enable_rollback_snapshot: enable_rollback_snapshot.unwrap_or(true),
             auto_rollback_policy: policy,
         };
-        match self.inner.execute(req) {
-            Ok(r) => r.into(),
-            Err(e) => PyExecutionResult {
-                exit_code: -1,
-                stderr: format!("executor 内部错误: {}", e),
-                task_id,
-                command: Some(command),
-                duration_sec: 0.0,
-                blocked_by_security: false,
-                timed_out: false,
-                stdout: String::new(),
-                security_reason: None,
-                snapshot_id: None,
-                diagnostics: None,
-                auto_rolled_back: false,
-            },
-        }
+        // M-PYO3-02: 内部错误 fail-loud (旧版伪造 exit_code=-1 ExecutionResult, 调用方无法区分
+        // 安全拦截与 executor bug; execute 仅在 sandbox 内部异常返 Err, 应上抛)
+        self.inner
+            .execute(req)
+            .map(PyExecutionResult::from)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("executor 内部错误: {e}"))
+            })
     }
 
-    /// snapshot_create(cwd) -> str (快照 id; 非 repo 为空串)
-    fn snapshot_create(&self, cwd: String) -> String {
-        match fe_core::BLOCKING_RT.block_on(self.inner.snapshot_create_async(&cwd)) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!(error = %e, "snapshot_create 失败");
-                String::new()
-            }
-        }
+    /// snapshot_create(cwd) -> str (快照 id; 非 repo 为空串, 合法契约)
+    /// M-PYO3-01: git 失败 (非 "非 repo 空串") fail-loud 抛 PyRuntimeError
+    fn snapshot_create(&self, cwd: String) -> PyResult<String> {
+        fe_core::BLOCKING_RT
+            .block_on(self.inner.snapshot_create_async(&cwd))
+            .map_err(|e| {
+                tracing::error!(error = %e, "snapshot_create 失败");
+                pyo3::exceptions::PyRuntimeError::new_err(format!("snapshot_create 失败: {e}"))
+            })
     }
 
-    /// rollback(snapshot_id, cwd) -> bool
-    fn rollback(&self, snapshot_id: String, cwd: String) -> bool {
-        match fe_core::BLOCKING_RT.block_on(self.inner.rollback_async(&snapshot_id, &cwd)) {
-            Ok(ok) => ok,
-            Err(e) => {
-                tracing::warn!(error = %e, "rollback 失败");
-                false
-            }
-        }
+    /// rollback(snapshot_id, cwd) -> bool (Ok(false) = 跳过/非 repo, 合法)
+    /// M-PYO3-01: git 失败 (Err) fail-loud 抛 PyRuntimeError
+    fn rollback(&self, snapshot_id: String, cwd: String) -> PyResult<bool> {
+        fe_core::BLOCKING_RT
+            .block_on(self.inner.rollback_async(&snapshot_id, &cwd))
+            .map_err(|e| {
+                tracing::error!(error = %e, "rollback 失败");
+                pyo3::exceptions::PyRuntimeError::new_err(format!("rollback 失败: {e}"))
+            })
     }
 
     /// gui_action(action: dict) -> NativeGuiResult
@@ -464,20 +490,23 @@ impl PyExecutor {
         auto_rollback_policy: Option<Bound<'_, PyAny>>,
     ) -> PyResult<PyStreamIterator> {
         let policy = match auto_rollback_policy {
-            Some(obj) => match py
-                .import("json")
-                .and_then(|json| json.call_method1("dumps", (&obj,)))
-                .and_then(|s| s.extract::<String>())
-                .ok()
-                .and_then(|s| serde_json::from_str::<RollbackPolicy>(&s).ok())
-            {
-                Some(p) => Some(p),
-                None => {
-                    tracing::warn!("auto_rollback_policy 入参无效, 忽略");
-                    None
-                }
-            },
             None => None,
+            Some(obj) => Some({
+                let json_str: String = py
+                    .import("json")
+                    .and_then(|json| json.call_method1("dumps", (&obj,)))
+                    .and_then(|s| s.extract::<String>())
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "auto_rollback_policy 转 JSON 失败: {e}"
+                        ))
+                    })?;
+                serde_json::from_str::<RollbackPolicy>(&json_str).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "auto_rollback_policy 反序列化失败: {e}"
+                    ))
+                })?
+            }),
         };
         let req = ExecutionRequest {
             command,
@@ -488,9 +517,10 @@ impl PyExecutor {
             enable_rollback_snapshot: enable_rollback_snapshot.unwrap_or(true),
             auto_rollback_policy: policy,
         };
-        // execute_streaming async → BLOCKING_RT.block_on 取 (rx, handle); 后续 __next__ 同 RT 收帧
-        let (rx, handle) = fe_core::BLOCKING_RT
-            .block_on(self.inner.execute_streaming(req))
+        // L-PYO3-01: execute_streaming async → 释 GIL 后在 BLOCKING_RT block_on (旧版持 GIL
+        // 整个 spawn + 校验期间, 阻塞 Python 线程; detach 后 Python 可并发跑其他协程)
+        let (rx, handle) = py
+            .detach(|| fe_core::BLOCKING_RT.block_on(self.inner.execute_streaming(req)))
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("execute_streaming 失败: {e}"))
             })?;
@@ -605,17 +635,24 @@ impl PyExecutor {
     }
 
     /// serve(sock_path=None) — 启动 UDS JSON-RPC 2.0 服务器, 永驻直到进程退出
-    fn serve(&self, sock_path: Option<String>) -> PyResult<()> {
+    /// P-PYO3-01: serve 用独立 Executor::new() 而非 self.inner — Executor 每任务无状态
+    /// (CLAUDE.md 约定: consecutive-failure counting owned by caller), 跨调用无共享状态,
+    /// 故 serve 的 IPC 请求与进程内 self.inner.execute 语义等价。隔离避免长驻 serve 影响
+    /// 调用方持有的 self.inner (如 serve 内命令改动 cwd 影响进程内调用)。
+    fn serve(&self, py: pyo3::Python<'_>, sock_path: Option<String>) -> PyResult<()> {
         let sock = IpcServer::resolve_sock(sock_path.as_deref());
         let server = IpcServer::with_executor(Executor::new());
-        tracing::info!(sock = %sock, "PyO3 serve() — 启动 IPC 服务器");
-        match server.serve_blocking(&sock) {
+        tracing::info!(sock = %sock, "PyO3 serve() — 启动 IPC 服务器 (释 GIL, 信号可停)");
+        // C-PYO3-02: 释 GIL 跑 serve_blocking — Rust 侧 tokio::signal 监听 SIGINT/SIGTERM
+        // 中断 accept_loop (不依赖 Python 信号 handler, 后者在 GIL 持有时不执行)。
+        // py.detach 释 GIL 期间 Python 信号 handler 亦可运行; 双路皆干净退出。
+        py.detach(|| match server.serve_blocking(&sock) {
             Ok(()) => Ok(()),
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "serve 失败: {}",
                 e
             ))),
-        }
+        })
     }
 }
 

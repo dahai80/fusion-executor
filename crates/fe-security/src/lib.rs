@@ -134,11 +134,16 @@ const WHITELIST: &[&str] = &[
     "cd",
 ];
 
+/// 命令输入长度上限 — 防 M-SEC-06 大输入放大 DoS
+const MAX_COMMAND_LEN: usize = 1_000_000;
+
 /// Security Guard — 两级校验
 pub struct SecurityGuard {
     blocklist: Vec<(Regex, &'static str)>,
     whitelist: HashSet<&'static str>,
     sensitive_paths: Vec<String>,
+    sensitive_paths_exp: Vec<String>,
+    redirect_re: Regex,
 }
 
 impl Default for SecurityGuard {
@@ -152,18 +157,40 @@ impl SecurityGuard {
         let blocklist = build_blocklist();
         let whitelist = WHITELIST.iter().copied().collect::<HashSet<_>>();
         let sensitive_paths = SENSITIVE_PATHS.iter().map(|s| (*s).to_string()).collect();
+        let sensitive_paths_exp = SENSITIVE_PATHS.iter().map(|s| expand_tilde(s)).collect();
+        let redirect_re = Regex::new(r"(?:\d)?>>?\s*(\S+)").expect("重定向正则编译失败");
         Self {
             blocklist,
             whitelist,
             sensitive_paths,
+            sensitive_paths_exp,
+            redirect_re,
         }
     }
 
     /// 校验入口 — 先正则快筛，再 token 解析防链式绕过
     pub fn validate(&self, command: &str) -> SecurityVerdict {
+        // M-SEC-05: 空字节清理 — 命令含 \0 拒绝 (echo hi\0id)
+        if command.contains('\0') {
+            return SecurityVerdict::block("命令含空字节 (null byte)", SecurityStage::Regex);
+        }
+        // M-SEC-06: 输入长度上限 — 防大输入放大 DoS
+        if command.len() > MAX_COMMAND_LEN {
+            return SecurityVerdict::block(
+                format!("命令超长 ({} > {})", command.len(), MAX_COMMAND_LEN),
+                SecurityStage::Regex,
+            );
+        }
+
         let trimmed = command.trim();
         if trimmed.is_empty() {
             return SecurityVerdict::allow();
+        }
+
+        // C-SEC-05: 命令替换全盲 — 拒绝 $(/反引号/`<(>`/`<<<`
+        if let Some(reason) = check_shell_substitution(trimmed) {
+            debug!(%reason, "命令替换命中拒绝");
+            return SecurityVerdict::block(reason, SecurityStage::Tokenizer);
         }
 
         // Stage 1: 静态正则黑名单
@@ -184,9 +211,8 @@ impl SecurityGuard {
     /// 校验 cwd — 禁止敏感路径
     pub fn validate_cwd(&self, cwd: &str) -> SecurityVerdict {
         let expanded = expand_tilde(cwd);
-        for sens in &self.sensitive_paths {
-            let sens_exp = expand_tilde(sens);
-            if expanded == sens_exp || expanded.starts_with(&format!("{}/", sens_exp)) {
+        for (sens, sens_exp) in self.sensitive_paths.iter().zip(&self.sensitive_paths_exp) {
+            if &expanded == sens_exp || expanded.starts_with(&format!("{}/", sens_exp)) {
                 return SecurityVerdict::block(
                     format!("cwd 位于敏感路径: {} (匹配 {})", cwd, sens),
                     SecurityStage::Regex,
@@ -240,21 +266,19 @@ impl SecurityGuard {
             return Err(format!("二进制程序不在白名单: {}", binary));
         }
 
-        // argv 级约束 — mv/cp 目的地、sed -i 等
-        self.validate_argv(binary_basename, &words[idx..])?;
+        // argv 级约束 — mv/cp 目的地、sed -i 等 (跳过 argv[0] 二进制名)
+        self.validate_argv(binary_basename, &words[idx + 1..])?;
 
         Ok(())
     }
 
     /// 校验重定向目标
     fn check_redirect(&self, segment: &str) -> Option<String> {
-        let re = Regex::new(r"(?:\d)?>>?\s*(\S+)").ok()?;
-        for cap in re.captures_iter(segment) {
+        for cap in self.redirect_re.captures_iter(segment) {
             if let Some(target) = cap.get(1) {
                 let expanded = expand_tilde(target.as_str());
-                for sens in &self.sensitive_paths {
-                    let sens_exp = expand_tilde(sens);
-                    if expanded == sens_exp || expanded.starts_with(&format!("{}/", sens_exp)) {
+                for (sens, sens_exp) in self.sensitive_paths.iter().zip(&self.sensitive_paths_exp) {
+                    if &expanded == sens_exp || expanded.starts_with(&format!("{}/", sens_exp)) {
                         return Some(format!(
                             "重定向目标位于敏感路径: {} (匹配 {})",
                             target.as_str(),
@@ -276,16 +300,8 @@ impl SecurityGuard {
                     .rev()
                     .find(|a| !a.starts_with('-') && !a.starts_with('>'));
                 if let Some(dest) = dest {
-                    if dest.starts_with('/') {
-                        let expanded = expand_tilde(dest);
-                        for sens in &self.sensitive_paths {
-                            let sens_exp = expand_tilde(sens);
-                            if expanded == sens_exp
-                                || expanded.starts_with(&format!("{}/", sens_exp))
-                            {
-                                return Err(format!("{} 目的地位于敏感路径: {}", binary, dest));
-                            }
-                        }
+                    if self.is_sensitive_path(dest) {
+                        return Err(format!("{} 目的地位于敏感路径: {}", binary, dest));
                     }
                 }
                 Ok(())
@@ -296,8 +312,92 @@ impl SecurityGuard {
                 }
                 Ok(())
             }
+            "find" => {
+                if args
+                    .iter()
+                    .any(|a| a == "-exec" || a == "-execdir" || a == "-ok" || a == "-delete")
+                {
+                    return Err("禁止 find -exec/-execdir/-ok/-delete 任意命令执行".into());
+                }
+                Ok(())
+            }
+            "awk" => {
+                let prog = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .cloned()
+                    .unwrap_or_default();
+                if prog.contains("system(")
+                    || prog.contains("| getline")
+                    || prog.contains("|getline")
+                {
+                    return Err("禁止 awk system()/getline 任意命令执行".into());
+                }
+                Ok(())
+            }
+            "tee" => {
+                for a in args.iter() {
+                    if a.starts_with('-') {
+                        continue;
+                    }
+                    if self.is_sensitive_path(a) {
+                        return Err(format!("tee 目标位于敏感路径: {}", a));
+                    }
+                }
+                Ok(())
+            }
+            "chmod" => {
+                for a in args.iter() {
+                    if a.starts_with('-') {
+                        continue;
+                    }
+                    if self.is_sensitive_path(a) {
+                        return Err(format!("chmod 敏感路径: {}", a));
+                    }
+                }
+                Ok(())
+            }
+            "cd" => {
+                if let Some(dest) = args.first() {
+                    if self.is_sensitive_path(dest) {
+                        return Err(format!("cd 敏感路径: {}", dest));
+                    }
+                }
+                Ok(())
+            }
+            "git" => self.validate_git_argv(args),
             _ => Ok(()),
         }
+    }
+
+    /// 路径是否敏感 (含 ~ 展开) — 仅供内部 argv/cwd 校验复用
+    fn is_sensitive_path(&self, path: &str) -> bool {
+        if !path.starts_with('/') && !path.starts_with('~') {
+            return false;
+        }
+        let expanded = expand_tilde(path);
+        for (_, sens_exp) in self.sensitive_paths.iter().zip(&self.sensitive_paths_exp) {
+            if &expanded == sens_exp || expanded.starts_with(&format!("{}/", sens_exp)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// git 子命令约束 — C-SEC-02: 拒 config/-c/alias.*/core.*
+    fn validate_git_argv(&self, args: &[String]) -> Result<(), String> {
+        for a in args.iter() {
+            if a == "config" {
+                return Err("禁止 git config 持久配置后门".into());
+            }
+            if a == "-c" {
+                return Err("禁止 git -c 临时配置注入".into());
+            }
+            if a.starts_with("alias.") || a.starts_with("core.") {
+                return Err("禁止 git config alias/core 持久后门".into());
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -343,7 +443,7 @@ fn build_blocklist() -> Vec<(Regex, &'static str)> {
         (r">\s*/dev/disk", "禁止写入磁盘设备"),
         // fork bomb
         (r":\s*\(\)\s*\{\s*:\|:&\s*\}\s*;:", "禁止 fork bomb"),
-        // 受保护分支 force-push / reset --hard
+        // 受保护分支 force-push / reset —hard
         (
             r"git\s+push\b.*\s--force\b.*\s(origin/)?(main|master)",
             "禁止 force-push 主分支",
@@ -352,14 +452,19 @@ fn build_blocklist() -> Vec<(Regex, &'static str)> {
             r"git\s+push\s+-f\b.*\s(origin/)?(main|master)",
             "禁止 force-push 主分支",
         ),
+        // M-SEC-08: git push origin +main force-push `+` 简写
+        (
+            r"git\s+push\b.*\s\+(origin/)?(main|master)",
+            "禁止 force-push 主分支 (+ 简写)",
+        ),
         (
             r"git\s+reset\s+--hard\b.*\s(origin/)?(main|master)",
             "禁止 reset --hard 主分支",
         ),
-        // chmod 777 敏感路径
+        // M-SEC-04: chmod 777 敏感路径 — 扩 /root/~/.ssh//dev
         (
-            r"chmod\s+(-R\s+)?777\s+/(etc|System|Library|usr)",
-            "禁止 777 敏感系统路径",
+            r"chmod\s+(-R\s+)?777\s+(/(etc|System|Library|usr|root|dev)|~/\.ssh)",
+            "禁止 777 敏感路径",
         ),
     ];
 
@@ -412,6 +517,10 @@ fn split_chain(command: &str) -> Vec<String> {
             ';' => {
                 segments.push(std::mem::take(&mut current));
             }
+            // C-SEC-06: 换行符作命令分隔符 — 同 ;/| 拆分 (引号内除外)
+            '\n' | '\r' => {
+                segments.push(std::mem::take(&mut current));
+            }
             '|' => {
                 segments.push(std::mem::take(&mut current));
             }
@@ -429,6 +538,18 @@ fn basename(path: &str) -> &str {
         Some(s) if !s.is_empty() => s,
         _ => path,
     }
+}
+
+/// C-SEC-05: 检测 shell 命令替换 — 拒绝 $(/反引号/`<(>`/`<<<`
+/// 引号内仍视作危险 — 解释器 -c payload 内含 $(...) 同样可执行
+fn check_shell_substitution(command: &str) -> Option<String> {
+    if command.contains("$(") || command.contains('`') {
+        return Some("禁止命令替换 $(...)/反引号".into());
+    }
+    if command.contains("<(") || command.contains("<<<") {
+        return Some("禁止进程替换 <(...)/<<<".into());
+    }
+    None
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -710,5 +831,231 @@ mod tests {
         assert!(guard().whitelist_contains("pytest"));
         assert!(guard().whitelist_contains("cargo"));
         assert!(!guard().whitelist_contains("ncat"));
+    }
+
+    // ── C-SEC-05: 命令替换拒绝 ──
+
+    #[test]
+    fn blocks_dollar_paren_substitution() {
+        let v = guard().validate("echo $(id)");
+        assert!(!v.allowed);
+        assert_eq!(v.stage, Some(SecurityStage::Tokenizer));
+        assert!(v.reason.as_ref().unwrap().contains("命令替换"));
+    }
+
+    #[test]
+    fn blocks_backtick_substitution() {
+        let v = guard().validate("echo `id`");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("命令替换"));
+    }
+
+    #[test]
+    fn blocks_process_substitution() {
+        let v = guard().validate("cat <(ls)");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("进程替换"));
+    }
+
+    #[test]
+    fn blocks_heredoc_string() {
+        let v = guard().validate("cat <<< hi");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("进程替换"));
+    }
+
+    #[test]
+    fn blocks_substitution_in_interpreter_payload() {
+        // python -c payload 内含 $(...) — 仍拒 (C-SEC-05 顶层扫全串)
+        let v = guard().validate("python -c \"print('$(id)')\"");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("命令替换"));
+    }
+
+    // ── C-SEC-06: 换行分隔符拆分 ──
+
+    #[test]
+    fn blocks_newline_separator() {
+        let v = guard().validate("echo hi\nsudo id");
+        assert!(!v.allowed);
+        // sudo 命中正则黑名单 (Stage1)
+    }
+
+    #[test]
+    fn blocks_carriage_return_separator() {
+        let v = guard().validate("echo hi\rncat /etc/passwd");
+        assert!(!v.allowed);
+    }
+
+    #[test]
+    fn blocks_newline_nonwhitelisted() {
+        let v = guard().validate("echo hi\nncat evil 1234");
+        assert!(!v.allowed);
+        assert_eq!(v.stage, Some(SecurityStage::Tokenizer));
+    }
+
+    // ── C-SEC-02: git 安全子白名单 ──
+
+    #[test]
+    fn blocks_git_config() {
+        let v = guard().validate("git config user.name evil");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("git config"));
+    }
+
+    #[test]
+    fn blocks_git_dash_c() {
+        let v = guard().validate("git -c core.editor=evil commit");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("git -c"));
+    }
+
+    #[test]
+    fn allows_git_status() {
+        let v = guard().validate("git status");
+        assert!(v.allowed, "git status 应允许, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn allows_git_log_diff() {
+        let v = guard().validate("git log --oneline -5");
+        assert!(v.allowed, "git log 应允许, reason={:?}", v.reason);
+        let d = guard().validate("git diff HEAD~1");
+        assert!(d.allowed, "git diff 应允许, reason={:?}", d.reason);
+    }
+
+    #[test]
+    fn blocks_git_force_push_plus_shorthand() {
+        // M-SEC-08: git push origin +main
+        let v = guard().validate("git push origin +main");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("force-push"));
+    }
+
+    // ── M-SEC-01: find -exec/-delete ──
+
+    #[test]
+    fn blocks_find_exec() {
+        let v = guard().validate("find . -exec rm {} \\;");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("find -exec"));
+    }
+
+    #[test]
+    fn blocks_find_delete() {
+        let v = guard().validate("find . -delete");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("find"));
+    }
+
+    #[test]
+    fn allows_find_simple() {
+        let v = guard().validate("find . -name '*.py'");
+        assert!(v.allowed, "find 简单查询应允许, reason={:?}", v.reason);
+    }
+
+    // ── M-SEC-02: awk system() ──
+
+    #[test]
+    fn blocks_awk_system() {
+        let v = guard().validate("awk 'BEGIN{system(\"id\")}'");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("awk system"));
+    }
+
+    #[test]
+    fn allows_awk_simple() {
+        let v = guard().validate("awk '{print $1}' file.txt");
+        assert!(v.allowed, "awk 简单应允许, reason={:?}", v.reason);
+    }
+
+    // ── M-SEC-03: tee 敏感目标 ──
+
+    #[test]
+    fn blocks_tee_ssh() {
+        let v = guard().validate("echo key | tee ~/.ssh/authorized_keys");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("敏感路径"));
+    }
+
+    #[test]
+    fn allows_tee_cwd() {
+        let v = guard().validate("echo data | tee out.txt");
+        assert!(v.allowed, "tee cwd 应允许, reason={:?}", v.reason);
+    }
+
+    // ── M-SEC-04: chmod 777 扩敏感路径 ──
+
+    #[test]
+    fn blocks_chmod_777_root() {
+        let v = guard().validate("chmod 777 /root");
+        assert!(!v.allowed);
+    }
+
+    #[test]
+    fn blocks_chmod_777_ssh() {
+        let v = guard().validate("chmod -R 777 ~/.ssh");
+        assert!(!v.allowed);
+    }
+
+    #[test]
+    fn blocks_chmod_777_dev() {
+        let v = guard().validate("chmod 777 /dev");
+        assert!(!v.allowed);
+    }
+
+    #[test]
+    fn blocks_chmod_777_dev_via_argv() {
+        // argv 级也拦截
+        let v = guard().validate("chmod 755 /dev/sda");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("chmod"));
+    }
+
+    // ── M-SEC-05/06: 空字节 + 长度上限 ──
+
+    #[test]
+    fn blocks_null_byte() {
+        let v = guard().validate("echo hi\0id");
+        assert!(!v.allowed);
+        assert_eq!(v.stage, Some(SecurityStage::Regex));
+        assert!(v.reason.as_ref().unwrap().contains("空字节"));
+    }
+
+    #[test]
+    fn blocks_oversized_command() {
+        let big = "echo ".to_string() + &"a".repeat(MAX_COMMAND_LEN);
+        let v = guard().validate(&big);
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("超长"));
+    }
+
+    // ── M-SEC-07: cd 敏感路径 ──
+
+    #[test]
+    fn blocks_cd_etc() {
+        let v = guard().validate("cd /etc");
+        assert!(!v.allowed);
+        assert!(v.reason.as_ref().unwrap().contains("cd"));
+    }
+
+    #[test]
+    fn blocks_cd_ssh() {
+        let v = guard().validate("cd ~/.ssh");
+        assert!(!v.allowed);
+    }
+
+    // ── 回归: 解释器 -c 仍允许 (用户决策保留) ──
+
+    #[test]
+    fn allows_python_c_inline() {
+        let v = guard().validate("python3 -c \"print('hello')\"");
+        assert!(v.allowed, "python -c 应保留允许, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn allows_node_e_inline() {
+        let v = guard().validate("node -e \"console.log(1)\"");
+        assert!(v.allowed, "node -e 应保留允许, reason={:?}", v.reason);
     }
 }

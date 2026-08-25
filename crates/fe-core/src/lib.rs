@@ -4,14 +4,14 @@
 // 重型组件 (tree-sitter / git handle) 懒加载，new() <5ms (NFR)
 
 use std::sync::LazyLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use fe_diagnostics::Slicer;
 use fe_gui::{GuiAction, GuiController, GuiResult};
@@ -37,8 +37,14 @@ pub use fe_tools::{
 
 // BLOCKING_RT — 多线程 1 worker，避免 asyncio 调用者嵌套 runtime panic
 // 模式源自 fusion-design/crates/fd-ai-adapter/src/lib.rs:251-257
-pub static BLOCKING_RT: LazyLock<Runtime> =
-    LazyLock::new(|| Runtime::new().expect("failed to build BLOCKING_RT"));
+// P-CORE-01: 显式 worker_threads(1) 对齐注释 (Runtime::new() 实为 num_cpus)
+pub static BLOCKING_RT: LazyLock<Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("failed to build BLOCKING_RT")
+});
 
 /// 退出码约定: 0=成功, -124=超时, -1=拦截/内部异常
 pub const EXIT_OK: i32 = 0;
@@ -171,49 +177,80 @@ pub enum ExecutionStreamEvent {
     Done(Box<ExecutionResult>),
 }
 
-/// 自动回滚守卫 (FR-04) — 单次执行内追踪连续失败 + 文件毁损, 达阈值触发 rollback。
+/// 自动回滚守卫 (FR-04) — 单次执行内检测文件毁损, 达阈值触发 rollback。
 /// 生命周期限定单次 execute_async: 不跨请求累积 (Executor 无状态锁定决策)。
-/// 连续失败计数靠调用方多次传同一 policy 维持? 否 — caller-driven 无状态, 单次内仅能基于
-/// 本次结果 + 上次快照判断 "文件毁损" (git status 比对快照前后)。连续失败计数本设计降级为:
-/// 单次执行内部 exit_code!=0 即视为 "本次失败", 配合 file_damage_check 触发回滚。
 /// 真正的连续失败计数归 caller (fusion-code 自愈循环 owns retry count, PRD §重构 明确)。
-/// 故此 guard 实现: exit_code==0 不回滚; exit_code!=0 且检测到文件改动 (git status 非空
-/// 且非本次命令预期改动) → rollback(last_snapshot)。max_consecutive_failures 保留字段,
-/// 供未来 stateful 扩展; 当前单次内阈值=1 (本次失败即检毁损)。
+/// max_consecutive_failures 保留字段, 供未来 stateful 扩展 (A4: 当前死字段, 文档标注非删除)。
+///
+/// C-CORE-01: 旧版 `git status --porcelain` 非空即判毁损 — 未跟踪 `__pycache__`/WIP/并发编辑
+/// 全算 → 误触发回滚丢无关改动。修: 命令前 capture `pre_status` (porcelain 快照), 命令后
+/// 再 capture `post_status`, diff 出**命令新增**的改动条目才判毁损。pre 已记录的未跟踪文件
+/// 不算 (命令前就脏)。这样 WIP/`__pycache__` 等命令前已存在的脏状态不误触发。
 pub struct AutoRollbackGuard {
     policy: RollbackPolicy,
     snapshot_id: String,
     cwd: String,
     rollback: RollbackManager,
+    pre_status: std::collections::HashSet<String>,
 }
 
 impl AutoRollbackGuard {
-    /// 构造 — 持有本次执行前创建的快照 id + cwd
-    pub fn new(policy: RollbackPolicy, snapshot_id: String, cwd: String) -> Self {
+    /// 构造 — 持有本次执行前创建的快照 id + cwd + 命令前 git status 快照。
+    /// `pre_status` 由 `capture_status` 在命令前采集, 捕获失败则空集 (detect 时 fail-loud)。
+    pub fn new(
+        policy: RollbackPolicy,
+        snapshot_id: String,
+        cwd: String,
+        pre_status: std::collections::HashSet<String>,
+    ) -> Self {
         Self {
             policy,
             snapshot_id,
             cwd,
             rollback: RollbackManager::new(),
+            pre_status,
         }
     }
 
-    /// 检测文件毁损 — git status --porcelain 比对快照后工作区状态。
-    /// 非空 (有改动) 视为 "文件被本次命令改动/毁损"。返回改动文件数。
-    async fn detect_damage(&self) -> Result<usize> {
+    /// 采集 git status --porcelain 行集 (去空白行)。命令前后各采一次, diff 出命令新增改动。
+    /// L-CORE-02: git 失败 fail-loud (返 Err), 不再 `.unwrap_or(0)` 静默跳回滚。
+    async fn capture_status(cwd: &str) -> Result<std::collections::HashSet<String>> {
         let out = tokio::process::Command::new("git")
             .arg("-C")
-            .arg(&self.cwd)
+            .arg(cwd)
             .args(["status", "--porcelain"])
             .output()
             .await
             .map_err(|e| anyhow::anyhow!("git status 启动失败: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            anyhow::bail!("git status 失败 (exit {}): {}", out.status, stderr);
+        }
         let s = String::from_utf8_lossy(&out.stdout);
-        Ok(s.lines().filter(|l| !l.is_empty()).count())
+        Ok(s.lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
-    /// 记录结果 — exit_code==0 无动作; !=0 且检测毁损 → rollback, 标记 auto_rolled_back。
-    /// 就地修改 result.auto_rolled_back。非 git repo → 跳过 (rollback no-op)。
+    /// 检测命令导致的文件毁损 — diff 命令后状态与命令前快照, 只算**命令新增**的条目。
+    /// (C-CORE-01) 返回新增条目数。git 失败 fail-loud (L-CORE-02)。
+    async fn detect_damage(&self) -> Result<usize> {
+        let post = Self::capture_status(&self.cwd).await?;
+        let new_entries: Vec<&String> = post
+            .iter()
+            .filter(|entry| !self.pre_status.contains(*entry))
+            .collect();
+        if !new_entries.is_empty() {
+            info!(new = ?new_entries, "命令新增改动条目 (命令导致)");
+        }
+        Ok(new_entries.len())
+    }
+
+    /// 记录结果 — exit_code==0 无动作; !=0 且检测命令导致毁损 → rollback, 标记 auto_rolled_back。
+    /// 就地修改 result.auto_rolled_back。非 git repo → detect 失败 (fail-loud) 由调用方 log。
+    /// L-CORE-02: detect_damage 失败不再静默 (旧 .unwrap_or(0) 跳回滚); 现 propagate Err,
+    /// 调用方 (execute_async/execute_streaming) 已 warn! 记录。
     pub async fn record_result(&self, result: &mut ExecutionResult) -> Result<()> {
         if result.exit_code == 0 {
             return Ok(());
@@ -221,15 +258,15 @@ impl AutoRollbackGuard {
         if !self.policy.file_damage_check {
             return Ok(());
         }
-        let damaged = self.detect_damage().await.unwrap_or(0);
+        let damaged = self.detect_damage().await?;
         if damaged == 0 {
-            info!(exit_code = result.exit_code, "失败但无文件改动, 不回滚");
+            info!(exit_code = result.exit_code, "失败但无命令新增改动, 不回滚");
             return Ok(());
         }
         info!(
             damaged,
             exit_code = result.exit_code,
-            "检测到文件改动, 触发自动回滚"
+            "检测到命令导致文件改动, 触发自动回滚"
         );
         let ok = self.rollback.rollback(&self.snapshot_id, &self.cwd).await?;
         if ok {
@@ -361,26 +398,39 @@ impl Executor {
             }
         }
 
-        // 快照 (caller-driven 锁定决策: 仅当 enable_rollback_snapshot 且有 cwd)
-        let snapshot_id = if req.enable_rollback_snapshot {
+        // 快照 + 命令前 git status 快照 (caller-driven 锁定决策: 仅当 enable_rollback_snapshot 且有 cwd)
+        // C-CORE-01: pre_status 是命令前工作区状态, 供 guard diff 命令后状态找出命令新增改动
+        // (旧版非空即判毁损, __pycache__/WIP 误触发)。pre_status 与 snapshot 同期采集 (命令前)。
+        let (snapshot_id, pre_status) = if req.enable_rollback_snapshot {
             if let Some(cwd) = &req.cwd {
-                match self.rollback.snapshot_create(cwd).await {
-                    Ok(id) => {
+                let snap = self.rollback.snapshot_create(cwd).await;
+                let pre = AutoRollbackGuard::capture_status(cwd).await;
+                match (snap, pre) {
+                    (Ok(id), Ok(st)) => {
                         if !id.is_empty() {
                             info!(%id, "快照已创建");
                         }
-                        Some(id)
+                        (Some(id), st)
                     }
-                    Err(e) => {
+                    (Ok(id), Err(e)) => {
+                        // 命令前 status 采集失败 — 非 git repo 或 git 异常。pre_status 空集,
+                        // guard detect 时 post 若非空则全部算命令新增 (保守: 当作全命令导致)。
+                        warn!(error = %e, cwd, "命令前 git status 采集失败, pre_status 置空");
+                        if !id.is_empty() {
+                            info!(%id, "快照已创建");
+                        }
+                        (Some(id), std::collections::HashSet::new())
+                    }
+                    (Err(e), _) => {
                         info!(error = %e, "快照创建失败, 继续 (非致命)");
-                        None
+                        (None, std::collections::HashSet::new())
                     }
                 }
             } else {
-                None
+                (None, std::collections::HashSet::new())
             }
         } else {
-            None
+            (None, std::collections::HashSet::new())
         };
 
         let env = req.env_vars.unwrap_or_default();
@@ -417,13 +467,14 @@ impl Executor {
         };
 
         // 自动回滚 (FR-04) — 调用方传 policy 且有快照+cwd 时, 单次内 guard 判定
+        // pre_status 命令前已采集, 传入 guard 供 detect_damage diff (C-CORE-01)
         if let (Some(policy), Some(cwd), Some(sid)) = (
             req.auto_rollback_policy.clone(),
             req.cwd.clone(),
             sid_filtered.as_ref(),
         ) {
             if !sid.is_empty() {
-                let guard = AutoRollbackGuard::new(policy, sid.clone(), cwd);
+                let guard = AutoRollbackGuard::new(policy, sid.clone(), cwd, pre_status.clone());
                 if let Err(e) = guard.record_result(&mut result).await {
                     warn!(error = %e, "自动回滚 guard 异常 (非致命)");
                 }
@@ -486,26 +537,35 @@ impl Executor {
             }
         }
 
-        // 快照 (与 execute_async 同策略: caller-driven, 仅 enable + 有 cwd)
-        let snapshot_id = if req.enable_rollback_snapshot {
+        // 快照 + 命令前 git status 快照 (与 execute_async 同策略; C-CORE-01 pre_status diff)
+        let (snapshot_id, pre_status) = if req.enable_rollback_snapshot {
             if let Some(cwd) = &req.cwd {
-                match self.rollback.snapshot_create(cwd).await {
-                    Ok(id) => {
+                let snap = self.rollback.snapshot_create(cwd).await;
+                let pre = AutoRollbackGuard::capture_status(cwd).await;
+                match (snap, pre) {
+                    (Ok(id), Ok(st)) => {
                         if !id.is_empty() {
                             info!(%id, "快照已创建 (streaming)");
                         }
-                        Some(id)
+                        (Some(id), st)
                     }
-                    Err(e) => {
+                    (Ok(id), Err(e)) => {
+                        warn!(error = %e, cwd, "命令前 git status 采集失败 (streaming), pre_status 置空");
+                        if !id.is_empty() {
+                            info!(%id, "快照已创建 (streaming)");
+                        }
+                        (Some(id), std::collections::HashSet::new())
+                    }
+                    (Err(e), _) => {
                         info!(error = %e, "快照创建失败, 继续 (非致命, streaming)");
-                        None
+                        (None, std::collections::HashSet::new())
                     }
                 }
             } else {
-                None
+                (None, std::collections::HashSet::new())
             }
         } else {
-            None
+            (None, std::collections::HashSet::new())
         };
 
         let env = req.env_vars.unwrap_or_default();
@@ -525,6 +585,7 @@ impl Executor {
         let command_for_done = req.command.clone();
         let policy_for_done = req.auto_rollback_policy.clone();
         let cwd_for_guard = req.cwd.clone();
+        let pre_status_for_guard = pre_status.clone();
 
         let (outer_tx, outer_rx) = mpsc::channel::<ExecutionStreamEvent>(64);
         let handle = tokio::spawn(async move {
@@ -560,7 +621,7 @@ impl Executor {
                             diagnostics: diag,
                             ..Default::default()
                         };
-                        // 自动回滚 (FR-04, 同 execute_async)
+                        // 自动回滚 (FR-04, 同 execute_async; pre_status diff C-CORE-01)
                         if let (Some(policy), Some(cwd), Some(sid)) = (
                             policy_for_done.as_ref(),
                             cwd_for_guard.as_ref(),
@@ -571,6 +632,7 @@ impl Executor {
                                     policy.clone(),
                                     sid.clone(),
                                     cwd.clone(),
+                                    pre_status_for_guard.clone(),
                                 );
                                 if let Err(e) = guard.record_result(&mut result).await {
                                     warn!(error = %e, "自动回滚 guard 异常 (streaming, 非致命)");
@@ -584,7 +646,16 @@ impl Executor {
                     }
                 }
             }
-            let _ = sb_handle.await;
+            // L-CORE-01: break 后 sb_handle.await 可能阻塞到子进程超时 (chunk 通道断后
+            // 沙箱协调任务仍驱动子进程)。abort 先停协调任务, 再 timeout 包 await 兜底 —
+            // 子进程由沙箱内部 timeout/supervisor 自管, fe-core 任务不无限挂起。
+            sb_handle.abort();
+            match tokio::time::timeout(Duration::from_secs(5), sb_handle).await {
+                Ok(_) => debug!("execute_streaming 协调任务已结束"),
+                Err(_) => warn!(
+                    "execute_streaming 协调任务 abort 后 5s 仍在运行 (子进程可能仍在超时回收中)"
+                ),
+            }
         });
         Ok((outer_rx, handle))
     }
@@ -819,6 +890,44 @@ mod tests {
             // 文件保持损坏 (未回滚)
             let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
             assert_eq!(content, "broken\n", "无 policy 文件应保持改动: {content}");
+        });
+    }
+
+    // C-CORE-01: 命令前已脏 (未跟踪 wip.txt) + 命令失败但不碰任何文件 → 不误触发回滚。
+    // 旧版 detect_damage 见 git status 非空 (wip.txt) 即判毁损 → 误回滚 (无谓 reset, 丢 wip.txt
+    // 若已 stash 则恢复). 新版 diff pre/post: wip.txt 在 pre_status, 非"命令新增" → 不回滚。
+    #[test]
+    fn auto_rollback_no_false_trigger_on_preexisting_dirty() {
+        rt().block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cwd = dir.path().to_str().unwrap().to_string();
+            make_git_repo(dir.path());
+            // 命令前制造未跟踪文件 (WIP) — pre_status 记录它
+            std::fs::write(dir.path().join("wip.txt"), "work in progress\n").unwrap();
+            // 命令失败但不改任何文件 (纯 raise) — post_status 含 wip.txt 但 pre 也有 → 无新增
+            let cmd = "python3 -c \"raise ValueError('boom')\"";
+            let req = ExecutionRequest {
+                command: cmd.to_string(),
+                task_id: None,
+                cwd: Some(cwd),
+                timeout_sec: 15.0,
+                env_vars: None,
+                enable_rollback_snapshot: true,
+                auto_rollback_policy: Some(RollbackPolicy::default()),
+            };
+            let ex = Executor::new();
+            let res = ex.execute_async(req).await.unwrap();
+            assert_ne!(res.exit_code, 0, "应失败");
+            assert!(
+                !res.auto_rolled_back,
+                "命令未新增改动 (wip.txt 命令前已脏) → 不应误回滚"
+            );
+            // app.py 未被命令触碰, 保持原样
+            let app = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
+            assert_eq!(app, "print('ok')\n", "app.py 未动");
+            // wip.txt 保留 (无回滚, 无丢失)
+            let wip = std::fs::read_to_string(dir.path().join("wip.txt")).unwrap();
+            assert_eq!(wip, "work in progress\n", "wip.txt 不应被回滚丢失");
         });
     }
 

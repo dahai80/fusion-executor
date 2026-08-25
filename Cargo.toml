@@ -30,7 +30,7 @@ thiserror = "2"
 anyhow = "1"
 
 # 异步运行时
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util", "time", "process", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util", "time", "process", "net", "signal"] }
 futures = "0.3"
 
 # 日志追踪

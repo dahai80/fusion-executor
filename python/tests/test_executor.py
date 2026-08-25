@@ -184,7 +184,7 @@ def test_run_streaming_blocked_single_result(executor: FusionSandboxExecutor):
 
 
 def test_run_streaming_timeout(executor: FusionSandboxExecutor):
-    _chunks, result = _consume_stream(executor, 'python3 -c "while True: pass"', timeout=1.0)
+    _chunks, result = _consume_stream(executor, 'python3 -c "while True: pass"', timeout_sec=1.0)
     assert result is not None
     assert result.timed_out
     assert result.exit_code == -124
@@ -425,9 +425,9 @@ def test_telemetry_native_iterator(executor: FusionSandboxExecutor):
     it = executor._native.telemetry_stream(20, 3)
     frames = [f for f in it]
     assert len(frames) == 3, "max_samples=3 应产 3 帧"
-    assert frames[0]["ts_ms"] == 0
-    assert frames[1]["ts_ms"] == 20
-    assert frames[2]["ts_ms"] == 40
+    # L-TEL-01: ts_ms 墙钟 (非假计数); 单调递增, 末帧 > 首帧
+    assert frames[0]["ts_ms"] > 0, "墙钟时间戳非零"
+    assert frames[2]["ts_ms"] > frames[0]["ts_ms"], "末帧 ts > 首帧 (单调递增)"
     assert frames[0]["mem_mb"] > 0.0, "本进程内存非零"
     assert frames[0]["cpu_pct"] >= 0.0
     assert frames[0].get("gpu_pct") is None, "GPU 默认不注入 (serde skip)"
@@ -437,8 +437,9 @@ def test_telemetry_python_wrapper(executor: FusionSandboxExecutor):
     samples = list(executor.telemetry_stream(interval_ms=20, max_samples=4))
     assert len(samples) == 4
     assert all(isinstance(s, TelemetrySample) for s in samples)
-    assert samples[0].ts_ms == 0
-    assert samples[3].ts_ms == 60
+    # L-TEL-01: ts_ms 墙钟 (非假计数); 单调递增
+    assert samples[0].ts_ms > 0, "墙钟时间戳非零"
+    assert samples[3].ts_ms > samples[0].ts_ms, "末帧 ts > 首帧 (单调递增)"
     assert samples[0].mem_mb > 0.0
     assert all(s.gpu_pct is None for s in samples)
 
@@ -479,8 +480,9 @@ def test_telemetry_over_uds(uds_server: str):
     assert all(f["id"] == 11 for f in frames)
     assert all(f["result"]["type"] == "sample" for f in frames)
     samples = [f["result"]["sample"] for f in frames]
-    assert samples[0]["ts_ms"] == 0
-    assert samples[2]["ts_ms"] == 40
+    # L-TEL-01: ts_ms 墙钟 (非假计数); 单调递增
+    assert samples[0]["ts_ms"] > 0, "墙钟时间戳非零"
+    assert samples[2]["ts_ms"] > samples[0]["ts_ms"], "末帧 ts > 首帧 (单调递增)"
     assert samples[0]["mem_mb"] > 0.0
     assert samples[0].get("gpu_pct") is None, "GPU 默认不注入 (serde skip)"
     del _json, _socket
@@ -500,7 +502,7 @@ def test_self_healing_closed_loop(executor: FusionSandboxExecutor, tmp_path):
     bug.write_text(BUG_SRC)
 
     # 2. 首次执行 — 应失败, diagnostics 切片定位到 bug.py
-    first = executor.run("python bug.py", cwd=str(tmp_path), timeout=15.0, enable_rollback_snapshot=False)
+    first = executor.run("python bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
     assert first.exit_code != 0, "故障脚本应非零退出"
     assert not first.blocked_by_security
     assert first.diagnostics is not None, "exit!=0 应触发诊断切片"
@@ -521,10 +523,67 @@ def test_self_healing_closed_loop(executor: FusionSandboxExecutor, tmp_path):
     assert fix.matches == 1
 
     # 4. 二次执行 — 应通过 (闭环收敛)
-    second = executor.run("python bug.py", cwd=str(tmp_path), timeout=15.0, enable_rollback_snapshot=False)
+    second = executor.run("python bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
     assert second.exit_code == 0, f"修复后应 exit 0: stderr={second.stderr}"
     assert "3" in second.stdout, "修复后应输出 3"
     assert second.diagnostics is None, "exit==0 不应触发诊断"
 
     # 5. 过程数据清理 — 只保留 tmp_path (pytest 自动清)
     bug.unlink(missing_ok=True)
+
+
+# ── T8 输入校验 (M-PY-01 / M-PY-02): 前置 fail-fast, 非延迟到 PyO3 ──
+
+
+def test_run_non_str_command_raises_typeerror(executor: FusionSandboxExecutor):
+    with pytest.raises(TypeError, match="command 必须为 str"):
+        executor.run(123)  # type: ignore[arg-type]
+
+
+def test_run_non_positive_timeout_raises_valueerror(executor: FusionSandboxExecutor):
+    with pytest.raises(ValueError, match="timeout_sec 必须为正数"):
+        executor.run("echo hi", timeout_sec=0)
+    with pytest.raises(ValueError, match="timeout_sec 必须为正数"):
+        executor.run("echo hi", timeout_sec=-1.5)
+
+
+def test_run_non_str_cwd_raises_typeerror(executor: FusionSandboxExecutor):
+    with pytest.raises(TypeError, match="cwd 必须为 str"):
+        executor.run("echo hi", cwd=42)  # type: ignore[arg-type]
+
+
+def test_run_non_dict_env_vars_raises_typeerror(executor: FusionSandboxExecutor):
+    with pytest.raises(TypeError, match="env_vars 必须为 dict"):
+        executor.run("echo hi", env_vars="PATH=/x")  # type: ignore[arg-type]
+
+
+def test_run_env_vars_non_str_value_raises_typeerror(executor: FusionSandboxExecutor):
+    with pytest.raises(TypeError, match="env_vars 键值均须 str"):
+        executor.run("echo hi", env_vars={"K": 42})  # type: ignore[dict-item]
+
+
+def test_gui_action_non_dict_raises_typeerror(executor: FusionSandboxExecutor):
+    with pytest.raises(TypeError, match="action 必须为 dict"):
+        executor.gui_action("focus_app")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="action 必须为 dict"):
+        executor.gui_action(None)  # type: ignore[arg-type]
+
+
+def test_gui_action_missing_kind_raises_valueerror(executor: FusionSandboxExecutor):
+    with pytest.raises(ValueError, match="kind"):
+        executor.gui_action({"bundle_id": "com.apple.TextEdit"})
+
+
+def test_gui_action_non_str_kind_raises_typeerror(executor: FusionSandboxExecutor):
+    with pytest.raises(TypeError, match="action\\['kind'\\] 必须为 str"):
+        executor.gui_action({"kind": 123})  # type: ignore[dict-item]
+
+
+def test_run_streaming_non_str_command_raises_typeerror(executor: FusionSandboxExecutor):
+    with pytest.raises(TypeError, match="command 必须为 str"):
+        list(executor.run_streaming(None))  # type: ignore[arg-type]
+
+
+def test_run_streaming_non_positive_timeout_raises_valueerror(executor: FusionSandboxExecutor):
+    with pytest.raises(ValueError, match="timeout_sec 必须为正数"):
+        list(executor.run_streaming("echo hi", timeout_sec=0))

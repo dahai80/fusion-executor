@@ -49,9 +49,10 @@ impl Slicer {
         info!("Slicer::new() — 编译 8 语言 traceback 正则");
         Self {
             // Python: Traceback ... File "path", line N ... <Type>Error: msg
-            // (?ms): m=^按行锚, s=.跨行 (.*? 跨过 "in forward\n return...\n" 到达错误行)
+            // (?ms): m=^按行锚, s=.跨行。.*File 贪心取最深 (最后) File 帧 — M-DIAG-01
+            // 配合 tail_lines 保标记行后, 深 traceback 多帧保留时取最接近根因的栈帧。
             python_re: Regex::new(
-                r#"(?ms)Traceback \(most recent call last\):.*?File "([^"]+)", line (\d+).*?^(\w+(?:Error|Exception|Warning)):\s*([^\n]*)"#,
+                r#"(?ms)Traceback \(most recent call last\):.*File "([^"]+)", line (\d+).*?^(\w+(?:Error|Exception|Warning)):\s*([^\n]*)"#,
             )
             .expect("python_re 编译失败"),
             // TS: path.ts(l,c): error TSxxxx: msg (tsc 括号形式)
@@ -216,7 +217,16 @@ impl Slicer {
 
     fn extract_swift(&self, tail: &str) -> Option<Diagnostics> {
         let c = self.swift_re.captures(tail)?;
+        // M-DIAG-02: 扩展名隔离 — swift_re 仅锚 :l:c: error: 无扩展名约束,
+        // go vet `file.go:l:c: error: msg` 同格式会误匹配 .go 为 swift。
+        // 守 .swift 后缀, 确保只处理 Swift 文件 (go_compile 已锚 .go)。
         let file_path = c.get(1).map(|m| m.as_str().to_string());
+        let is_swift = file_path
+            .as_ref()
+            .is_some_and(|p| Path::new(p).extension().is_some_and(|e| e == "swift"));
+        if !is_swift {
+            return None;
+        }
         let line_number = c.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
         let msg = c.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
         Some(Diagnostics {
@@ -299,11 +309,44 @@ fn _parser_for_ext(ext: &str) -> Option<Parser> {
     Some(p)
 }
 
-/// 取文本末尾 N 行 (保留 traceback 尾部)
+/// 取文本末尾 N 行 + 保根因标记行 (M-DIAG-01)
+///
+/// 纯末 N 行会丢深 traceback 前部的根因 `Error:`/`Exception:` 行 (诊断失效)。
+/// 策略: 保 traceback 段头 (`Traceback (most recent call last):` / `panic:` /
+/// `goroutine`) + 根因标记行 (Error/Exception/Warning 含子串覆盖 TypeError 等;
+/// `error:` 行首锚) + 标记行的下一行 (Node/Bun `at` 邻接依赖) + 末 N 行,
+/// 按原序去重合并。过保几行无害 (正则仍精确捕), 漏保根因行才有害 — 此处治漏保。
 fn tail_lines(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
+    if lines.len() <= n {
+        return lines.join("\n");
+    }
+    let tail_start = lines.len() - n;
+    let mut keep_idx: Vec<usize> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let is_header = l.starts_with("Traceback (most recent call last)")
+            || l.starts_with("panic:")
+            || l.starts_with("goroutine ");
+        let is_marker = l.contains("Error:")
+            || l.contains("Exception:")
+            || l.contains("Warning:")
+            || l.starts_with("error:");
+        if is_header || is_marker {
+            keep_idx.push(i);
+            if is_marker && i + 1 < lines.len() {
+                keep_idx.push(i + 1);
+            }
+        } else if i >= tail_start {
+            keep_idx.push(i);
+        }
+    }
+    keep_idx.sort();
+    keep_idx.dedup();
+    keep_idx
+        .into_iter()
+        .map(|i| lines[i])
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 解析 file_path — 相对路径接 cwd, 绝对直接用
@@ -480,6 +523,77 @@ mod tests {
         let tail = tail_lines(&big, 5);
         assert!(tail.contains("line 99"));
         assert!(!tail.contains("line 0"));
+    }
+
+    #[test]
+    fn tail_lines_keeps_error_marker_in_deep_traceback() {
+        // M-DIAG-01: 根因 Error 行在 traceback 前部, 纯末 30 行会丢。
+        // 造 40 行填充 + TypeError 行 + 5 行尾, tail_lines(20) 应保 TypeError。
+        let mut lines: Vec<String> = (0..40).map(|i| format!("fill line {}", i)).collect();
+        lines.push("ValueError: root cause here".to_string());
+        lines.push("    at deep (x.py:99:5)".to_string());
+        lines.extend((0..5).map(|i| format!("tail line {}", i)));
+        let big = lines.join("\n");
+        let tail = tail_lines(&big, 20);
+        assert!(
+            tail.contains("ValueError: root cause here"),
+            "根因标记行应保, tail={:?}",
+            tail
+        );
+        assert!(tail.contains("at deep (x.py:99:5)"), "标记行下一行应保");
+        assert!(tail.contains("tail line 4"), "末行应保");
+        // 中段填充行 (非标记非末尾) 应丢
+        assert!(!tail.contains("fill line 10"), "中段非标记行应丢");
+    }
+
+    #[test]
+    fn python_deep_traceback_keeps_root_error() {
+        // M-DIAG-01 端到端: 深 traceback 超 30 行, slice 仍捕到根因 TypeError + 最深 File 帧。
+        let mut frames: Vec<String> = Vec::new();
+        for i in 0..40 {
+            frames.push(format!(
+                "  File \"mod{}.py\", line {}, in fn{}",
+                i,
+                i + 1,
+                i
+            ));
+            frames.push(format!("    x{}()", i));
+        }
+        frames.push("  File \"src/real.py\", line 142, in forward".into());
+        frames.push("    return x + None".into());
+        frames.push("TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'".into());
+        let mut out = String::from("Traceback (most recent call last):\n");
+        out.push_str(&frames.join("\n"));
+        out.push_str("\ntail1\ntail2\ntail3");
+        let d = s().slice(&out, None);
+        assert_eq!(
+            d.error_type.as_deref(),
+            Some("TypeError"),
+            "根因 error_type 应捕到"
+        );
+        assert_eq!(
+            d.file_path.as_deref(),
+            Some("src/real.py"),
+            "最深 File 帧应取"
+        );
+        assert_eq!(d.line_number, Some(142));
+    }
+
+    #[test]
+    fn swift_re_rejects_go_vet_error_format() {
+        // M-DIAG-02: go vet 输出 `file.go:l:c: error: msg` 格式同 swift_re, 无扩展名
+        // 守卫会误匹配 .go 为 swift。守 .swift 后应不匹配, 回退 go_compile 或 raw。
+        let out = "go vet ./...\nmain.go:8:7: error: undefined: foo";
+        let d = s().slice(out, None);
+        // 不应是 swift (file_path .go 非 .swift); go_compile_re 锚 .go 应捕到
+        assert_eq!(
+            d.error_type.as_deref(),
+            Some("compile error"),
+            "go vet error 应走 go_compile 非 swift, got error_type={:?}",
+            d.error_type
+        );
+        assert_eq!(d.file_path.as_deref(), Some("main.go"));
+        assert_eq!(d.line_number, Some(8));
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

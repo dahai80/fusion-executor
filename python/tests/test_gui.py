@@ -491,3 +491,46 @@ def test_subscription_next_raises_stopiteration_on_closed_stream():
         listener.close()
         if os.path.exists(sock_path):
             os.unlink(sock_path)
+
+
+# ── T8 M-PY-03 空 channels + C-PYO3-03 上下文管理器 ──
+
+
+def test_subscribe_empty_channels_raises_valueerror():
+    ex = FusionSandboxExecutor()
+    with pytest.raises(ValueError, match="channels 不能为空"):
+        ex.subscribe([])
+
+
+def test_subscribe_none_channels_raises_valueerror():
+    ex = FusionSandboxExecutor()
+    with pytest.raises((ValueError, TypeError)):
+        ex.subscribe(None)  # type: ignore[arg-type]
+
+
+def test_subscription_context_manager_closes_socket(server: str):
+    # C-PYO3-03: `with executor.subscribe(...) as sub:` — __enter__ 返 self,
+    # __exit__ 调 unsubscribe (关 sock) + close 幂等
+    ex = FusionSandboxExecutor(sock_path=server)
+    with ex.subscribe(["telemetry"], interval_ms=50) as sub:
+        assert sub.subscription_id is not None
+        assert sub._sock is not None
+    # __exit__ 后 sock 应关
+    assert sub._sock is None
+
+
+def test_subscription_del_closes_without_raise(server: str):
+    # C-PYO3-03: __del__ 尽力 close, 不抛异常
+    ex = FusionSandboxExecutor(sock_path=server)
+    sub = ex.subscribe(["telemetry"], interval_ms=50)
+    assert sub._sock is not None
+    sub.__del__()  # 显式触发, 不应抛
+    assert sub._sock is None
+
+
+def test_subscription_close_idempotent():
+    # close() 多次调用安全 (M-PY-04 + C-PYO3-03)
+    sub = Subscription("/tmp/fe-cov-del.sock", ["telemetry"], None, None)
+    sub.close()
+    sub.close()  # 二次不抛
+    assert sub._sock is None
