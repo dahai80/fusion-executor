@@ -46,6 +46,10 @@ class ExecutionRequest(BaseModel):
         default=False,
         description="环境隔离: False(默认)=env_clear+最小基线 PATH/TMPDIR/SHELL+env_vars, 不泄漏宿主密钥; True=继承宿主全量 env (受信本地 opt-in)",
     )
+    use_pty: bool = Field(
+        default=True,
+        description="I/O 后端: True(默认)=PTY (合流 stdout/stderr 保 ANSI/Traceback, stderr 恒空); False=stdio (stdout/stderr 独立捕获, 需分流的调用方 opt-in)",
+    )
 
 
 class ExecutionResult(BaseModel):

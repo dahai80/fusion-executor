@@ -82,6 +82,14 @@ pub struct ExecutionRequest {
     /// true → 继承宿主全量 env (受信本地场景显式 opt-in, 文档化泄漏风险)。
     #[serde(default)]
     pub inherit_env: bool,
+    /// Issue #4: 捕获后端。true(默认)=PTY (ANSI/Traceback 保真, stdout+stderr 合并);
+    /// false=stdio 独立管道 (FR-03 双工 stdout/stderr 分离, Slicer 吃 stderr)。PTY 合并时 stderr 恒空。
+    #[serde(default = "default_use_pty")]
+    pub use_pty: bool,
+}
+
+fn default_use_pty() -> bool {
+    true
 }
 
 fn default_timeout() -> f64 {
@@ -468,14 +476,26 @@ impl Executor {
             max_output_chars: 100_000,
             seatbelt: req.seatbelt,
             inherit_env: req.inherit_env,
+            use_pty: req.use_pty,
         };
-        info!(seatbelt = req.seatbelt, "execute_async — 沙箱执行");
+        info!(
+            seatbelt = req.seatbelt,
+            use_pty = req.use_pty,
+            "execute_async — 沙箱执行"
+        );
         let sb = self.sandbox.run(sb_cfg).await?;
 
         // 诊断切片 — exit_code != 0 且非拦截/超时时填充 (PRD §4.2)
+        // Issue #4: use_pty=false 时 stderr 独立 → Slicer 优先吃 stderr (error channel);
+        // PTY 模式 stderr 恒空 → 退回 stdout (traceback 在 tail)
         let diag = if sb.exit_code != 0 && !sb.timed_out {
             let cwd_ref = req.cwd.as_deref();
-            Some(Diagnostics::from(self.slicer.slice(&sb.stdout, cwd_ref)))
+            let diag_src = if !sb.stderr.is_empty() {
+                &sb.stderr
+            } else {
+                &sb.stdout
+            };
+            Some(Diagnostics::from(self.slicer.slice(diag_src, cwd_ref)))
         } else {
             None
         };
@@ -605,6 +625,7 @@ impl Executor {
             max_output_chars: 100_000,
             seatbelt: req.seatbelt,
             inherit_env: req.inherit_env,
+            use_pty: req.use_pty,
         };
         info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg)?;
@@ -634,7 +655,13 @@ impl Executor {
                         // 诊断切片 — exit_code != 0 且非超时 (PRD §4.2, 同 execute_async)
                         let diag = if sb.exit_code != 0 && !sb.timed_out {
                             let cwd_ref = cwd_for_diag.as_deref();
-                            Some(Diagnostics::from(slicer.slice(&sb.stdout, cwd_ref)))
+                            // Issue #4: stdio 模式 stderr 独立 → 优先吃 stderr
+                            let diag_src = if !sb.stderr.is_empty() {
+                                &sb.stderr
+                            } else {
+                                &sb.stdout
+                            };
+                            Some(Diagnostics::from(slicer.slice(diag_src, cwd_ref)))
                         } else {
                             None
                         };
@@ -727,6 +754,7 @@ mod tests {
                 auto_rollback_policy: None,
                 seatbelt: false,
                 inherit_env: false,
+                use_pty: true,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut combined = String::new();
@@ -760,6 +788,7 @@ mod tests {
                 auto_rollback_policy: None,
                 seatbelt: false,
                 inherit_env: false,
+                use_pty: true,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut frames = 0;
@@ -792,6 +821,7 @@ mod tests {
                 auto_rollback_policy: None,
                 seatbelt: false,
                 inherit_env: false,
+                use_pty: true,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -821,6 +851,7 @@ mod tests {
                 auto_rollback_policy: None,
                 seatbelt: false,
                 inherit_env: false,
+                use_pty: true,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -872,6 +903,7 @@ mod tests {
                 auto_rollback_policy: Some(RollbackPolicy::default()),
                 seatbelt: false,
                 inherit_env: false,
+                use_pty: true,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -900,6 +932,7 @@ mod tests {
                 auto_rollback_policy: Some(RollbackPolicy::default()),
                 seatbelt: false,
                 inherit_env: false,
+                use_pty: true,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -926,6 +959,7 @@ mod tests {
                 auto_rollback_policy: None,
                 seatbelt: false,
                 inherit_env: false,
+                use_pty: true,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -959,6 +993,7 @@ mod tests {
                 }),
                 seatbelt: false,
                 inherit_env: false,
+                use_pty: true,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -996,6 +1031,7 @@ mod tests {
                 auto_rollback_policy: Some(RollbackPolicy::default()),
                 seatbelt: false,
                 inherit_env: false,
+                use_pty: true,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();

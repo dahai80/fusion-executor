@@ -39,8 +39,8 @@ const READER_RECV_TIMEOUT_MS: u64 = 2000;
 pub struct SandboxResult {
     pub exit_code: i32,
     pub stdout: String,
-    /// L-SB-05: PTY 合并 stdout+stderr → 本字段恒空。保留以匹配 PRD §4.1 wire 契约;
-    /// Slicer 解析 stdout (traceback 在 tail)。需分离流者另起 stdio-only 后端 (本沙箱不支持)。
+    /// Issue #4: use_pty=false (stdio 后端) 时独立捕获 fd 2 (stderr-only, FR-03 双工);
+    /// use_pty=true (PTY 默认) 时 PTY 合并 stdout+stderr, 本字段恒空, Slicer 吃 stdout tail。
     pub stderr: String,
     pub timed_out: bool,
 }
@@ -67,6 +67,10 @@ pub struct SandboxConfig {
     /// Issue #9: 环境隔离。默认 false → env_clear() + 仅注入最小基线 (PATH/TMPDIR/SHELL) + env。
     /// true → 继承宿主全量 env (旧行为; 受信本地场景显式 opt-in, 文档化泄漏风险)。
     pub inherit_env: bool,
+    /// Issue #4: 捕获后端。true(默认)=PTY (ANSI/Traceback 保真, 但 stdout+stderr 合并)。
+    /// false=stdio 子进程管道 (stdout/stderr 独立捕获, FR-03 双工; 丢失 PTY 保真)。
+    /// 诊断 Slicer 在 stdio 模式直接吃 stderr; PTY 模式吃合并 stdout 的 tail。
+    pub use_pty: bool,
 }
 
 impl Default for SandboxConfig {
@@ -79,6 +83,7 @@ impl Default for SandboxConfig {
             max_output_chars: DEFAULT_MAX_OUTPUT,
             seatbelt: false,
             inherit_env: false,
+            use_pty: true,
         }
     }
 }
@@ -106,6 +111,41 @@ fn configure_env(cmd: &mut portable_pty::CommandBuilder, cfg: &SandboxConfig) {
     }
 }
 
+/// Issue #4: stdio 后端环境配置 — 与 configure_env 同语义 (env_clear + 基线 + env_vars),
+/// 但作用于 std::process::Command (非 portable-pty CommandBuilder)。
+fn configure_std_env(cmd: &mut std::process::Command, cfg: &SandboxConfig) {
+    if !cfg.inherit_env {
+        cmd.env_clear();
+        let path = std::env::var("PATH").unwrap_or_else(|_| SANDBOX_FALLBACK_PATH.to_string());
+        cmd.env("PATH", path);
+        cmd.env("TMPDIR", std::env::temp_dir());
+        cmd.env("SHELL", SANDBOX_BASE_SHELL);
+        debug!(
+            "env 隔离 (stdio): env_clear + 基线 PATH/TMPDIR/SHELL ({} env_vars 覆盖)",
+            cfg.env.len()
+        );
+    }
+    for (k, v) in &cfg.env {
+        cmd.env(k, v);
+    }
+}
+
+/// Issue #4: 收 reader 线程输出 — kill 后 reader 可能永不 EOF, recv_timeout 兜底
+fn recv_output(rx: &std_mpsc::Receiver<Result<String>>, pid: Option<u32>, label: &str) -> String {
+    match rx.recv_timeout(Duration::from_millis(READER_RECV_TIMEOUT_MS)) {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) => {
+            warn!(?pid, label, "stdio reader 送了 Err (不应发生)");
+            String::new()
+        }
+        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+            warn!(?pid, label, "kill 后 stdio reader 未 EOF, 返回空");
+            String::new()
+        }
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => String::new(),
+    }
+}
+
 /// 沙箱 — PTY 执行 + 超时 + 截断 + OOM 上限
 pub struct Sandbox;
 
@@ -122,7 +162,11 @@ impl Sandbox {
                 ..Default::default()
             });
         }
-        info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run");
+        // Issue #4: use_pty=false 走 stdio 后端 (stdout/stderr 独立), 否则 PTY (合并, 默认)
+        if !cfg.use_pty {
+            return self.run_stdio(cfg).await;
+        }
+        info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run (PTY)");
 
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -253,6 +297,133 @@ impl Sandbox {
             exit_code: raw_exit,
             stdout,
             stderr: String::new(),
+            timed_out,
+        })
+    }
+
+    /// Issue #4: stdio 后端 — std::process::Command + 独立 Stdio::piped (stdout/stderr 分离)。
+    /// 非 PTY: 丢失 ANSI/Traceback 保真, 但满足 FR-03 双工捕获 + Slicer 直接吃 stderr。
+    /// 复用截断/OOM-cap/超时/SIGINT→SIGKILL 进程树杀语义 (与 PTY run() 等价)。
+    async fn run_stdio(&self, cfg: SandboxConfig) -> Result<SandboxResult> {
+        info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run (stdio, 分离 stdout/stderr)");
+        let mut cmd = seatbelt::build_std_command(&cfg.command, cfg.seatbelt);
+        if let Some(cwd) = &cfg.cwd {
+            cmd.current_dir(cwd);
+        }
+        configure_std_env(&mut cmd, &cfg);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().context("spawn (stdio) 失败")?;
+        let pid: Option<u32> = Some(child.id());
+        debug!(?pid, "child spawned (stdio)");
+        // 取出 stdout/stderr handle 后移走 child 剩余引用供 wait
+        let mut stdout_handle = child.stdout.take().context("stdout piped 失败")?;
+        let mut stderr_handle = child.stderr.take().context("stderr piped 失败")?;
+
+        let effective_max = effective_output_cap(cfg.max_output_chars);
+        let max_cap = effective_max.saturating_mul(2);
+        let tail_cap = effective_max;
+
+        // stdout reader 线程 — 环形缓冲 (与 PTY 一致 OOM-cap)
+        let (out_tx, out_rx) = std_mpsc::channel::<Result<String>>();
+        let _out_handle = std::thread::spawn(move || {
+            let mut buf = Vec::<u8>::with_capacity(8192);
+            let mut tmp = [0u8; 4096];
+            loop {
+                match stdout_handle.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.len() > max_cap {
+                            let keep = buf.len().saturating_sub(tail_cap);
+                            buf.drain(0..keep);
+                        }
+                    }
+                    Err(e) => {
+                        let partial = String::from_utf8_lossy(&buf).into_owned();
+                        let _ = out_tx.send(Ok(partial));
+                        warn!(error = %e, "stdio stdout reader 失败, 返回已收 partial");
+                        return;
+                    }
+                }
+            }
+            let s = String::from_utf8_lossy(&buf).into_owned();
+            let _ = out_tx.send(Ok(s));
+        });
+
+        // stderr reader 线程 — 独立缓冲 (Issue #4 核心分离)
+        let (err_tx, err_rx) = std_mpsc::channel::<Result<String>>();
+        let _err_handle = std::thread::spawn(move || {
+            let mut buf = Vec::<u8>::with_capacity(8192);
+            let mut tmp = [0u8; 4096];
+            loop {
+                match stderr_handle.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.len() > max_cap {
+                            let keep = buf.len().saturating_sub(tail_cap);
+                            buf.drain(0..keep);
+                        }
+                    }
+                    Err(e) => {
+                        let partial = String::from_utf8_lossy(&buf).into_owned();
+                        let _ = err_tx.send(Ok(partial));
+                        warn!(error = %e, "stdio stderr reader 失败, 返回已收 partial");
+                        return;
+                    }
+                }
+            }
+            let s = String::from_utf8_lossy(&buf).into_owned();
+            let _ = err_tx.send(Ok(s));
+        });
+
+        // wait + 超时 (复用 timeout 边界规则 + kill_tree)
+        if cfg.timeout_sec < 0.0 {
+            bail!("timeout_sec 不能为负: {}", cfg.timeout_sec);
+        }
+        let effective_timeout = if cfg.timeout_sec == 0.0 {
+            DEFAULT_TIMEOUT_CAP_SEC
+        } else {
+            cfg.timeout_sec
+        };
+        let timeout_dur = Duration::from_secs_f64(effective_timeout);
+        let wait_fut = tokio::task::spawn_blocking(move || child.wait());
+        let sleep = tokio::time::sleep(timeout_dur);
+
+        let (timed_out, raw_exit) = tokio::select! {
+            biased;
+            join_res = wait_fut => {
+                let status = join_res
+                    .map_err(|e| anyhow::anyhow!("wait 线程 panic: {e}"))?
+                    .context("wait 失败")?;
+                (false, status.code().unwrap_or(-1))
+            }
+            _ = sleep => {
+                warn!(?pid, timeout_sec = effective_timeout, "超时 (stdio), kill 进程组");
+                let exit = kill_tree(pid);
+                (true, exit)
+            }
+        };
+
+        let raw_stdout = recv_output(&out_rx, pid, "stdout");
+        let raw_stderr = recv_output(&err_rx, pid, "stderr");
+        // stdio 无 PTY ONLCR 回显, 无 CRLF 归一化需求
+        let stdout = truncate_output(&raw_stdout, effective_max);
+        let stderr = truncate_output(&raw_stderr, effective_max);
+        debug!(
+            out_len = stdout.len(),
+            err_len = stderr.len(),
+            timed_out,
+            "sandbox run (stdio) 完成"
+        );
+
+        Ok(SandboxResult {
+            exit_code: raw_exit,
+            stdout,
+            stderr,
             timed_out,
         })
     }
@@ -799,6 +970,50 @@ mod tests {
     }
 
     #[test]
+    fn run_stdio_separates_stdout_stderr() {
+        // Issue #4: use_pty=false stdio 后端 — stdout/stderr 独立捕获
+        let mut c = cfg(
+            "python3 -c \"import sys; sys.stdout.write('OUT\\n'); sys.stderr.write('ERR\\n')\"",
+        );
+        c.use_pty = false;
+        let r = rt().block_on(Sandbox::new().run(c));
+        let r = r.unwrap();
+        assert_eq!(r.exit_code, 0, "stderr={:?}", r.stderr);
+        assert!(r.stdout.contains("OUT"), "stdout={:?}", r.stdout);
+        assert!(
+            !r.stdout.contains("ERR"),
+            "stdout 不应被 stderr 污染: {:?}",
+            r.stdout
+        );
+        assert!(
+            r.stderr.contains("ERR"),
+            "stderr 应独立捕获: {:?}",
+            r.stderr
+        );
+    }
+
+    #[test]
+    fn run_stdio_stderr_only_traceback() {
+        // use_pty=false: Python traceback 进 stderr 独立 (非合流 stdout)
+        let mut c = cfg("python3 -c \"raise ValueError('boom-stdio')\"");
+        c.use_pty = false;
+        let r = rt().block_on(Sandbox::new().run(c));
+        let r = r.unwrap();
+        assert_ne!(r.exit_code, 0);
+        assert!(r.stderr.contains("boom-stdio"), "stderr={:?}", r.stderr);
+        assert!(!r.stdout.contains("boom-stdio"), "stdout 不应含 traceback");
+    }
+
+    #[test]
+    fn run_stdio_exit_code_nonzero() {
+        let mut c = cfg("python3 -c \"import sys; sys.exit(7)\"");
+        c.use_pty = false;
+        let r = rt().block_on(Sandbox::new().run(c));
+        let r = r.unwrap();
+        assert_eq!(r.exit_code, 7);
+    }
+
+    #[test]
     fn truncate_short_unchanged() {
         assert_eq!(truncate_output("abc", 100), "abc");
     }
@@ -1041,6 +1256,7 @@ mod tests {
             max_output_chars: 100_000,
             seatbelt: false,
             inherit_env: false,
+            use_pty: true,
         };
         let (mut rx, handle) = sb.run_streaming(cfg).unwrap();
         // 收首块 (含 "started"), 确认子进程已起

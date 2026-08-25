@@ -958,3 +958,29 @@ def test_env_inherit_true_restores_host_env(executor: FusionSandboxExecutor, mon
     r = executor.run(_REFLECT % ("FE_TEST_SECRET", "clean"), timeout_sec=5, inherit_env=True)
     assert r.exit_code == 0
     assert "leak-me-please" in r.stdout, "inherit_env=True 应继承宿主 env (opt-in 受信场景)"
+
+
+# Issue #4: use_pty=False stdio 后端 — stdout/stderr 独立捕获 (PTY 合流, stderr 恒空)
+def test_use_pty_false_captures_stderr_separately(executor: FusionSandboxExecutor):
+    cmd = "python3 -c \"import sys; sys.stdout.write('OUT-LINE\\n'); sys.stderr.write('ERR-LINE\\n')\""
+    r = executor.run(cmd, timeout_sec=5, use_pty=False)
+    assert r.exit_code == 0, f"exit={r.exit_code} stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "OUT-LINE" in r.stdout, f"stdout 应含 OUT: {r.stdout!r}"
+    assert "ERR-LINE" not in r.stdout, f"stdout 不应被 stderr 污染: {r.stdout!r}"
+    assert "ERR-LINE" in r.stderr, f"stderr 应独立捕获 ERR: {r.stderr!r}"
+
+
+def test_use_pty_true_merges_stderr_into_stdout(executor: FusionSandboxExecutor):
+    # PTY 后端: stdout/stderr 合流, stderr 恒空 (portable-pty 强制 stderr=PTY as_stdio)
+    cmd = "python3 -c \"import sys; sys.stdout.write('OUT\\n'); sys.stderr.write('ERR\\n')\""
+    r = executor.run(cmd, timeout_sec=5, use_pty=True)
+    assert r.exit_code == 0
+    assert r.stderr == "", "PTY 后端 stderr 恒空 (合流进 stdout)"
+    assert "OUT" in r.stdout
+    assert "ERR" in r.stdout, "PTY 后端 stderr 应合流进 stdout"
+
+
+def test_run_streaming_rejects_use_pty_false(executor: FusionSandboxExecutor):
+    # 流式无 stdio 后端, 显式拒 (fail-loud 而非静默降级 PTY)
+    with pytest.raises(ValueError, match="use_pty=False"):
+        next(executor.run_streaming("echo hi", timeout_sec=5, use_pty=False))

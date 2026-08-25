@@ -15,6 +15,7 @@
 // crate 仍 unsafe_code="deny" (fe-sandbox 未开 allow)。
 
 use portable_pty::CommandBuilder;
+use std::process::Command;
 use tracing::{debug, info};
 
 /// 危险二进制黑名单 — 运行时 process-exec deny 目标。
@@ -70,6 +71,28 @@ pub fn build_command(command: &str, seatbelt: bool) -> CommandBuilder {
         let mut cmd = CommandBuilder::new("sh");
         cmd.arg("-c");
         cmd.arg(command);
+        cmd
+    }
+}
+
+/// Issue #4: stdio 后端命令构建 — 与 build_command 同语义 (seatbelt 包装 / 裸 sh -c),
+/// 但返回 std::process::Command (stdout/stderr 独立 Stdio::piped, 非 PTY)。
+/// use_pty=false 路径专用, 保留与 PTY 路径一致的 seatbelt 行为。
+pub fn build_std_command(command: &str, seatbelt: bool) -> Command {
+    if seatbelt {
+        let profile = build_profile();
+        info!(
+            profile_len = profile.len(),
+            bins = DANGEROUS_BINS.len(),
+            "seatbelt (stdio) 运行时隔离启用 — sandbox-exec 包装"
+        );
+        let mut cmd = Command::new("sandbox-exec");
+        cmd.arg("-p").arg(&profile).arg("sh").arg("-c").arg(command);
+        cmd
+    } else {
+        debug!("seatbelt (stdio) 未启用 — 裸 sh -c");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command);
         cmd
     }
 }
