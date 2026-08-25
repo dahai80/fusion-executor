@@ -13,10 +13,10 @@ server.
     python examples/07_subscribe.py
 """
 
+import contextlib
 import logging
 import os
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -39,13 +39,14 @@ def wait_for_sock(path: str, timeout: float = 5.0) -> None:
 
 def main() -> None:
     # Clean any stale socket, start the server on a private path.
-    try:
+    with contextlib.suppress(FileNotFoundError):
         os.unlink(SOCK)
-    except FileNotFoundError:
-        pass
 
     env = dict(os.environ, FUSION_EXECUTOR_SOCK=SOCK)
-    proc = subprocess.Popen([sys.executable, "-c", "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"], env=env)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"],
+        env=env,
+    )
     try:
         wait_for_sock(SOCK)
         print(f"server up on {SOCK} (pid={proc.pid})")
@@ -69,10 +70,8 @@ def main() -> None:
     finally:
         proc.send_signal(signal.SIGTERM)
         proc.wait(timeout=5.0)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(SOCK)
-        except FileNotFoundError:
-            pass
         print("server stopped.")
 
 
