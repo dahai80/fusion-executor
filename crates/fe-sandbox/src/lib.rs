@@ -434,22 +434,32 @@ impl Sandbox {
                 return;
             }
 
-            // 阶段 2: exit 已到 — 等 reader EOF, C-SB-03 grace 超时防 reader 永不 EOF
+            // 阶段 2: exit 已到 — 排空 reader 直到 EOF/None。
+            // C-SB-03 grace 超时防 reader 永不 EOF。必须循环: exit 先于 reader 刷盘时,
+            // reader 可能仍持多条 Chunk + 末尾 Eof; 单次 recv 只取一条会漏掉 Eof,
+            // 导致 eof_output 留 None → unwrap_or_default 空串 → done.stdout 丢全部输出
+            // (CI 慢机 echo hi 竞态: exit 比 PTY flush 快)。
             if eof_output.is_none() {
-                match tokio::time::timeout(
-                    Duration::from_millis(READER_RECV_TIMEOUT_MS),
-                    inner_rx.recv(),
-                )
-                .await
-                {
-                    Ok(Some(ReaderMsg::Chunk(c))) => {
-                        let _ = outer_tx.send(StreamEvent::Chunk { data: c }).await;
-                    }
-                    Ok(Some(ReaderMsg::Eof(s))) => eof_output = Some(s),
-                    Ok(None) => eof_output = Some(String::new()),
-                    Err(_) => {
-                        warn!(?pid, "streaming kill 后 reader 未 EOF, 合成空 eof");
-                        eof_output = Some(String::new());
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_millis(READER_RECV_TIMEOUT_MS);
+                loop {
+                    match tokio::time::timeout_at(deadline, inner_rx.recv()).await {
+                        Ok(Some(ReaderMsg::Chunk(c))) => {
+                            let _ = outer_tx.send(StreamEvent::Chunk { data: c }).await;
+                        }
+                        Ok(Some(ReaderMsg::Eof(s))) => {
+                            eof_output = Some(s);
+                            break;
+                        }
+                        Ok(None) => {
+                            eof_output = Some(String::new());
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(?pid, "streaming kill 后 reader 未 EOF, 合成空 eof");
+                            eof_output = Some(String::new());
+                            break;
+                        }
                     }
                 }
             }
