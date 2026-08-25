@@ -942,7 +942,10 @@ mod tests {
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败");
             // 即使 max_consecutive_failures=99 (远超单次), 文件毁损仍立即回滚 — 字段不限制单次执行
-            assert!(res.auto_rolled_back, "max_consecutive_failures 不影响单次回滚 (死字段)");
+            assert!(
+                res.auto_rolled_back,
+                "max_consecutive_failures 不影响单次回滚 (死字段)"
+            );
             let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
             assert_eq!(content, "print('ok')\n", "回滚后应恢复: {content}");
         });

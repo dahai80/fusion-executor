@@ -192,6 +192,16 @@ class FusionSandboxExecutor:
         logger.info("snapshot_create cwd=%s", cwd)
         return self._native.snapshot_create(cwd)
 
+    def validate(self, command: str) -> dict:
+        # Issue #11 / #12.4: 非执行预校验 — 调用方先问用户授权再 run (Option A: caller owns gating)。
+        # Executor 只强制硬黑名单 (never-blocked); interactive confirmation 归 caller。
+        # 返回 {allowed: bool, blocked: bool, reason: str|None, stage: "regex"|"tokenizer"|None}
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError(f"command 必须非空字符串, 得 {command!r}")
+        result = self._native.validate(command)
+        logger.info("validate command=%r allowed=%s blocked=%s", command, result.get("allowed"), result.get("blocked"))
+        return result
+
     def file_edit(
         self,
         path: str,

@@ -4,7 +4,7 @@
 // P1: 最小 execute_sync; 后续暴露 rollback/gui/serve
 
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyDict};
 
 use fe_core::gui::{GuiAction, GuiResult as RsGuiResult};
 use fe_core::telemetry::{TelemetryConfig, TelemetrySample};
@@ -422,6 +422,24 @@ impl PyExecutor {
                 tracing::error!(error = %e, "rollback 失败");
                 pyo3::exceptions::PyRuntimeError::new_err(format!("rollback 失败: {e}"))
             })
+    }
+
+    /// validate(command) -> dict {allowed, blocked, reason, stage}
+    /// Issue #11 / #12.4: 非执行预校验 — 调用方先问用户授权再 execute (Option A, caller owns gating)。
+    /// 同步 (纯 CPU 校验, 无 I/O, 不需 BLOCKING_RT)。
+    fn validate<'py>(&self, py: Python<'py>, command: String) -> PyResult<Bound<'py, PyDict>> {
+        let verdict = self.inner.validate(&command);
+        let dict = PyDict::new(py);
+        dict.set_item("allowed", verdict.allowed)?;
+        dict.set_item("blocked", !verdict.allowed)?;
+        dict.set_item("reason", verdict.reason.clone())?;
+        // stage: SecurityStage → 字符串 ("regex"/"tokenizer"), 避 serde_json 带引号
+        let stage_str = verdict.stage.map(|s| match s {
+            fe_core::security::SecurityStage::Regex => "regex",
+            fe_core::security::SecurityStage::Tokenizer => "tokenizer",
+        });
+        dict.set_item("stage", stage_str)?;
+        Ok(dict)
     }
 
     /// gui_action(action: dict) -> NativeGuiResult

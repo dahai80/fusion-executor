@@ -1006,6 +1006,26 @@ async fn handle_method(
                 .map_err(|e| (ERR_INTERNAL, format!("snapshot_create 失败: {}", e)))?;
             Ok(json!({"snapshot_id": id}))
         }
+        // Issue #11 / #12.4: 非执行预校验 — 调用方 (fusion-code) 先问用户授权再 execute。
+        // Executor 只强制硬黑名单 (never-blocked); interactive confirmation 归 caller (Option A, stateless)。
+        "executor.validate" => {
+            let command = param_str(&params, "command")
+                .ok_or((ERR_INVALID_REQ, "缺少 command".to_string()))?;
+            let verdict = executor.validate(&command);
+            let allowed = verdict.allowed;
+            let reason = verdict.reason.clone();
+            // 手工映射为小写串 — 与 fe-pyo3 validate() 一致, 两传输层 wire shape 统一
+            let stage = verdict.stage.map(|s| match s {
+                fe_core::security::SecurityStage::Regex => "regex",
+                fe_core::security::SecurityStage::Tokenizer => "tokenizer",
+            });
+            Ok(json!({
+                "allowed": allowed,
+                "blocked": !allowed,
+                "reason": reason,
+                "stage": stage,
+            }))
+        }
         "executor.rollback" => {
             let snapshot_id = param_str(&params, "snapshot_id")
                 .ok_or((ERR_INVALID_REQ, "缺少 snapshot_id".to_string()))?;
@@ -1191,6 +1211,34 @@ mod tests {
             "ax_trusted 应为布尔: {}",
             resp["result"]["ax_trusted"]
         );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // Issue #11 / #12.4: executor.validate 非执行预校验 over UDS — 调用方先问授权再 execute
+    #[tokio::test]
+    async fn validate_roundtrip() {
+        let sock = tmp_sock("validate");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        // 安全命令
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.validate","params":{"command":"echo hi"}}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["allowed"], true);
+        assert_eq!(resp["result"]["blocked"], false);
+        assert!(resp["result"]["reason"].is_null());
+        // 危险命令 — 非执行, 仅返 verdict
+        let resp2 = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":2,"method":"executor.validate","params":{"command":"rm -rf /"}}"#,
+        )
+        .await;
+        assert_eq!(resp2["result"]["allowed"], false);
+        assert_eq!(resp2["result"]["blocked"], true);
+        assert!(resp2["result"]["reason"].is_string(), "reason 应为字符串");
+        assert_eq!(resp2["result"]["stage"], "regex");
         let _ = std::fs::remove_file(&sock);
     }
 

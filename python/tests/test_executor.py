@@ -846,3 +846,37 @@ def test_serve_passes_resolved_path_not_raw_none(monkeypatch, tmp_path):
     with pytest.raises(KeyboardInterrupt):
         ex.serve(sp)
     assert captured["path"] == sp, "serve 应传解析后 path 非原始 sock_path"
+
+
+def test_validate_safe_command_allowed(executor: FusionSandboxExecutor):
+    # Issue #11 / #12.4: 非执行预校验 — 安全命令 allowed=True, 不执行
+    v = executor.validate("echo hi")
+    assert v["allowed"] is True
+    assert v["blocked"] is False
+    assert v["reason"] is None
+    assert v["stage"] is None
+
+
+def test_validate_blocked_command_returns_verdict(executor: FusionSandboxExecutor):
+    # 危险命令 → blocked=True + reason + stage, 命令不执行 (无副作用)
+    v = executor.validate("rm -rf /")
+    assert v["allowed"] is False
+    assert v["blocked"] is True
+    assert isinstance(v["reason"], str) and v["reason"]
+    assert v["stage"] == "regex"
+
+
+def test_validate_chain_bypass_caught_at_tokenizer(executor: FusionSandboxExecutor):
+    # 链装配绕过: echo hi && sudo ls → Stage-2 tokenizer 拦 sudo
+    v = executor.validate("echo hi && sudo ls")
+    assert v["blocked"] is True
+    assert v["stage"] in ("regex", "tokenizer")
+
+
+def test_validate_empty_command_raises_valueerror(executor: FusionSandboxExecutor):
+    with pytest.raises(ValueError, match="command 必须非空字符串"):
+        executor.validate("")
+    with pytest.raises(ValueError, match="command 必须非空字符串"):
+        executor.validate("   ")
+    with pytest.raises(ValueError, match="command 必须非空字符串"):
+        executor.validate(123)  # type: ignore[arg-type]
