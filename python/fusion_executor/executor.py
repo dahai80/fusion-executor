@@ -27,12 +27,17 @@ SUB_CHANNELS = ("telemetry", "stdio", "screenshot")
 
 
 class FusionSandboxExecutor:
-    def __init__(self, sock_path: str | None = None) -> None:
+    def __init__(
+        self,
+        sock_path: str | None = None,
+        *,
+        extra_whitelist: list[str] | None = None,
+    ) -> None:
         try:
             from ._native import NativeExecutor
         except ImportError as e:
             raise ImportError("fusion_executor._native 未加载 — 运行 `maturin develop` 编译原生扩展") from e
-        self._native = NativeExecutor()
+        self._native = NativeExecutor(extra_whitelist)
         self._sock_path = sock_path
 
     def run(

@@ -882,6 +882,53 @@ def test_validate_empty_command_raises_valueerror(executor: FusionSandboxExecuto
         executor.validate(123)  # type: ignore[arg-type]
 
 
+# Issue #10: 白名单覆盖 + 项目级扩展 + 动态执行拦截
+def test_extra_whitelist_allows_project_tool():
+    ex = FusionSandboxExecutor(extra_whitelist=["myproj-runner"])
+    v = ex.validate("myproj-runner --version")
+    assert v["allowed"] is True, v
+
+
+def test_extra_whitelist_rejects_shell_interpreter():
+    # 解释器/内建不可经扩展自我后门
+    ex = FusionSandboxExecutor(extra_whitelist=["bash", "sh", "exec", "eval"])
+    for cmd in ["bash -c 'x'", "sh -c 'x'", "eval 'x'", "exec foo"]:
+        v = ex.validate(cmd)
+        assert v["allowed"] is False, f"危险扩展项应仍被拦: {cmd} -> {v}"
+
+
+def test_blocks_eval_source_exec_dynamic():
+    ex = FusionSandboxExecutor()
+    for cmd, kw in [
+        ("eval 'echo hi'", "eval"),
+        ("source /tmp/evil.sh", "source"),
+        ("exec /bin/sh", "exec"),
+    ]:
+        v = ex.validate(cmd)
+        assert v["allowed"] is False, f"{cmd} 应被拦: {v}"
+        assert kw in v["reason"], f"{cmd} reason 应提及 {kw}: {v['reason']}"
+
+
+def test_blocks_interpreter_dash_c_and_pipe_to_shell():
+    ex = FusionSandboxExecutor()
+    for cmd in [
+        "bash -c 'echo pwned'",
+        "sh -c 'echo pwned'",
+        "echo aGVsbG8= | base64 -d | sh",
+        "echo 'rm -rf /' | sh",
+        "printf 'pwn' | bash",
+    ]:
+        v = ex.validate(cmd)
+        assert v["allowed"] is False, f"{cmd} 应被拦: {v}"
+
+
+def test_allows_pipe_to_non_shell_no_false_positive():
+    ex = FusionSandboxExecutor()
+    for cmd in ["echo hi | grep hi", "git log --oneline | head -5", "echo bash | grep bash"]:
+        v = ex.validate(cmd)
+        assert v["allowed"] is True, f"{cmd} 不应误拦: {v}"
+
+
 # Issue #9: 环境隔离 — 默认不泄漏宿主密钥; env_vars 注入; inherit_env opt-in 继承
 _REFLECT = 'python3 -c "import os,sys;sys.stdout.write(os.environ.get(%r,%r))"'
 

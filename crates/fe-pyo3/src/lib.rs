@@ -335,14 +335,29 @@ impl PyTelemetryIterator {
 #[pyclass(name = "NativeExecutor", skip_from_py_object)]
 struct PyExecutor {
     inner: Executor,
+    extra_whitelist: Vec<String>,
 }
 
 #[pymethods]
 impl PyExecutor {
     #[new]
-    fn new() -> Self {
+    #[pyo3(signature = (extra_whitelist=None))]
+    fn new(extra_whitelist: Option<Vec<String>>) -> Self {
+        let extras: Vec<&str> = extra_whitelist
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let inner = if extras.is_empty() {
+            Executor::new()
+        } else {
+            tracing::info!(count = extras.len(), "PyExecutor 构造带项目级白名单扩展");
+            Executor::new().with_extra_whitelist(&extras)
+        };
         Self {
-            inner: Executor::new(),
+            inner,
+            extra_whitelist: extra_whitelist.unwrap_or_default(),
         }
     }
 
@@ -670,7 +685,13 @@ impl PyExecutor {
     /// 调用方持有的 self.inner (如 serve 内命令改动 cwd 影响进程内调用)。
     fn serve(&self, py: pyo3::Python<'_>, sock_path: Option<String>) -> PyResult<()> {
         let sock = IpcServer::resolve_sock(sock_path.as_deref());
-        let server = IpcServer::with_executor(Executor::new());
+        let extras: Vec<&str> = self.extra_whitelist.iter().map(String::as_str).collect();
+        let exec = if extras.is_empty() {
+            Executor::new()
+        } else {
+            Executor::new().with_extra_whitelist(&extras)
+        };
+        let server = IpcServer::with_executor(exec);
         tracing::info!(sock = %sock, "PyO3 serve() — 启动 IPC 服务器 (释 GIL, 信号可停)");
         // C-PYO3-02: 释 GIL 跑 serve_blocking — Rust 侧 tokio::signal 监听 SIGINT/SIGTERM
         // 中断 accept_loop (不依赖 Python 信号 handler, 后者在 GIL 持有时不执行)。

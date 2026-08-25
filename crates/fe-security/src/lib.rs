@@ -134,6 +134,10 @@ const WHITELIST: &[&str] = &[
     "fd",
     "bat",
     "exa",
+    "jq",
+    "gh",
+    "make",
+    "cmake",
     "true",
     "false",
     "test",
@@ -150,7 +154,9 @@ const MAX_COMMAND_LEN: usize = 1_000_000;
 #[derive(Clone)]
 pub struct SecurityGuard {
     blocklist: Vec<(Regex, &'static str)>,
-    whitelist: HashSet<&'static str>,
+    // 白名单 — 基线 (WHITELIST) + 项目扩展 (with_extra_whitelist)。Issue #10:
+    // 项目可声明额外允许的二进制 (如项目专用工具), 基线不可被收缩 (仅追加)。
+    whitelist: HashSet<String>,
     sensitive_paths: Vec<String>,
     sensitive_paths_exp: Vec<String>,
     redirect_re: Regex,
@@ -165,7 +171,10 @@ impl Default for SecurityGuard {
 impl SecurityGuard {
     pub fn new() -> Self {
         let blocklist = build_blocklist();
-        let whitelist = WHITELIST.iter().copied().collect::<HashSet<_>>();
+        let whitelist = WHITELIST
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<HashSet<_>>();
         let sensitive_paths = SENSITIVE_PATHS.iter().map(|s| (*s).to_string()).collect();
         let sensitive_paths_exp = SENSITIVE_PATHS.iter().map(|s| expand_tilde(s)).collect();
         let redirect_re = Regex::new(r"(?:\d)?>>?\s*(\S+)").expect("重定向正则编译失败");
@@ -176,6 +185,29 @@ impl SecurityGuard {
             sensitive_paths_exp,
             redirect_re,
         }
+    }
+
+    /// Issue #10: 项目级白名单扩展 — 追加额外允许的二进制 (仅追加, 不收缩基线)。
+    /// 调用方 (fusion-code/CLI) 按项目声明专用工具; 基线 WHITELIST 恒在。
+    /// 安全约束: 扩展项不得含 shell 解释器/危险内建 (sh/bash/zsh/fish/exec/eval/source/.),
+    /// 否则忽略并记日志 (防项目配置自我后门)。
+    pub fn with_extra_whitelist(mut self, extras: &[&str]) -> Self {
+        const DENY_EXTEND: &[&str] = &[
+            "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "exec", "eval", "source",
+            ".", "system", "sudo", "doas",
+        ];
+        for name in extras {
+            let n = name.trim();
+            if n.is_empty() {
+                continue;
+            }
+            if DENY_EXTEND.contains(&n) {
+                debug!(binary = n, "白名单扩展拒绝危险解释器/内建");
+                continue;
+            }
+            self.whitelist.insert(n.to_string());
+        }
+        self
     }
 
     /// 校验入口 — 先正则快筛，再 token 解析防链式绕过
@@ -499,6 +531,24 @@ fn build_blocklist() -> Vec<(Regex, &'static str)> {
             r"chmod\s+(-R\s+)?777\s+(/(etc|System|Library|usr|root|dev)|~/\.ssh)",
             "禁止 777 敏感路径",
         ),
+        // Issue #10: shell 内建/解释器动态执行 — eval/source/exec/`. cmd`
+        // (解释器本身未在白名单, 此处显式拦截给清晰错误 + 纵深防御)
+        (r"(^|[\s;|&])eval\b", "禁止 eval 动态执行"),
+        (r"(^|[\s;|&])source\b", "禁止 source 动态执行脚本"),
+        (r"(^|[\s;|&])exec\b", "禁止 exec 替换进程/动态执行"),
+        // Issue #10: 解释器 -c 动态脚本执行 — bash -c '...' / sh -c '...' / zsh -c ...
+        (
+            r"\b(bash|sh|zsh|fish|dash|ksh|csh|tcsh)\s+-c\b",
+            "禁止解释器 -c 动态脚本执行",
+        ),
+        // Issue #10: base64 解码管道执行 — base64 -d | sh / 任意 | base64 -d | bash
+        (
+            r"base64\s+(-d|--decode)\b.*\|\s*(sh|bash|zsh|fish)\b",
+            "禁止 base64 解码管道执行 shell",
+        ),
+        // Issue #10: 任意管道到解释器 — echo ... | sh / printf ... | bash (非 curl/wget 源)
+        // \b 词边界防误匹配 (| sort 等); 兼容管道后带参数 (| sh -x) 与行尾 (| sh)
+        (r"\|\s*(sh|bash|zsh|fish)\b", "禁止管道执行 shell 解释器"),
     ];
 
     patterns
@@ -1213,5 +1263,119 @@ mod tests {
         // 子树访问 — ~/.aws/credentials 在 ~/.aws 下应被拦
         let v = guard().validate("grep AKIA ~/.aws/credentials");
         assert!(!v.allowed, "grep AWS 子树应被拦截");
+    }
+
+    // ── Issue #10: 白名单覆盖 + 项目扩展 + 动态执行拦截 + split_chain 边界 ──
+
+    #[test]
+    fn whitelist_covers_common_agent_toolset() {
+        let g = guard();
+        for name in [
+            "rg", "fd", "jq", "gh", "make", "cmake", "bun", "deno", "uv", "pip", "cargo", "npm",
+            "pnpm", "yarn", "go", "rustc", "swift", "python3", "git", "tsc",
+        ] {
+            assert!(g.whitelist_contains(name), "白名单应含: {}", name);
+        }
+    }
+
+    #[test]
+    fn with_extra_whitelist_allows_project_tool() {
+        let g = SecurityGuard::new().with_extra_whitelist(&["myproj-runner"]);
+        let v = g.validate("myproj-runner --version");
+        assert!(v.allowed, "项目扩展工具应放行: {:?}", v.reason);
+    }
+
+    #[test]
+    fn with_extra_whitelist_rejects_shell_interpreter() {
+        // 解释器/内建不可经项目扩展自我后门
+        let g = SecurityGuard::new().with_extra_whitelist(&["bash", "sh", "exec", "eval"]);
+        for cmd in ["bash -c 'x'", "sh -c 'x'", "eval 'x'", "exec foo"] {
+            let v = g.validate(cmd);
+            assert!(!v.allowed, "危险扩展项应仍被拦: {}", cmd);
+        }
+        // 基线工具不受扩展拒绝影响
+        let v = g.validate("python3 --version");
+        assert!(v.allowed, "基线工具不受影响");
+    }
+
+    #[test]
+    fn blocks_eval_dynamic_exec() {
+        // 用不含 rm-rf 的 payload, 确保命中的是 eval 规则而非 rm-rf 规则
+        let v = guard().validate("eval 'echo hi'");
+        assert!(!v.allowed, "eval 应被拦");
+        assert!(
+            v.reason.as_deref().unwrap().contains("eval"),
+            "reason 应提及 eval"
+        );
+    }
+
+    #[test]
+    fn blocks_source_dynamic_exec() {
+        let v = guard().validate("source /tmp/evil.sh");
+        assert!(!v.allowed && v.reason.as_deref().unwrap().contains("source"));
+    }
+
+    #[test]
+    fn blocks_exec_replace_process() {
+        let v = guard().validate("exec /bin/sh");
+        assert!(!v.allowed && v.reason.as_deref().unwrap().contains("exec"));
+    }
+
+    #[test]
+    fn blocks_bash_c_dynamic_script() {
+        let v = guard().validate("bash -c 'echo pwned'");
+        assert!(!v.allowed, "bash -c 应被拦");
+        let v = guard().validate("sh -c 'echo pwned'");
+        assert!(!v.allowed, "sh -c 应被拦");
+    }
+
+    #[test]
+    fn blocks_base64_pipe_to_shell() {
+        let v = guard().validate("echo aGVsbG8= | base64 -d | sh");
+        assert!(!v.allowed, "base64 -d | sh 应被拦");
+    }
+
+    #[test]
+    fn blocks_any_pipe_to_shell() {
+        let v = guard().validate("echo 'rm -rf /' | sh");
+        assert!(!v.allowed, "echo | sh 应被拦");
+        let v = guard().validate("printf 'pwn' | bash");
+        assert!(!v.allowed, "printf | bash 应被拦");
+    }
+
+    #[test]
+    fn allows_pipe_to_non_shell() {
+        // 管道到非解释器工具应放行 (防误拦)
+        let v = guard().validate("echo hi | grep hi");
+        assert!(v.allowed, "echo | grep 应放行: {:?}", v.reason);
+        let v = guard().validate("git log --oneline | head -5");
+        assert!(v.allowed, "git log | head 应放行: {:?}", v.reason);
+    }
+
+    #[test]
+    fn split_chain_handles_quoted_operators() {
+        // 引号内 && 不应拆段
+        let v = guard().validate("echo \"a && b\"");
+        assert!(v.allowed, "引号内 && 应作字面量: {:?}", v.reason);
+    }
+
+    #[test]
+    fn split_chain_handles_single_quoted_pipe() {
+        let v = guard().validate("echo 'a | b'");
+        assert!(v.allowed, "单引号内 | 应作字面量: {:?}", v.reason);
+    }
+
+    #[test]
+    fn split_chain_newline_is_separator() {
+        // 换行作分隔符 — 第二段非白名单应拦
+        let v = guard().validate("echo hi\nbashbadthing");
+        assert!(!v.allowed, "换行分隔后非白名单二进制应拦");
+    }
+
+    #[test]
+    fn split_chain_heredoc_body_validated() {
+        // heredoc 主体含 rm -rf / 应被正则拦截 (无绕过)
+        let v = guard().validate("cat <<EOF\nrm -rf /\nEOF");
+        assert!(!v.allowed, "heredoc 内 rm -rf 应被拦");
     }
 }

@@ -327,6 +327,13 @@ impl Executor {
         }
     }
 
+    /// 扩展白名单 — Issue #10: 项目级二进制放行 (含危险解释器拒绝守卫)
+    pub fn with_extra_whitelist(mut self, extras: &[&str]) -> Self {
+        info!(count = extras.len(), "Executor 扩展白名单 (项目级放行)");
+        self.security = self.security.with_extra_whitelist(extras);
+        self
+    }
+
     /// GUI 动作 (P4 FR-05) — 同步入口, 供 fe-pyo3/fe-ipc 调用
     pub fn gui_action(&self, action: GuiAction) -> Result<GuiResult> {
         self.gui.execute(action)
