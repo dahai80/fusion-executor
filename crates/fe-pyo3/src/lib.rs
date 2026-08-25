@@ -10,6 +10,7 @@ use fe_core::gui::{GuiAction, GuiResult as RsGuiResult};
 use fe_core::telemetry::{TelemetryConfig, TelemetrySample};
 use fe_core::tools::{
     EditResult as RsEditResult, GlobEntry as RsGlobEntry, GrepMatch as RsGrepMatch,
+    GrepOptions as RsGrepOptions,
 };
 use fe_core::{
     Diagnostics as RsDiag, ExecutionRequest, ExecutionResult as RsResult, ExecutionStreamEvent,
@@ -169,7 +170,7 @@ impl From<RsGlobEntry> for PyGlobEntry {
     }
 }
 
-/// Python 可见 grep 命中 — 镜像 fe_tools::GrepMatch
+/// Python 可见 grep 命中 — 镜像 fe_tools::GrepMatch (#7 +上下文)
 #[pyclass(name = "NativeGrepMatch", skip_from_py_object)]
 #[derive(Clone)]
 struct PyGrepMatch {
@@ -179,6 +180,10 @@ struct PyGrepMatch {
     line_number: u32,
     #[pyo3(get)]
     content: String,
+    #[pyo3(get)]
+    context_before: Vec<String>,
+    #[pyo3(get)]
+    context_after: Vec<String>,
 }
 
 impl From<RsGrepMatch> for PyGrepMatch {
@@ -187,7 +192,90 @@ impl From<RsGrepMatch> for PyGrepMatch {
             path: m.path,
             line_number: m.line_number,
             content: m.content,
+            context_before: m.context_before,
+            context_after: m.context_after,
         }
+    }
+}
+
+/// Python 可见 grep 计数行 — 镜像 fe_tools::GrepFileCount (#7 count 模式)
+#[pyclass(name = "NativeGrepFileCount", skip_from_py_object)]
+#[derive(Clone)]
+struct PyGrepFileCount {
+    #[pyo3(get)]
+    path: String,
+    #[pyo3(get)]
+    count: u32,
+}
+
+impl From<fe_core::tools::GrepFileCount> for PyGrepFileCount {
+    fn from(c: fe_core::tools::GrepFileCount) -> Self {
+        Self {
+            path: c.path,
+            count: c.count,
+        }
+    }
+}
+
+/// Python 可见 grep 输出 — 镜像 fe_tools::GrepOutput (#7 三模式聚合)
+/// serde 序列化后透传 Python (避免逐字段拷贝); content 模式 matches 非空, files_with_matches 模式 files 非空
+#[pyclass(name = "NativeGrepOutput", skip_from_py_object)]
+struct PyGrepOutput {
+    raw: String,
+}
+
+#[pymethods]
+impl PyGrepOutput {
+    /// 返回 dict (json.loads 反序列化), 与 Python Pydantic GrepOutput 一致
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let json = py.import("json")?;
+        Ok(json.call_method1("loads", (self.raw.clone(),))?.unbind())
+    }
+
+    #[getter]
+    fn output_mode(&self) -> PyResult<String> {
+        let v: serde_json::Value = serde_json::from_str(&self.raw)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化错误: {e}")))?;
+        Ok(v.get("output_mode")
+            .and_then(|m| m.as_str())
+            .unwrap_or("content")
+            .to_string())
+    }
+
+    #[getter]
+    fn matches(&self) -> PyResult<Vec<PyGrepMatch>> {
+        let v: serde_json::Value = serde_json::from_str(&self.raw)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化错误: {e}")))?;
+        let ms: Vec<RsGrepMatch> = v
+            .get("matches")
+            .and_then(|m| serde_json::from_value(m.clone()).ok())
+            .unwrap_or_default();
+        Ok(ms.into_iter().map(PyGrepMatch::from).collect())
+    }
+
+    #[getter]
+    fn files(&self) -> PyResult<Vec<String>> {
+        let v: serde_json::Value = serde_json::from_str(&self.raw)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化错误: {e}")))?;
+        Ok(v.get("files")
+            .and_then(|f| f.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    #[getter]
+    fn counts(&self) -> PyResult<Vec<PyGrepFileCount>> {
+        let v: serde_json::Value = serde_json::from_str(&self.raw)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化错误: {e}")))?;
+        let cs: Vec<fe_core::tools::GrepFileCount> = v
+            .get("counts")
+            .and_then(|c| serde_json::from_value(c.clone()).ok())
+            .unwrap_or_default();
+        Ok(cs.into_iter().map(PyGrepFileCount::from).collect())
     }
 }
 
@@ -754,6 +842,37 @@ impl PyExecutor {
             .grep(&pattern, &paths, cwd.as_deref())
             .map(|ms| ms.into_iter().map(PyGrepMatch::from).collect())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("grep 失败: {e}")))
+    }
+
+    /// #7 ripgrep parity — grep_with_opts(pattern, paths, opts, cwd=None) -> NativeGrepOutput
+    /// opts: dict (output_mode/after/before/context/multiline/glob_include/glob_exclude), 字段全可选
+    fn grep_with_opts(
+        &self,
+        pattern: String,
+        paths: Vec<String>,
+        opts: &Bound<'_, PyAny>,
+        cwd: Option<String>,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyGrepOutput>> {
+        // dict → json str → serde GrepOptions (字段全 #[serde(default)])
+        let json_mod = py.import("json")?;
+        let opts_str: String = json_mod
+            .call_method1("dumps", (opts,))?
+            .extract()
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("opts 序列化失败: {e}"))
+            })?;
+        let rs_opts: RsGrepOptions = serde_json::from_str(&opts_str).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("opts 解析失败: {e}"))
+        })?;
+        let out = self
+            .inner
+            .grep_with_opts(&pattern, &paths, cwd.as_deref(), &rs_opts)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("grep 失败: {e}")))?;
+        let raw = serde_json::to_string(&out).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("输出序列化失败: {e}"))
+        })?;
+        Py::new(py, PyGrepOutput { raw })
     }
 
     /// apply_patch(diff, cwd=None) -> NativeEditResult — Unified Diff 应用, 禁全文件重写

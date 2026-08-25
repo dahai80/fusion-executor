@@ -105,6 +105,41 @@ class GrepMatch(BaseModel):
     path: str
     line_number: int
     content: str
+    context_before: list[str] = Field(default_factory=list, description="命中行之前的上下文 (-B)")
+    context_after: list[str] = Field(default_factory=list, description="命中行之后的上下文 (-A)")
+
+
+class GrepFileCount(BaseModel):
+    model_config = _STRICT
+    path: str
+    count: int
+
+
+class GrepOutputMode(BaseModel):
+    model_config = _STRICT
+    mode: str = Field(
+        default="content",
+        description="grep 输出模式: content | files_with_matches | count",
+    )
+
+
+class GrepOptions(BaseModel):
+    model_config = _STRICT
+    output_mode: str = Field(default="content", description="content | files_with_matches | count")
+    after: int = Field(default=0, description="命中行后额外行数 (-A)")
+    before: int = Field(default=0, description="命中行前额外行数 (-B)")
+    context: int = Field(default=0, description="命中行前后均取 (-C, 等价 max(A,B))")
+    multiline: bool = Field(default=False, description="多行模式 (整文件 buffer 匹配)")
+    glob_include: list[str] = Field(default_factory=list, description="仅匹配这些 glob 的文件 (-g)")
+    glob_exclude: list[str] = Field(default_factory=list, description="排除匹配这些 glob 的文件 (-g '!...')")
+
+
+class GrepOutput(BaseModel):
+    model_config = _STRICT
+    output_mode: str = Field(default="content")
+    matches: list[GrepMatch] = Field(default_factory=list, description="content 模式命中")
+    files: list[str] = Field(default_factory=list, description="files_with_matches 模式命中文件")
+    counts: list[GrepFileCount] = Field(default_factory=list, description="count 模式每文件计数")
 
 
 class MultiEditItem(BaseModel):

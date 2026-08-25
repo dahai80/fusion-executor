@@ -15,6 +15,7 @@ from .models import (
     ExecutionResult,
     GlobEntry,
     GrepMatch,
+    GrepOutput,
     GuiResult,
     MultiEditItem,
     RollbackPolicy,
@@ -340,9 +341,39 @@ class FusionSandboxExecutor:
     ) -> list[GrepMatch]:
         logger.debug("grep pattern=%r paths=%s cwd=%s", pattern, paths, cwd)
         native_matches = self._native.grep(pattern, paths, cwd)
-        out = [GrepMatch(path=m.path, line_number=m.line_number, content=m.content) for m in native_matches]
+        out = [
+            GrepMatch(
+                path=m.path,
+                line_number=m.line_number,
+                content=m.content,
+                context_before=list(m.context_before),
+                context_after=list(m.context_after),
+            )
+            for m in native_matches
+        ]
         logger.info("grep done matches=%s", len(out))
         return out
+
+    def grep_with_opts(
+        self,
+        pattern: str,
+        paths: list[str],
+        opts: dict,
+        *,
+        cwd: str | None = None,
+    ) -> GrepOutput:
+        logger.debug("grep_with_opts pattern=%r paths=%s opts=%s cwd=%s", pattern, paths, opts, cwd)
+        native = self._native.grep_with_opts(pattern, paths, opts, cwd)
+        data = native.to_dict()
+        result = GrepOutput.model_validate(data)
+        logger.info(
+            "grep_with_opts done mode=%s matches=%s files=%s counts=%s",
+            result.output_mode,
+            len(result.matches),
+            len(result.files),
+            len(result.counts),
+        )
+        return result
 
     def apply_patch(self, diff: str, *, cwd: str | None = None) -> EditResult:
         logger.debug("apply_patch cwd=%s diff_len=%s", cwd, len(diff))

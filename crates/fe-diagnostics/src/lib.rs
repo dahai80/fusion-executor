@@ -1,6 +1,7 @@
-// fe-diagnostics — Traceback 提取 + tree-sitter AST 切片 (PRD §4.2)
+// fe-diagnostics — Traceback 提取 + 纯文本行切片 (PRD §4.2)
 //
-// Pipeline: 正则提取 4 语言 traceback → tree-sitter 定位行号 → 上下 20 行切片
+// Pipeline: 正则提取多语言 traceback → 末 N 行 + 根因标记行保段头 → 上下 20 行切片
+// (tree-sitter AST 定位为 P5 预留, 当前用纯文本行, 正则 = 生产路径)
 // 输出 Diagnostics → ExecutionResult.diagnostics (exit_code != 0 时)
 //
 // 语言:
@@ -19,7 +20,6 @@ use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
-use tree_sitter::Parser;
 
 use fe_security::SecurityGuard;
 
@@ -330,20 +330,6 @@ impl Default for Slicer {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// tree-sitter 按文件扩展选 grammar (预留 — v1 snippet 用纯文本行, AST 定位 P5)
-fn _parser_for_ext(ext: &str) -> Option<Parser> {
-    let mut p = Parser::new();
-    let lang: tree_sitter::Language = match ext {
-        "py" => tree_sitter_python::LANGUAGE.into(),
-        "js" => tree_sitter_javascript::LANGUAGE.into(),
-        "ts" | "tsx" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "rs" => tree_sitter_rust::LANGUAGE.into(),
-        _ => return None,
-    };
-    p.set_language(&lang).ok()?;
-    Some(p)
 }
 
 /// 取文本末尾 N 行 + 保根因标记行 (M-DIAG-01)
