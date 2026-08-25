@@ -51,9 +51,18 @@ impl SecurityVerdict {
     }
 }
 
-/// 敏感路径 — 禁止作为 cwd、mv/cp 目的地、`>` 重定向目标
+/// 敏感路径 — 禁止作为 cwd、mv/cp 目的地、`>` 重定向目标、读源 (cat/grep/...)
+/// Issue #5: 补齐凭据目录 — Claude SDK/真实泄露面覆盖 AWS/GPG/Docker/K8s/Netrc/npmrc/gcloud/pass
 const SENSITIVE_PATHS: &[&str] = &[
     "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.docker",
+    "~/.kube",
+    "~/.netrc",
+    "~/.npmrc",
+    "~/.config/gcloud",
+    "~/.password-store",
     "/etc",
     "/System",
     "/Library",
@@ -1127,5 +1136,82 @@ mod tests {
     fn allows_node_e_inline() {
         let v = guard().validate("node -e \"console.log(1)\"");
         assert!(v.allowed, "node -e 应保留允许, reason={:?}", v.reason);
+    }
+
+    // ── Issue #5: 凭据目录敏感路径防护 ──
+
+    #[test]
+    fn blocks_cat_aws_credentials() {
+        let v = guard().validate("cat ~/.aws/credentials");
+        assert!(!v.allowed, "cat AWS 凭据应被拦截");
+        assert!(v.reason.as_deref().unwrap().contains("敏感路径"));
+    }
+
+    #[test]
+    fn blocks_cat_gnupg() {
+        let v = guard().validate("cat ~/.gnupg/secring.gpg");
+        assert!(!v.allowed, "cat GPG 私钥环应被拦截");
+    }
+
+    #[test]
+    fn blocks_cat_kube_config() {
+        let v = guard().validate("cat ~/.kube/config");
+        assert!(!v.allowed, "cat K8s config 应被拦截");
+    }
+
+    #[test]
+    fn blocks_cat_netrc() {
+        let v = guard().validate("cat ~/.netrc");
+        assert!(!v.allowed, "cat .netrc 凭据应被拦截");
+    }
+
+    #[test]
+    fn blocks_cat_npmrc() {
+        let v = guard().validate("cat ~/.npmrc");
+        assert!(!v.allowed, "cat .npmrc token 应被拦截");
+    }
+
+    #[test]
+    fn blocks_cat_gcloud_creds() {
+        let v = guard().validate("cat ~/.config/gcloud/credentials.db");
+        assert!(!v.allowed, "cat gcloud 凭据应被拦截");
+    }
+
+    #[test]
+    fn blocks_cat_password_store() {
+        let v = guard().validate("cat ~/.password-store/email.gpg");
+        assert!(!v.allowed, "cat pass 密码库应被拦截");
+    }
+
+    #[test]
+    fn blocks_cat_docker_creds() {
+        let v = guard().validate("cat ~/.docker/config.json");
+        assert!(!v.allowed, "cat docker 凭据应被拦截");
+    }
+
+    #[test]
+    fn blocks_redirect_to_aws() {
+        let v = guard().validate("echo key > ~/.aws/credentials");
+        assert!(!v.allowed, "写 AWS 凭据应被拦截");
+        assert!(v.reason.as_deref().unwrap().contains("敏感路径"));
+    }
+
+    #[test]
+    fn blocks_cwd_gnupg() {
+        let v = guard().validate_cwd("~/.gnupg");
+        assert!(!v.allowed, "cwd ~/.gnupg 应被拦截");
+    }
+
+    #[test]
+    fn blocks_mv_to_password_store() {
+        let v = guard().validate("mv file.txt ~/.password-store/evil");
+        assert!(!v.allowed, "mv 到密码库应被拦截");
+    }
+
+    #[test]
+    fn blocks_grep_aws_subtree() {
+        // 子树访问 — ~/.aws/credentials 在 ~/.aws 下应被拦
+        let v = guard().validate("grep AKIA ~/.aws/credentials");
+        assert!(!v.allowed, "grep AWS 子树应被拦截");
     }
 }
