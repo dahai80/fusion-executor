@@ -63,6 +63,10 @@ pub enum GuiAction {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         modifiers: Vec<String>,
     },
+    HoldKey {
+        key: String,
+        duration_ms: u64,
+    },
     Screenshot {},
     InspectTree {},
     Scroll {
@@ -76,6 +80,10 @@ pub enum GuiAction {
         to: (f64, f64),
     },
     DoubleClick {
+        ax_label: Option<String>,
+        ax_position: Option<(f64, f64)>,
+    },
+    TripleClick {
         ax_label: Option<String>,
         ax_position: Option<(f64, f64)>,
     },
@@ -168,6 +176,7 @@ impl GuiController {
             } => self.click(ax_label.as_deref(), ax_position),
             GuiAction::TypeText { text } => self.type_text(&text),
             GuiAction::KeyPress { key, modifiers } => self.key_press(&key, &modifiers),
+            GuiAction::HoldKey { key, duration_ms } => self.hold_key(&key, duration_ms),
             GuiAction::Screenshot {} => self.screenshot(),
             GuiAction::InspectTree {} => self.inspect_tree(),
             GuiAction::Scroll { dx, dy, at } => self.scroll(dx, dy, at),
@@ -176,6 +185,10 @@ impl GuiController {
                 ax_label,
                 ax_position,
             } => self.double_click(ax_label.as_deref(), ax_position),
+            GuiAction::TripleClick {
+                ax_label,
+                ax_position,
+            } => self.triple_click(ax_label.as_deref(), ax_position),
             GuiAction::RightClick {
                 ax_label,
                 ax_position,
@@ -439,6 +452,57 @@ impl GuiController {
             keycode = code,
             mods = mods.len(),
             "KeyPress 完成 (和弦 keydown+keyup posted)"
+        );
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
+
+    /// HoldKey — 按住单键 duration_ms 后释放 (keydown → sleep → keyup)。
+    /// 用于长按 (如按住方向键移动光标, 按住 Backspace 连删)。单键无 modifier 和弦。
+    /// 未识别键名同 key_press 降级 ok:false + 已知列表。sleep 阻塞当前线程 (GUI 同步路径)。
+    fn hold_key(&self, key: &str, duration_ms: u64) -> Result<GuiResult> {
+        info!(key, duration_ms, "HoldKey");
+        let code = match Self::resolve_keycode(key) {
+            Some(c) => c,
+            None => {
+                warn!(key, "未知键名 — 降级返回已知列表");
+                return Ok(GuiResult {
+                    ok: false,
+                    error: Some(format!(
+                        "unknown-key: '{key}'; 支持的键名见 resolve_keycode \
+                         (Return/Tab/Space/Delete/Forward_delete/Escape/Up_arrow/Down_arrow/\
+                         Left_arrow/Right_arrow/Home/End/Page_up/Page_down/Help/\
+                         F1-F20/Command/Shift/Option/Control/Function/Caps_lock/Mute/\
+                         Volume_up/Volume_down)",
+                    )),
+                    ..Default::default()
+                });
+            }
+        };
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("CGEventSource 创建失败 (hold_key)"))?;
+        // keydown
+        let down = CGEvent::new_keyboard_event(source.clone(), code, true)
+            .map_err(|_| anyhow!("CGEvent keydown 创建失败 (hold_key)"))?;
+        down.post(CGEventTapLocation::HID);
+        // 按住 — 阻塞 sleep (GUI 同步, duration_ms 量级; 超 5s 截断防误用挂死)
+        let capped = duration_ms.min(5000);
+        if capped != duration_ms {
+            warn!(
+                asked = duration_ms,
+                capped, "HoldKey duration 超 5s 上限, 截断防挂死"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(capped));
+        // keyup
+        let up = CGEvent::new_keyboard_event(source.clone(), code, false)
+            .map_err(|_| anyhow!("CGEvent keyup 创建失败 (hold_key)"))?;
+        up.post(CGEventTapLocation::HID);
+        debug!(
+            keycode = code,
+            capped, "HoldKey 完成 (keydown→sleep→keyup posted)"
         );
         Ok(GuiResult {
             ok: true,
@@ -869,6 +933,45 @@ impl GuiController {
         })
     }
 
+    /// 三击 — 同 double_click 定位, CGEvent 合成三次 left click, click_state 递增 1..=3。
+    /// 用于整段/整行文本选择 (如三击选行)。复用 resolve_click_position 取坐标。
+    fn triple_click(
+        &self,
+        ax_label: Option<&str>,
+        ax_position: Option<(f64, f64)>,
+    ) -> Result<GuiResult> {
+        info!(ax_label, ax_position = ?ax_position, "TripleClick");
+        let pos = self.resolve_click_position(ax_label, ax_position)?;
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("CGEventSource 创建失败 (triple_click)"))?;
+        // 三次 left click, click_state 1/2/3 递增 (系统据连续击数判手势)
+        for click_no in 1..=3i64 {
+            let down = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::LeftMouseDown,
+                CGPoint::new(pos.0, pos.1),
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow!("CGEvent LeftMouseDown 创建失败 (triple_click {click_no})"))?;
+            down.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_no);
+            down.post(CGEventTapLocation::HID);
+            let up = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::LeftMouseUp,
+                CGPoint::new(pos.0, pos.1),
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow!("CGEvent LeftMouseUp 创建失败 (triple_click {click_no})"))?;
+            up.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_no);
+            up.post(CGEventTapLocation::HID);
+        }
+        debug!(pos = ?pos, "TripleClick 完成 (3× down/up posted, click_state=3)");
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
+
     /// 右击 — 先定位取坐标, CGEvent RightMouseDown/RightMouseUp + CGMouseButton::Right。
     fn right_click(
         &self,
@@ -1101,6 +1204,14 @@ mod tests {
                 height: 200.0,
             },
             GuiAction::Wait { seconds: 0.0 },
+            GuiAction::TripleClick {
+                ax_label: None,
+                ax_position: Some((1.0, 2.0)),
+            },
+            GuiAction::HoldKey {
+                key: "Return".into(),
+                duration_ms: 100,
+            },
         ];
         for a in cases {
             let s = serde_json::to_string(&a).unwrap();
@@ -1118,6 +1229,24 @@ mod tests {
         assert!(
             s.contains("\"kind\":\"inspect_tree\""),
             "tag snake_case: {s}"
+        );
+        let s = serde_json::to_string(&GuiAction::TripleClick {
+            ax_label: None,
+            ax_position: None,
+        })
+        .unwrap();
+        assert!(
+            s.contains("\"kind\":\"triple_click\""),
+            "triple_click tag snake_case: {s}"
+        );
+        let s = serde_json::to_string(&GuiAction::HoldKey {
+            key: "Tab".into(),
+            duration_ms: 200,
+        })
+        .unwrap();
+        assert!(
+            s.contains("\"kind\":\"hold_key\""),
+            "hold_key tag snake_case: {s}"
         );
     }
 
@@ -1202,6 +1331,52 @@ mod tests {
                 r.error
             );
         } else {
+            assert!(!r.ok, "未授权应降级");
+            assert_eq!(
+                r.error.as_deref(),
+                Some("accessibility-permission-required")
+            );
+        }
+    }
+
+    /// HoldKey 未知键名降级 — trusted 时经 resolve_keycode 返 None → ok:false unknown-key;
+    /// CI 未授权路径在 AX 闸门降级 accessibility-permission-required (闸门先于 dispatch)。
+    #[test]
+    fn holdkey_unknown_key_degrades_even_if_trusted() {
+        let ctrl = GuiController::new();
+        let r = ctrl
+            .execute(GuiAction::HoldKey {
+                key: "totally-fake-key".into(),
+                duration_ms: 10,
+            })
+            .unwrap();
+        if GuiController::ax_trusted() {
+            assert!(!r.ok, "未知键名应 ok:false");
+            assert!(
+                r.error.as_deref().unwrap_or("").contains("unknown-key"),
+                "未知键名错误标记: {:?}",
+                r.error
+            );
+        } else {
+            assert!(!r.ok, "未授权应降级");
+            assert_eq!(
+                r.error.as_deref(),
+                Some("accessibility-permission-required")
+            );
+        }
+    }
+
+    /// TripleClick 未授权降级 — 指针动作, CI 无 TCC 走降级路径。
+    #[test]
+    fn tripleclick_degrades_without_ax_trust() {
+        let ctrl = GuiController::new();
+        let r = ctrl
+            .execute(GuiAction::TripleClick {
+                ax_label: None,
+                ax_position: Some((1.0, 2.0)),
+            })
+            .unwrap();
+        if !GuiController::ax_trusted() {
             assert!(!r.ok, "未授权应降级");
             assert_eq!(
                 r.error.as_deref(),

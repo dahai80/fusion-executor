@@ -267,7 +267,7 @@ def test_gui_action_drag_when_trusted():
 # ── v1.5 新动作 (double_click/right_click/hover/window_*) ──
 
 
-# CI 路径 (untrusted): 7 个新变体均经 !ax_trusted() 闸门降级 — 证明 4 层 auto-flow
+# CI 路径 (untrusted): 9 个新变体均经 !ax_trusted() 闸门降级 — 证明 4 层 auto-flow
 NEW_VARIANTS_CI = [
     {"kind": "double_click", "ax_position": [5.0, 5.0]},
     {"kind": "right_click", "ax_position": [5.0, 5.0]},
@@ -276,6 +276,8 @@ NEW_VARIANTS_CI = [
     {"kind": "window_minimize"},
     {"kind": "window_zoom"},
     {"kind": "window_resize", "width": 800.0, "height": 600.0},
+    {"kind": "triple_click", "ax_position": [5.0, 5.0]},
+    {"kind": "hold_key", "key": "Return", "duration_ms": 20},
 ]
 
 
@@ -304,11 +306,23 @@ def test_gui_action_pointer_variants_when_trusted():
         {"kind": "hover", "ax_position": [10.0, 20.0]},
         {"kind": "double_click", "ax_position": [5.0, 5.0]},
         {"kind": "right_click", "ax_position": [5.0, 5.0]},
+        {"kind": "triple_click", "ax_position": [5.0, 5.0]},
     ]:
         r = ex.gui_action(action)
         assert isinstance(r, GuiResult), f"{action['kind']} 应返回 GuiResult"
         assert r.ok is True, f"{action['kind']} 带坐标应 ok=True: {r.error}"
         assert r.error is None
+
+
+def test_gui_action_holdkey_when_trusted():
+    # hold_key 单键 CGEvent 合成 (keydown→sleep→keyup), 无需 AX 树 → ok=True
+    if not _ax_access_trusted():
+        pytest.skip("AX Accessibility 未授权 — 跳过真实 key 合成测试 (CI 路径)")
+    ex = FusionSandboxExecutor()
+    r = ex.gui_action({"kind": "hold_key", "key": "return", "duration_ms": 20})
+    assert isinstance(r, GuiResult)
+    assert r.ok is True, f"HoldKey 应成功: {r.error}"
+    assert r.error is None
 
 
 # ── v1.5 #14 双向 server-push (subscribe/unsubscribe) ──

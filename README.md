@@ -155,7 +155,8 @@ hits: list[GrepMatch] = ex.grep(r"^import\s", ["app.py"], cwd="/repo")
 
 # grep_with_opts — ripgrep parity: output modes + context + multiline + glob filter (#7)
 out: GrepOutput = ex.grep_with_opts(
-    r"^import\s", ["app.py"],
+    r"^import\s",
+    ["app.py"],
     {"output_mode": "files_with_matches", "glob_include": ["*.py"]},
     cwd="/repo",
 )  # modes: content | files_with_matches | count; -A/-B/-C context, multiline, -g include/exclude
@@ -371,4 +372,11 @@ The fusion-code TS client sketch is in `docs/ipc-client-typescript.md`; fusion-s
   - 4-layer wiring: fe-core `grep_with_opts` wrapper + re-export `GrepOptions`/`GrepOutput`/`GrepOutputMode`; fe-ipc `executor.grep_with_opts` arm (manual `param_str` extract + `params.get("opts")` serde_json::from_value or default); fe-pyo3 `NativeGrepFileCount`/`NativeGrepOutput` pyclass (raw String + `to_dict` json.loads) + `grep_with_opts`; Python `GrepFileCount`/`GrepOutputMode`/`GrepOptions`/`GrepOutput` Pydantic (_STRICT) + `FusionSandboxExecutor.grep_with_opts`
   - +6 fe-tools Rust unit tests (files_with_matches/count/context/multiline/glob_filter/gitignore) + 7 Python native tests + 1 UDS round-trip
   - Exit gate: **287 Rust + 152 Python (6 skip TCC) tests green**; clippy `--all-targets -D warnings` clean (only upstream block v0.1.6 future-incompat); `cargo fmt --check` + `ruff check/format` clean; `maturin develop --release` builds
+- **v1.6 — GUI triple_click/hold_key + diagnostics dead-path cleanup (#12.1/#12.2)** ✅ complete
+  - fe-gui `GuiAction` 16→18 variants: added `triple_click` (ax_label/ax_position, CGEvent 3× LeftMouseDown/Up with `EventField::MOUSE_EVENT_CLICK_STATE=1..=3`; reuses `resolve_click_position`) and `hold_key` (single key name + `duration_ms`, CGEvent keydown→sleep→keyup; `duration_ms` capped at 5000ms to prevent hang; unknown key name via `resolve_keycode` → `ok:false, unknown-key: ...` degrade, trust-independent)
+  - **4-layer auto-flow**: fe-core/fe-ipc/fe-pyo3 dispatch after deserializing the GuiAction enum — new variants flow through with zero per-variant wiring (only fe-gui changes enum+execute+methods+tests); Python `gui_action(action: dict)` generic
+  - **0 new unsafe**: all via accessibility 0.2 + core-graphics 0.24 safe wrappers; reuses fe-gui crate-level `#![allow(unsafe_code)]` scope
+  - fe-diagnostics dead-path cleanup: deleted `_parser_for_ext` (underscore-prefixed dead tree-sitter grammar selector; v1 diagnostics uses pure-text line slicing as the production path, AST locate was a P5 reservation never wired) + `use tree_sitter::Parser;` import + 5 tree-sitter deps (`tree-sitter`/`-python`/`-javascript`/`-typescript`/`-rust`) removed from `fe-diagnostics/Cargo.toml`; regex remains the production path (fe-tools keeps its own live tree-sitter for `replace_function` — untouched)
+  - +3 fe-gui Rust unit tests (triple_click/hold_key tag snake_case + holdkey unknown-key degrade + tripleclick untrusted degrade) +2 Python GUI tests (NEW_VARIANTS_CI +2 variants degrade / triple_click into pointer-when-trusted + new holdkey-when-trusted TCC path)
+  - Exit gate: **289 Rust + 153 Python (6 skip TCC) tests green**; clippy `--all-targets -D warnings` clean (only upstream block v0.1.6 future-incompat); `cargo fmt --check` + `ruff check/format` clean; `maturin develop --release` builds
 - **v0.1.0 released** ✅ — tagged `v0.1.0` (annotated), pushed to `origin`. First stable release. See `examples/` for runnable demos (Python API 01–07 + TypeScript UDS client) and `docs/INDEX.md` for the documentation map.

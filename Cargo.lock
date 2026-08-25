@@ -437,11 +437,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tracing",
- "tree-sitter",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
 ]
 
 [[package]]
