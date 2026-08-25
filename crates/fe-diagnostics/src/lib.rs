@@ -98,8 +98,12 @@ impl Slicer {
 
     /// 切片 — output 是合并后的 stdio (PTY 合并, traceback 在 stdout)
     pub fn slice(&self, output: &str, cwd: Option<&str>) -> Diagnostics {
+        // PRD: "捕获 ANSI 颜色代码" — PTY 模式 python/tsc 等会注入 ANSI 转义 (如
+        // \x1b[35m...\x1b[0m), 正则 `File "..."` 因颜色码紧贴引号前而失配。先剥离
+        // ANSI 转义序列 (CSI/OSC/SGR 等) 再切片, 保正则匹配稳定 (与终端是否着色无关)。
+        let cleaned = strip_ansi(output);
         // 取最后 30 行 (PRD "最后 30 行")
-        let tail = tail_lines(output, 30);
+        let tail = tail_lines(&cleaned, 30);
         debug!(tail_len = tail.len(), "slice — 提取 traceback");
 
         if let Some(d) = self.extract_ts(&tail) {
@@ -347,6 +351,78 @@ fn _parser_for_ext(ext: &str) -> Option<Parser> {
 /// 纯末 N 行会丢深 traceback 前部的根因 `Error:`/`Exception:` 行 (诊断失效)。
 /// 策略: 保 traceback 段头 (`Traceback (most recent call last):` / `panic:` /
 /// `goroutine`) + 根因标记行 (Error/Exception/Warning 含子串覆盖 TypeError 等;
+/// 剥离 ANSI 转义序列 — PTY 着色输出 (CSI SGR/光标/擦除, OSC 标题, 单字符 BEL/BS)。
+/// 兼容 unterminated CSI (PTY 半截读)。正则切片前调用, 保 `File "path"` 等模式稳定。
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            // ESC — 序列起点
+            if i + 1 >= bytes.len() {
+                break;
+            }
+            match bytes[i + 1] {
+                b'[' => {
+                    // CSI: ESC [ <params 0x30-0x3F> <intermediates 0x20-0x2F> <final 0x40-0x7E>
+                    i += 2;
+                    while i < bytes.len() && (bytes[i] >= 0x20 && bytes[i] <= 0x2f) {
+                        i += 1;
+                    }
+                    while i < bytes.len() && (bytes[i] >= 0x30 && bytes[i] <= 0x3f) {
+                        i += 1;
+                    }
+                    if i < bytes.len() && (bytes[i] >= 0x40 && bytes[i] <= 0x7e) {
+                        i += 1;
+                    }
+                }
+                b']' => {
+                    // OSC: ESC ] ... BEL (0x07) 或 ST (ESC \)
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                        }
+                    }
+                }
+                _ => {
+                    // 单字符转义 (ESC + 1 byte, 如 ESC M / ESC 7) — 跳 2
+                    i += 2;
+                }
+            }
+        } else if b == 0x07 {
+            // 裸 BEL (残留 OSC 终止符) — 丢弃
+            i += 1;
+        } else {
+            // 取 char 边界, 避多字节 UTF-8 截断
+            let ch_len = utf8_len(b);
+            if i + ch_len <= bytes.len() {
+                out.push_str(&s[i..i + ch_len]);
+            }
+            i += ch_len.max(1);
+        }
+    }
+    out
+}
+
+/// 取 UTF-8 首字节指示的字符字节长度 (非法字节返回 1)
+fn utf8_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7f => 1,
+        0x80..=0xbf => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
+}
+
 /// `error:` 行首锚) + 标记行的下一行 (Node/Bun `at` 邻接依赖) + 末 N 行,
 /// 按原序去重合并。过保几行无害 (正则仍精确捕), 漏保根因行才有害 — 此处治漏保。
 fn tail_lines(s: &str, n: usize) -> String {
@@ -674,6 +750,23 @@ mod tests {
             "私钥 ~/.ssh/id_rsa 不应被读取: {:?}",
             d.code_snippet
         );
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_sgr() {
+        let colored = "Traceback (most recent call last):\n  File \u{1b}[35m\"<string>\"\u{1b}[0m, line \u{1b}[35m1\u{1b}[0m, in \u{1b}[35m<module>\u{1b}[0m\n    raise ValueError('boom')\n\u{1b}[1;35mValueError\u{1b}[0m: \u{1b}[35mboom\u{1b}[0m\n";
+        let d = s().slice(colored, None);
+        assert_eq!(d.error_type.as_deref(), Some("ValueError"));
+        assert_eq!(d.file_path.as_deref(), Some("<string>"));
+        assert_eq!(d.line_number, Some(1));
+    }
+
+    #[test]
+    fn strip_ansi_preserves_plain_text() {
+        let plain = "Traceback (most recent call last):\n  File \"app.py\", line 2, in <module>\n    raise ValueError('x')\nValueError: x";
+        let d = s().slice(plain, None);
+        assert_eq!(d.error_type.as_deref(), Some("ValueError"));
+        assert_eq!(d.file_path.as_deref(), Some("app.py"));
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

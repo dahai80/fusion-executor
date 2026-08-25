@@ -42,6 +42,10 @@ class ExecutionRequest(BaseModel):
     seatbelt: bool = Field(
         default=False, description="macOS seatbelt 运行时隔离 (sandbox-exec 禁网 + 危险二进制 execve deny)"
     )
+    inherit_env: bool = Field(
+        default=False,
+        description="环境隔离: False(默认)=env_clear+最小基线 PATH/TMPDIR/SHELL+env_vars, 不泄漏宿主密钥; True=继承宿主全量 env (受信本地 opt-in)",
+    )
 
 
 class ExecutionResult(BaseModel):

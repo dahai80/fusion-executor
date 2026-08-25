@@ -77,6 +77,11 @@ pub struct ExecutionRequest {
     /// 默认 false — 调用方显式开启; 透传 SandboxConfig.seatbelt。
     #[serde(default)]
     pub seatbelt: bool,
+    /// Issue #9: 环境隔离。默认 false → 子进程 env_clear + 仅最小基线 (PATH/TMPDIR/SHELL) + env_vars,
+    /// 不泄漏宿主密钥 (AWS_SECRET_ACCESS_KEY/ANTHROPIC_API_KEY 等)。
+    /// true → 继承宿主全量 env (受信本地场景显式 opt-in, 文档化泄漏风险)。
+    #[serde(default)]
+    pub inherit_env: bool,
 }
 
 fn default_timeout() -> f64 {
@@ -455,6 +460,7 @@ impl Executor {
             timeout_sec: req.timeout_sec,
             max_output_chars: 100_000,
             seatbelt: req.seatbelt,
+            inherit_env: req.inherit_env,
         };
         info!(seatbelt = req.seatbelt, "execute_async — 沙箱执行");
         let sb = self.sandbox.run(sb_cfg).await?;
@@ -591,6 +597,7 @@ impl Executor {
             timeout_sec: req.timeout_sec,
             max_output_chars: 100_000,
             seatbelt: req.seatbelt,
+            inherit_env: req.inherit_env,
         };
         info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg)?;
@@ -712,6 +719,7 @@ mod tests {
                 enable_rollback_snapshot: false,
                 auto_rollback_policy: None,
                 seatbelt: false,
+                inherit_env: false,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut combined = String::new();
@@ -744,6 +752,7 @@ mod tests {
                 enable_rollback_snapshot: false,
                 auto_rollback_policy: None,
                 seatbelt: false,
+                inherit_env: false,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut frames = 0;
@@ -775,6 +784,7 @@ mod tests {
                 enable_rollback_snapshot: false,
                 auto_rollback_policy: None,
                 seatbelt: false,
+                inherit_env: false,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -803,6 +813,7 @@ mod tests {
                 enable_rollback_snapshot: false,
                 auto_rollback_policy: None,
                 seatbelt: false,
+                inherit_env: false,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -853,6 +864,7 @@ mod tests {
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: Some(RollbackPolicy::default()),
                 seatbelt: false,
+                inherit_env: false,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -880,6 +892,7 @@ mod tests {
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: Some(RollbackPolicy::default()),
                 seatbelt: false,
+                inherit_env: false,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -905,6 +918,7 @@ mod tests {
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: None,
                 seatbelt: false,
+                inherit_env: false,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -937,6 +951,7 @@ mod tests {
                     file_damage_check: true,
                 }),
                 seatbelt: false,
+                inherit_env: false,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -973,6 +988,7 @@ mod tests {
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: Some(RollbackPolicy::default()),
                 seatbelt: false,
+                inherit_env: false,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();

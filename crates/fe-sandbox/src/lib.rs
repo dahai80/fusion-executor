@@ -64,6 +64,9 @@ pub struct SandboxConfig {
     /// true → sandbox-exec -p '<profile>' sh -c '<cmd>' (禁网 + 危险二进制 process-exec deny)。
     /// 默认 false — 调用方显式开启 (ExecutionRequest.seatbelt 透传)。
     pub seatbelt: bool,
+    /// Issue #9: 环境隔离。默认 false → env_clear() + 仅注入最小基线 (PATH/TMPDIR/SHELL) + env。
+    /// true → 继承宿主全量 env (旧行为; 受信本地场景显式 opt-in, 文档化泄漏风险)。
+    pub inherit_env: bool,
 }
 
 impl Default for SandboxConfig {
@@ -75,7 +78,31 @@ impl Default for SandboxConfig {
             timeout_sec: 30.0,
             max_output_chars: DEFAULT_MAX_OUTPUT,
             seatbelt: false,
+            inherit_env: false,
         }
+    }
+}
+
+/// Issue #9: 最小安全环境基线 — env_clear 后注入, 保证命令可解析 (PATH) + 有临时目录 (TMPDIR) + 有 shell (SHELL)。
+/// PATH 取宿主 PATH (非密钥, 保 python/node/cargo 等工具可解析; 不可用时回退静态 macOS 标准路径)。
+/// 不注入 HOME (多数命令不需; 隔离更彻底)。env_vars 覆盖基线 (调用方显式优先)。
+const SANDBOX_FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const SANDBOX_BASE_SHELL: &str = "/bin/sh";
+
+fn configure_env(cmd: &mut portable_pty::CommandBuilder, cfg: &SandboxConfig) {
+    if !cfg.inherit_env {
+        cmd.env_clear();
+        let path = std::env::var("PATH").unwrap_or_else(|_| SANDBOX_FALLBACK_PATH.to_string());
+        cmd.env("PATH", path);
+        cmd.env("TMPDIR", std::env::temp_dir());
+        cmd.env("SHELL", SANDBOX_BASE_SHELL);
+        debug!(
+            "env 隔离: env_clear + 基线 PATH/TMPDIR/SHELL ({} env_vars 覆盖)",
+            cfg.env.len()
+        );
+    }
+    for (k, v) in &cfg.env {
+        cmd.env(k, v);
     }
 }
 
@@ -112,9 +139,7 @@ impl Sandbox {
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
-        for (k, v) in &cfg.env {
-            cmd.env(k, v);
-        }
+        configure_env(&mut cmd, &cfg);
 
         let mut child = pair
             .slave
@@ -267,9 +292,7 @@ impl Sandbox {
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
-        for (k, v) in &cfg.env {
-            cmd.env(k, v);
-        }
+        configure_env(&mut cmd, &cfg);
 
         let mut child = pair
             .slave
@@ -693,6 +716,59 @@ mod tests {
         assert!(r.stdout.contains("hello"), "stdout={:?}", r.stdout);
     }
 
+    // Issue #9: env 隔离 — 默认 env_clear + 基线, 宿主密钥不泄漏; env_vars 注入; inherit_env 继承
+    #[test]
+    fn run_env_isolation_strips_host_secret_by_default() {
+        std::env::set_var("FE_TEST_SECRET", "leak-me-please");
+        let reflect = "python3 -c \"import os;print(os.environ.get('FE_TEST_SECRET','CLEAN'))\"";
+        let r = rt().block_on(Sandbox::new().run(cfg(reflect))).unwrap();
+        std::env::remove_var("FE_TEST_SECRET");
+        assert_eq!(r.exit_code, 0, "stderr={:?}", r.stderr);
+        assert!(
+            !r.stdout.contains("leak-me-please"),
+            "宿主密钥 FE_TEST_SECRET 不应泄漏到默认隔离的子进程: stdout={:?}",
+            r.stdout
+        );
+    }
+
+    #[test]
+    fn run_env_isolation_injects_env_vars_and_baseline() {
+        let mut c = cfg("python3 -c \"import os;print(os.environ.get('FE_TASK_VAR','MISSING'))\"");
+        c.env
+            .insert("FE_TASK_VAR".to_string(), "injected".to_string());
+        let r = rt().block_on(Sandbox::new().run(c)).unwrap();
+        assert_eq!(r.exit_code, 0);
+        assert!(
+            r.stdout.contains("injected"),
+            "env_vars 必须注入: stdout={:?}",
+            r.stdout
+        );
+        // 基线 PATH/TMPDIR/SHELL 存在
+        let base = cfg("python3 -c \"import os;print('PATH' in os.environ, 'TMPDIR' in os.environ, 'SHELL' in os.environ)\"");
+        let rb = rt().block_on(Sandbox::new().run(base)).unwrap();
+        assert!(
+            rb.stdout.contains("True"),
+            "PATH/TMPDIR/SHELL 基线应存在: stdout={:?}",
+            rb.stdout
+        );
+    }
+
+    #[test]
+    fn run_env_inherit_true_restores_host_env() {
+        std::env::set_var("FE_TEST_SECRET", "leak-me-please");
+        let reflect = "python3 -c \"import os;print(os.environ.get('FE_TEST_SECRET','CLEAN'))\"";
+        let mut c = cfg(reflect);
+        c.inherit_env = true;
+        let r = rt().block_on(Sandbox::new().run(c)).unwrap();
+        std::env::remove_var("FE_TEST_SECRET");
+        assert_eq!(r.exit_code, 0);
+        assert!(
+            r.stdout.contains("leak-me-please"),
+            "inherit_env=true 应回退旧行为继承宿主 env: stdout={:?}",
+            r.stdout
+        );
+    }
+
     #[test]
     fn run_timeout_infinite_loop() {
         // 无限循环 → 超时 1s → exit -124, 完成 <3s
@@ -964,6 +1040,7 @@ mod tests {
             timeout_sec: 60.0,
             max_output_chars: 100_000,
             seatbelt: false,
+            inherit_env: false,
         };
         let (mut rx, handle) = sb.run_streaming(cfg).unwrap();
         // 收首块 (含 "started"), 确认子进程已起

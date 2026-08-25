@@ -880,3 +880,34 @@ def test_validate_empty_command_raises_valueerror(executor: FusionSandboxExecuto
         executor.validate("   ")
     with pytest.raises(ValueError, match="command 必须非空字符串"):
         executor.validate(123)  # type: ignore[arg-type]
+
+
+# Issue #9: 环境隔离 — 默认不泄漏宿主密钥; env_vars 注入; inherit_env opt-in 继承
+_REFLECT = 'python3 -c "import os,sys;sys.stdout.write(os.environ.get(%r,%r))"'
+
+
+def test_env_isolation_strips_host_secret_by_default(executor: FusionSandboxExecutor, monkeypatch):
+    monkeypatch.setenv("FE_TEST_SECRET", "leak-me-please")
+    r = executor.run(_REFLECT % ("FE_TEST_SECRET", "clean"), timeout_sec=5)
+    assert r.exit_code == 0, f"stderr={r.stderr}"
+    assert "leak-me-please" not in r.stdout, "宿主密钥不应泄漏到默认隔离的子进程"
+
+
+def test_env_isolation_injects_env_vars(executor: FusionSandboxExecutor):
+    r = executor.run(_REFLECT % ("FE_TASK_VAR", "missing"), timeout_sec=5, env_vars={"FE_TASK_VAR": "injected"})
+    assert r.exit_code == 0
+    assert "injected" in r.stdout, "env_vars 必须注入到子进程"
+
+
+def test_env_isolation_baseline_present(executor: FusionSandboxExecutor):
+    for key in ("PATH", "TMPDIR", "SHELL"):
+        r = executor.run(_REFLECT % (key, "missing"), timeout_sec=5)
+        assert r.exit_code == 0
+        assert "missing" not in r.stdout, f"基线 {key} 应存在使命令可解析"
+
+
+def test_env_inherit_true_restores_host_env(executor: FusionSandboxExecutor, monkeypatch):
+    monkeypatch.setenv("FE_TEST_SECRET", "leak-me-please")
+    r = executor.run(_REFLECT % ("FE_TEST_SECRET", "clean"), timeout_sec=5, inherit_env=True)
+    assert r.exit_code == 0
+    assert "leak-me-please" in r.stdout, "inherit_env=True 应继承宿主 env (opt-in 受信场景)"
