@@ -23,6 +23,9 @@ use fe_sandbox::{kill_tree, spawn_pty, SpawnedPty};
 /// 尾部输出上限 — 防 OOM (同 fe-sandbox DEFAULT_MAX_OUTPUT/HARD_CEILING 语义)
 const TAIL_CAP: usize = 100_000;
 
+/// 注册表上限 — 超 MAX_SHELLS 时自动回收已退 shell (最旧优先), 防长寿命 serve() 内存单调增长
+const MAX_SHELLS: usize = 256;
+
 /// 后台 shell 启动结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellStartResult {
@@ -140,8 +143,10 @@ impl ShellRegistry {
             .unwrap_or(0);
         info!(%shell_id, ?pid, command = %p.command, "后台 shell 已起");
 
-        // reader 线程 — 累积 tail (超 TAIL_CAP 留尾), EOF 时 drop master
+        // reader 线程 — 累积 tail (超 TAIL_CAP 留尾), EOF 时 drop master, 然后 mark finished
+        // finished 由 reader 置位 (非 waiter) — 保证 running=false 时 tail 已全部落地, 调用方轮询无末段丢失
         let tail_r = Arc::clone(&tail);
+        let finished_r = Arc::clone(&finished);
         let mut reader = spawned.reader;
         let master = spawned.master;
         std::thread::spawn(move || {
@@ -161,7 +166,7 @@ impl ShellRegistry {
                             let mut g = match tail_r.lock() {
                                 Ok(g) => g,
                                 Err(e) => {
-                                    warn!("shell reader tail lock poisoned: {e}");
+                                    warn!(error = %e, "shell reader tail lock poisoned");
                                     break;
                                 }
                             };
@@ -173,18 +178,19 @@ impl ShellRegistry {
                         }
                     }
                     Err(e) => {
-                        warn!("shell reader read 失败: {e}");
+                        warn!(error = %e, "shell reader read 失败");
                         break;
                     }
                 }
             }
             drop(master);
-            debug!("shell reader 线程结束");
+            // EOF: tail 已落地, 置 finished (running=false 必伴随 tail 完整)
+            finished_r.store(true, Ordering::Release);
+            debug!("shell reader 线程结束 (finished 已置)");
         });
 
-        // waiter 线程 — 阻塞 child.wait → 记 exit_code + finished
+        // waiter 线程 — 仅阻塞 child.wait → 记 exit_code (finished 由 reader 置, 不在此)
         let exit_w = Arc::clone(&exit);
-        let finished_w = Arc::clone(&finished);
         let child = spawned.child;
         std::thread::spawn(move || {
             let mut child = child;
@@ -192,13 +198,15 @@ impl ShellRegistry {
             let code = match status {
                 Ok(s) => s.exit_code() as i32,
                 Err(e) => {
-                    warn!("shell waiter child.wait 失败: {e}");
+                    warn!(error = %e, "shell waiter child.wait 失败");
                     -1
                 }
             };
             let _ = exit_w.set(code);
-            finished_w.store(true, Ordering::Release);
-            debug!(exit_code = code, "shell waiter: 子进程已退");
+            debug!(
+                exit_code = code,
+                "shell waiter: 子进程已退 (exit_code 已记)"
+            );
         });
 
         let handle = ShellHandle {
@@ -210,7 +218,11 @@ impl ShellRegistry {
             started_at_ms,
             finished: Arc::clone(&finished),
         };
-        self.shells.lock().unwrap().insert(shell_id.clone(), handle);
+        {
+            let mut g = self.shells.lock().unwrap();
+            reap_finished(&mut g);
+            g.insert(shell_id.clone(), handle);
+        }
         ShellStartResult {
             ok: true,
             shell_id: Some(shell_id),
@@ -226,7 +238,13 @@ impl ShellRegistry {
         let h = g
             .get(shell_id)
             .with_context(|| format!("shell 未找到: {shell_id}"))?;
-        let output = h.tail.lock().map(|s| s.clone()).unwrap_or_default();
+        let output = match h.tail.lock() {
+            Ok(s) => s.clone(),
+            Err(e) => {
+                warn!(error = %e, %shell_id, "shell_output tail lock poisoned, 返回空 (可能丢数据)");
+                String::new()
+            }
+        };
         let exit_code = h.exit.get().copied();
         let running = !h.finished.load(Ordering::Acquire);
         Ok(ShellOutput {
@@ -238,6 +256,8 @@ impl ShellRegistry {
     }
 
     /// kill 进程树 — 复用 fe_sandbox::kill_tree (SIGINT→grace→SIGKILL)
+    /// finished 正常由 reader EOF 置位; kill 强制置 finished 防 reader 在死 PTY 上阻塞永挂
+    /// (kill 场景调用方期望终止非末段输出, 末段丢失可接受)
     pub fn kill_shell(&self, shell_id: &str) -> Result<bool> {
         let pid = {
             let g = self.shells.lock().unwrap();
@@ -247,7 +267,6 @@ impl ShellRegistry {
             h.pid
         };
         let exit = kill_tree(pid);
-        // 标记 finished (waiter 线程会重设 exit_code, 这里仅防 running 永真)
         let g = self.shells.lock().unwrap();
         if let Some(h) = g.get(shell_id) {
             h.finished.store(true, Ordering::Release);
@@ -257,9 +276,10 @@ impl ShellRegistry {
         Ok(true)
     }
 
-    /// 列出全部 shell (含已退)
+    /// 列出全部 shell (含已退) — 超上限自动回收已退 shell (最旧优先)
     pub fn list_shells(&self) -> Vec<ShellInfo> {
-        let g = self.shells.lock().unwrap();
+        let mut g = self.shells.lock().unwrap();
+        reap_finished(&mut g);
         g.iter()
             .map(|(id, h)| ShellInfo {
                 shell_id: id.clone(),
@@ -277,6 +297,29 @@ impl ShellRegistry {
 impl Default for ShellRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 回收已退 shell — 超 MAX_SHELLS 时按 started_at_ms 最旧优先移除 finished 且 exit_code 已知的条目
+/// (running=false 尚无 exit_code 的过渡态保留, 防 waiter 落后于 reader 误删)
+fn reap_finished(shells: &mut HashMap<String, ShellHandle>) {
+    if shells.len() <= MAX_SHELLS {
+        return;
+    }
+    let mut finished: Vec<(String, u128)> = shells
+        .iter()
+        .filter(|(_, h)| h.finished.load(Ordering::Acquire) && h.exit.get().is_some())
+        .map(|(id, h)| (id.clone(), h.started_at_ms))
+        .collect();
+    if finished.is_empty() {
+        return;
+    }
+    finished.sort_unstable_by_key(|(_, t)| *t);
+    let remove_count = shells.len().saturating_sub(MAX_SHELLS);
+    for (id, _) in finished.into_iter().take(remove_count) {
+        if shells.remove(&id).is_some() {
+            debug!(%id, "reap_finished: 已退 shell 已回收");
+        }
     }
 }
 
@@ -418,5 +461,48 @@ mod tests {
         // 截断首字节 — 应回退到 0 (留全字符到下块)
         let partial = &"中".as_bytes()[..1];
         assert_eq!(utf8_safe_prefix_len(partial), 0);
+    }
+
+    // reader-sets-finished 保证: finished=true 时末段输出已落地, 无末段丢失
+    #[test]
+    fn finished_implies_final_output_drained() {
+        let reg = ShellRegistry::new();
+        let id = reg
+            .shell_start(params("echo final_marker_xyz", None))
+            .shell_id
+            .unwrap();
+        // 轮询直到 running=false, 然后立即读 output — 末段必须已在
+        let mut out = reg.shell_output(&id).unwrap();
+        let mut waited = 0;
+        while out.running && waited < 2000 {
+            std::thread::sleep(Duration::from_millis(50));
+            out = reg.shell_output(&id).unwrap();
+            waited += 50;
+        }
+        assert!(!out.running, "应已结束 (waited={}ms)", waited);
+        assert!(
+            out.output.contains("final_marker_xyz"),
+            "finished=true 时末段应已落地: {}",
+            out.output
+        );
+    }
+
+    // 自动回收: 超 MAX_SHELLS 时 list_shells 触发 reap_finished 移除最旧已退 shell
+    #[test]
+    fn reap_finished_drops_oldest_when_over_ceiling() {
+        let reg = ShellRegistry::new();
+        // 起超 MAX_SHELLS 个快速退出的 shell, 触发 shell_start 内的 reap
+        for _ in 0..(MAX_SHELLS + 10) {
+            let _ = reg.shell_start(params("echo x", None)).shell_id.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        // list_shells 再 reap 一次; 总数应回落到 <= MAX_SHELLS
+        let list = reg.list_shells();
+        assert!(
+            list.len() <= MAX_SHELLS,
+            "reap 后应 <= {} 条, 实际 {}",
+            MAX_SHELLS,
+            list.len()
+        );
     }
 }
