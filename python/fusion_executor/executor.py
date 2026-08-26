@@ -607,6 +607,34 @@ class FusionSandboxExecutor:
         finally:
             sock.close()
 
+    def metrics_prometheus(self, sock_path: str | None = None) -> str:
+        # M-OPS-02: Prometheus text format — 经 UDS 调 executor.metrics_prometheus 拉
+        # scrape 文本 (fe_exec_total/fe_shell_active/fe_connections... + HELP/TYPE 头)。
+        # 不开 HTTP 端口 (保 M-SEC-01 UDS-only); 调用方喂自家 exporter 或直接展板。
+        # recorder install 失败 → -32603, 调用方降级用 metrics() JSON。
+        path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        req = {"jsonrpc": "2.0", "id": 1, "method": "executor.metrics_prometheus", "params": {}}
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
+        try:
+            sock.connect(path)
+            sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0].decode("utf-8").strip()
+            resp = json.loads(line) if line else {}
+            if "error" in resp:
+                raise RuntimeError(f"metrics_prometheus 失败: {resp['error']}")
+            text = resp.get("result", {}).get("text", "")
+            logger.info("metrics_prometheus ok: %d bytes", len(text))
+            return text
+        finally:
+            sock.close()
+
     def serve(self, sock_path: str | None = None) -> None:
         # C-PYO3-02: 旧版裸 self._native.serve() — fe-pyo3 serve_blocking 无 shutdown
         # 句柄, SIGINT/SIGTERM 不解 socket 残留。改信号处理 + try/finally 清理:

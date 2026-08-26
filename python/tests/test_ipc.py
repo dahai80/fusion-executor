@@ -134,6 +134,29 @@ def test_metrics_wrapper_method(server: str):
     assert m["exec_success"] >= 1
 
 
+def test_metrics_prometheus_over_uds(server: str):
+    # M-OPS-02: Prometheus text format — execute 一次后 fe_exec_total 命中 + HELP/TYPE 头
+    _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "executor.execute", "params": {"command": "echo hi"}})
+    resp = _rpc(server, {"jsonrpc": "2.0", "id": 3, "method": "executor.metrics_prometheus", "params": {}})
+    assert resp["result"]["ok"] is True
+    text = resp["result"]["text"]
+    assert "# HELP fe_exec_total" in text
+    assert "# TYPE fe_exec_total counter" in text
+    assert "# TYPE fe_connections gauge" in text
+    assert "fe_exec_total" in text
+
+
+def test_metrics_prometheus_wrapper_method(server: str):
+    # M-OPS-02: Python FusionSandboxExecutor.metrics_prometheus() 包装 UDS 调用
+    from fusion_executor import FusionSandboxExecutor
+
+    _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "executor.execute", "params": {"command": "echo hi"}})
+    ex = FusionSandboxExecutor(sock_path=server)
+    text = ex.metrics_prometheus()
+    assert "# HELP fe_exec_total" in text
+    assert "# TYPE fe_exec_total counter" in text
+
+
 def test_snapshot_rollback_over_uds(server: str, tmp_path: Path):
     d = tmp_path / "repo"
     d.mkdir()

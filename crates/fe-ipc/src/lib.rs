@@ -26,10 +26,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -123,6 +124,38 @@ fn parse_shutdown_timeout(raw: Option<String>) -> Duration {
     }
 }
 
+/// M-OPS-02: Prometheus recorder handle — global, idempotent 安装。
+/// metrics-exporter-prometheus 的 PrometheusBuilder::install() 安装全局 recorder,
+/// 返 PrometheusHandle (render() 出 Prometheus text format 供 scrape)。
+/// install 幂等: 重复调返 Err, 我们吞掉 — 首次成功后全局 recorder 已就位。
+static PROM_HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
+
+/// 安装 Prometheus recorder (幂等) 并返 handle 克隆; 已装则从 static 取。
+/// describe_counter 让 render() 带 HELP/TYPE 头 (无观测值时也有 schema)。
+fn install_prometheus_recorder() -> Option<PrometheusHandle> {
+    PROM_HANDLE
+        .get_or_init(|| {
+            let handle = PrometheusBuilder::new()
+                .install_recorder()
+                .map_err(|e| {
+                    warn!(error = %e, "M-OPS-02: Prometheus recorder install 失败");
+                    e
+                })
+                .ok()?;
+            metrics::describe_counter!("fe_exec_total", "Total execute() calls");
+            metrics::describe_counter!("fe_exec_success", "Executes exited 0");
+            metrics::describe_counter!("fe_exec_blocked", "Executes blocked by security");
+            metrics::describe_counter!("fe_exec_timeout", "Executes timed out (-124)");
+            metrics::describe_counter!("fe_exec_failed", "Executes failed (non-0/timeout/blocked)");
+            metrics::describe_counter!("fe_rollback_total", "Total rollback() calls");
+            metrics::describe_counter!("fe_rollback_failed", "Rollback failures");
+            metrics::describe_gauge!("fe_shell_active", "Active background shells");
+            metrics::describe_gauge!("fe_connections", "Active UDS connections");
+            Some(handle)
+        })
+        .clone()
+}
+
 /// stdio 订阅作用域 (审计 2.9 / Blocker 10) — per-sub 过滤防跨租户泄漏。
 /// 默认 OwnConn: 仅收本连接发起命令的 stdio (多租户隔离基线)。
 /// All: 收全部 (向后兼容 dashboard 场景, 显式 opt-in)。
@@ -180,6 +213,9 @@ struct BroadcastHub {
     /// execute 累计墙钟 (ns) + stdio 累计字节 — 配合 exec_total 算均值
     exec_duration_nanos_sum: AtomicU64,
     stdio_bytes_sum: AtomicU64,
+    /// M-OPS-02: Prometheus handle — render() 出 text format 供 executor.metrics_prometheus。
+    /// None = recorder install 失败 (降级: 仅 JSON snapshot, 无 prometheus 端点)。
+    prom_handle: Option<PrometheusHandle>,
 }
 
 impl BroadcastHub {
@@ -202,6 +238,7 @@ impl BroadcastHub {
             rollback_failed: AtomicU64::new(0),
             exec_duration_nanos_sum: AtomicU64::new(0),
             stdio_bytes_sum: AtomicU64::new(0),
+            prom_handle: install_prometheus_recorder(),
         })
     }
 
@@ -209,14 +246,19 @@ impl BroadcastHub {
     /// exit_code 0=success, -124=timeout, -1=blocked/internal, 其他=failed。
     fn record_exec(&self, r: &ExecutionResult) {
         self.exec_total.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("fe_exec_total").increment(1);
         if r.blocked_by_security {
             self.exec_blocked.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("fe_exec_blocked").increment(1);
         } else if r.timed_out || r.exit_code == -124 {
             self.exec_timeout.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("fe_exec_timeout").increment(1);
         } else if r.exit_code == 0 {
             self.exec_success.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("fe_exec_success").increment(1);
         } else {
             self.exec_failed.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("fe_exec_failed").increment(1);
         }
         // 墙钟 (duration_sec 秒 → ns; f64 截断到 u64 纳秒, 累加溢出极不可能 — u64 ns ≈ 584 年)
         let dur_ns = (r.duration_sec.max(0.0) * 1e9) as u64;
@@ -230,8 +272,10 @@ impl BroadcastHub {
     /// C-OPS-05: 记一次 rollback — ok=true 算 total, false 算 total+failed
     fn record_rollback(&self, ok: bool) {
         self.rollback_total.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("fe_rollback_total").increment(1);
         if !ok {
             self.rollback_failed.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("fe_rollback_failed").increment(1);
         }
     }
 
@@ -259,6 +303,13 @@ impl BroadcastHub {
             "rollback_total": self.rollback_total.load(Ordering::Relaxed),
             "rollback_failed": self.rollback_failed.load(Ordering::Relaxed),
         })
+    }
+
+    /// M-OPS-02: Prometheus text format — render() 出 scrape 文本给 executor.metrics_prometheus。
+    /// recorder install 失败 → None → handler 返 -32603 (降级, 仅 JSON snapshot 可用)。
+    /// 不开 HTTP 端口 (保 M-SEC-01 UDS-only); 调用方经 UDS 拉 text 喂自家 exporter。
+    fn metrics_prometheus(&self) -> Option<String> {
+        self.prom_handle.as_ref().map(|h| h.render())
     }
 
     fn next_conn_id(&self) -> u64 {
@@ -322,6 +373,7 @@ impl BroadcastHub {
     /// 连接断开 — 清该连接所有订阅
     fn drop_conn(&self, conn_id: u64) {
         self.active_conns.fetch_sub(1, Ordering::Relaxed);
+        metrics::gauge!("fe_connections").set(self.active_conns.load(Ordering::Relaxed) as f64);
         let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let before = reg.len();
         reg.retain(|_, s| s.conn_id != conn_id);
@@ -808,6 +860,7 @@ async fn handle_conn(
 ) {
     let conn_id = hub.next_conn_id();
     hub.active_conns.fetch_add(1, Ordering::Relaxed);
+    metrics::gauge!("fe_connections").set(hub.active_conns.load(Ordering::Relaxed) as f64);
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(AsyncMutex::new(writer));
     let (push_tx, push_rx) = mpsc::channel::<Value>(128);
@@ -1364,6 +1417,17 @@ async fn handle_method(
             // 运维面板/负载均衡器读此判健康趋势 (拦截率/超时率/回滚失败率), 无外部 exporter 依赖。
             Ok(hub.metrics_snapshot())
         }
+        "executor.metrics_prometheus" => {
+            // M-OPS-02: Prometheus text format — 调用方经 UDS 拉, 喂自家 exporter。
+            // 不开 HTTP 端口 (保 M-SEC-01 UDS-only)。recorder install 失败 → -32603。
+            match hub.metrics_prometheus() {
+                Some(text) => Ok(json!({ "ok": true, "text": text })),
+                None => Err((
+                    ERR_INTERNAL,
+                    "Prometheus recorder 未安装, 仅 executor.metrics JSON 可用".to_string(),
+                )),
+            }
+        }
         "executor.shutdown" => {
             // C-OPS-04: IPC 触发优雅 drain — notify_waiters 唤醒 accept_loop 的 shutdown_notify
             // 分支 → 停止 accept + drain in-flight 连接 (join_all 10s deadline)。
@@ -1562,6 +1626,12 @@ async fn handle_method(
                 max_idle_sec,
             };
             let r = executor.shell_start(shells, sp);
+            // M-OPS-02: fe_shell_active gauge — list_shells 已 reap finished, running 计数即活跃。
+            let active = Executor::list_shells(shells)
+                .iter()
+                .filter(|s| !s.finished)
+                .count() as f64;
+            metrics::gauge!("fe_shell_active").set(active);
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         "executor.shell_output" => {
@@ -1578,6 +1648,12 @@ async fn handle_method(
                 .ok_or((ERR_INVALID_REQ, "缺少 shell_id".to_string()))?;
             let ok = Executor::kill_shell(shells, &shell_id)
                 .map_err(|e| (ERR_INTERNAL, format!("kill_shell 失败: {}", e)))?;
+            // M-OPS-02: fe_shell_active gauge — kill 后重算活跃数。
+            let active = Executor::list_shells(shells)
+                .iter()
+                .filter(|s| !s.finished)
+                .count() as f64;
+            metrics::gauge!("fe_shell_active").set(active);
             Ok(json!({ "ok": ok }))
         }
         "executor.list_shells" => {
@@ -2030,6 +2106,43 @@ mod tests {
         );
         assert_eq!(m["exec_blocked"], 0);
         assert_eq!(m["rollback_total"], 0);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // M-OPS-02: executor.metrics_prometheus 返 Prometheus text format — execute 一次后
+    // fe_exec_total 命中 + HELP/TYPE 头 (describe_counter 注册)。
+    #[tokio::test]
+    async fn metrics_prometheus_after_execute() {
+        let sock = tmp_sock("metrics-prom");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let req = r#"{"jsonrpc":"2.0","id":3,"method":"executor.execute","params":{"command":"echo hi"}}"#;
+        let resp = rpc(&sock, req).await;
+        assert_eq!(resp["result"]["exit_code"], 0);
+        let presp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":5,"method":"executor.metrics_prometheus","params":{}}"#,
+        )
+        .await;
+        assert!(presp["result"]["ok"].as_bool().unwrap_or(false));
+        let text = presp["result"]["text"].as_str().unwrap_or("");
+        // describe_counter 注册的 HELP/TYPE 头应在文本里。
+        assert!(
+            text.contains("# HELP fe_exec_total"),
+            "缺 fe_exec_total HELP: {text}"
+        );
+        assert!(
+            text.contains("# TYPE fe_exec_total counter"),
+            "缺 fe_exec_total TYPE: {text}"
+        );
+        assert!(
+            text.contains("fe_exec_total"),
+            "缺 fe_exec_total 指标行: {text}"
+        );
+        assert!(
+            text.contains("# TYPE fe_connections gauge"),
+            "缺 fe_connections gauge: {text}"
+        );
         let _ = std::fs::remove_file(&sock);
     }
 
