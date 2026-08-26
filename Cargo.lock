@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "fe-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "fe-diagnostics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fe-security",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "fe-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "accessibility",
  "accessibility-sys",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "fe-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fe-core",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "fe-pyo3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fe-core",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "fe-rollback"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fe-security",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "fe-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "fe-security"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "regex",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "fe-shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fe-sandbox",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "fe-telemetry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "fe-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "diffy",
