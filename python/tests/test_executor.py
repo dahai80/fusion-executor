@@ -259,6 +259,33 @@ def test_run_streaming_done_has_schema_fields(executor: FusionSandboxExecutor):
     assert result.duration_sec > 0.0
 
 
+# ── M-OPS-06: trace_id 跨层关联 (auto-gen + forwarded + blocked + streaming) ──
+
+
+def test_run_trace_id_auto_generated(executor: FusionSandboxExecutor):
+    result = executor.run("echo t")
+    assert result.trace_id is not None
+    assert len(result.trace_id) == 36
+    assert result.trace_id.count("-") == 4
+
+
+def test_run_trace_id_forwarded(executor: FusionSandboxExecutor):
+    result = executor.run("echo t", trace_id="caller-tid-999")
+    assert result.trace_id == "caller-tid-999"
+
+
+def test_run_trace_id_on_blocked(executor: FusionSandboxExecutor):
+    result = executor.run("rm -rf /", trace_id="blk-tid-1")
+    assert result.blocked_by_security
+    assert result.trace_id == "blk-tid-1"
+
+
+def test_run_streaming_trace_id(executor: FusionSandboxExecutor):
+    _chunks, result = _consume_stream(executor, "echo s", trace_id="stream-tid-1")
+    assert result is not None
+    assert result.trace_id == "stream-tid-1"
+
+
 # ── Issue #3: RLIMIT_NPROC/CPU 注入 (run + run_streaming 4-layer 端到端) ──
 # Darwin RLIMIT_NPROC per-UID spread-limiter: 低值令 sh 自身 fork python3 EAGAIN,
 # 故测可观测 rlimit (python resource.getrlimit 读回注入值), 确定性无 fork 依赖。

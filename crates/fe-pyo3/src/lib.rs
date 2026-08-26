@@ -77,6 +77,9 @@ struct PyExecutionResult {
     diagnostics: Option<PyDiagnostics>,
     #[pyo3(get)]
     auto_rolled_back: bool,
+    /// M-OPS-06: 跨层关联 id (回填请求侧或入口自动生成)
+    #[pyo3(get)]
+    trace_id: Option<String>,
 }
 
 impl From<RsResult> for PyExecutionResult {
@@ -94,6 +97,7 @@ impl From<RsResult> for PyExecutionResult {
             snapshot_id: r.snapshot_id,
             diagnostics: r.diagnostics.map(PyDiagnostics::from),
             auto_rolled_back: r.auto_rolled_back,
+            trace_id: r.trace_id,
         }
     }
 }
@@ -527,7 +531,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None))]
+                        max_nproc=None, max_cpu_sec=None, trace_id=None))]
     fn execute_sync(
         &self,
         py: Python<'_>,
@@ -543,6 +547,7 @@ impl PyExecutor {
         use_pty: Option<bool>,
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
+        trace_id: Option<String>,
     ) -> PyResult<PyExecutionResult> {
         // L-PYO3-02: policy 入参无效应 fail-loud (旧版 warn+None 静默吞错, 调用方以为开了回滚实则没开)
         let policy = match auto_rollback_policy {
@@ -577,6 +582,7 @@ impl PyExecutor {
             use_pty: use_pty.unwrap_or(true),
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
+            trace_id,
         };
         // M-PYO3-02: 内部错误 fail-loud (旧版伪造 exit_code=-1 ExecutionResult, 调用方无法区分
         // 安全拦截与 executor bug; execute 仅在 sandbox 内部异常返 Err, 应上抛)
@@ -691,7 +697,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None))]
+                        max_nproc=None, max_cpu_sec=None, trace_id=None))]
     fn execute_streaming(
         &self,
         py: Python<'_>,
@@ -707,6 +713,7 @@ impl PyExecutor {
         use_pty: Option<bool>,
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
+        trace_id: Option<String>,
     ) -> PyResult<PyStreamIterator> {
         let policy = match auto_rollback_policy {
             None => None,
@@ -740,6 +747,7 @@ impl PyExecutor {
             use_pty: use_pty.unwrap_or(true),
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
+            trace_id,
         }; // L-PYO3-01: execute_streaming async → 释 GIL 后在 BLOCKING_RT block_on (旧版持 GIL
            // 整个 spawn + 校验期间, 阻塞 Python 线程; detach 后 Python 可并发跑其他协程)
         let (rx, handle) = py

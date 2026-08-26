@@ -60,6 +60,7 @@ class FusionSandboxExecutor:
         use_pty: bool = True,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
+        trace_id: str | None = None,
     ) -> ExecutionResult:
         # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
         if not isinstance(command, str):
@@ -103,6 +104,7 @@ class FusionSandboxExecutor:
             use_pty,
             max_nproc,
             max_cpu_sec,
+            trace_id,
         )
         diag = None
         if native.diagnostics is not None:
@@ -127,6 +129,7 @@ class FusionSandboxExecutor:
             snapshot_id=native.snapshot_id,
             diagnostics=diag,
             auto_rolled_back=native.auto_rolled_back,
+            trace_id=native.trace_id,
         )
         logger.info(
             "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s dur=%.3fs",
@@ -160,6 +163,7 @@ class FusionSandboxExecutor:
         use_pty: bool = True,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
+        trace_id: str | None = None,
     ) -> Iterator[str | ExecutionResult]:
         # M-PY-01: 同 run() 前置校验
         if not isinstance(command, str):
@@ -199,6 +203,7 @@ class FusionSandboxExecutor:
             use_pty,
             max_nproc,
             max_cpu_sec,
+            trace_id,
         )
         for frame in it:
             # L-PY-02: 严格键 (旧 .get(default) 吞 serde bug, 缺字段静默成功看像 blocked)

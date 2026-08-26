@@ -130,9 +130,13 @@ for params in sub:  # __next__ yields the params (dict) of executor.event frames
 sub.unsubscribe()  # or sub.close()
 ```
 
-`run` signature: `run(command, *, task_id=None, cwd=None, timeout=30.0, env_vars=None, enable_rollback_snapshot=True) -> ExecutionResult`.
+`run` signature: `run(command, *, task_id=None, cwd=None, timeout=30.0, env_vars=None, enable_rollback_snapshot=True, trace_id=None) -> ExecutionResult`.
 
-`ExecutionResult` fields: `exit_code, stdout, stderr, task_id, command, duration_sec, timed_out, blocked_by_security, security_reason, snapshot_id, diagnostics`.
+`ExecutionResult` fields: `exit_code, stdout, stderr, task_id, command, duration_sec, timed_out, blocked_by_security, security_reason, snapshot_id, diagnostics, auto_rolled_back, trace_id`.
+
+## Cross-layer trace_id (v0.2.1 — M-OPS-06/m-OPS-03)
+
+`run()` / `run_streaming()` accept an optional `trace_id: str | None`. When `None`, the execute entrypoint auto-generates a uuid v4. The id is threaded through the Rust `tracing::span!` context (log lines carry `trace_id=...`), the IPC wire, and is backfilled on `ExecutionResult.trace_id` — one id correlates logs, IPC frames, and the result across all four layers. Blocked results also carry the caller's `trace_id`. Background shells (`shell_start`) are out of scope — they have no `ExecutionResult` to carry the id.
 
 ## Background Shells (v1.8 — #1 run_in_background parity)
 
