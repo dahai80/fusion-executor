@@ -202,7 +202,12 @@ impl Tools {
         replace_all: bool,
     ) -> Result<EditResult> {
         let abs = guard_path(&self.guard, path, cwd).map_err(|e| anyhow::anyhow!(e))?;
+        // #2 create-on-empty: 路径不存在 + old_string 空 → 用 new_string 建文件 (Claude Code FileEdit parity)
+        // 路径不存在 + old_string 非空 → 仍拒绝 (不能凭空匹配不存在的 old_string)
         if !abs.exists() {
+            if old_string.is_empty() {
+                return self.write_file(path, new_string, cwd);
+            }
             return Ok(EditResult {
                 ok: false,
                 path: Some(path.to_string()),
@@ -210,7 +215,7 @@ impl Tools {
                 matches: 0,
             });
         }
-        // L-TOOLS-02: 空 old_string 在空文件上 matches().count()==1 误判唯一 → 提前拒绝
+        // L-TOOLS-02: 已存在文件 + 空 old_string → matches().count()==1 误判唯一 → 拒绝 (create-on-empty 仅对缺失路径)
         if old_string.is_empty() {
             return Ok(EditResult {
                 ok: false,
@@ -274,6 +279,63 @@ impl Tools {
             path: Some(path.to_string()),
             error: None,
             matches: count as u32,
+        })
+    }
+
+    /// write_file — 整文件创建/覆盖 (#2, Claude Code Write parity)
+    /// 父目录不存在 → create_dir_all; 已存在 → 原子覆盖; 全程经 atomic_write (temp+persist rename)
+    /// 内容经 guard_path (逃逸/敏感防护) + 大小上限 (WRITE_FILE_MAX_BYTES 防 OOM)
+    pub fn write_file(&self, path: &str, content: &str, cwd: Option<&str>) -> Result<EditResult> {
+        let abs = guard_path(&self.guard, path, cwd).map_err(|e| anyhow::anyhow!(e))?;
+        // #2: 内容大小上限 — 防 1GB 生成文件整写 OOM (同 check_size 语义, 但新建文件无 metadata 可查, 校验 content.len)
+        if content.len() as u64 > WRITE_FILE_MAX_BYTES {
+            warn!(
+                path = %abs.display(),
+                size = content.len(),
+                max = WRITE_FILE_MAX_BYTES,
+                "write_file 内容超 64MB 上限, 拒绝"
+            );
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(format!(
+                    "文件超大小上限 ({} > {} bytes) — 防 OOM",
+                    content.len(),
+                    WRITE_FILE_MAX_BYTES
+                )),
+                matches: 0,
+            });
+        }
+        // #2: 父目录不存在 → create_dir_all (Claude Code Write 建父目录语义)
+        let parent = abs.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建父目录失败: {}", parent.display()))?;
+            debug!(dir = %parent.display(), "write_file 建父目录");
+        }
+        // #2: 已存在文件取 flock LOCK_EX 防并发 (与 file_edit RMW 同锁语义; 不存在则跳过锁)
+        let _lock = if abs.exists() {
+            match FileLock::exclusive(&abs) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    return Ok(EditResult {
+                        ok: false,
+                        path: Some(path.to_string()),
+                        error: Some(format!("获取文件锁失败: {}", e)),
+                        matches: 0,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        atomic_write(&abs, content)?;
+        info!(path = %abs.display(), bytes = content.len(), "write_file 写入成功 (建/覆盖)");
+        Ok(EditResult {
+            ok: true,
+            path: Some(path.to_string()),
+            error: None,
+            matches: 1,
         })
     }
 
@@ -1047,14 +1109,16 @@ fn guard_path(
                 ),
                 None => {
                     // 父目录也不存在 — 字面校验 (.. 已拦, 无符号链接旁路)
+                    // abs 由 raw cwd + p 构造, 故用 raw cwd (非 canonicalize) 校验 starts_with
+                    // 避免 macOS tempdir 符号链接 (/var → /private/var) 导致字面 vs 规范化误判
                     let lit = abs.to_string_lossy().into_owned();
                     let lit_parent = abs
                         .parent()
                         .map(|d| d.to_string_lossy().into_owned())
                         .unwrap_or_else(|| lit.clone());
-                    if let Some(cwd_abs) = &cwd_abs {
-                        if !Path::new(&lit).starts_with(cwd_abs)
-                            && !Path::new(&lit_parent).starts_with(cwd_abs)
+                    if let Some(c) = cwd {
+                        if !Path::new(&lit).starts_with(Path::new(c))
+                            && !Path::new(&lit_parent).starts_with(Path::new(c))
                         {
                             return Err(ToolsError::PathBlocked(format!(
                                 "路径逃逸 cwd: {} (cwd={:?})",
@@ -2449,6 +2513,102 @@ mod tests {
             .unwrap();
         assert!(!r.ok);
         assert_eq!(r.matches, 0);
+    }
+
+    // ── #2: write_file 整文件创建/覆盖 + create-on-empty ──
+
+    #[test]
+    fn test_write_file_creates_new_with_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        // 父目录不存在 → create_dir_all 建出
+        let r = tools
+            .write_file("nested/deep/new.py", "print('hi')\n", Some(&cwd))
+            .unwrap();
+        assert!(r.ok, "write_file 应建父目录并写入: {r:?}");
+        assert_eq!(r.matches, 1);
+        let fp = dir.path().join("nested/deep/new.py");
+        assert!(fp.exists(), "新文件应存在");
+        assert_eq!(std::fs::read_to_string(&fp).unwrap(), "print('hi')\n");
+    }
+
+    #[test]
+    fn test_write_file_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("over.txt");
+        std::fs::write(&fp, "old content\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .write_file("over.txt", "new content\n", Some(&cwd))
+            .unwrap();
+        assert!(r.ok, "write_file 覆盖应成功: {r:?}");
+        assert_eq!(std::fs::read_to_string(&fp).unwrap(), "new content\n");
+    }
+
+    #[test]
+    fn test_write_file_rejects_oversize_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let big = "x".repeat(WRITE_FILE_MAX_BYTES as usize + 1);
+        let r = tools.write_file("big.txt", &big, Some(&cwd)).unwrap();
+        assert!(!r.ok, "超 64MB 内容应被拒");
+        assert!(r.error.unwrap().contains("超大小上限"));
+    }
+
+    #[test]
+    fn test_file_edit_create_on_empty_missing_path() {
+        // #2: file_edit 在缺失路径 + 空 old_string → 用 new_string 建文件 (Claude Code parity)
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .file_edit(
+                "brand_new.py",
+                "",
+                "def f():\n    pass\n",
+                Some(&cwd),
+                false,
+            )
+            .unwrap();
+        assert!(r.ok, "create-on-empty 缺失路径应建文件: {r:?}");
+        let fp = dir.path().join("brand_new.py");
+        assert_eq!(
+            std::fs::read_to_string(&fp).unwrap(),
+            "def f():\n    pass\n"
+        );
+    }
+
+    #[test]
+    fn test_file_edit_existing_empty_old_string_still_rejected() {
+        // #2: 已存在文件 + 空 old_string 仍拒 (L-TOOLS-02 保持; create-on-empty 仅对缺失路径)
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("exist.txt");
+        std::fs::write(&fp, "data\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .file_edit("exist.txt", "", "new\n", Some(&cwd), false)
+            .unwrap();
+        assert!(!r.ok, "已存在文件 + 空 old_string 应拒");
+        assert!(r.error.unwrap().contains("不能为空"));
+        // 原文件未被改动
+        assert_eq!(std::fs::read_to_string(&fp).unwrap(), "data\n");
+    }
+
+    #[test]
+    fn test_file_edit_missing_path_nonempty_old_string_rejected() {
+        // #2: 缺失路径 + 非空 old_string → 仍拒 (不能凭空匹配不存在的 old_string)
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .file_edit("ghost.py", "foo", "bar", Some(&cwd), false)
+            .unwrap();
+        assert!(!r.ok, "缺失路径 + 非空 old_string 应拒");
+        assert!(r.error.unwrap().contains("文件未找到"));
     }
 
     // ── #6: multi_edit 原子 all-or-nothing ──

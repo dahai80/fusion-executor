@@ -726,6 +726,23 @@ impl PyExecutor {
         }
     }
 
+    /// write_file(path, content, cwd=None) -> NativeEditResult — 整文件创建/覆盖 + 建父目录 (#2)
+    #[pyo3(signature = (path, content, cwd=None))]
+    fn write_file(&self, path: String, content: String, cwd: Option<String>) -> PyEditResult {
+        match self.inner.write_file(&path, &content, cwd.as_deref()) {
+            Ok(r) => r.into(),
+            Err(e) => {
+                tracing::warn!(error = %e, "write_file 失败");
+                PyEditResult {
+                    ok: false,
+                    path: Some(path),
+                    error: Some(format!("write_file 失败: {e}")),
+                    matches: 0,
+                }
+            }
+        }
+    }
+
     /// multi_edit(path, edits, cwd=None) -> NativeEditResult
     /// 同文件顺序批量编辑, 原子 all-or-nothing
     fn multi_edit(
