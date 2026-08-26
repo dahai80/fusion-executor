@@ -1099,7 +1099,18 @@ fn guard_path(
     // abs 不存在 → canonicalize(abs 的父目录) (新文件在 cwd 内创建合法)
     let cwd_abs = cwd.and_then(|c| std::fs::canonicalize(c).ok());
     let (escape_check, sensitive_check) = match abs.canonicalize() {
-        Ok(canonical) => (canonical.clone(), canonical),
+        Ok(canonical) => {
+            // C-SEC-03: 文件已存在 = 读场景 (file_edit/grep 老文件), 拒读凭据文件名模式
+            // (id_rsa* / *.pem / *.key 等) — 路径前缀已拦 ~/.ssh/*, 此处补 cwd 内/任意位置凭据文件。
+            // 创建新文件 (cert.pem) 走 Err 分支不拦 — 仅阻读已有凭据。
+            if guard.is_sensitive_filename(&canonical.to_string_lossy()) {
+                return Err(ToolsError::PathBlocked(format!(
+                    "拒绝读取凭据文件 (敏感文件名模式): {} (C-SEC-03)",
+                    raw
+                )));
+            }
+            (canonical.clone(), canonical)
+        }
         Err(_) => {
             // abs 不存在 — 取父目录 canonicalize (符号链接在父段)
             match abs.parent().and_then(|p| p.canonicalize().ok()) {
@@ -2060,6 +2071,81 @@ mod tests {
         // /etc 在 SENSITIVE_PATHS 内 → validate_cwd 拒 → glob 返回空
         let r = tools.glob("/etc/passwd", Some("/tmp")).unwrap();
         assert!(r.is_empty(), "敏感路径 /etc/passwd 应被过滤: {:?}", r);
+    }
+
+    // ── C-SEC-03: guard_path 拒读 cwd 内凭据文件名模式 ──
+
+    #[test]
+    fn guard_path_blocks_read_existing_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("secrets.pem");
+        std::fs::write(&fp, "PRIVATE\n").unwrap();
+        let guard = SecurityGuard::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = guard_path(&guard, "secrets.pem", Some(&cwd));
+        assert!(r.is_err(), "读已有 secrets.pem 应被拦截");
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("凭据文件"), "应含凭据文件提示: {}", msg);
+    }
+
+    #[test]
+    fn guard_path_blocks_read_existing_id_rsa() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("id_rsa");
+        std::fs::write(&fp, "KEY\n").unwrap();
+        let guard = SecurityGuard::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = guard_path(&guard, "id_rsa", Some(&cwd));
+        assert!(r.is_err(), "读已有 id_rsa 应被拦截");
+    }
+
+    #[test]
+    fn guard_path_allows_read_id_rsa_pub() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("id_rsa.pub");
+        std::fs::write(&fp, "PUBLIC\n").unwrap();
+        let guard = SecurityGuard::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = guard_path(&guard, "id_rsa.pub", Some(&cwd));
+        assert!(r.is_ok(), "读公钥 id_rsa.pub 不应被拦截");
+    }
+
+    #[test]
+    fn guard_path_allows_create_new_pem() {
+        // 创建新 cert.pem (文件不存在 → Err 分支) 不拦 — 仅阻读已有凭据
+        let dir = tempfile::tempdir().unwrap();
+        let guard = SecurityGuard::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = guard_path(&guard, "newcert.pem", Some(&cwd));
+        assert!(r.is_ok(), "创建新 newcert.pem 不应被拦截");
+    }
+
+    #[test]
+    fn file_edit_blocks_read_credential_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("server.key");
+        std::fs::write(&fp, "secret\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        // guard_path Err 经 anyhow 透传 (不降级为 EditResult) — 安全校验失败 fail-loud
+        let r = tools.file_edit("server.key", "secret", "x", Some(&cwd), false);
+        assert!(r.is_err(), "file_edit 读 server.key 应被拦截 (Err)");
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("凭据文件"), "应含凭据文件提示: {}", msg);
+    }
+
+    #[test]
+    fn grep_blocks_read_credential_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("agent.pem");
+        std::fs::write(&fp, "data\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        // grep 走 guard_path → PathBlocked → Err (propagate), 不读文件
+        let r = tools.grep("data", &["agent.pem".to_string()], Some(&cwd));
+        assert!(r.is_err(), "grep agent.pem 应被拦截 (Err): {:?}", r);
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("凭据文件"), "应含凭据文件提示: {}", msg);
     }
 
     // C-TOOLS-02: 全文件重写 (删全部+加全部) 应被拒 (旧启发式漏判)

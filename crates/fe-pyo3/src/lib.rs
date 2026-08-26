@@ -3,8 +3,11 @@
 // 产出 fusion_executor._native 扩展, 纯 Python executor.py 包装
 // P1: 最小 execute_sync; 后续暴露 rollback/gui/serve
 
+use std::sync::OnceLock;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
+use tracing_subscriber::EnvFilter;
 
 use fe_core::gui::{GuiAction, GuiResult as RsGuiResult};
 use fe_core::shell::{ShellStartParams, ShellStartResult as RsShellStartResult};
@@ -1102,6 +1105,7 @@ impl PyExecutor {
     /// 故 serve 的 IPC 请求与进程内 self.inner.execute 语义等价。隔离避免长驻 serve 影响
     /// 调用方持有的 self.inner (如 serve 内命令改动 cwd 影响进程内调用)。
     fn serve(&self, py: pyo3::Python<'_>, sock_path: Option<String>) -> PyResult<()> {
+        init_tracing();
         let sock = IpcServer::resolve_sock(sock_path.as_deref());
         let extras: Vec<&str> = self.extra_whitelist.iter().map(String::as_str).collect();
         let exec = if extras.is_empty() {
@@ -1124,6 +1128,32 @@ impl PyExecutor {
     }
 }
 
+/// C-OPS-01: 初始化 tracing subscriber — serve() 入口调用, 幂等 (OnceLock 守护)
+/// 默认级别 INFO, 可经 RUST_LOG=fusion_executor=debug 覆盖。修复前 242 处日志调用
+/// 全静默 (无 subscriber); 修复后 stderr 有结构化日志, 可被 journalctl/log 收集。
+static TRACING_INIT: OnceLock<()> = OnceLock::new();
+fn init_tracing() {
+    if TRACING_INIT.set(()).is_err() {
+        return;
+    }
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init();
+}
+
+/// C-OPS-06: 版本/构建信息 — build.rs 注入 FE_GIT_SHA/FE_BUILD_TIME, 版本取 CARGO_PKG_VERSION
+/// Python __init__.py 经此读 __version__; IPC health 经 fe-ipc 读 (fe-ipc 自身 env! CARGO_PKG_VERSION)
+#[pyfunction]
+fn version_info() -> (String, String, String) {
+    (
+        env!("CARGO_PKG_VERSION").to_string(),
+        env!("FE_GIT_SHA").to_string(),
+        env!("FE_BUILD_TIME").to_string(),
+    )
+}
+
 #[pymodule]
 fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDiagnostics>()?;
@@ -1138,5 +1168,6 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShellOutput>()?;
     m.add_class::<PyShellInfo>()?;
     m.add_class::<PyExecutor>()?;
+    m.add_function(wrap_pyfunction!(version_info, m)?)?;
     Ok(())
 }

@@ -294,6 +294,32 @@ impl ShellRegistry {
     }
 }
 
+/// C-OPS-02: ShellRegistry drop 时 kill 所有活跃 shell, 防 serve() 退出孤儿进程泄漏。
+/// 进程退出 (signal/crash) 时 registry drop → 遍历 finished==false 的 shell kill_tree,
+/// reader/waiter 线程随 PTY 关闭自然退出。fail-loud: 记录 kill 失败, 不静默吞。
+impl Drop for ShellRegistry {
+    fn drop(&mut self) {
+        let g = self.shells.lock().unwrap();
+        let active: Vec<(String, Option<u32>)> = g
+            .iter()
+            .filter(|(_, h)| !h.finished.load(Ordering::Acquire))
+            .map(|(id, h)| (id.clone(), h.pid))
+            .collect();
+        if active.is_empty() {
+            return;
+        }
+        info!(count = active.len(), "ShellRegistry drop: drain 活跃 shell");
+        for (shell_id, pid) in active {
+            if let Some(pid) = pid {
+                let exit = kill_tree(Some(pid));
+                info!(%shell_id, pid, kill_exit = exit, "drop drain kill 完成");
+            } else {
+                warn!(%shell_id, "drop drain: shell 无 pid, 跳过 kill");
+            }
+        }
+    }
+}
+
 impl Default for ShellRegistry {
     fn default() -> Self {
         Self::new()
@@ -503,6 +529,40 @@ mod tests {
             "reap 后应 <= {} 条, 实际 {}",
             MAX_SHELLS,
             list.len()
+        );
+    }
+
+    /// C-OPS-02: ShellRegistry drop 必须 kill 活跃 shell, 防孤儿进程。
+    /// 起一个 sleep 长任务, drop registry 后确认子进程不再存活 (kill -0 退出码非 0)。
+    #[test]
+    fn drop_drains_active_shells() {
+        let pid = {
+            let reg = ShellRegistry::new();
+            let id = reg
+                .shell_start(params("python3 -c 'import time; time.sleep(60)'", None))
+                .shell_id
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let out = reg.shell_output(&id).unwrap();
+            assert!(out.running, "drop 前长任务应仍在跑");
+            // pid 在 ShellInfo (list_shells), 不在 ShellOutput
+            reg.list_shells()
+                .into_iter()
+                .find(|i| i.shell_id == id)
+                .and_then(|i| i.pid)
+                .expect("shell 应有 pid")
+        };
+        // reg 离作用域 → Drop 触发 kill_tree; 等待 kill 生效
+        std::thread::sleep(Duration::from_millis(1500));
+        // kill -0 探进程存活: 存活返 exit 0, 不存在返非 0 (无 unsafe, 走子进程)
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .expect("kill 命令应可执行");
+        assert!(
+            !status.success(),
+            "drop 后子进程 pid={} 应被 kill, kill -0 仍成功 = 孤儿进程",
+            pid
         );
     }
 }

@@ -70,6 +70,8 @@ const MAX_CONCURRENT_EXECS: usize = 16;
 const IDLE_READ_TIMEOUT_SECS: u64 = 30;
 /// 截图 b64 帧上限 (4MB) — 超此降级去 png_b64 防 N 订阅内存堆积 (P-IPC-03)
 const MAX_SCREENSHOT_B64_BYTES: usize = 4 * 1024 * 1024;
+/// C-OPS-03: 优雅 drain 截止 — join in-flight 连接 10s, 超时 abort 剩余 (强制停, 防挂死)。
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// stdio 订阅作用域 (审计 2.9 / Blocker 10) — per-sub 过滤防跨租户泄漏。
 /// 默认 OwnConn: 仅收本连接发起命令的 stdio (多租户隔离基线)。
@@ -104,6 +106,9 @@ struct Subscriber {
 
 /// 广播中心 (v1.5 #14) — Arc 共享给 accept_loop/handle_conn/源任务。
 /// registry: sub_id → Subscriber。源任务 lazy 启停: 0 订阅自退, 下次 subscribe 重启。
+/// C-OPS-04: shutdown Notify — executor.shutdown IPC 触发, accept_loop 监听 → 优雅 drain。
+/// C-OPS-05: 运维指标 — AtomicU64 计数 (exec_total/blocked/timeout/success/failed, rollback) +
+///   duration/stdio 累加器 (无锁, 调用方读 snapshot 算均值)。无直方图存储 (内存预算), 聚合够运维。
 struct BroadcastHub {
     registry: Mutex<HashMap<String, Subscriber>>,
     executor: Arc<Executor>,
@@ -111,6 +116,18 @@ struct BroadcastHub {
     sub_counter: AtomicU64,
     telemetry_task: Mutex<Option<JoinHandle<()>>>,
     screenshot_task: Mutex<Option<JoinHandle<()>>>,
+    shutdown: Arc<tokio::sync::Notify>,
+    // C-OPS-05 指标
+    exec_total: AtomicU64,
+    exec_blocked: AtomicU64,
+    exec_timeout: AtomicU64,
+    exec_success: AtomicU64,
+    exec_failed: AtomicU64,
+    rollback_total: AtomicU64,
+    rollback_failed: AtomicU64,
+    /// execute 累计墙钟 (ns) + stdio 累计字节 — 配合 exec_total 算均值
+    exec_duration_nanos_sum: AtomicU64,
+    stdio_bytes_sum: AtomicU64,
 }
 
 impl BroadcastHub {
@@ -122,6 +139,72 @@ impl BroadcastHub {
             sub_counter: AtomicU64::new(1),
             telemetry_task: Mutex::new(None),
             screenshot_task: Mutex::new(None),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            exec_total: AtomicU64::new(0),
+            exec_blocked: AtomicU64::new(0),
+            exec_timeout: AtomicU64::new(0),
+            exec_success: AtomicU64::new(0),
+            exec_failed: AtomicU64::new(0),
+            rollback_total: AtomicU64::new(0),
+            rollback_failed: AtomicU64::new(0),
+            exec_duration_nanos_sum: AtomicU64::new(0),
+            stdio_bytes_sum: AtomicU64::new(0),
+        })
+    }
+
+    /// C-OPS-05: 记一次 execute 结果 → 原子累加指标。
+    /// exit_code 0=success, -124=timeout, -1=blocked/internal, 其他=failed。
+    fn record_exec(&self, r: &ExecutionResult) {
+        self.exec_total.fetch_add(1, Ordering::Relaxed);
+        if r.blocked_by_security {
+            self.exec_blocked.fetch_add(1, Ordering::Relaxed);
+        } else if r.timed_out || r.exit_code == -124 {
+            self.exec_timeout.fetch_add(1, Ordering::Relaxed);
+        } else if r.exit_code == 0 {
+            self.exec_success.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.exec_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        // 墙钟 (duration_sec 秒 → ns; f64 截断到 u64 纳秒, 累加溢出极不可能 — u64 ns ≈ 584 年)
+        let dur_ns = (r.duration_sec.max(0.0) * 1e9) as u64;
+        self.exec_duration_nanos_sum
+            .fetch_add(dur_ns, Ordering::Relaxed);
+        // stdio 字节 (stdout+stderr 截断后长度 — 真实传输量)
+        let bytes = (r.stdout.len() + r.stderr.len()) as u64;
+        self.stdio_bytes_sum.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// C-OPS-05: 记一次 rollback — ok=true 算 total, false 算 total+failed
+    fn record_rollback(&self, ok: bool) {
+        self.rollback_total.fetch_add(1, Ordering::Relaxed);
+        if !ok {
+            self.rollback_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// C-OPS-05: 指标快照 — 转为 JSON 给 executor.metrics handler。
+    /// 均值用 exec_total 算 (blocked/timeout 不计 duration — 它们 duration_sec=0)。
+    fn metrics_snapshot(&self) -> Value {
+        let total = self.exec_total.load(Ordering::Relaxed);
+        let dur_ns_sum = self.exec_duration_nanos_sum.load(Ordering::Relaxed);
+        let stdio_sum = self.stdio_bytes_sum.load(Ordering::Relaxed);
+        let avg_dur_sec = if total > 0 {
+            (dur_ns_sum as f64) / 1e9 / (total as f64)
+        } else {
+            0.0
+        };
+        let avg_stdio_bytes = stdio_sum.checked_div(total).unwrap_or(0);
+        json!({
+            "exec_total": total,
+            "exec_success": self.exec_success.load(Ordering::Relaxed),
+            "exec_blocked": self.exec_blocked.load(Ordering::Relaxed),
+            "exec_timeout": self.exec_timeout.load(Ordering::Relaxed),
+            "exec_failed": self.exec_failed.load(Ordering::Relaxed),
+            "execute_duration_sec_avg": avg_dur_sec,
+            "stdio_bytes_total": stdio_sum,
+            "stdio_bytes_avg": avg_stdio_bytes,
+            "rollback_total": self.rollback_total.load(Ordering::Relaxed),
+            "rollback_failed": self.rollback_failed.load(Ordering::Relaxed),
         })
     }
 
@@ -409,6 +492,10 @@ impl IpcServer {
             .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", path.display(), e))?;
         chmod_secure(&path);
         info!(sock = %path.display(), "IPC 服务器监听中");
+        // C-SEC-02: seatbelt 治理 — 默认 false, 生产环境须调用方透传 seatbelt:true 启运行时隔离。
+        warn!(
+            "⚠️ seatbelt 默认关闭 — 子进程无 macOS sandbox-exec 隔离 (禁网/execve deny 均未启)。生产部署须在 ExecutionRequest 透传 seatbelt:true。查 health.seatbelt_default_off"
+        );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let executor = self.executor.clone();
@@ -421,10 +508,11 @@ impl IpcServer {
     }
 
     /// 同步阻塞 serve — 供 PyO3 serve() 直接调用 (走 BLOCKING_RT)
-    /// C-PYO3-02 修复: serve_blocking 持 GIL 时 Python 信号 handler 不执行 (主线程
-    /// 阻在 Rust block_on) → SIGTERM 无法中断。改 Rust 侧 tokio::signal 监听 SIGINT/
-    /// SIGTERM, select 与 accept_loop 竞争; 收信号即 break, drop listener, 清理 sock。
-    /// PyO3 serve() 须 py.detach 释 GIL (见 fe-pyo3) — 本函数自身不持 GIL。
+    /// C-PYO3-02: serve_blocking 持 GIL 时 Python 信号 handler 不执行 (主线程阻在
+    /// Rust block_on) → SIGTERM 无法中断。改 Rust 侧 tokio::signal 监听 SIGINT/SIGTERM。
+    /// C-OPS-03: 信号不 select-丢弃 accept_loop (否则 drain 不跑, 孤儿连接)。改为
+    /// 信号任务收信号后 hub.shutdown.notify_waiters(), accept_loop 自身监听该 Notify
+    /// 退出并 drain in-flight 连接 (join_all 10s deadline)。PyO3 serve() 须 py.detach 释 GIL。
     pub fn serve_blocking(&self, sock_path: &str) -> Result<()> {
         let path = sock_path.to_string();
         let executor = self.executor.clone();
@@ -438,42 +526,48 @@ impl IpcServer {
                 .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", p.display(), e))?;
             chmod_secure(&p);
             info!(sock = %p.display(), "IPC 服务器监听中 (blocking, 信号可停)");
+            // C-SEC-02: seatbelt 治理 — 默认 false, 生产环境须调用方透传 seatbelt:true 启运行时隔离。
+            warn!(
+                "⚠️ seatbelt 默认关闭 — 子进程无 macOS sandbox-exec 隔离 (禁网/execve deny 均未启)。生产部署须在 ExecutionRequest 透传 seatbelt:true。查 health.seatbelt_default_off"
+            );
             let (_tx, rx) = oneshot::channel::<()>();
-            // 信号监听: SIGINT/SIGTERM 任一到达 → break select, drop listener, 清 sock
-            #[cfg(unix)]
-            let sig = async {
-                let sigint = tokio::signal::ctrl_c();
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .map_err(|e| anyhow::anyhow!("注册 SIGTERM 失败: {e}"))?;
+            // 信号任务: 收 SIGINT/SIGTERM → notify_waiters, accept_loop 自行退出并 drain
+            let signal_task = tokio::spawn(wait_signal_and_notify(hub.clone()));
+            // accept_loop 运行至 shutdown_notify (信号) 或 shutdown_rx 触发, 内部 drain in-flight
+            accept_loop(listener, executor, hub, rx).await;
+            signal_task.abort();
+            let _ = std::fs::remove_file(&p);
+            Ok(())
+        })
+    }
+}
+
+/// C-OPS-03/04: 阻塞至 SIGINT/SIGTERM, 然后触发 hub.shutdown.notify_waiters()。
+/// accept_loop 监听该 Notify → 退出 accept 并 drain in-flight 连接 (不被 select 丢弃)。
+async fn wait_signal_and_notify(hub: Arc<BroadcastHub>) {
+    #[cfg(unix)]
+    {
+        let sigint = tokio::signal::ctrl_c();
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
                 tokio::select! {
                     biased;
                     _ = sigint => {}
                     _ = sigterm.recv() => {}
                 }
-                info!("收到 SIGINT/SIGTERM, 停止 serve_blocking");
-                Ok::<(), anyhow::Error>(())
-            };
-            #[cfg(not(unix))]
-            let sig = async {
-                let _ = tokio::signal::ctrl_c().await;
-                info!("收到 SIGINT, 停止 serve_blocking");
-                Ok::<(), anyhow::Error>(())
-            };
-            tokio::select! {
-                biased;
-                res = sig => {
-                    if let Err(e) = res {
-                        warn!(error = %e, "信号监听失败, 仅靠 accept_loop 退出");
-                    }
-                    info!("信号触发, 退出 accept 循环");
-                }
-                _ = accept_loop(listener, executor, hub, rx) => {}
             }
-            let _ = std::fs::remove_file(&p);
-            Ok(())
-        })
+            Err(e) => {
+                warn!(error = %e, "SIGTERM 注册失败, 仅监听 SIGINT");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    info!("收到 SIGINT/SIGTERM, 触发优雅 drain");
+    hub.shutdown.notify_waiters();
 }
 
 impl Default for IpcServer {
@@ -482,7 +576,8 @@ impl Default for IpcServer {
     }
 }
 
-/// accept 循环 — 收到 shutdown 信号或 listener 关闭则退出。
+/// accept 循环 — 收到 shutdown 信号 (oneshot 编程式 或 IPC Notify) 或 listener 关闭则退出。
+/// C-OPS-03: 收集 handle_conn JoinHandle, 退出后 drain (join_all 带 SHUTDOWN_DEADLINE 超时, 超时 abort)。
 /// 并发连接受 MAX_CONNECTIONS 信号量限制 (C-IPC-05)。
 async fn accept_loop(
     listener: UnixListener,
@@ -493,11 +588,18 @@ async fn accept_loop(
     let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     // 审计 2.11: 执行信号量 — 限并发 **执行** (子进程) 非并发连接。全 server 共享, 与连接信号量解耦。
     let exec_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_EXECS));
+    // C-OPS-03: in-flight 连接 JoinHandle 收集 — drain 时 join_all + deadline
+    let conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>> = Arc::new(AsyncMutex::new(Vec::new()));
+    let shutdown_notify = hub.shutdown.clone();
     loop {
         tokio::select! {
             biased;
             _ = &mut shutdown_rx => {
-                info!("shutdown 信号收到, 停止 accept");
+                info!("shutdown (oneshot) 收到, 停止 accept");
+                break;
+            }
+            _ = shutdown_notify.notified() => {
+                info!("shutdown (IPC Notify) 收到, 停止 accept");
                 break;
             }
             accept = listener.accept() => {
@@ -514,16 +616,60 @@ async fn accept_loop(
                         let ex = executor.clone();
                         let h = hub.clone();
                         let es = exec_sem.clone();
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             handle_conn(stream, ex, h, es).await;
                             drop(permit);
                         });
+                        conns.lock().await.push(handle);
                     }
                     Err(e) => warn!(error = %e, "accept 失败"),
                 }
             }
         }
     }
+    // C-OPS-03: drain in-flight 连接 — join_all 带 deadline, 超时 abort 剩余
+    drain_connections(conns).await;
+}
+
+/// C-OPS-03/M-OPS-03: 优雅 drain — join 所有 in-flight 连接, SHUTDOWN_DEADLINE 内未完则 abort。
+/// 完成的移出, 超时的 abort (强制停, 防孤儿响应/子进程挂死)。fail-loud 记 abort 数。
+async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>) {
+    let mut handles = conns.lock().await;
+    let total = handles.len();
+    if total == 0 {
+        return;
+    }
+    info!(
+        in_flight = total,
+        deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
+        "drain in-flight 连接"
+    );
+    // join_all 带超时: 超时则 abort 剩余未完成的
+    let join_all = async {
+        let mut remaining = Vec::new();
+        for h in handles.drain(..) {
+            remaining.push(h);
+        }
+        let mut joined_ok = 0usize;
+        for mut h in remaining {
+            if h.is_finished() {
+                let _ = h.await;
+                joined_ok += 1;
+            } else {
+                match tokio::time::timeout(SHUTDOWN_DEADLINE, &mut h).await {
+                    Ok(Ok(())) => joined_ok += 1,
+                    Ok(Err(e)) => warn!(error = %e, "连接 task join 失败"),
+                    Err(_) => {
+                        warn!("连接 drain 超时, abort (强制停)");
+                        h.abort();
+                    }
+                }
+            }
+        }
+        joined_ok
+    };
+    let ok = join_all.await;
+    info!(in_flight = total, drained_ok = ok, "drain 完成");
 }
 
 /// 单连接处理 — DUPLEX (v1.5 #14):
@@ -969,11 +1115,27 @@ async fn handle_method(
     exec_sem: &Arc<Semaphore>,
 ) -> Result<Value, (i64, String)> {
     match method {
-        "executor.health" => Ok(json!({
-            "ok": true,
-            "version": env!("CARGO_PKG_VERSION"),
-            "ax_trusted": fe_core::gui::GuiController::ax_trusted()
-        })),
+        "executor.health" => {
+            // C-OPS-05: ok 由真实探针决定 (非硬编码) — 探 BLOCKING_RT 响应 + 外部依赖 (git)。
+            // BLOCKING_RT 停摆 / worker 全阻塞 / 死锁 → spawn 超时 → ok:false, 负载均衡器摘除卡死实例。
+            let rt_ok = probe_runtime(Duration::from_secs(1)).await;
+            let deps = probe_dependencies().await;
+            // 任一核心依赖缺失 → ok:false (依赖不健康 = 服务降级)
+            let deps_ok = deps.iter().all(|d| d["ok"].as_bool() == Some(true));
+            let ok = rt_ok && deps_ok;
+            Ok(json!({
+                "ok": ok,
+                "version": env!("CARGO_PKG_VERSION"),
+                "git_sha": env!("FE_GIT_SHA"),
+                "build_time": env!("FE_BUILD_TIME"),
+                "ax_trusted": fe_core::gui::GuiController::ax_trusted(),
+                // C-SEC-02: seatbelt 治理信号 — 默认 false (调用方须显式 opt-in seatbelt:true)。
+                // 负载均衡器/运维查此字段知实例未开运行时隔离, 提示生产环境须透传 seatbelt:true。
+                "seatbelt_default_off": true,
+                "runtime": { "ok": rt_ok },
+                "dependencies": deps
+            }))
+        }
         "executor.execute" => {
             let req: ExecutionRequest = serde_json::from_value(params)
                 .map_err(|e| (ERR_INVALID_REQ, format!("params 无效: {}", e)))?;
@@ -987,6 +1149,7 @@ async fn handle_method(
                 .execute_async(req)
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("execute 失败: {}", e)))?;
+            hub.record_exec(&r);
             let val = serde_json::to_value(&r).unwrap_or(json!({}));
             hub.broadcast_stdio(
                 json!({
@@ -1034,6 +1197,7 @@ async fn handle_method(
                 .rollback_async(&snapshot_id, &cwd)
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("rollback 失败: {}", e)))?;
+            hub.record_rollback(ok);
             if !ok {
                 return Err((-32012, "rollback 失败 (stash apply 或非 repo)".to_string()));
             }
@@ -1063,9 +1227,18 @@ async fn handle_method(
                 .map_err(|e| (ERR_INTERNAL, format!("gui_action 失败: {e}")))?;
             Ok(serde_json::to_value(&result).unwrap_or(json!({})))
         }
+        "executor.metrics" => {
+            // C-OPS-05: 自服务指标 — exec 计数 + duration/stdio 聚合 + rollback 计数。
+            // 运维面板/负载均衡器读此判健康趋势 (拦截率/超时率/回滚失败率), 无外部 exporter 依赖。
+            Ok(hub.metrics_snapshot())
+        }
         "executor.shutdown" => {
-            info!("收到 shutdown 请求 (注意: 按进程退出, 此方法仅回确认)");
-            Ok(json!({"ok": true}))
+            // C-OPS-04: IPC 触发优雅 drain — notify_waiters 唤醒 accept_loop 的 shutdown_notify
+            // 分支 → 停止 accept + drain in-flight 连接 (join_all 10s deadline)。
+            // 响应先回再让 accept_loop 退出 (本连接的 read_task 在 dispatch 后自然结束)。
+            info!("收到 shutdown 请求, 触发优雅 drain (C-OPS-04)");
+            hub.shutdown.notify_waiters();
+            Ok(json!({"ok": true, "shutting_down": true}))
         }
         "executor.file_edit" => {
             let path =
@@ -1284,6 +1457,40 @@ async fn handle_method(
     }
 }
 
+/// C-OPS-05: 探 BLOCKING_RT 响应 — spawn 空任务 + 超时, 超时即 rt_ok=false (worker 停摆/死锁)。
+/// BLOCKING_RT 是 executor 异步 runtime; 停摆则一切 execute 阻塞, 健康检查必须探测到。
+async fn probe_runtime(timeout: Duration) -> bool {
+    let h = fe_core::BLOCKING_RT.handle();
+    let task = h.spawn(async {});
+    tokio::time::timeout(timeout, task).await.is_ok()
+}
+
+/// C-OPS-05: 探外部依赖 — `git --version` (rollback/快照依赖 git CLI)。
+/// 任一依赖缺失 → 服务降级, ok=false。返回 [{name, ok, version?}]。
+async fn probe_dependencies() -> Vec<Value> {
+    let git_ok = tokio::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let git_version = if git_ok {
+        tokio::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    } else {
+        None
+    };
+    let mut d = json!({ "name": "git", "ok": git_ok });
+    if let Some(v) = git_version {
+        d["version"] = json!(v);
+    }
+    vec![d]
+}
+
 /// 取 params["key"] 字符串
 fn param_str(params: &Value, key: &str) -> Option<String> {
     params
@@ -1351,13 +1558,37 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
         )
         .await;
+        // C-OPS-05: ok 由真实探针决定 (BLOCKING_RT + git 依赖), CI 环境 git 存在 → ok=true。
         assert_eq!(resp["result"]["ok"], true);
+        // C-SEC-02: seatbelt 治理信号 — 默认关闭, 调用方须显式 opt-in seatbelt:true
+        assert_eq!(resp["result"]["seatbelt_default_off"], true);
         // ax_trusted = 真实 AXIsProcessTrusted() 查询 (C-GUI-01), CI 无 TCC 时为 false。
         // 仅断言字段存在且为布尔, 不硬编码 true。
         assert!(
             resp["result"]["ax_trusted"].is_boolean(),
             "ax_trusted 应为布尔: {}",
             resp["result"]["ax_trusted"]
+        );
+        // C-OPS-05: runtime 探针 — BLOCKING_RT spawn 空任务超时探活
+        assert_eq!(
+            resp["result"]["runtime"]["ok"], true,
+            "runtime 应健康 (BLOCKING_RT 可响应): {}",
+            resp["result"]["runtime"]
+        );
+        // C-OPS-05: dependencies 数组 — git CLI (rollback 依赖)
+        let deps = &resp["result"]["dependencies"];
+        assert!(deps.is_array(), "dependencies 应为数组: {}", deps);
+        let git_dep = deps
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "git")
+            .expect("dependencies 应含 git");
+        assert_eq!(git_dep["ok"], true, "git 依赖应健康: {}", git_dep);
+        assert!(
+            git_dep["version"].is_string(),
+            "git 应报 version: {}",
+            git_dep
         );
         let _ = std::fs::remove_file(&sock);
     }
@@ -1423,6 +1654,44 @@ mod tests {
         let resp = rpc(&sock, req).await;
         assert_eq!(resp["result"]["exit_code"], 0);
         assert_eq!(resp["result"]["stdout"], "hi\n");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // C-OPS-05b: executor.metrics 返运行态计数 — execute 一次后 exec_total>=1, exec_success>=1
+    #[tokio::test]
+    async fn metrics_roundtrip_after_execute() {
+        let sock = tmp_sock("metrics");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        // 先跑一次成功命令, 累 metrics 计数
+        let req = r#"{"jsonrpc":"2.0","id":3,"method":"executor.execute","params":{"command":"echo hi"}}"#;
+        let resp = rpc(&sock, req).await;
+        assert_eq!(resp["result"]["exit_code"], 0);
+        // 读 metrics 快照
+        let mresp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":4,"method":"executor.metrics","params":{}}"#,
+        )
+        .await;
+        let m = &mresp["result"];
+        assert!(m["exec_total"].as_u64().unwrap() >= 1, "exec_total: {}", m);
+        assert!(
+            m["exec_success"].as_u64().unwrap() >= 1,
+            "exec_success: {}",
+            m
+        );
+        assert!(
+            m["execute_duration_sec_avg"].is_number(),
+            "execute_duration_sec_avg 应为数字: {}",
+            m["execute_duration_sec_avg"]
+        );
+        assert!(
+            m["stdio_bytes_total"].as_u64().is_some(),
+            "stdio_bytes_total 应为 u64: {}",
+            m["stdio_bytes_total"]
+        );
+        assert_eq!(m["exec_blocked"], 0);
+        assert_eq!(m["rollback_total"], 0);
         let _ = std::fs::remove_file(&sock);
     }
 
@@ -2076,6 +2345,82 @@ mod tests {
         assert_eq!(blocked["result"]["blocked_by_security"], true);
         assert!(blocked["result"]["shell_id"].is_null());
 
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // C-OPS-04: executor.shutdown IPC 触发 hub.shutdown.notify_waiters() →
+    // accept_loop 退出 + drain in-flight。响应应为 {ok:true, shutting_down:true}。
+    // serve 的 join handle 应在 deadline 内完成 (accept_loop 返回)。
+    #[tokio::test]
+    async fn shutdown_ipc_triggers_graceful_drain() {
+        let sock = tmp_sock("shutdown");
+        let server = IpcServer::new();
+        let (_tx, join) = server.serve(&sock).await.unwrap();
+        // 先 health 确认 server 活
+        let h = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
+        )
+        .await;
+        assert_eq!(h["result"]["ok"], true);
+        // 触发 shutdown
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":2,"method":"executor.shutdown","params":{}}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["ok"], true);
+        assert_eq!(resp["result"]["shutting_down"], true);
+        // accept_loop 退出 → serve join 在 deadline 内完成 (drain 空连接秒退)
+        let done = tokio::time::timeout(SHUTDOWN_DEADLINE, join).await;
+        assert!(
+            done.is_ok(),
+            "serve join 应在 SHUTDOWN_DEADLINE 内完成 (drain 后)"
+        );
+        // socket 文件应被 serve 清理
+        assert!(!Path::new(&sock).exists(), "shutdown 后 sock 应被清理");
+    }
+
+    // C-OPS-03: in-flight 连接在 shutdown 时被 drain (join 完成, 非孤儿)。
+    // 起一个 sleep 长命令 → 触发 shutdown → drain 超时 abort 该连接 (其内子进程
+    // 由 sandbox 退出 kill)。验证: serve join 在 deadline+缓冲 内完成。
+    #[tokio::test]
+    async fn shutdown_drains_inflight_connection() {
+        let sock = tmp_sock("drain");
+        let server = IpcServer::new();
+        let (_tx, join) = server.serve(&sock).await.unwrap();
+        // 起长命令 (sleep 30s, 不等响应 — 慢请求占连接)
+        let mut long_conn = UnixStream::connect(&sock).await.unwrap();
+        long_conn
+            .write_all(
+                (r#"{"jsonrpc":"2.0","id":1,"method":"executor.execute","params":{"command":"python3 -c 'import time; time.sleep(30)'","timeout_sec":30}}"#
+                    .to_string()
+                    + "\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        // 确认命令已派发 (health 走另一连接)
+        let h = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":2,"method":"executor.health","params":{}}"#,
+        )
+        .await;
+        assert_eq!(h["result"]["ok"], true);
+        // 触发 shutdown → drain in-flight (长命令连接超 10s → abort)
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":3,"method":"executor.shutdown","params":{}}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["shutting_down"], true);
+        // drain deadline 10s + abort 缓冲: serve join 应在 ~12s 内完成
+        let done = tokio::time::timeout(Duration::from_secs(12), join).await;
+        assert!(
+            done.is_ok(),
+            "serve join 应在 drain deadline+缓冲内完成 (in-flight abort 后)"
+        );
+        drop(long_conn);
         let _ = std::fs::remove_file(&sock);
     }
 }

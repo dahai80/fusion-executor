@@ -76,6 +76,7 @@ def test_health_over_uds(server: str):
     assert resp["id"] == 1
     assert resp["result"]["ok"] is True
     assert resp["result"]["ax_trusted"] is True
+    assert resp["result"]["seatbelt_default_off"] is True  # C-SEC-02
     assert "version" in resp["result"]
 
 
@@ -107,6 +108,30 @@ def test_execute_diagnostics_over_uds(server: str):
 def test_unknown_method_over_uds(server: str):
     resp = _rpc(server, {"jsonrpc": "2.0", "id": 4, "method": "nope", "params": {}})
     assert resp["error"]["code"] == -32601
+
+
+def test_metrics_over_uds(server: str):
+    # C-OPS-05b: 先跑一次成功命令累计数, 再读 metrics 快照
+    _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "executor.execute", "params": {"command": "echo hi"}})
+    resp = _rpc(server, {"jsonrpc": "2.0", "id": 3, "method": "executor.metrics", "params": {}})
+    m = resp["result"]
+    assert m["exec_total"] >= 1
+    assert m["exec_success"] >= 1
+    assert isinstance(m["execute_duration_sec_avg"], (int, float))
+    assert isinstance(m["stdio_bytes_total"], int)
+    assert m["exec_blocked"] == 0
+    assert m["rollback_total"] == 0
+
+
+def test_metrics_wrapper_method(server: str):
+    # C-OPS-05b: Python FusionSandboxExecutor.metrics() 包装 UDS 调用
+    from fusion_executor import FusionSandboxExecutor
+
+    _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "executor.execute", "params": {"command": "echo hi"}})
+    ex = FusionSandboxExecutor(sock_path=server)
+    m = ex.metrics()
+    assert m["exec_total"] >= 1
+    assert m["exec_success"] >= 1
 
 
 def test_snapshot_rollback_over_uds(server: str, tmp_path: Path):

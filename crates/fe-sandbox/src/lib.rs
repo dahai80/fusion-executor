@@ -35,6 +35,26 @@ const KILL_GRACE_MS: u64 = 500;
 /// C-SB-02/03: kill 后收 reader 输出超时 — 子进程忽略信号时 reader 永不 EOF
 const READER_RECV_TIMEOUT_MS: u64 = 2000;
 
+/// C-PERF-02/C-SB-06: macOS openpty 进程级串行锁 — 高并发 (多线程 BLOCKING_RT 并发 execute,
+/// 或并行测试) 下 openpty 偶返 ENXIO (code -6, 无空闲 PTY 设备)。仅锁 openpty 设备分配临界区,
+/// pair 返回后立即释放; spawn/reader 不持锁 (不串行化命令执行, 仅防 PTY 分配竞态)。
+static PTY_OPEN_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+/// 开 PTY — 持 PTY_OPEN_LOCK 防 ENXIO 竞态。仅设备分配临界区, 返回 pair 后释放。
+fn open_pty_pair() -> Result<portable_pty::PtyPair> {
+    let _guard = PTY_OPEN_LOCK.lock().unwrap();
+    let pty_system = NativePtySystem::default();
+    pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("openpty 失败")
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SandboxResult {
     pub exit_code: i32,
@@ -103,7 +123,71 @@ impl Default for SandboxConfig {
 const SANDBOX_FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const SANDBOX_BASE_SHELL: &str = "/bin/sh";
 
-fn configure_env(cmd: &mut portable_pty::CommandBuilder, cfg: &SandboxConfig) {
+/// C-SEC-01: env_vars 总量上限 64KB — 防调用方灌超大 env 打爆子进程 env 缓冲 (OOM/Argument list too long)
+const ENV_VARS_TOTAL_CAP: usize = 64 * 1024;
+
+/// C-SEC-01: 危险 env 名 denylist — 命中即 fail-loud (沙箱逃逸向量, 无威胁模型可豁免)。
+///   - DYLD_*/LD_PRELOAD/LD_LIBRARY_PATH: 动态库注入, 加载恶意 .dylib/.so 进沙箱子进程
+///   - PYTHONPATH/PYTHONSTARTUP/PYTHONHOME: 解释器启动劫持, 自动执行 payload
+///   - NODE_OPTIONS/NODE_PATH: node --require / require() 路径劫持
+///   - PERL5OPT/RUBYOPT: 解释器自动加载
+///   - BASH_ENV/ENV/ZDOTDIR: 交互 shell 启动脚本劫持
+///   - PS1: 提示符展开命令替换 (`$(...)`) 执行
+fn is_dangerous_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with("DYLD_") {
+        return true;
+    }
+    matches!(
+        upper.as_str(),
+        "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "PYTHONPATH"
+            | "PYTHONSTARTUP"
+            | "PYTHONHOME"
+            | "NODE_OPTIONS"
+            | "NODE_PATH"
+            | "PERL5OPT"
+            | "RUBYOPT"
+            | "BASH_ENV"
+            | "ENV"
+            | "ZDOTDIR"
+            | "PS1"
+    )
+}
+
+/// C-SEC-01: 校验 cfg.env — 危险名 denylist + 64KB 总量上限。命中即 Err (fail-loud)。
+fn validate_env_vars(env: &std::collections::HashMap<String, String>) -> Result<()> {
+    let mut total: usize = 0;
+    for (k, v) in env {
+        if is_dangerous_env_name(k) {
+            warn!(env_name = %k, "C-SEC-01: 危险 env 名被拒 (沙箱逃逸向量)");
+            bail!(
+                "危险环境变量 '{}' 被拒 (C-SEC-01: 库注入/解释器劫持逃逸向量)",
+                k
+            );
+        }
+        // k + '=' + v, 溢出即 Err (防 usize 溢出绕过 cap)
+        let entry = k.len().saturating_add(1).saturating_add(v.len());
+        total = total.saturating_add(entry);
+        if total > ENV_VARS_TOTAL_CAP {
+            warn!(
+                total,
+                cap = ENV_VARS_TOTAL_CAP,
+                "C-SEC-01: env_vars 总量超 64KB 上限"
+            );
+            bail!(
+                "env_vars 总量 {} 字节超 {} 上限 (C-SEC-01: env 缓冲 OOM 防护)",
+                total,
+                ENV_VARS_TOTAL_CAP
+            );
+        }
+    }
+    Ok(())
+}
+
+fn configure_env(cmd: &mut portable_pty::CommandBuilder, cfg: &SandboxConfig) -> Result<()> {
+    validate_env_vars(&cfg.env)?;
     if !cfg.inherit_env {
         cmd.env_clear();
         let path = std::env::var("PATH").unwrap_or_else(|_| SANDBOX_FALLBACK_PATH.to_string());
@@ -118,11 +202,13 @@ fn configure_env(cmd: &mut portable_pty::CommandBuilder, cfg: &SandboxConfig) {
     for (k, v) in &cfg.env {
         cmd.env(k, v);
     }
+    Ok(())
 }
 
 /// Issue #4: stdio 后端环境配置 — 与 configure_env 同语义 (env_clear + 基线 + env_vars),
 /// 但作用于 std::process::Command (非 portable-pty CommandBuilder)。
-fn configure_std_env(cmd: &mut std::process::Command, cfg: &SandboxConfig) {
+fn configure_std_env(cmd: &mut std::process::Command, cfg: &SandboxConfig) -> Result<()> {
+    validate_env_vars(&cfg.env)?;
     if !cfg.inherit_env {
         cmd.env_clear();
         let path = std::env::var("PATH").unwrap_or_else(|_| SANDBOX_FALLBACK_PATH.to_string());
@@ -137,6 +223,7 @@ fn configure_std_env(cmd: &mut std::process::Command, cfg: &SandboxConfig) {
     for (k, v) in &cfg.env {
         cmd.env(k, v);
     }
+    Ok(())
 }
 
 /// Issue #4: 收 reader 线程输出 — kill 后 reader 可能永不 EOF, recv_timeout 兜底
@@ -175,17 +262,11 @@ impl Sandbox {
         if !cfg.use_pty {
             return self.run_stdio(cfg).await;
         }
+        // C-SEC-01: env_vars 早校验 — openpty 前 fail-loud, 拦截不浪费 PTY 资源 (defense-in-depth)
+        validate_env_vars(&cfg.env)?;
         info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run (PTY)");
 
-        let pty_system = NativePtySystem::default();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("openpty 失败")?;
+        let pair = open_pty_pair()?;
 
         // Blocker 1 / 1.1: seatbelt=true → sandbox-exec 包装 (禁网 + 危险二进制 execve deny)
         // Issue #3: max_nproc/max_cpu_sec 经 wrap_rlimits 注入 ulimit 到 sh -c 脚本
@@ -194,7 +275,7 @@ impl Sandbox {
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
-        configure_env(&mut cmd, &cfg);
+        configure_env(&mut cmd, &cfg)?;
 
         let mut child = pair
             .slave
@@ -281,7 +362,7 @@ impl Sandbox {
             }
             _ = sleep => {
                 warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组");
-                let exit = kill_tree(pid);
+                let exit = kill_tree_async(pid).await;
                 drop(_writer);
                 drop(pair.master);
                 (true, exit)
@@ -322,13 +403,15 @@ impl Sandbox {
     /// 非 PTY: 丢失 ANSI/Traceback 保真, 但满足 FR-03 双工捕获 + Slicer 直接吃 stderr。
     /// 复用截断/OOM-cap/超时/SIGINT→SIGKILL 进程树杀语义 (与 PTY run() 等价)。
     async fn run_stdio(&self, cfg: SandboxConfig) -> Result<SandboxResult> {
+        // C-SEC-01: env_vars 早校验 — spawn 前 fail-loud (defense-in-depth, 与 PTY 路径一致)
+        validate_env_vars(&cfg.env)?;
         info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run (stdio, 分离 stdout/stderr)");
         let mut cmd =
             seatbelt::build_std_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
         if let Some(cwd) = &cfg.cwd {
             cmd.current_dir(cwd);
         }
-        configure_std_env(&mut cmd, &cfg);
+        configure_std_env(&mut cmd, &cfg)?;
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -421,7 +504,7 @@ impl Sandbox {
             }
             _ = sleep => {
                 warn!(?pid, timeout_sec = effective_timeout, "超时 (stdio), kill 进程组");
-                let exit = kill_tree(pid);
+                let exit = kill_tree_async(pid).await;
                 (true, exit)
             }
         };
@@ -465,24 +548,18 @@ impl Sandbox {
             });
             return Ok((rx, handle));
         }
+        // C-SEC-01: env_vars 早校验 — openpty 前 fail-loud, 拦截不浪费 PTY 资源
+        validate_env_vars(&cfg.env)?;
         info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run_streaming");
 
-        let pty_system = NativePtySystem::default();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("openpty 失败")?;
+        let pair = open_pty_pair()?;
 
         let mut cmd =
             seatbelt::build_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
-        configure_env(&mut cmd, &cfg);
+        configure_env(&mut cmd, &cfg)?;
 
         let mut child = pair
             .slave
@@ -598,7 +675,7 @@ impl Sandbox {
                     }
                     _ = tokio::time::sleep(timeout_dur) => {
                         warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组 (streaming)");
-                        let exit = kill_tree(pid);
+                        let exit = kill_tree_async(pid).await;
                         drop(_writer);
                         drop(pair.master);
                         (true, exit)
@@ -621,7 +698,7 @@ impl Sandbox {
                     // Blocker 6: 消费者断开 outer_rx (即使无输出静默期) → closed() 就绪 → kill 子进程
                     _ = outer_tx.closed() => {
                         warn!(?pid_for_cancel, "streaming 消费者断开 (closed), kill 子进程防孤儿 (Blocker 6)");
-                        let _ = kill_tree(pid_for_cancel);
+                        let _ = kill_tree_async(pid_for_cancel).await;
                         cancelled = true;
                         break;
                     }
@@ -631,7 +708,7 @@ impl Sandbox {
                                 // Blocker 6: send 失败 = 消费者断开 outer_rx → kill 子进程, 跳出
                                 if outer_tx.send(StreamEvent::Chunk { data: c }).await.is_err() {
                                     warn!(?pid_for_cancel, "streaming 消费者断开, kill 子进程防孤儿 (Blocker 6)");
-                                    let _ = kill_tree(pid_for_cancel);
+                                    let _ = kill_tree_async(pid_for_cancel).await;
                                     cancelled = true;
                                     break;
                                 }
@@ -876,25 +953,33 @@ pub fn kill_tree(pid: Option<u32>) -> i32 {
     -124
 }
 
+/// C-PERF-02: async 进程树杀 — 把 kill_tree 的 500ms grace sleep 移出 worker 线程。
+/// kill_tree 内 `std::thread::sleep(KILL_GRACE_MS)` 直接阻塞 tokio worker, 高并发下
+/// 多条超时命令串行占满 worker 池 (worker_threads 默认仅 available_parallelism)。
+/// spawn_blocking 把阻塞段丢给专用阻塞线程池, worker 线程 grace 期间空闲可服务其他任务。
+/// 返回 -124 (超时约定) 或 JoinHandle panic 兜底 -1。
+/// 同步 kill_tree 保留给 fe-shell (std::thread 无 tokio runtime, 不可 await)。
+pub async fn kill_tree_async(pid: Option<u32>) -> i32 {
+    match tokio::task::spawn_blocking(move || kill_tree(pid)).await {
+        Ok(exit) => exit,
+        Err(e) => {
+            warn!("kill_tree_async: spawn_blocking panic: {e}");
+            -1
+        }
+    }
+}
+
 /// #1 fe-shell 复用: PTY spawn 事务 — openpty + seatbelt::build_command + cwd + configure_env + spawn
 /// 返回 (pid, master_reader, master_writer, child)。调用方 (fe-shell) 自管 reader 线程 + child.wait
 /// 纯 spawn, 不含 reader/timeout/exit 协调 — 那些 run_streaming 自有, 此处仅事务性 setup
 pub fn spawn_pty(cfg: &SandboxConfig) -> Result<SpawnedPty> {
-    let pty_system = NativePtySystem::default();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("spawn_pty: openpty 失败")?;
+    let pair = open_pty_pair().context("spawn_pty: openpty 失败")?;
     let mut cmd =
         seatbelt::build_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
     if let Some(cwd) = &cfg.cwd {
         cmd.cwd(cwd);
     }
-    configure_env(&mut cmd, cfg);
+    configure_env(&mut cmd, cfg)?;
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -940,6 +1025,12 @@ mod tests {
             .unwrap()
     }
 
+    // 串行化所有 std::env::set_var/remove_var 测试 — Rust 默认多线程并行跑测试,
+    // 全局 env mutation 并发竞态 (线程A set_var 后线程B spawn 读到不一致状态)。
+    // openpty ENXIO 竞态已由生产级 PTY_OPEN_LOCK (open_pty_pair) 解决, 无需测试侧再串行 PTY。
+    static ENV_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
     fn cfg(cmd: &str) -> SandboxConfig {
         SandboxConfig {
             command: cmd.to_string(),
@@ -968,6 +1059,7 @@ mod tests {
     // Issue #9: env 隔离 — 默认 env_clear + 基线, 宿主密钥不泄漏; env_vars 注入; inherit_env 继承
     #[test]
     fn run_env_isolation_strips_host_secret_by_default() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::set_var("FE_TEST_SECRET", "leak-me-please");
         let reflect = "python3 -c \"import os;print(os.environ.get('FE_TEST_SECRET','CLEAN'))\"";
         let r = rt().block_on(Sandbox::new().run(cfg(reflect))).unwrap();
@@ -1004,6 +1096,7 @@ mod tests {
 
     #[test]
     fn run_env_inherit_true_restores_host_env() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::set_var("FE_TEST_SECRET", "leak-me-please");
         let reflect = "python3 -c \"import os;print(os.environ.get('FE_TEST_SECRET','CLEAN'))\"";
         let mut c = cfg(reflect);
@@ -1540,5 +1633,92 @@ mod tests {
             r.stdout
         );
         assert!(r.stdout.contains("no-rlimit-injected"));
+    }
+
+    // C-SEC-01: env_vars 危险名 denylist + 64KB 上限
+    fn env_cfg(cmd: &str, env: &[(&str, &str)]) -> SandboxConfig {
+        let mut e = std::collections::HashMap::new();
+        for (k, v) in env {
+            e.insert((*k).to_string(), (*v).to_string());
+        }
+        SandboxConfig {
+            command: cmd.to_string(),
+            timeout_sec: 10.0,
+            env: e,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn c_sec01_dangerous_env_names_rejected() {
+        let cases = [
+            "DYLD_INSERT_LIBRARIES",
+            "dyld_library_path", // 大小写不敏感
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PYTHONHOME",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "PERL5OPT",
+            "RUBYOPT",
+            "BASH_ENV",
+            "ENV",
+            "ZDOTDIR",
+            "PS1",
+        ];
+        for name in cases {
+            let err = validate_env_vars(
+                &[(name.to_string(), "/tmp/evil".to_string())]
+                    .into_iter()
+                    .collect(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("C-SEC-01"),
+                "{} 应被 C-SEC-01 拦, 实际: {}",
+                name,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn c_sec01_safe_env_names_pass() {
+        let env: std::collections::HashMap<_, _> = [
+            ("FOO".to_string(), "bar".to_string()),
+            ("MY_PROJECT_DIR".to_string(), "/tmp/p".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        validate_env_vars(&env).expect("安全 env 名应通过");
+    }
+
+    #[test]
+    fn c_sec01_env_total_cap_64kb() {
+        // 单条 64KB+1 → 超 cap 拒
+        let big = "X".repeat(ENV_VARS_TOTAL_CAP);
+        let env: std::collections::HashMap<_, _> =
+            [("SAFE_BUT_HUGE".to_string(), big)].into_iter().collect();
+        let err = validate_env_vars(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("C-SEC-01"),
+            "超 cap 应 C-SEC-01 拦: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn c_sec01_dylod_injection_blocked_at_run() {
+        // 验收标准 §5.1: "注入 DYLD 被拦" — 真 run() 路径, 非仅单测
+        let cfg = env_cfg("echo hi", &[("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib")]);
+        let err = rt().block_on(Sandbox::new().run(cfg)).unwrap_err();
+        assert!(
+            err.to_string().contains("C-SEC-01"),
+            "DYLD 注入应被 run() 拦: {}",
+            err
+        );
     }
 }

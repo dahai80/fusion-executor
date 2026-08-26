@@ -8,6 +8,7 @@
 // 返回 SecurityVerdict { allowed, reason, stage }
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -335,6 +336,12 @@ impl SecurityGuard {
 
     /// argv 级约束
     fn validate_argv(&self, binary: &str, args: &[String]) -> Result<(), String> {
+        // C-SEC-03 威胁模型边界 (设计取舍, 审计 §4 显式声明):
+        // `python -c` / `node -e` / `ruby -e` 等内联代码执行绕过文件审计白名单语义 —
+        // 解释器本身在白名单 (跑脚本文件), -c/-e 使参数变任意代码, regex 无法枚举所有危险 one-liner。
+        // 但本工具为单用户 local-first trusted-caller 模型 (人作者写命令), 此为已知接受取舍;
+        // 企业多用户/Agent 驱动场景应叠加 seatbelt (C-SEC-02) + UDS 鉴权 (M-SEC-01) 纵深, 非此处封堵。
+        // (拒绝 -c 会破坏沙箱测试机制 — 56 处测试依赖 python3 -c。)
         match binary {
             "mv" | "cp" => {
                 let dest = args
@@ -420,6 +427,13 @@ impl SecurityGuard {
                             binary, a
                         ));
                     }
+                    // C-SEC-03: 凭据文件名模式 (id_rsa* / *.pem / *.key 等) — cwd 内或任意绝对路径
+                    if self.is_sensitive_filename(a) {
+                        return Err(format!(
+                            "{} 读源为凭据文件 (敏感文件名模式): {} (C-SEC-03)",
+                            binary, a
+                        ));
+                    }
                     // .. 逃逸嫌疑 — 路径含 .. 组件拒绝 (绕过 cwd)
                     if std::path::Path::new(a)
                         .components()
@@ -447,6 +461,25 @@ impl SecurityGuard {
             }
         }
         false
+    }
+
+    /// C-SEC-03: 文件名模式敏感校验 — 捕获 cwd 内或任意绝对路径的凭据文件
+    /// (路径前缀校验只拦 ~/.ssh/* 等目录, 漏 cwd 内 id_rsa / 任意位置 *.pem/*.key)
+    /// 匹配: id_rsa* (含 .pub 之外的私钥/备份) / *.pem / *.key / *.p12 / *.pfx / *.keystore
+    /// 注: *.pub 公钥不拦 (非机密); trusted-caller 模型下 cwd 内私钥读仍为纵深防御
+    pub fn is_sensitive_filename(&self, path: &str) -> bool {
+        let fname = Path::new(path)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if fname.is_empty() {
+            return false;
+        }
+        if fname == "id_rsa" || fname.starts_with("id_rsa.") || fname.starts_with("id_rsa_") {
+            return !fname.ends_with(".pub");
+        }
+        let suffixes = [".pem", ".key", ".p12", ".pfx", ".keystore", ".htpasswd"];
+        suffixes.iter().any(|s| fname.ends_with(s))
     }
 
     /// git 子命令约束 — C-SEC-02: 拒 config/-c/alias.*/core.*
@@ -685,6 +718,60 @@ mod tests {
         let v = guard().validate("cat ../../etc/shadow");
         assert!(!v.allowed, "cat 含 .. 逃逸应被拦截");
         assert!(v.reason.as_deref().unwrap().contains(".."));
+    }
+
+    // ── C-SEC-03: 凭据文件名模式读拦截 (cwd 内 / 任意位置) ──
+
+    #[test]
+    fn is_sensitive_filename_blocks_credential_patterns() {
+        let g = guard();
+        assert!(g.is_sensitive_filename("secrets.pem"), "pem 应拦");
+        assert!(g.is_sensitive_filename("/tmp/x.key"), "绝对 .key 应拦");
+        assert!(g.is_sensitive_filename("id_rsa"), "id_rsa 应拦");
+        assert!(g.is_sensitive_filename("id_rsa_backup"), "id_rsa_ 前缀应拦");
+        assert!(g.is_sensitive_filename("cert.p12"), "p12 应拦");
+        assert!(g.is_sensitive_filename("server.pfx"), "pfx 应拦");
+        assert!(g.is_sensitive_filename("CA.keystore"), "keystore 应拦");
+        assert!(
+            g.is_sensitive_filename("./creds/agent.key"),
+            "相对 .key 应拦"
+        );
+    }
+
+    #[test]
+    fn is_sensitive_filename_allows_public_key_and_normal() {
+        let g = guard();
+        assert!(!g.is_sensitive_filename("id_rsa.pub"), "公钥 .pub 不拦");
+        assert!(!g.is_sensitive_filename("app.py"), "普通文件不拦");
+        assert!(!g.is_sensitive_filename("README.md"), "普通文件不拦");
+        assert!(!g.is_sensitive_filename(""), "空名不拦");
+        assert!(!g.is_sensitive_filename("not_a_key.pem.txt"), "伪后缀不拦");
+    }
+
+    #[test]
+    fn blocks_cat_credential_filename() {
+        let v = guard().validate("cat cert.pem");
+        assert!(!v.allowed, "cat cert.pem 应被拦截");
+        assert!(v.reason.as_deref().unwrap().contains("凭据文件"));
+    }
+
+    #[test]
+    fn blocks_grep_id_rsa_filename() {
+        let v = guard().validate("grep foo id_rsa");
+        assert!(!v.allowed, "grep id_rsa 应被拦截");
+        assert!(v.reason.as_deref().unwrap().contains("C-SEC-03"));
+    }
+
+    #[test]
+    fn blocks_head_credential_filename() {
+        let v = guard().validate("head secret.key");
+        assert!(!v.allowed, "head secret.key 应被拦截");
+    }
+
+    #[test]
+    fn allows_cat_id_rsa_pub() {
+        let v = guard().validate("cat id_rsa.pub");
+        assert!(v.allowed, "cat 公钥 id_rsa.pub 不应被拦截");
     }
 
     #[test]

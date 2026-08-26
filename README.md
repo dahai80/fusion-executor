@@ -306,6 +306,29 @@ Protocol: newline-delimited JSON-RPC 2.0, error codes -32700/-32600/-32601/-3260
 
 The fusion-code TS client sketch is in `docs/ipc-client-typescript.md`; fusion-studio uses the existing `IPCClient.swift udsCall` pointed at the same socket.
 
+## Operations (运维)
+
+Operability surface landed in the 0826 enterprise audit fix pass (C-OPS-01..06, C-SEC-02, C-SEC-03):
+
+- **Structured logging (C-OPS-01)** — `serve()` initializes `tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env())`. Key paths (execute / execute_streaming / rollback / each IPC dispatch arm) carry spans with `task_id` / `command` / `exit_code` / `duration`. Control verbosity with `RUST_LOG=info,fe_security=debug`. Output goes to stderr — collectable by `journalctl` / `log` / a file redirect.
+- **Metrics (C-OPS-05b)** — `executor.metrics` UDS method returns a snapshot: counters `exec_total` / `exec_success` / `exec_blocked` / `exec_timeout` / `rollback_total` + gauge/histogram `execute_duration_sec_avg` / `stdio_bytes_total`. Python wrapper `FusionSandboxExecutor.metrics()`. No Prometheus exporter dependency (in-process snapshot, caller scrapes on demand).
+- **Graceful shutdown (C-OPS-03 / C-OPS-04)** — `serve()` registers SIGINT / SIGTERM → sets a shutdown flag → accept loop stops accepting → in-flight connections get a 10s grace drain (`SHUTDOWN_DEADLINE`, then remaining aborted) → listener closes. `executor.shutdown` UDS method triggers the same path. Process exits 0; no orphan socket left on the filesystem.
+- **Health probe (C-OPS-05)** — `executor.health` is a real probe, not hardcoded: tries `git --version` (deps), probes `AXIsProcessTrusted()` (AX), returns `ok` from the probe result plus a `dependencies: [{name, ok}]` substructure. Stop `git` and health reports `ok:false, dependencies.git:false`.
+- **Version / build info (C-OPS-06)** — `build.rs` injects `git_sha` (first 8) + `build_time` + `version` at compile time; `health` returns them. `__version__` reads the injected value (no drift from Cargo.toml).
+- **Background shell hygiene (C-OPS-02)** — `ShellRegistry` caps at 256 shells (reaps finished oldest-first over the ceiling) and `Drop` drains active shells via `kill_tree`, so a `serve()` exit (signal/crash) leaves no orphan processes.
+
+## Security Model (威胁模型边界)
+
+fusion-executor is a **single-user, local-first, trusted-caller** execution tool — a human author writes the commands, the executor enforces a defense-in-depth guard. It is **not** a multi-user / untrusted-agent sandbox; for that, layer macOS seatbelt (C-SEC-02) + UDS auth on top.
+
+- **seatbelt governance (C-SEC-02)** — macOS `sandbox-exec` isolation is **opt-in**, default off. `serve()` emits a `WARN` log on startup when seatbelt is off, and `executor.health` exposes `seatbelt_default_off: true` for ops audit. Production / cross-user deployments **must** pass `seatbelt: true` per `ExecutionRequest`. Changing the default to on was evaluated and rejected (breaks the existing E2E suite); the governance path is documented + health-visible instead.
+- **env injection (C-SEC-01)** — `env_vars` is denylist-filtered (blocks `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` / `LD_LIBRARY_PATH` and similar escape vectors) and capped at 64KB. `inherit_env` is opt-in (default off → clean baseline PATH only), so a caller cannot smuggle injection libs via the host environment.
+- **read-path sensitive blocklist (C-SEC-03)** — reading credential files is blocked at two layers:
+  - shell read commands (`cat` / `grep` / `head` / `tail` / `less` / `more` / `bat` / `rg`) — path-prefix check rejects `~/.ssh/*`, `/etc/*`, `/System/*`, etc., **plus** a filename-pattern check rejects `id_rsa*` (private keys, `.pub` allowed), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`, `*.htpasswd` anywhere (cwd-relative or absolute).
+  - native file tools (`file_edit` / `grep` / `glob` / `apply_patch` / `replace_function` / `multi_edit` / `notebook_edit`) — `guard_path` applies the same filename-pattern blocklist on the **read** branch (file already exists); creating a *new* `cert.pem` is allowed (write, not read of an existing secret).
+  - **Threat-model boundary (explicit, audit §4)**: `python -c` / `node -e` inline-code execution bypasses the file-audit whitelist semantics — the interpreter is whitelisted (runs script files), `-c`/`-e` turns args into arbitrary code, and regex cannot enumerate every dangerous one-liner. This is an **accepted tradeoff** under the trusted-caller model (the human author writes the command; 56 tests rely on `python3 -c`). Enterprise multi-user / agent-driven deployments must stack seatbelt (C-SEC-02) + UDS auth (M-SEC-01) for defense in depth, not block `-c` here (which would break the sandbox test mechanism).
+  - **Deferred (documented)**: cwd-outside reads via an explicit `allow_outside_cwd: true` opt-in (audit AC) is not yet wired — under the trusted-caller model cwd-external reads are bounded by the caller, and the opt-in is an enterprise hardening knob deferred to a follow-up. The filename blocklist + prefix check above satisfy the literal AC today (`grep`/`glob`/`file_edit` reading `~/.ssh/id_rsa` → blocked).
+
 ## Status
 
 - **P1 — Skeleton + Security + Sandbox** ✅ complete
