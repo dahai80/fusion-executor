@@ -41,6 +41,8 @@ use fe_core::gui::GuiAction;
 use fe_core::TelemetryStreamConfig;
 use fe_core::{Diagnostics, ExecutionRequest, ExecutionResult, Executor};
 
+pub mod logging;
+
 /// 默认 socket 目录 — M-SEC-01: 私有 0o700 目录 (非全局可扫描 /tmp)。
 /// 同主机他 UID 无法进入该目录 → 无法 connect socket, 阻跨 UID 越权。
 /// 仍可经 FUSION_EXECUTOR_SOCK 覆盖回 /tmp (用户显式 opt-in, 自担风险)。
