@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 
 use fe_core::gui::{GuiAction, GuiResult as RsGuiResult};
+use fe_core::shell::{ShellStartParams, ShellStartResult as RsShellStartResult};
 use fe_core::telemetry::{TelemetryConfig, TelemetrySample};
 use fe_core::tools::{
     EditResult as RsEditResult, GlobEntry as RsGlobEntry, GrepMatch as RsGrepMatch,
@@ -279,7 +280,71 @@ impl PyGrepOutput {
     }
 }
 
-/// 流式迭代器 — 消费 tokio mpsc<ExecutionStreamEvent>, 每次 __next__ 返回一帧 dict
+/// Python 可见 shell 启动结果 — 镜像 fe_shell::ShellStartResult (#1)
+/// raw serde 透传; 安全校验在 fe-core (blocked_by_security=true 时 shell_id=None)
+#[pyclass(name = "NativeShellStartResult", skip_from_py_object)]
+struct PyShellStartResult {
+    raw: String,
+}
+
+#[pymethods]
+impl PyShellStartResult {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let json = py.import("json")?;
+        Ok(json.call_method1("loads", (self.raw.clone(),))?.unbind())
+    }
+
+    #[getter]
+    fn ok(&self) -> PyResult<bool> {
+        let v: serde_json::Value = serde_json::from_str(&self.raw)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化错误: {e}")))?;
+        Ok(v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false))
+    }
+
+    #[getter]
+    fn shell_id(&self) -> PyResult<Option<String>> {
+        let v: serde_json::Value = serde_json::from_str(&self.raw)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化错误: {e}")))?;
+        Ok(v.get("shell_id").and_then(|s| s.as_str()).map(String::from))
+    }
+}
+
+/// Python 可见 shell 轮询结果 — 镜像 fe_shell::ShellOutput (#1)
+#[pyclass(name = "NativeShellOutput", skip_from_py_object)]
+struct PyShellOutput {
+    raw: String,
+}
+
+#[pymethods]
+impl PyShellOutput {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let json = py.import("json")?;
+        Ok(json.call_method1("loads", (self.raw.clone(),))?.unbind())
+    }
+
+    #[getter]
+    fn running(&self) -> PyResult<bool> {
+        let v: serde_json::Value = serde_json::from_str(&self.raw)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化错误: {e}")))?;
+        Ok(v.get("running").and_then(|b| b.as_bool()).unwrap_or(false))
+    }
+}
+
+/// Python 可见 shell 信息 — 镜像 fe_shell::ShellInfo (#1)
+#[pyclass(name = "NativeShellInfo", skip_from_py_object)]
+#[derive(Clone)]
+struct PyShellInfo {
+    raw: String,
+}
+
+#[pymethods]
+impl PyShellInfo {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let json = py.import("json")?;
+        Ok(json.call_method1("loads", (self.raw.clone(),))?.unbind())
+    }
+}
+
 /// chunk: {"type":"chunk","data":"..."} / done: {"type":"done","result":{...ExecutionResult}}
 /// 通道关闭 → StopIteration
 #[pyclass(name = "NativeStreamIterator", skip_from_py_object)]
@@ -743,6 +808,104 @@ impl PyExecutor {
         }
     }
 
+    /// shell_start(command, cwd=None, env_vars=None, task_id=None, max_output_chars=100000,
+    ///             seatbelt=False, inherit_env=False, max_nproc=1024, max_cpu_sec=0)
+    /// -> NativeShellStartResult — 后台持久 shell 启动 (#1, run_in_background parity)
+    /// 安全校验在 fe-core (fail-closed); blocked → ok=false, shell_id=None
+    #[pyo3(signature = (
+        command,
+        cwd=None,
+        env_vars=None,
+        task_id=None,
+        max_output_chars=100_000,
+        seatbelt=false,
+        inherit_env=false,
+        max_nproc=1024,
+        max_cpu_sec=0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn shell_start(
+        &self,
+        py: Python<'_>,
+        command: String,
+        cwd: Option<String>,
+        env_vars: Option<&Bound<'_, PyAny>>,
+        task_id: Option<String>,
+        max_output_chars: usize,
+        seatbelt: bool,
+        inherit_env: bool,
+        max_nproc: u32,
+        max_cpu_sec: u32,
+    ) -> PyResult<Py<PyShellStartResult>> {
+        let env: std::collections::HashMap<String, String> = match env_vars {
+            Some(obj) => {
+                let json_mod = py.import("json")?;
+                let s: String = json_mod
+                    .call_method1("dumps", (obj,))?
+                    .extract()
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "env_vars 序列化失败: {e}"
+                        ))
+                    })?;
+                serde_json::from_str(&s).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("env_vars 解析失败: {e}"))
+                })?
+            }
+            None => std::collections::HashMap::new(),
+        };
+        let sp = ShellStartParams {
+            command,
+            cwd,
+            env,
+            task_id,
+            max_output_chars,
+            seatbelt,
+            inherit_env,
+            max_nproc,
+            max_cpu_sec,
+        };
+        let r: RsShellStartResult = self.inner.shell_start(sp);
+        let raw = serde_json::to_string(&r)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化失败: {e}")))?;
+        Py::new(py, PyShellStartResult { raw })
+    }
+
+    /// shell_output(shell_id) -> NativeShellOutput — 轮询 tail 快照 + 运行/退出状态 (#1)
+    fn shell_output(&self, py: Python<'_>, shell_id: String) -> PyResult<Py<PyShellOutput>> {
+        match self.inner.shell_output(&shell_id) {
+            Ok(out) => {
+                let raw = serde_json::to_string(&out).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("序列化失败: {e}"))
+                })?;
+                Py::new(py, PyShellOutput { raw })
+            }
+            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "shell_output 失败: {e}"
+            ))),
+        }
+    }
+
+    /// kill_shell(shell_id) -> bool — kill 进程树 (#1, KillShell parity)
+    fn kill_shell(&self, shell_id: String) -> PyResult<bool> {
+        self.inner
+            .kill_shell(&shell_id)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("kill_shell 失败: {e}")))
+    }
+
+    /// list_shells() -> list[NativeShellInfo] — 列出全部后台 shell (#1)
+    fn list_shells(&self) -> PyResult<Vec<PyShellInfo>> {
+        let list = self.inner.list_shells();
+        let mut out = Vec::with_capacity(list.len());
+        for info in list {
+            let raw = serde_json::to_string(&info).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("序列化失败: {e}"))
+            })?;
+            out.push(PyShellInfo { raw });
+        }
+        Ok(out)
+    }
+
     /// multi_edit(path, edits, cwd=None) -> NativeEditResult
     /// 同文件顺序批量编辑, 原子 all-or-nothing
     fn multi_edit(
@@ -971,6 +1134,9 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGrepMatch>()?;
     m.add_class::<PyStreamIterator>()?;
     m.add_class::<PyTelemetryIterator>()?;
+    m.add_class::<PyShellStartResult>()?;
+    m.add_class::<PyShellOutput>()?;
+    m.add_class::<PyShellInfo>()?;
     m.add_class::<PyExecutor>()?;
     Ok(())
 }

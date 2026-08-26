@@ -165,3 +165,31 @@ class TelemetrySample(BaseModel):
     gpu_pct: float | None = Field(default=None, description="GPU 占用百分比 (调用方注入)")
     gpu_mem_mb: float | None = Field(default=None, description="GPU 显存占用 (MB, 调用方注入)")
     task_id: str | None = Field(default=None, description="关联任务 id")
+
+
+class ShellStartResult(BaseModel):
+    model_config = _STRICT
+    ok: bool = Field(description="是否启动成功")
+    shell_id: str | None = Field(default=None, description="后台 shell id (sh-N); 失败或被拦截时 None")
+    blocked_by_security: bool = Field(default=False, description="是否被安全守卫拦截")
+    security_reason: str | None = Field(default=None, description="拦截原因")
+    error: str | None = Field(default=None, description="启动错误")
+
+
+class ShellOutput(BaseModel):
+    model_config = _STRICT
+    shell_id: str = Field(description="后台 shell id")
+    output: str = Field(description="累积 tail 快照 (非增量; 调用方自去重)")
+    running: bool = Field(description="是否仍在运行")
+    exit_code: int | None = Field(default=None, description="退出码 (运行中为 None)")
+
+
+class ShellInfo(BaseModel):
+    model_config = _STRICT
+    shell_id: str = Field(description="后台 shell id")
+    pid: int | None = Field(default=None, description="子进程 pid")
+    task_id: str | None = Field(default=None, description="关联任务 id")
+    command: str = Field(description="启动命令")
+    started_at_ms: int = Field(description="启动时间戳 (毫秒纪元)")
+    finished: bool = Field(description="是否已退出")
+    exit_code: int | None = Field(default=None, description="退出码 (运行中为 None)")

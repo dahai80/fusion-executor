@@ -10,6 +10,7 @@ members = [
     "crates/fe-ipc",
     "crates/fe-tools",
     "crates/fe-telemetry",
+    "crates/fe-shell",
     "crates/fe-pyo3",
 ]
 
@@ -99,6 +100,7 @@ fe-diagnostics = { path = "crates/fe-diagnostics" }
 fe-ipc = { path = "crates/fe-ipc" }
 fe-tools = { path = "crates/fe-tools" }
 fe-telemetry = { path = "crates/fe-telemetry" }
+fe-shell = { path = "crates/fe-shell" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

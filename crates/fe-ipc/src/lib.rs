@@ -1203,6 +1203,80 @@ async fn handle_method(
                 .map_err(|e| (ERR_INTERNAL, format!("notebook_edit 失败: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
+        "executor.shell_start" => {
+            // #1: 后台持久 shell 启动 — 安全校验在 fe-core (fail-closed)
+            let command = param_str(&params, "command")
+                .ok_or((ERR_INVALID_REQ, "缺少 command".to_string()))?;
+            let cwd = params.get("cwd").and_then(|c| c.as_str()).map(String::from);
+            let task_id = params
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let env: std::collections::HashMap<String, String> = match params.get("env_vars") {
+                Some(v) => serde_json::from_value(v.clone())
+                    .map_err(|e| (ERR_INVALID_REQ, format!("env_vars 解析失败: {}", e)))?,
+                None => std::collections::HashMap::new(),
+            };
+            let max_output_chars = params
+                .get("max_output_chars")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(100_000);
+            let seatbelt = params
+                .get("seatbelt")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let inherit_env = params
+                .get("inherit_env")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let max_nproc = params
+                .get("max_nproc")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(1024);
+            let max_cpu_sec = params
+                .get("max_cpu_sec")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(0);
+            let sp = fe_core::shell::ShellStartParams {
+                command,
+                cwd,
+                env,
+                task_id,
+                max_output_chars,
+                seatbelt,
+                inherit_env,
+                max_nproc,
+                max_cpu_sec,
+            };
+            let r = executor.shell_start(sp);
+            Ok(serde_json::to_value(&r).unwrap_or(json!({})))
+        }
+        "executor.shell_output" => {
+            // #1: 轮询 tail 快照 + 运行/退出状态
+            let shell_id = param_str(&params, "shell_id")
+                .ok_or((ERR_INVALID_REQ, "缺少 shell_id".to_string()))?;
+            let out = executor
+                .shell_output(&shell_id)
+                .map_err(|e| (ERR_INTERNAL, format!("shell_output 失败: {}", e)))?;
+            Ok(serde_json::to_value(&out).unwrap_or(json!({})))
+        }
+        "executor.kill_shell" => {
+            // #1: kill 进程树 (KillShell parity)
+            let shell_id = param_str(&params, "shell_id")
+                .ok_or((ERR_INVALID_REQ, "缺少 shell_id".to_string()))?;
+            let ok = executor
+                .kill_shell(&shell_id)
+                .map_err(|e| (ERR_INTERNAL, format!("kill_shell 失败: {}", e)))?;
+            Ok(json!({ "ok": ok }))
+        }
+        "executor.list_shells" => {
+            // #1: 列出全部后台 shell
+            let list = executor.list_shells();
+            Ok(serde_json::to_value(&list).unwrap_or(json!({})))
+        }
         _ => Err((
             ERR_METHOD_NOT_FOUND,
             format!("Method not found: {}", method),
@@ -1926,6 +2000,82 @@ mod tests {
         }
         assert!(b_done, "B 应收到自己 done 帧");
         assert!(a_stdio, "task_ids 白名单匹配应收到 stdio 推送");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // Issue #1: 后台 shell 启停轮询 over UDS — shell_start→shell_output→kill_shell→list_shells
+    #[tokio::test]
+    async fn shell_start_output_kill_list_over_uds() {
+        let sock = tmp_sock("shell");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+
+        // 启动长任务
+        let start = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.shell_start","params":{"command":"python3 -c 'import time; time.sleep(30)'"}}"#,
+        )
+        .await;
+        assert_eq!(start["result"]["ok"], true);
+        let sid = start["result"]["shell_id"].as_str().unwrap().to_string();
+        assert!(sid.starts_with("sh-"));
+
+        // 轮询: 运行中, 无 exit_code
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let out = rpc(
+            &sock,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"executor.shell_output","params":{{"shell_id":"{}"}}}}"#,
+                sid
+            ),
+        )
+        .await;
+        assert_eq!(out["result"]["shell_id"], sid);
+        assert_eq!(out["result"]["running"], true);
+        assert!(out["result"]["exit_code"].is_null());
+
+        // kill
+        let kill = rpc(
+            &sock,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"executor.kill_shell","params":{{"shell_id":"{}"}}}}"#,
+                sid
+            ),
+        )
+        .await;
+        assert_eq!(kill["result"]["ok"], true);
+
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let after = rpc(
+            &sock,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"executor.shell_output","params":{{"shell_id":"{}"}}}}"#,
+                sid
+            ),
+        )
+        .await;
+        assert_eq!(after["result"]["running"], false, "kill 后应结束");
+
+        // list_shells 含本 shell
+        let list = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":5,"method":"executor.list_shells","params":{}}"#,
+        )
+        .await;
+        assert!(list["result"].is_array());
+        let arr = list["result"].as_array().unwrap();
+        assert!(arr.iter().any(|e| e["shell_id"] == sid));
+
+        // 拦截: rm -rf / → blocked_by_security, shell_id null
+        let blocked = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":6,"method":"executor.shell_start","params":{"command":"rm -rf /"}}"#,
+        )
+        .await;
+        assert_eq!(blocked["result"]["ok"], false);
+        assert_eq!(blocked["result"]["blocked_by_security"], true);
+        assert!(blocked["result"]["shell_id"].is_null());
+
         let _ = std::fs::remove_file(&sock);
     }
 }

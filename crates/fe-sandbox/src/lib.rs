@@ -6,7 +6,7 @@
 // OOM: 环形缓冲 cap = 2*effective_max; effective_max = max_output_chars.min(HARD_CEILING) 绝对上限
 // PTY 合并 stdout+stderr → 全入 stdout (stderr 空; traceback 在 tail 可读)
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
@@ -874,6 +874,59 @@ pub fn kill_tree(pid: Option<u32>) -> i32 {
     let _ = nix::sys::wait::waitpid(pid_nix, None);
 
     -124
+}
+
+/// #1 fe-shell 复用: PTY spawn 事务 — openpty + seatbelt::build_command + cwd + configure_env + spawn
+/// 返回 (pid, master_reader, master_writer, child)。调用方 (fe-shell) 自管 reader 线程 + child.wait
+/// 纯 spawn, 不含 reader/timeout/exit 协调 — 那些 run_streaming 自有, 此处仅事务性 setup
+pub fn spawn_pty(cfg: &SandboxConfig) -> Result<SpawnedPty> {
+    let pty_system = NativePtySystem::default();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("spawn_pty: openpty 失败")?;
+    let mut cmd =
+        seatbelt::build_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
+    if let Some(cwd) = &cfg.cwd {
+        cmd.cwd(cwd);
+    }
+    configure_env(&mut cmd, cfg);
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .context("spawn_pty: spawn_command 失败")?;
+    let pid = child.process_id();
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("spawn_pty: try_clone_reader 失败")?;
+    let writer = pair
+        .master
+        .take_writer()
+        .context("spawn_pty: take_writer 失败")?;
+    drop(pair.slave);
+    debug!(?pid, seatbelt = cfg.seatbelt, "spawn_pty 子进程已起");
+    Ok(SpawnedPty {
+        pid,
+        reader,
+        writer,
+        child,
+        master: pair.master,
+    })
+}
+
+/// spawn_pty 产物 — fe-shell 自管生命周期
+pub struct SpawnedPty {
+    pub pid: Option<u32>,
+    pub reader: Box<dyn Read + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// master 持有到 reader EOF — drop 前保 PTY 活; fe-shell reader 线程结束时 drop
+    pub master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
 #[cfg(test)]

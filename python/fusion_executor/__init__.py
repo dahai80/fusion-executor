@@ -15,6 +15,9 @@ from .models import (
     GuiResult,
     MultiEditItem,
     RollbackPolicy,
+    ShellInfo,
+    ShellOutput,
+    ShellStartResult,
     TelemetrySample,
 )
 
@@ -33,6 +36,9 @@ __all__ = [
     "GuiResult",
     "MultiEditItem",
     "RollbackPolicy",
+    "ShellInfo",
+    "ShellOutput",
+    "ShellStartResult",
     "Subscription",
     "TelemetrySample",
 ]
