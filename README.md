@@ -138,6 +138,8 @@ sub.unsubscribe()  # or sub.close()
 
 Persistent long-running shells with poll-based output capture (Claude Code `run_in_background` / `BashOutput` / `KillShell` parity). The new `fe-shell` crate owns a `ShellRegistry` (id → handle); each shell reuses `fe-sandbox::spawn_pty` for proven env/seatbelt/PTY setup, then runs self-managed reader (tail accumulator, OOM-capped) + waiter (child exit) threads. **Poll model** — `shell_output` returns the accumulated tail snapshot (not a delta); the caller de-duplicates. Live-tail via `BroadcastHub` is a future issue. Security is enforced in `fe-core` (fail-closed) before any spawn — `fe-shell` never validates commands.
 
+> **M-ARCH-1 (architecture):** `ShellRegistry` is owned by the IPC layer (`IpcServer`, alongside `BroadcastHub`) and by `PyExecutor` — **not** by the `Executor`. The `Executor` stays stateless per-task (CLAUDE.md contract): `shell_start` takes `&ShellRegistry` by reference and keeps the security check co-located; `shell_output`/`kill_shell`/`list_shells` are associated functions (no `&self`). `PyExecutor.serve()` shares its `Arc<ShellRegistry>` into the `IpcServer` via `with_executor_and_shells`, so the in-process path and the serve path see the **same** registry — a serve-path restart no longer drops background shell handles.
+
 ```python
 from fusion_executor import FusionSandboxExecutor, ShellStartResult, ShellOutput, ShellInfo
 

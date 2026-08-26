@@ -515,25 +515,59 @@ fn notification(sub_id: String, channel: &str, data: Value) -> Value {
     })
 }
 
-/// IPC 服务器 — 持有 Arc<Executor> + Arc<BroadcastHub>, 换行分隔 JSON-RPC 2.0 over UDS
+/// IPC 服务器 — 持有 Arc<Executor> + Arc<BroadcastHub> + Arc<ShellRegistry>,
+/// 换行分隔 JSON-RPC 2.0 over UDS。
+/// M-ARCH-1: ShellRegistry 移此层 (与 BroadcastHub 并列) — Executor 保持 per-task 无状态;
+/// IPC 层重启 Executor 不丢后台 shell 句柄; serve-path 与 in-process path 可共享同一 registry。
 pub struct IpcServer {
     executor: Arc<Executor>,
     hub: Arc<BroadcastHub>,
+    shells: Arc<fe_core::shell::ShellRegistry>,
 }
 
 impl IpcServer {
     pub fn new() -> Self {
-        info!("IpcServer::new() — 持有 Executor + BroadcastHub");
+        info!("IpcServer::new() — 持有 Executor + BroadcastHub + ShellRegistry");
         let executor = Arc::new(Executor::new());
         let hub = BroadcastHub::new(executor.clone());
-        Self { executor, hub }
+        let shells = Arc::new(fe_core::shell::ShellRegistry::new());
+        Self {
+            executor,
+            hub,
+            shells,
+        }
     }
 
     pub fn with_executor(executor: Executor) -> Self {
         info!("IpcServer::with_executor()");
         let executor = Arc::new(executor);
         let hub = BroadcastHub::new(executor.clone());
-        Self { executor, hub }
+        let shells = Arc::new(fe_core::shell::ShellRegistry::new());
+        Self {
+            executor,
+            hub,
+            shells,
+        }
+    }
+
+    /// M-ARCH-1: 共享调用方已持有的 registry — fe-pyo3 serve() 与 in-process path 见同一批 shell。
+    pub fn with_executor_and_shells(
+        executor: Executor,
+        shells: Arc<fe_core::shell::ShellRegistry>,
+    ) -> Self {
+        info!("IpcServer::with_executor_and_shells() — 共享 ShellRegistry");
+        let executor = Arc::new(executor);
+        let hub = BroadcastHub::new(executor.clone());
+        Self {
+            executor,
+            hub,
+            shells,
+        }
+    }
+
+    /// M-ARCH-1: 暴露 registry 引用 (health probe / dispatch 取用)。
+    pub fn shells(&self) -> &Arc<fe_core::shell::ShellRegistry> {
+        &self.shells
     }
 
     /// 解析 socket 路径 — 参数覆盖 > 环境变量 FUSION_EXECUTOR_SOCK > 默认
@@ -570,10 +604,11 @@ impl IpcServer {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let executor = self.executor.clone();
         let hub = self.hub.clone();
+        let shells = self.shells.clone();
         // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
         let drain_deadline = resolve_shutdown_timeout();
         let join = tokio::spawn(async move {
-            accept_loop(listener, executor, hub, shutdown_rx, drain_deadline).await;
+            accept_loop(listener, executor, hub, shells, shutdown_rx, drain_deadline).await;
             let _ = std::fs::remove_file(&path);
         });
         Ok((shutdown_tx, join))
@@ -589,6 +624,7 @@ impl IpcServer {
         let path = sock_path.to_string();
         let executor = self.executor.clone();
         let hub = self.hub.clone();
+        let shells = self.shells.clone();
         fe_core::BLOCKING_RT.block_on(async move {
             let p = Path::new(&path).to_path_buf();
             if p.exists() {
@@ -609,7 +645,7 @@ impl IpcServer {
             // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
             let drain_deadline = resolve_shutdown_timeout();
             // accept_loop 运行至 shutdown_notify (信号) 或 shutdown_rx 触发, 内部 drain in-flight
-            accept_loop(listener, executor, hub, rx, drain_deadline).await;
+            accept_loop(listener, executor, hub, shells, rx, drain_deadline).await;
             signal_task.abort();
             let _ = std::fs::remove_file(&p);
             Ok(())
@@ -659,6 +695,7 @@ async fn accept_loop(
     listener: UnixListener,
     executor: Arc<Executor>,
     hub: Arc<BroadcastHub>,
+    shells: Arc<fe_core::shell::ShellRegistry>,
     mut shutdown_rx: oneshot::Receiver<()>,
     drain_deadline: Duration,
 ) {
@@ -696,9 +733,10 @@ async fn accept_loop(
                         };
                         let ex = executor.clone();
                         let h = hub.clone();
+                        let sh = shells.clone();
                         let es = exec_sem.clone();
                         let handle = tokio::spawn(async move {
-                            handle_conn(stream, ex, h, es).await;
+                            handle_conn(stream, ex, h, sh, es).await;
                             drop(permit);
                         });
                         conns.lock().await.push(handle);
@@ -763,6 +801,7 @@ async fn handle_conn(
     stream: UnixStream,
     executor: Arc<Executor>,
     hub: Arc<BroadcastHub>,
+    shells: Arc<fe_core::shell::ShellRegistry>,
     exec_sem: Arc<Semaphore>,
 ) {
     let conn_id = hub.next_conn_id();
@@ -814,6 +853,7 @@ async fn handle_conn(
     let mut reader = BufReader::new(reader);
     let read_hub = hub.clone();
     let read_exec = executor.clone();
+    let read_shells = shells.clone();
     let read_push_tx = push_tx.clone();
     let read_writer = writer.clone();
     let read_close = close_tx;
@@ -870,10 +910,11 @@ async fn handle_conn(
         let w = read_writer.clone();
         let ex = read_exec.clone();
         let h = read_hub.clone();
+        let sh = read_shells.clone();
         let ptx = read_push_tx.clone();
         let es = exec_sem.clone();
         let handle = tokio::spawn(async move {
-            dispatch_request(&w, req_id, method, params, &ex, &h, conn_id, &ptx, &es).await;
+            dispatch_request(&w, req_id, method, params, &ex, &h, &sh, conn_id, &ptx, &es).await;
         });
         req_tasks.push(handle);
     }
@@ -896,6 +937,7 @@ async fn dispatch_request(
     params: Value,
     executor: &Arc<Executor>,
     hub: &Arc<BroadcastHub>,
+    shells: &Arc<fe_core::shell::ShellRegistry>,
     conn_id: u64,
     push_tx: &mpsc::Sender<Value>,
     exec_sem: &Arc<Semaphore>,
@@ -923,7 +965,8 @@ async fn dispatch_request(
         return;
     }
 
-    let resp = match handle_method(&method, params, executor, hub, conn_id, exec_sem).await {
+    let resp = match handle_method(&method, params, executor, hub, shells, conn_id, exec_sem).await
+    {
         Ok(r) => ok_resp(id, r),
         Err((code, msg)) => err_resp(id, code, &msg),
     };
@@ -1194,6 +1237,7 @@ async fn handle_method(
     params: Value,
     executor: &Arc<Executor>,
     hub: &Arc<BroadcastHub>,
+    shells: &Arc<fe_core::shell::ShellRegistry>,
     conn_id: u64,
     exec_sem: &Arc<Semaphore>,
 ) -> Result<Value, (i64, String)> {
@@ -1219,7 +1263,7 @@ async fn handle_method(
                 "dependencies": deps,
                 // M-OPS-04/M-OPS-05: 运维深度指标 — 连接数/worker 线程/活跃 shell/内存。
                 // 运维面板 + 负载均衡器据此判断实例负载与 shell 注册表水位。
-                "depth": probe_health_depth(executor, hub)
+                "depth": probe_health_depth(shells, hub)
             }))
         }
         "executor.execute" => {
@@ -1515,15 +1559,14 @@ async fn handle_method(
                 max_cpu_sec,
                 max_idle_sec,
             };
-            let r = executor.shell_start(sp);
+            let r = executor.shell_start(shells, sp);
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         "executor.shell_output" => {
             // #1: 轮询 tail 快照 + 运行/退出状态
             let shell_id = param_str(&params, "shell_id")
                 .ok_or((ERR_INVALID_REQ, "缺少 shell_id".to_string()))?;
-            let out = executor
-                .shell_output(&shell_id)
+            let out = Executor::shell_output(shells, &shell_id)
                 .map_err(|e| (ERR_INTERNAL, format!("shell_output 失败: {}", e)))?;
             Ok(serde_json::to_value(&out).unwrap_or(json!({})))
         }
@@ -1531,14 +1574,13 @@ async fn handle_method(
             // #1: kill 进程树 (KillShell parity)
             let shell_id = param_str(&params, "shell_id")
                 .ok_or((ERR_INVALID_REQ, "缺少 shell_id".to_string()))?;
-            let ok = executor
-                .kill_shell(&shell_id)
+            let ok = Executor::kill_shell(shells, &shell_id)
                 .map_err(|e| (ERR_INTERNAL, format!("kill_shell 失败: {}", e)))?;
             Ok(json!({ "ok": ok }))
         }
         "executor.list_shells" => {
             // #1: 列出全部后台 shell
-            let list = executor.list_shells();
+            let list = Executor::list_shells(shells);
             Ok(serde_json::to_value(&list).unwrap_or(json!({})))
         }
         _ => Err((
@@ -1585,16 +1627,18 @@ async fn probe_dependencies() -> Vec<Value> {
 /// M-OPS-04/M-OPS-05: health 深度指标 — 连接数/worker 线程数/活跃 shell 数/内存 (MB)。
 /// - connections: BroadcastHub.active_conns 原子快照 (无锁)。
 /// - workers: BLOCKING_RT worker_threads — 与 fe-core 初始化公式一致 (available_parallelism, 下限 2)。
-/// - active_shells: executor.list_shells().filter(!finished) 计数; M-OPS-05 接近 MAX_SHELLS 时 warn。
+/// - active_shells: Executor::list_shells(registry).filter(!finished) 计数; M-OPS-05 接近 MAX_SHELLS 时 warn。
 /// - mem_mb: 本进程 RSS via sysinfo (轻量单次 refresh, 无采样任务)。
-fn probe_health_depth(executor: &Executor, hub: &BroadcastHub) -> Value {
+///
+/// M-ARCH-1: registry 由 IpcServer 持有 (Executor 无状态), 经 dispatch_request 传引用。
+fn probe_health_depth(shells: &Arc<fe_core::shell::ShellRegistry>, hub: &BroadcastHub) -> Value {
     let connections = hub.active_conns.load(Ordering::Relaxed);
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
         .max(2);
-    let shells = executor.list_shells();
-    let active_shells = shells.iter().filter(|s| !s.finished).count();
+    let sh = Executor::list_shells(shells);
+    let active_shells = sh.iter().filter(|s| !s.finished).count();
     // M-OPS-05: 接近上限告警 (80%) — 防 registry 打满导致新 shell_start 被迫 reap。
     let max_shells = fe_core::shell::MAX_SHELLS;
     if max_shells > 0 && active_shells * 5 >= max_shells * 4 {

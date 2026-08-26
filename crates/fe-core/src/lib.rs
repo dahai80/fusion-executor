@@ -334,7 +334,9 @@ pub struct Executor {
     rollback: RollbackManager,
     gui: GuiController,
     tools: Tools,
-    shell: ShellRegistry,
+    // M-ARCH-1: ShellRegistry 不再属 Executor — 移到 IpcServer/PyExecutor (与 BroadcastHub 并列)。
+    // Executor 保持 per-task 无状态: IPC 层重启 Executor 不丢后台 shell 句柄; serve-path 与
+    // in-process path 共享同一 registry。安在校验留此层 (self.security), registry 由调用方传引用。
 }
 
 impl Default for Executor {
@@ -353,7 +355,6 @@ impl Executor {
             rollback: RollbackManager::new(),
             gui: GuiController::new(),
             tools: Tools::new(),
-            shell: ShellRegistry::new(),
         }
     }
 
@@ -398,7 +399,8 @@ impl Executor {
 
     /// 后台 shell — 启动持久 shell (#1, Claude Code run_in_background parity)
     /// 安全校验在此层 (fail-closed): blocked → ShellStartResult{ok:false, blocked_by_security:true}
-    pub fn shell_start(&self, p: ShellStartParams) -> ShellStartResult {
+    /// M-ARCH-1: registry 由调用方传引用 (Executor 无状态; registry 归 IpcServer/PyExecutor)。
+    pub fn shell_start(&self, registry: &ShellRegistry, p: ShellStartParams) -> ShellStartResult {
         let v = self.security.validate(&p.command);
         if !v.allowed {
             warn!(command = %p.command, reason = ?v.reason, "shell_start 被安全守卫拦截");
@@ -410,22 +412,25 @@ impl Executor {
                 error: None,
             };
         }
-        self.shell.shell_start(p)
+        registry.shell_start(p)
     }
 
     /// 后台 shell — 轮询 tail 快照 + 运行/退出状态 (#1)
-    pub fn shell_output(&self, shell_id: &str) -> Result<ShellOutput> {
-        self.shell.shell_output(shell_id)
+    /// M-ARCH-1: registry 由调用方传引用。
+    pub fn shell_output(registry: &ShellRegistry, shell_id: &str) -> Result<ShellOutput> {
+        registry.shell_output(shell_id)
     }
 
     /// 后台 shell — kill 进程树 (#1, Claude Code KillShell parity)
-    pub fn kill_shell(&self, shell_id: &str) -> Result<bool> {
-        self.shell.kill_shell(shell_id)
+    /// M-ARCH-1: registry 由调用方传引用。
+    pub fn kill_shell(registry: &ShellRegistry, shell_id: &str) -> Result<bool> {
+        registry.kill_shell(shell_id)
     }
 
     /// 后台 shell — 列出全部 shell (#1)
-    pub fn list_shells(&self) -> Vec<ShellInfo> {
-        self.shell.list_shells()
+    /// M-ARCH-1: registry 由调用方传引用。
+    pub fn list_shells(registry: &ShellRegistry) -> Vec<ShellInfo> {
+        registry.list_shells()
     }
 
     /// 原生文件工具 — multi_edit 同文件原子批量编辑 (#6)

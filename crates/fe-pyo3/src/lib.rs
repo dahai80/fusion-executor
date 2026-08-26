@@ -3,14 +3,14 @@
 // 产出 fusion_executor._native 扩展, 纯 Python executor.py 包装
 // P1: 最小 execute_sync; 后续暴露 rollback/gui/serve
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use tracing_subscriber::EnvFilter;
 
 use fe_core::gui::{GuiAction, GuiResult as RsGuiResult};
-use fe_core::shell::{ShellStartParams, ShellStartResult as RsShellStartResult};
+use fe_core::shell::{ShellRegistry, ShellStartParams, ShellStartResult as RsShellStartResult};
 use fe_core::telemetry::{TelemetryConfig, TelemetrySample};
 use fe_core::tools::{
     EditResult as RsEditResult, GlobEntry as RsGlobEntry, GrepMatch as RsGrepMatch,
@@ -492,6 +492,9 @@ impl PyTelemetryIterator {
 struct PyExecutor {
     inner: Executor,
     extra_whitelist: Vec<String>,
+    // M-ARCH-1: ShellRegistry 归 PyExecutor (非 Executor)。serve() 时 self.shells.clone()
+    // (Arc 浅拷) 共享进 IpcServer — in-process path 与 serve-path 同一 registry, serve 重启不丢句柄。
+    shells: Arc<ShellRegistry>,
 }
 
 #[pymethods]
@@ -514,6 +517,7 @@ impl PyExecutor {
         Self {
             inner,
             extra_whitelist: extra_whitelist.unwrap_or_default(),
+            shells: Arc::new(ShellRegistry::new()),
         }
     }
 
@@ -873,7 +877,7 @@ impl PyExecutor {
             max_cpu_sec,
             max_idle_sec,
         };
-        let r: RsShellStartResult = self.inner.shell_start(sp);
+        let r: RsShellStartResult = self.inner.shell_start(&self.shells, sp);
         let raw = serde_json::to_string(&r)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化失败: {e}")))?;
         Py::new(py, PyShellStartResult { raw })
@@ -881,7 +885,7 @@ impl PyExecutor {
 
     /// shell_output(shell_id) -> NativeShellOutput — 轮询 tail 快照 + 运行/退出状态 (#1)
     fn shell_output(&self, py: Python<'_>, shell_id: String) -> PyResult<Py<PyShellOutput>> {
-        match self.inner.shell_output(&shell_id) {
+        match Executor::shell_output(&self.shells, &shell_id) {
             Ok(out) => {
                 let raw = serde_json::to_string(&out).map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("序列化失败: {e}"))
@@ -896,14 +900,13 @@ impl PyExecutor {
 
     /// kill_shell(shell_id) -> bool — kill 进程树 (#1, KillShell parity)
     fn kill_shell(&self, shell_id: String) -> PyResult<bool> {
-        self.inner
-            .kill_shell(&shell_id)
+        Executor::kill_shell(&self.shells, &shell_id)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("kill_shell 失败: {e}")))
     }
 
     /// list_shells() -> list[NativeShellInfo] — 列出全部后台 shell (#1)
     fn list_shells(&self) -> PyResult<Vec<PyShellInfo>> {
-        let list = self.inner.list_shells();
+        let list = Executor::list_shells(&self.shells);
         let mut out = Vec::with_capacity(list.len());
         for info in list {
             let raw = serde_json::to_string(&info).map_err(|e| {
@@ -1118,7 +1121,7 @@ impl PyExecutor {
         } else {
             Executor::new().with_extra_whitelist(&extras)
         };
-        let server = IpcServer::with_executor(exec);
+        let server = IpcServer::with_executor_and_shells(exec, self.shells.clone());
         tracing::info!(sock = %sock, "PyO3 serve() — 启动 IPC 服务器 (释 GIL, 信号可停)");
         // C-PYO3-02: 释 GIL 跑 serve_blocking — Rust 侧 tokio::signal 监听 SIGINT/SIGTERM
         // 中断 accept_loop (不依赖 Python 信号 handler, 后者在 GIL 持有时不执行)。
