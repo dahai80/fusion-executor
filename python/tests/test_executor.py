@@ -500,6 +500,56 @@ def test_multi_edit_per_item_replace_all(executor: FusionSandboxExecutor, tmp_pa
     assert fp.read_text() == "P\nP\nq\n"
 
 
+# ── #2 write_file: 整文件创建/覆盖 + 建父目录 (Claude Code Write parity) ──
+
+
+def test_write_file_creates_new_with_parent_dirs(executor: FusionSandboxExecutor, tmp_path):
+    r = executor.write_file("nested/deep/new.py", "x = 1\n", cwd=str(tmp_path))
+    assert isinstance(r, EditResult)
+    assert r.ok
+    assert r.matches == 1
+    assert (tmp_path / "nested" / "deep" / "new.py").read_text() == "x = 1\n"
+
+
+def test_write_file_overwrites_existing(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "old.txt"
+    fp.write_text("old content\n")
+    r = executor.write_file("old.txt", "brand new\n", cwd=str(tmp_path))
+    assert r.ok
+    assert fp.read_text() == "brand new\n"
+
+
+def test_write_file_rejects_oversize_content(executor: FusionSandboxExecutor, tmp_path):
+    big = "A" * (64 * 1024 * 1024 + 1)
+    r = executor.write_file("big.txt", big, cwd=str(tmp_path))
+    assert not r.ok
+    assert "超大小上限" in (r.error or "")
+    assert not (tmp_path / "big.txt").exists()
+
+
+def test_file_edit_create_on_empty_missing_path(executor: FusionSandboxExecutor, tmp_path):
+    # #2: 路径不存在 + old_string 空 → 用 new_string 建文件
+    r = executor.file_edit("new_via_edit.py", "", "created = True\n", cwd=str(tmp_path))
+    assert r.ok
+    assert (tmp_path / "new_via_edit.py").read_text() == "created = True\n"
+
+
+def test_file_edit_existing_empty_old_string_still_rejected(executor: FusionSandboxExecutor, tmp_path):
+    fp = tmp_path / "exists.txt"
+    fp.write_text("data\n")
+    r = executor.file_edit("exists.txt", "", "x\n", cwd=str(tmp_path))
+    assert not r.ok
+    assert "不能为空" in (r.error or "")
+    assert fp.read_text() == "data\n", "已存在文件空 old_string 不应写入"
+
+
+def test_file_edit_missing_path_nonempty_old_string_rejected(executor: FusionSandboxExecutor, tmp_path):
+    r = executor.file_edit("ghost.py", "old", "new\n", cwd=str(tmp_path))
+    assert not r.ok
+    assert "未找到" in (r.error or "")
+    assert not (tmp_path / "ghost.py").exists()
+
+
 def _write_minimal_nb(path, n_cells: int = 2) -> None:
     cells = [
         {
@@ -609,6 +659,25 @@ def test_file_edit_over_uds_roundtrip(uds_server: str, tmp_path):
     assert resp["result"]["ok"] is True
     assert resp["result"]["matches"] == 1
     assert fp.read_text() == "world\n"
+
+
+def test_write_file_over_uds_roundtrip(uds_server: str, tmp_path):
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "executor.write_file",
+            "params": {
+                "path": "sub/created.py",
+                "content": "print('hi')\n",
+                "cwd": str(tmp_path),
+            },
+        },
+    )
+    assert resp["result"]["ok"] is True
+    assert resp["result"]["matches"] == 1
+    assert (tmp_path / "sub" / "created.py").read_text() == "print('hi')\n"
 
 
 def test_glob_over_uds_roundtrip(uds_server: str, tmp_path):

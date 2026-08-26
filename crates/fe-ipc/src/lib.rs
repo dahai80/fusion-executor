@@ -1084,6 +1084,18 @@ async fn handle_method(
                 .map_err(|e| (ERR_INTERNAL, format!("file_edit 失败: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
+        "executor.write_file" => {
+            // #2: write_file(path, content, cwd?) — 整文件创建/覆盖 + 建父目录
+            let path =
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+            let content = param_str(&params, "content")
+                .ok_or((ERR_INVALID_REQ, "缺少 content".to_string()))?;
+            let cwd = params.get("cwd").and_then(|c| c.as_str());
+            let r = executor
+                .write_file(&path, &content, cwd)
+                .map_err(|e| (ERR_INTERNAL, format!("write_file 失败: {}", e)))?;
+            Ok(serde_json::to_value(&r).unwrap_or(json!({})))
+        }
         "executor.glob" => {
             let pattern = param_str(&params, "pattern")
                 .ok_or((ERR_INVALID_REQ, "缺少 pattern".to_string()))?;

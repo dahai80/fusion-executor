@@ -378,6 +378,11 @@ impl Executor {
             .file_edit(path, old_string, new_string, cwd, replace_all)
     }
 
+    /// 原生文件工具 — write_file 整文件创建/覆盖 + 建父目录 (#2, Claude Code Write parity)
+    pub fn write_file(&self, path: &str, content: &str, cwd: Option<&str>) -> Result<EditResult> {
+        self.tools.write_file(path, content, cwd)
+    }
+
     /// 原生文件工具 — multi_edit 同文件原子批量编辑 (#6)
     pub fn multi_edit(
         &self,

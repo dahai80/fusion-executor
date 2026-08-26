@@ -277,6 +277,24 @@ class FusionSandboxExecutor:
         logger.info("file_edit done ok=%s matches=%s path=%s", result.ok, result.matches, result.path)
         return result
 
+    def write_file(
+        self,
+        path: str,
+        content: str,
+        *,
+        cwd: str | None = None,
+    ) -> EditResult:
+        logger.debug("write_file path=%r cwd=%s bytes=%s", path, cwd, len(content))
+        native = self._native.write_file(path, content, cwd)
+        result = EditResult(
+            ok=native.ok,
+            path=native.path,
+            error=native.error,
+            matches=native.matches,
+        )
+        logger.info("write_file done ok=%s path=%s", result.ok, result.path)
+        return result
+
     def multi_edit(
         self,
         path: str,
