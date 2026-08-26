@@ -134,6 +134,36 @@ sub.unsubscribe()  # or sub.close()
 
 `ExecutionResult` fields: `exit_code, stdout, stderr, task_id, command, duration_sec, timed_out, blocked_by_security, security_reason, snapshot_id, diagnostics`.
 
+## Background Shells (v1.8 — #1 run_in_background parity)
+
+Persistent long-running shells with poll-based output capture (Claude Code `run_in_background` / `BashOutput` / `KillShell` parity). The new `fe-shell` crate owns a `ShellRegistry` (id → handle); each shell reuses `fe-sandbox::spawn_pty` for proven env/seatbelt/PTY setup, then runs self-managed reader (tail accumulator, OOM-capped) + waiter (child exit) threads. **Poll model** — `shell_output` returns the accumulated tail snapshot (not a delta); the caller de-duplicates. Live-tail via `BroadcastHub` is a future issue. Security is enforced in `fe-core` (fail-closed) before any spawn — `fe-shell` never validates commands.
+
+```python
+from fusion_executor import FusionSandboxExecutor, ShellStartResult, ShellOutput, ShellInfo
+
+ex = FusionSandboxExecutor()
+
+# Start a background shell (security-validated first; blocked → ok=False, shell_id=None)
+r: ShellStartResult = ex.shell_start("python3 -c 'import time; time.sleep(30)'", task_id="t1")
+assert r.ok and r.shell_id.startswith("sh-")
+
+# Poll the accumulated tail snapshot + running/exit state
+out: ShellOutput = ex.shell_output(r.shell_id)
+assert out.running and out.exit_code is None
+
+# Kill the process tree (SIGINT → 500ms grace → SIGKILL via killpg)
+assert ex.kill_shell(r.shell_id)
+
+# List all shells (running + finished)
+infos: list[ShellInfo] = ex.list_shells()
+
+# Blocked command — never spawns
+r = ex.shell_start("rm -rf /")
+assert not r.ok and r.blocked_by_security and r.shell_id is None
+```
+
+`shell_start(command, *, cwd=None, env_vars=None, task_id=None, max_output_chars=100000, seatbelt=False, inherit_env=False, max_nproc=1024, max_cpu_sec=0) -> ShellStartResult`. UDS methods: `executor.shell_start` / `executor.shell_output` / `executor.kill_shell` / `executor.list_shells`.
+
 ## Native File Tools + Surgical Patch Engine (v1.3)
 
 Replaces the Claude SDK FileEdit/Glob/Grep — native Rust implementation, guarded by the fe-security path guard (rejects cwd escape / sensitive-dir access), atomic write (`.fe-tmp-{pid}` + rename).
@@ -263,7 +293,7 @@ python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecu
 # Socket: /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK)
 ```
 
-Protocol: newline-delimited JSON-RPC 2.0, error codes -32700/-32600/-32601/-32603 + extensions -32010(security)/-32011(timeout)/-32012(rollback)/-32013(AX). Methods: `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`grep_with_opts`/`apply_patch`/`replace_function`/`telemetry_stream`/`subscribe`/`unsubscribe`/`shutdown`.
+Protocol: newline-delimited JSON-RPC 2.0, error codes -32700/-32600/-32601/-32603 + extensions -32010(security)/-32011(timeout)/-32012(rollback)/-32013(AX). Methods: `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`grep_with_opts`/`apply_patch`/`replace_function`/`telemetry_stream`/`subscribe`/`unsubscribe`/`shell_start`/`shell_output`/`kill_shell`/`list_shells`/`shutdown`.
 
 `executor.execute_stream` streaming: multi-frame (chunk/done) sharing one id, newline-delimited frame by frame —
 - chunk: `{"jsonrpc":"2.0","id":id,"result":{"type":"chunk","data":"..."}}`

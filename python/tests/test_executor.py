@@ -16,6 +16,9 @@ from fusion_executor import (
     GrepOutput,
     MultiEditItem,
     RollbackPolicy,
+    ShellInfo,
+    ShellOutput,
+    ShellStartResult,
     TelemetrySample,
 )
 
@@ -1372,3 +1375,191 @@ def test_run_streaming_rejects_use_pty_false(executor: FusionSandboxExecutor):
     # 流式无 stdio 后端, 显式拒 (fail-loud 而非静默降级 PTY)
     with pytest.raises(ValueError, match="use_pty=False"):
         next(executor.run_streaming("echo hi", timeout_sec=5, use_pty=False))
+
+
+# Issue #1: 后台持久 shell (run_in_background/BashOutput/KillShell parity)
+def test_shell_start_echo_and_poll(executor: FusionSandboxExecutor):
+    import time
+
+    r = executor.shell_start("echo hi-bg")
+    assert isinstance(r, ShellStartResult)
+    assert r.ok
+    assert r.shell_id and r.shell_id.startswith("sh-")
+    assert not r.blocked_by_security
+    sid = r.shell_id
+    time.sleep(0.8)
+    out = executor.shell_output(sid)
+    assert isinstance(out, ShellOutput)
+    assert out.shell_id == sid
+    assert "hi-bg" in out.output
+    assert not out.running
+    assert out.exit_code == 0
+
+
+def test_shell_start_repeated_output_accumulates(executor: FusionSandboxExecutor):
+    import time
+
+    sid = executor.shell_start("python3 -c 'for i in range(5): print(i)'").shell_id
+    time.sleep(1.0)
+    out = executor.shell_output(sid)
+    for i in range(5):
+        assert str(i) in out.output, f"缺 {i}: {out.output!r}"
+    assert out.exit_code == 0
+
+
+def test_shell_kill_long_running(executor: FusionSandboxExecutor):
+    import time
+
+    sid = executor.shell_start("python3 -c 'import time; time.sleep(30)'").shell_id
+    time.sleep(0.4)
+    mid = executor.shell_output(sid)
+    assert mid.running, "长任务应仍在跑"
+    ok = executor.kill_shell(sid)
+    assert ok
+    time.sleep(0.8)
+    after = executor.shell_output(sid)
+    assert not after.running, "kill 后应结束"
+
+
+def test_list_shells_records_all(executor: FusionSandboxExecutor):
+    import time
+
+    a = executor.shell_start("echo a1").shell_id
+    b = executor.shell_start("echo b1").shell_id
+    time.sleep(0.8)
+    infos = executor.list_shells()
+    ids = {i.shell_id for i in infos}
+    assert all(isinstance(i, ShellInfo) for i in infos)
+    assert a in ids and b in ids
+    for i in infos:
+        if i.shell_id in (a, b):
+            assert i.finished
+            assert i.exit_code == 0
+
+
+def test_shell_output_unknown_id_errors(executor: FusionSandboxExecutor):
+    with pytest.raises(Exception, match="sh-999"):
+        executor.shell_output("sh-999")
+
+
+def test_shell_start_blocked_by_security(executor: FusionSandboxExecutor):
+    r = executor.shell_start("rm -rf /")
+    assert isinstance(r, ShellStartResult)
+    assert not r.ok
+    assert r.blocked_by_security
+    assert r.shell_id is None
+    assert r.security_reason is not None
+
+
+def test_shell_start_rejects_empty(executor: FusionSandboxExecutor):
+    r = executor.shell_start("   ")
+    assert not r.ok
+    assert r.error is not None
+
+
+def test_shell_start_over_uds_roundtrip(uds_server: str):
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "executor.shell_start",
+            "params": {"command": "echo uds-bg"},
+        },
+    )
+    assert resp["result"]["ok"] is True
+    sid = resp["result"]["shell_id"]
+    assert sid and sid.startswith("sh-")
+
+
+def test_shell_output_over_uds_roundtrip(uds_server: str):
+    import time
+
+    start = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "executor.shell_start",
+            "params": {"command": "echo poll-me"},
+        },
+    )
+    sid = start["result"]["shell_id"]
+    time.sleep(0.8)
+    out = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "executor.shell_output",
+            "params": {"shell_id": sid},
+        },
+    )
+    assert out["result"]["shell_id"] == sid
+    assert "poll-me" in out["result"]["output"]
+    assert out["result"]["running"] is False
+    assert out["result"]["exit_code"] == 0
+
+
+def test_kill_shell_over_uds_roundtrip(uds_server: str):
+    import time
+
+    start = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "executor.shell_start",
+            "params": {"command": "python3 -c 'import time; time.sleep(30)'"},
+        },
+    )
+    sid = start["result"]["shell_id"]
+    time.sleep(0.4)
+    kill = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "executor.kill_shell",
+            "params": {"shell_id": sid},
+        },
+    )
+    assert kill["result"]["ok"] is True
+    time.sleep(0.8)
+    out = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "executor.shell_output",
+            "params": {"shell_id": sid},
+        },
+    )
+    assert out["result"]["running"] is False
+
+
+def test_list_shells_over_uds_roundtrip(uds_server: str):
+    import time
+
+    _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "executor.shell_start",
+            "params": {"command": "echo list-me"},
+        },
+    )
+    time.sleep(0.8)
+    lst = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "executor.list_shells",
+            "params": {},
+        },
+    )
+    assert isinstance(lst["result"], list)
+    assert len(lst["result"]) >= 1
+    assert all("shell_id" in e and "command" in e for e in lst["result"])

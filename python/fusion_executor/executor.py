@@ -19,6 +19,9 @@ from .models import (
     GuiResult,
     MultiEditItem,
     RollbackPolicy,
+    ShellInfo,
+    ShellOutput,
+    ShellStartResult,
     TelemetrySample,
 )
 
@@ -294,6 +297,73 @@ class FusionSandboxExecutor:
         )
         logger.info("write_file done ok=%s path=%s", result.ok, result.path)
         return result
+
+    def shell_start(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env_vars: dict[str, str] | None = None,
+        task_id: str | None = None,
+        max_output_chars: int = 100000,
+        seatbelt: bool = False,
+        inherit_env: bool = False,
+        max_nproc: int = 1024,
+        max_cpu_sec: int = 0,
+    ) -> ShellStartResult:
+        logger.debug(
+            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s",
+            command,
+            cwd,
+            task_id,
+            seatbelt,
+            inherit_env,
+        )
+        native = self._native.shell_start(
+            command,
+            cwd,
+            env_vars,
+            task_id,
+            max_output_chars,
+            seatbelt,
+            inherit_env,
+            max_nproc,
+            max_cpu_sec,
+        )
+        result = ShellStartResult.model_validate(native.to_dict())
+        logger.info(
+            "shell_start done ok=%s shell_id=%s blocked=%s",
+            result.ok,
+            result.shell_id,
+            result.blocked_by_security,
+        )
+        return result
+
+    def shell_output(self, shell_id: str) -> ShellOutput:
+        logger.debug("shell_output id=%s", shell_id)
+        native = self._native.shell_output(shell_id)
+        result = ShellOutput.model_validate(native.to_dict())
+        logger.info(
+            "shell_output done id=%s running=%s exit=%s out_len=%s",
+            result.shell_id,
+            result.running,
+            result.exit_code,
+            len(result.output),
+        )
+        return result
+
+    def kill_shell(self, shell_id: str) -> bool:
+        logger.debug("kill_shell id=%s", shell_id)
+        ok = self._native.kill_shell(shell_id)
+        logger.info("kill_shell done id=%s ok=%s", shell_id, ok)
+        return ok
+
+    def list_shells(self) -> list[ShellInfo]:
+        logger.debug("list_shells")
+        native_list = self._native.list_shells()
+        out = [ShellInfo.model_validate(i.to_dict()) for i in native_list]
+        logger.info("list_shells done count=%s", len(out))
+        return out
 
     def multi_edit(
         self,

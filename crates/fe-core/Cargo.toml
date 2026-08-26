@@ -14,6 +14,7 @@ fe-diagnostics.workspace = true
 fe-gui.workspace = true
 fe-tools.workspace = true
 fe-telemetry.workspace = true
+fe-shell.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

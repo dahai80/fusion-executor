@@ -415,6 +415,7 @@ dependencies = [
  "fe-rollback",
  "fe-sandbox",
  "fe-security",
+ "fe-shell",
  "fe-telemetry",
  "fe-tools",
  "serde",
@@ -530,6 +531,20 @@ dependencies = [
  "serde",
  "serde_json",
  "shell-words",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "fe-shell"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fe-sandbox",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
 ]

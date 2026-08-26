@@ -18,6 +18,7 @@ use fe_gui::{GuiAction, GuiController, GuiResult};
 use fe_rollback::RollbackManager;
 use fe_sandbox::{Sandbox, SandboxConfig};
 use fe_security::{SecurityGuard, SecurityVerdict};
+use fe_shell::{ShellInfo, ShellOutput, ShellRegistry, ShellStartParams, ShellStartResult};
 use fe_telemetry::{start_stream as start_telemetry, TelemetryConfig, TelemetrySample};
 use fe_tools::{
     EditResult, GlobEntry, GrepMatch, GrepOptions, GrepOutput, MultiEditItem, NotebookEditMode,
@@ -29,6 +30,7 @@ pub use fe_gui as gui;
 pub use fe_rollback as rollback;
 pub use fe_sandbox as sandbox;
 pub use fe_security as security;
+pub use fe_shell as shell;
 pub use fe_telemetry as telemetry;
 pub use fe_telemetry::{
     TelemetryConfig as TelemetryStreamConfig, TelemetrySample as TelemetryFrame,
@@ -332,6 +334,7 @@ pub struct Executor {
     rollback: RollbackManager,
     gui: GuiController,
     tools: Tools,
+    shell: ShellRegistry,
 }
 
 impl Default for Executor {
@@ -350,6 +353,7 @@ impl Executor {
             rollback: RollbackManager::new(),
             gui: GuiController::new(),
             tools: Tools::new(),
+            shell: ShellRegistry::new(),
         }
     }
 
@@ -381,6 +385,38 @@ impl Executor {
     /// 原生文件工具 — write_file 整文件创建/覆盖 + 建父目录 (#2, Claude Code Write parity)
     pub fn write_file(&self, path: &str, content: &str, cwd: Option<&str>) -> Result<EditResult> {
         self.tools.write_file(path, content, cwd)
+    }
+
+    /// 后台 shell — 启动持久 shell (#1, Claude Code run_in_background parity)
+    /// 安全校验在此层 (fail-closed): blocked → ShellStartResult{ok:false, blocked_by_security:true}
+    pub fn shell_start(&self, p: ShellStartParams) -> ShellStartResult {
+        let v = self.security.validate(&p.command);
+        if !v.allowed {
+            warn!(command = %p.command, reason = ?v.reason, "shell_start 被安全守卫拦截");
+            return ShellStartResult {
+                ok: false,
+                shell_id: None,
+                blocked_by_security: true,
+                security_reason: v.reason,
+                error: None,
+            };
+        }
+        self.shell.shell_start(p)
+    }
+
+    /// 后台 shell — 轮询 tail 快照 + 运行/退出状态 (#1)
+    pub fn shell_output(&self, shell_id: &str) -> Result<ShellOutput> {
+        self.shell.shell_output(shell_id)
+    }
+
+    /// 后台 shell — kill 进程树 (#1, Claude Code KillShell parity)
+    pub fn kill_shell(&self, shell_id: &str) -> Result<bool> {
+        self.shell.kill_shell(shell_id)
+    }
+
+    /// 后台 shell — 列出全部 shell (#1)
+    pub fn list_shells(&self) -> Vec<ShellInfo> {
+        self.shell.list_shells()
     }
 
     /// 原生文件工具 — multi_edit 同文件原子批量编辑 (#6)
