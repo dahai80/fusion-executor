@@ -310,14 +310,18 @@ class FusionSandboxExecutor:
         inherit_env: bool = False,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
+        max_idle_sec: int = 3600,
     ) -> ShellStartResult:
+        if not isinstance(max_idle_sec, int) or max_idle_sec < 0:
+            raise ValueError(f"max_idle_sec 必须为非负 int, 得 {max_idle_sec!r}")
         logger.debug(
-            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s",
+            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s",
             command,
             cwd,
             task_id,
             seatbelt,
             inherit_env,
+            max_idle_sec,
         )
         native = self._native.shell_start(
             command,
@@ -329,6 +333,7 @@ class FusionSandboxExecutor:
             inherit_env,
             max_nproc,
             max_cpu_sec,
+            max_idle_sec,
         )
         result = ShellStartResult.model_validate(native.to_dict())
         logger.info(

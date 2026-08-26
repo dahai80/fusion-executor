@@ -1378,7 +1378,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("无父目录: {}", path.display()))?;
-    // NamedTempFile 随机名, 写后 persist 原子 rename 到 path
+    // NamedTempFile 随机名 (避同进程并发互踩), 在目标同目录 (同 FS → rename 原子)
     let tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("创建临时文件失败 (dir={})", dir.display()))?;
     std::fs::write(tmp.path(), content)
@@ -1386,19 +1386,31 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     match tmp.persist(path) {
         Ok(_) => Ok(()),
         Err(e) => {
-            // persist 失败常因 EXDEV (跨文件系统); 降级非原子写
-            warn!(error = %e, target = %path.display(), "persist 失败, 降级 rename");
-            // NamedTempFile 已 drop; 重新走 std 写 (非原子, 兜底)
-            let fallback = dir.join(format!(".fe-tmp-fb-{}", std::process::id()));
-            std::fs::write(&fallback, content)
-                .with_context(|| format!("降级写 {} 失败", fallback.display()))?;
-            std::fs::rename(&fallback, path).with_context(|| {
-                format!(
-                    "降级 rename {} -> {} 失败",
-                    fallback.display(),
-                    path.display()
+            // m-SEC-03: persist 失败 — 复用同一随机名 NamedTempFile (非旧固定名 .fe-tmp-fb-{pid}
+            // 会同进程并发互踩), 仍在目标同目录 (同 FS), 走 std::fs::rename (同 FS 原子)。
+            // PersistError { file: NamedTempFile, error: io::Error } — 取出 file 重试 rename。
+            let persist_err = e.error;
+            let tmp_retry = e.file;
+            warn!(
+                error = %persist_err,
+                target = %path.display(),
+                "persist 失败, 重试 std::fs::rename (同目录, 同 FS 原子)"
+            );
+            let tmp_path = tmp_retry.path().to_path_buf();
+            // std::fs::rename 同 FS 原子; 真 EXDEV (不同 FS) 则 fail-loud Err (不静默降级非原子写)
+            if let Err(rename_err) = std::fs::rename(&tmp_path, path) {
+                return Err(anyhow::anyhow!(
+                    "atomic_write rename 失败 ({} -> {}): persist={}; rename={}",
+                    tmp_path.display(),
+                    path.display(),
+                    persist_err,
+                    rename_err
                 )
-            })?;
+                .context("m-SEC-03: 拒绝降级非原子写, fail-loud"));
+            }
+            // rename 成功 → forget 防 drop 删文件 (rename 后原路径已空, 但 NamedTempFile
+            // drop 会尝试删旧 path; forget 仅清 handle 不动已 rename 走的文件)
+            std::mem::forget(tmp_retry);
             Ok(())
         }
     }

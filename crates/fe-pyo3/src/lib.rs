@@ -812,9 +812,11 @@ impl PyExecutor {
     }
 
     /// shell_start(command, cwd=None, env_vars=None, task_id=None, max_output_chars=100000,
-    ///             seatbelt=False, inherit_env=False, max_nproc=1024, max_cpu_sec=0)
+    ///             seatbelt=False, inherit_env=False, max_nproc=1024, max_cpu_sec=0,
+    ///             max_idle_sec=3600)
     /// -> NativeShellStartResult — 后台持久 shell 启动 (#1, run_in_background parity)
     /// 安全校验在 fe-core (fail-closed); blocked → ok=false, shell_id=None
+    /// max_idle_sec (m-SEC-01): 无输出超此值 (秒) 自动 kill; 0=不限。默认 3600。
     #[pyo3(signature = (
         command,
         cwd=None,
@@ -825,6 +827,7 @@ impl PyExecutor {
         inherit_env=false,
         max_nproc=1024,
         max_cpu_sec=0,
+        max_idle_sec=fe_core::shell::DEFAULT_MAX_IDLE_SEC,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn shell_start(
@@ -839,6 +842,7 @@ impl PyExecutor {
         inherit_env: bool,
         max_nproc: u32,
         max_cpu_sec: u32,
+        max_idle_sec: u64,
     ) -> PyResult<Py<PyShellStartResult>> {
         let env: std::collections::HashMap<String, String> = match env_vars {
             Some(obj) => {
@@ -867,6 +871,7 @@ impl PyExecutor {
             inherit_env,
             max_nproc,
             max_cpu_sec,
+            max_idle_sec,
         };
         let r: RsShellStartResult = self.inner.shell_start(sp);
         let raw = serde_json::to_string(&r)

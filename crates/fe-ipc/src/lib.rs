@@ -24,7 +24,7 @@
 //   unsubscribe {subscription_id} → 停该订阅; 连接断开 → 清该连接所有订阅。
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,8 +41,25 @@ use fe_core::gui::GuiAction;
 use fe_core::TelemetryStreamConfig;
 use fe_core::{Diagnostics, ExecutionRequest, ExecutionResult, Executor};
 
-/// 默认 socket 路径
-pub const DEFAULT_SOCK: &str = "/tmp/fusion-executor.sock";
+/// 默认 socket 目录 — M-SEC-01: 私有 0o700 目录 (非全局可扫描 /tmp)。
+/// 同主机他 UID 无法进入该目录 → 无法 connect socket, 阻跨 UID 越权。
+/// 仍可经 FUSION_EXECUTOR_SOCK 覆盖回 /tmp (用户显式 opt-in, 自担风险)。
+pub const DEFAULT_SOCK_DIR: &str = ".fusion-executor";
+pub const DEFAULT_SOCK_NAME: &str = "fe.sock";
+
+/// 解析默认 socket 路径 — ~/.fusion-executor/fe.sock (HOME 下私有目录)。
+/// HOME 缺失时回退 /tmp/fusion-executor.sock (退化为旧路径, 仅 chmod 0o600)。
+fn default_sock_path() -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => {
+            let mut p = PathBuf::from(h);
+            p.push(DEFAULT_SOCK_DIR);
+            p.push(DEFAULT_SOCK_NAME);
+            p.to_string_lossy().into_owned()
+        }
+        _ => "/tmp/fusion-executor.sock".to_string(),
+    }
+}
 
 /// JSON-RPC 错误码
 const ERR_PARSE: i64 = -32700;
@@ -70,8 +87,39 @@ const MAX_CONCURRENT_EXECS: usize = 16;
 const IDLE_READ_TIMEOUT_SECS: u64 = 30;
 /// 截图 b64 帧上限 (4MB) — 超此降级去 png_b64 防 N 订阅内存堆积 (P-IPC-03)
 const MAX_SCREENSHOT_B64_BYTES: usize = 4 * 1024 * 1024;
-/// C-OPS-03: 优雅 drain 截止 — join in-flight 连接 10s, 超时 abort 剩余 (强制停, 防挂死)。
+/// C-OPS-03: 优雅 drain 默认截止 — join in-flight 连接 10s, 超时 abort 剩余 (强制停, 防挂死)。
+/// M-OPS-03: 运行时可经 FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS 覆盖 (1..=300s, 越界回退此默认)。
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// M-OPS-03: 解析优雅 drain 超时 — env `FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS` 覆盖默认 10s。
+/// 合法区间 1..=300 (秒): 过短误杀 in-flight, 过长拖延停机。越界/非数字 → 回退默认, fail-loud warn。
+fn resolve_shutdown_timeout() -> Duration {
+    parse_shutdown_timeout(std::env::var("FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS").ok())
+}
+
+/// M-OPS-03: 纯函数解析 (无 env 副作用, 可单测) — env 值 → Duration。
+fn parse_shutdown_timeout(raw: Option<String>) -> Duration {
+    match raw {
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(secs) if (1..=300).contains(&secs) => {
+                info!(secs, "M-OPS-03: shutdown drain 超时 env 覆盖");
+                Duration::from_secs(secs)
+            }
+            Ok(secs) => {
+                warn!(
+                    secs,
+                    "M-OPS-03: shutdown 超时越界 (须 1..=300), 回退默认 10s"
+                );
+                SHUTDOWN_DEADLINE
+            }
+            Err(e) => {
+                warn!(raw = %v, error = %e, "M-OPS-03: shutdown 超时非数字, 回退默认 10s");
+                SHUTDOWN_DEADLINE
+            }
+        },
+        None => SHUTDOWN_DEADLINE,
+    }
+}
 
 /// stdio 订阅作用域 (审计 2.9 / Blocker 10) — per-sub 过滤防跨租户泄漏。
 /// 默认 OwnConn: 仅收本连接发起命令的 stdio (多租户隔离基线)。
@@ -113,6 +161,8 @@ struct BroadcastHub {
     registry: Mutex<HashMap<String, Subscriber>>,
     executor: Arc<Executor>,
     conn_counter: AtomicU64,
+    /// M-OPS-04: 活跃连接计数 — handle_conn 入口 fetch_add, drop_conn fetch_sub。无锁, health 读快照。
+    active_conns: AtomicU64,
     sub_counter: AtomicU64,
     telemetry_task: Mutex<Option<JoinHandle<()>>>,
     screenshot_task: Mutex<Option<JoinHandle<()>>>,
@@ -136,6 +186,7 @@ impl BroadcastHub {
             registry: Mutex::new(HashMap::new()),
             executor,
             conn_counter: AtomicU64::new(1),
+            active_conns: AtomicU64::new(0),
             sub_counter: AtomicU64::new(1),
             telemetry_task: Mutex::new(None),
             screenshot_task: Mutex::new(None),
@@ -231,7 +282,7 @@ impl BroadcastHub {
         let has_telemetry = channels.contains(CH_TELEMETRY);
         let has_screenshot = channels.contains(CH_SCREENSHOT);
         {
-            let mut reg = self.registry.lock().unwrap();
+            let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
             reg.insert(
                 sub_id.clone(),
                 Subscriber {
@@ -254,7 +305,12 @@ impl BroadcastHub {
 
     /// 取消订阅 — 返回是否找到并移除
     fn unsubscribe(&self, sub_id: &str) -> bool {
-        let removed = self.registry.lock().unwrap().remove(sub_id).is_some();
+        let removed = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(sub_id)
+            .is_some();
         if removed {
             info!(%sub_id, "订阅取消");
         }
@@ -263,7 +319,8 @@ impl BroadcastHub {
 
     /// 连接断开 — 清该连接所有订阅
     fn drop_conn(&self, conn_id: u64) {
-        let mut reg = self.registry.lock().unwrap();
+        self.active_conns.fetch_sub(1, Ordering::Relaxed);
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let before = reg.len();
         reg.retain(|_, s| s.conn_id != conn_id);
         let dropped = before - reg.len();
@@ -276,7 +333,10 @@ impl BroadcastHub {
     /// 源任务 0 telemetry 订阅自退并清 handle; panic 后 handle.is_finished()=true 触发重启。
     /// interval_ms 由调用方传入 (M-IPC-01), 缺省 DEFAULT_INTERVAL_MS。
     fn ensure_telemetry_source(self: &Arc<Self>, interval_ms: u64) {
-        let mut slot = self.telemetry_task.lock().unwrap();
+        let mut slot = self
+            .telemetry_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if slot.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
@@ -288,7 +348,10 @@ impl BroadcastHub {
         let hub = self.clone();
         let handle = tokio::spawn(async move {
             hub.run_telemetry_source(effective).await;
-            hub.telemetry_task.lock().unwrap().take();
+            hub.telemetry_task
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
         });
         *slot = Some(handle);
         info!(interval_ms = effective, "遥测源任务启动");
@@ -297,7 +360,10 @@ impl BroadcastHub {
     /// 确保截图源任务运行 — 同 telemetry 逻辑 (C-IPC-02/03)。
     /// screenshot_interval_ms 由调用方传入 (M-IPC-01)。
     fn ensure_screenshot_source(self: &Arc<Self>, screenshot_interval_ms: u64) {
-        let mut slot = self.screenshot_task.lock().unwrap();
+        let mut slot = self
+            .screenshot_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if slot.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
@@ -309,7 +375,10 @@ impl BroadcastHub {
         let hub = self.clone();
         let handle = tokio::spawn(async move {
             hub.run_screenshot_source(effective).await;
-            hub.screenshot_task.lock().unwrap().take();
+            hub.screenshot_task
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
         });
         *slot = Some(handle);
         info!(interval_ms = effective, "截图源任务启动");
@@ -403,7 +472,7 @@ impl BroadcastHub {
 
     /// 收集某通道所有 (sub_id, tx, scope) — 锁内快照, 锁外发送
     fn collect_targets(&self, channel: &str) -> Vec<(String, StdioScope, mpsc::Sender<Value>)> {
-        let reg = self.registry.lock().unwrap();
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         reg.iter()
             .filter(|(_, s)| s.channels.contains(channel))
             .map(|(id, s)| (id.clone(), s.scope.clone(), s.tx.clone()))
@@ -474,7 +543,7 @@ impl IpcServer {
                 return p.to_string();
             }
         }
-        std::env::var("FUSION_EXECUTOR_SOCK").unwrap_or_else(|_| DEFAULT_SOCK.to_string())
+        std::env::var("FUSION_EXECUTOR_SOCK").unwrap_or_else(|_| default_sock_path())
     }
 
     /// 异步 serve — bind + unlink 旧 sock + chmod 0o600 + accept 循环
@@ -488,6 +557,7 @@ impl IpcServer {
             info!(sock = %path.display(), "清理旧 socket");
             let _ = std::fs::remove_file(&path);
         }
+        ensure_sock_dir(&path);
         let listener = UnixListener::bind(&path)
             .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", path.display(), e))?;
         chmod_secure(&path);
@@ -500,8 +570,10 @@ impl IpcServer {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let executor = self.executor.clone();
         let hub = self.hub.clone();
+        // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
+        let drain_deadline = resolve_shutdown_timeout();
         let join = tokio::spawn(async move {
-            accept_loop(listener, executor, hub, shutdown_rx).await;
+            accept_loop(listener, executor, hub, shutdown_rx, drain_deadline).await;
             let _ = std::fs::remove_file(&path);
         });
         Ok((shutdown_tx, join))
@@ -522,6 +594,7 @@ impl IpcServer {
             if p.exists() {
                 let _ = std::fs::remove_file(&p);
             }
+            ensure_sock_dir(&p);
             let listener = UnixListener::bind(&p)
                 .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", p.display(), e))?;
             chmod_secure(&p);
@@ -533,8 +606,10 @@ impl IpcServer {
             let (_tx, rx) = oneshot::channel::<()>();
             // 信号任务: 收 SIGINT/SIGTERM → notify_waiters, accept_loop 自行退出并 drain
             let signal_task = tokio::spawn(wait_signal_and_notify(hub.clone()));
+            // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
+            let drain_deadline = resolve_shutdown_timeout();
             // accept_loop 运行至 shutdown_notify (信号) 或 shutdown_rx 触发, 内部 drain in-flight
-            accept_loop(listener, executor, hub, rx).await;
+            accept_loop(listener, executor, hub, rx, drain_deadline).await;
             signal_task.abort();
             let _ = std::fs::remove_file(&p);
             Ok(())
@@ -577,13 +652,15 @@ impl Default for IpcServer {
 }
 
 /// accept 循环 — 收到 shutdown 信号 (oneshot 编程式 或 IPC Notify) 或 listener 关闭则退出。
-/// C-OPS-03: 收集 handle_conn JoinHandle, 退出后 drain (join_all 带 SHUTDOWN_DEADLINE 超时, 超时 abort)。
+/// C-OPS-03: 收集 handle_conn JoinHandle, 退出后 drain (join_all 带 deadline 超时, 超时 abort)。
+/// M-OPS-03: deadline 由调用方传入 (FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS, 默认 10s)。
 /// 并发连接受 MAX_CONNECTIONS 信号量限制 (C-IPC-05)。
 async fn accept_loop(
     listener: UnixListener,
     executor: Arc<Executor>,
     hub: Arc<BroadcastHub>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    drain_deadline: Duration,
 ) {
     let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     // 审计 2.11: 执行信号量 — 限并发 **执行** (子进程) 非并发连接。全 server 共享, 与连接信号量解耦。
@@ -605,6 +682,10 @@ async fn accept_loop(
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _)) => {
+                        // M-SEC-01: LOCAL_PEERCRED UID 校验 — 他 UID 立即拒, 不占信号量不跑 handler。
+                        if !peer_uid_matches(&stream) {
+                            continue;
+                        }
                         // 连接数上限 — 信号量满则拒连 (C-IPC-05)
                         let permit = match sem.clone().acquire_owned().await {
                             Ok(p) => p,
@@ -628,12 +709,13 @@ async fn accept_loop(
         }
     }
     // C-OPS-03: drain in-flight 连接 — join_all 带 deadline, 超时 abort 剩余
-    drain_connections(conns).await;
+    drain_connections(conns, drain_deadline).await;
 }
 
-/// C-OPS-03/M-OPS-03: 优雅 drain — join 所有 in-flight 连接, SHUTDOWN_DEADLINE 内未完则 abort。
+/// C-OPS-03/M-OPS-03: 优雅 drain — join 所有 in-flight 连接, deadline 内未完则 abort。
+/// deadline 由 serve/serve_blocking 从 FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS 解析 (默认 10s)。
 /// 完成的移出, 超时的 abort (强制停, 防孤儿响应/子进程挂死)。fail-loud 记 abort 数。
-async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>) {
+async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>, deadline: Duration) {
     let mut handles = conns.lock().await;
     let total = handles.len();
     if total == 0 {
@@ -641,7 +723,7 @@ async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>) {
     }
     info!(
         in_flight = total,
-        deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
+        deadline_secs = deadline.as_secs(),
         "drain in-flight 连接"
     );
     // join_all 带超时: 超时则 abort 剩余未完成的
@@ -656,7 +738,7 @@ async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>) {
                 let _ = h.await;
                 joined_ok += 1;
             } else {
-                match tokio::time::timeout(SHUTDOWN_DEADLINE, &mut h).await {
+                match tokio::time::timeout(deadline, &mut h).await {
                     Ok(Ok(())) => joined_ok += 1,
                     Ok(Err(e)) => warn!(error = %e, "连接 task join 失败"),
                     Err(_) => {
@@ -684,6 +766,7 @@ async fn handle_conn(
     exec_sem: Arc<Semaphore>,
 ) {
     let conn_id = hub.next_conn_id();
+    hub.active_conns.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(AsyncMutex::new(writer));
     let (push_tx, push_rx) = mpsc::channel::<Value>(128);
@@ -1133,7 +1216,10 @@ async fn handle_method(
                 // 负载均衡器/运维查此字段知实例未开运行时隔离, 提示生产环境须透传 seatbelt:true。
                 "seatbelt_default_off": true,
                 "runtime": { "ok": rt_ok },
-                "dependencies": deps
+                "dependencies": deps,
+                // M-OPS-04/M-OPS-05: 运维深度指标 — 连接数/worker 线程/活跃 shell/内存。
+                // 运维面板 + 负载均衡器据此判断实例负载与 shell 注册表水位。
+                "depth": probe_health_depth(executor, hub)
             }))
         }
         "executor.execute" => {
@@ -1413,6 +1499,10 @@ async fn handle_method(
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32)
                 .unwrap_or(0);
+            let max_idle_sec = params
+                .get("max_idle_sec")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(fe_core::shell::DEFAULT_MAX_IDLE_SEC);
             let sp = fe_core::shell::ShellStartParams {
                 command,
                 cwd,
@@ -1423,6 +1513,7 @@ async fn handle_method(
                 inherit_env,
                 max_nproc,
                 max_cpu_sec,
+                max_idle_sec,
             };
             let r = executor.shell_start(sp);
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
@@ -1491,7 +1582,53 @@ async fn probe_dependencies() -> Vec<Value> {
     vec![d]
 }
 
-/// 取 params["key"] 字符串
+/// M-OPS-04/M-OPS-05: health 深度指标 — 连接数/worker 线程数/活跃 shell 数/内存 (MB)。
+/// - connections: BroadcastHub.active_conns 原子快照 (无锁)。
+/// - workers: BLOCKING_RT worker_threads — 与 fe-core 初始化公式一致 (available_parallelism, 下限 2)。
+/// - active_shells: executor.list_shells().filter(!finished) 计数; M-OPS-05 接近 MAX_SHELLS 时 warn。
+/// - mem_mb: 本进程 RSS via sysinfo (轻量单次 refresh, 无采样任务)。
+fn probe_health_depth(executor: &Executor, hub: &BroadcastHub) -> Value {
+    let connections = hub.active_conns.load(Ordering::Relaxed);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .max(2);
+    let shells = executor.list_shells();
+    let active_shells = shells.iter().filter(|s| !s.finished).count();
+    // M-OPS-05: 接近上限告警 (80%) — 防 registry 打满导致新 shell_start 被迫 reap。
+    let max_shells = fe_core::shell::MAX_SHELLS;
+    if max_shells > 0 && active_shells * 5 >= max_shells * 4 {
+        warn!(
+            active_shells,
+            max_shells, "M-OPS-05: 活跃 shell 接近上限 (>=80%), 调用方应清理后台任务"
+        );
+    }
+    // mem_mb — 本进程 RSS (sysinfo 轻量 refresh)
+    let mem_mb = current_proc_mem_mb();
+    json!({
+        "connections": connections,
+        "workers": workers,
+        "active_shells": active_shells,
+        "max_shells": max_shells,
+        "mem_mb": mem_mb,
+    })
+}
+
+/// sysinfo 取本进程 RSS (MB) — M-OPS-04 health mem_mb 探针。
+/// 复用 fe-telemetry 同款 3-arg refresh_processes_specifics (sysinfo 0.32 API)。
+fn current_proc_mem_mb() -> f64 {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::new().with_memory(),
+    );
+    sys.process(pid)
+        .map(|p| (p.memory() as f64) / (1024.0 * 1024.0))
+        .unwrap_or(0.0)
+}
 fn param_str(params: &Value, key: &str) -> Option<String> {
     params
         .get(key)
@@ -1523,6 +1660,69 @@ fn chmod_secure(path: &Path) {
 
 #[cfg(not(unix))]
 fn chmod_secure(_path: &Path) {}
+
+/// M-SEC-01: 建 socket 父目录 0o700 — 私有目录阻他 UID connect (目录无搜索权限)。
+/// 仅对 HOME 下默认路径生效; 显式 /tmp 覆盖路径不建目录 (退化为 chmod 0o600 单文件)。
+/// 已存在目录不重设权限 (防误改用户定制目录), 仅缺失时 create_dir_all 0o700。
+#[cfg(unix)]
+fn ensure_sock_dir(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if parent.as_os_str().is_empty() {
+        return;
+    }
+    if parent.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        warn!(dir = %parent.display(), error = %e, "M-SEC-01: 建 socket 私有目录失败");
+        return;
+    }
+    if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
+        warn!(dir = %parent.display(), error = %e, "M-SEC-01: chmod 0o700 私有目录失败");
+    }
+    info!(dir = %parent.display(), "M-SEC-01: socket 私有目录已建 (0o700, 阻他 UID)");
+}
+
+#[cfg(not(unix))]
+fn ensure_sock_dir(_path: &Path) {}
+
+/// M-SEC-01: LOCAL_PEERCRED UID 校验 — accept 后查对端 UID, 须等于本进程 UID。
+/// 防同主机他 UID 经符号链接或 /tmp 覆盖路径越权 connect。零 unsafe (nix safe wrapper)。
+/// 返回 true=放行 (同 UID), false=拒 (他 UID 或取凭证失败, fail-closed)。
+#[cfg(unix)]
+fn peer_uid_matches(stream: &tokio::net::UnixStream) -> bool {
+    use nix::sys::socket::getsockopt;
+    use nix::sys::socket::sockopt::LocalPeerCred;
+    use nix::unistd::getuid;
+    let self_uid = getuid().as_raw();
+    match getsockopt(stream, LocalPeerCred) {
+        Ok(cred) => {
+            let peer_uid = cred.uid();
+            if peer_uid == self_uid {
+                true
+            } else {
+                warn!(
+                    peer_uid,
+                    self_uid, "M-SEC-01: 拒他 UID 连接 (LOCAL_PEERCRED)"
+                );
+                false
+            }
+        }
+        Err(e) => {
+            // fail-closed: 取不到对端凭证 → 拒 (防降级绕过)
+            warn!(error = %e, "M-SEC-01: LOCAL_PEERCRED 取凭证失败, fail-closed 拒连");
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn peer_uid_matches(_stream: &tokio::net::UnixStream) -> bool {
+    true
+}
 
 #[cfg(test)]
 mod tests {
@@ -1591,6 +1791,98 @@ mod tests {
             git_dep
         );
         let _ = std::fs::remove_file(&sock);
+    }
+
+    // M-OPS-04/M-OPS-05: health 深度指标 — connections/workers/active_shells/max_shells/mem_mb
+    #[tokio::test]
+    async fn health_depth_fields_present() {
+        let sock = tmp_sock("health_depth");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
+        )
+        .await;
+        let depth = &resp["result"]["depth"];
+        assert!(depth.is_object(), "depth 应为对象: {}", depth);
+        // M-OPS-04: 五字段齐
+        for key in [
+            "connections",
+            "workers",
+            "active_shells",
+            "max_shells",
+            "mem_mb",
+        ] {
+            assert!(depth.get(key).is_some(), "depth 缺字段 {key}: {depth}");
+        }
+        // M-OPS-04: 本次 RPC 连接计入 — 至少 1 个活跃连接
+        let conns = depth["connections"].as_u64();
+        assert!(
+            conns.is_some() && conns.unwrap() >= 1,
+            "connections 应 >=1 (本次 RPC 在连): {depth}"
+        );
+        // M-OPS-04: workers >=2 (BLOCKING_RT 下限)
+        let workers = depth["workers"].as_u64();
+        assert!(
+            workers.is_some() && workers.unwrap() >= 2,
+            "workers 应 >=2: {depth}"
+        );
+        // M-OPS-05: max_shells == 256 (fe-shell 上限)
+        assert_eq!(
+            depth["max_shells"].as_u64(),
+            Some(256),
+            "max_shells 应为 256: {depth}"
+        );
+        // M-OPS-05: active_shells == 0 (无后台 shell 启动)
+        assert_eq!(
+            depth["active_shells"].as_u64(),
+            Some(0),
+            "active_shells 应为 0: {depth}"
+        );
+        // M-OPS-04: mem_mb 非负 (本进程 RSS)
+        let mem = depth["mem_mb"].as_f64();
+        assert!(
+            mem.is_some() && mem.unwrap() >= 0.0,
+            "mem_mb 应 >=0: {depth}"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // M-OPS-03: 可配 shutdown drain 超时 — 纯函数解析 (无 env 副作用, 线程安全单测)。
+    #[test]
+    fn mops03_shutdown_timeout_parse() {
+        // 缺省 → 默认 10s
+        assert_eq!(parse_shutdown_timeout(None), SHUTDOWN_DEADLINE);
+        // 合法区间内 → 覆盖
+        assert_eq!(
+            parse_shutdown_timeout(Some("5".into())),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_shutdown_timeout(Some("300".into())),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_shutdown_timeout(Some("  42  ".into())),
+            Duration::from_secs(42)
+        );
+        // 越界 → 回退默认
+        assert_eq!(parse_shutdown_timeout(Some("0".into())), SHUTDOWN_DEADLINE);
+        assert_eq!(
+            parse_shutdown_timeout(Some("301".into())),
+            SHUTDOWN_DEADLINE
+        );
+        assert_eq!(
+            parse_shutdown_timeout(Some("99999".into())),
+            SHUTDOWN_DEADLINE
+        );
+        // 非数字 → 回退默认
+        assert_eq!(
+            parse_shutdown_timeout(Some("abc".into())),
+            SHUTDOWN_DEADLINE
+        );
+        assert_eq!(parse_shutdown_timeout(Some("".into())), SHUTDOWN_DEADLINE);
     }
 
     // Issue #11 / #12.4: executor.validate 非执行预校验 over UDS — 调用方先问授权再 execute
@@ -2422,5 +2714,108 @@ mod tests {
         );
         drop(long_conn);
         let _ = std::fs::remove_file(&sock);
+    }
+
+    // M-SEC-01: LOCAL_PEERCRED UID 校验 — 同 UID 连接应放行 (CI 进程同 UID connect 自己)。
+    // 跨 UID 拒绝需不同 UID 进程, 非单测可行 (记于 README/审计报告)。
+    // 此测验证: (1) peer_uid_matches 对真实同 UID stream 返 true;
+    //          (2) ensure_sock_dir 建私有 0o700 目录;
+    //          (3) default_sock_path 落在 HOME/.fusion-executor/fe.sock (非 /tmp)。
+    #[tokio::test]
+    async fn msec01_peer_uid_same_uid_allowed() {
+        // (1) 同 UID stream 放行
+        let sock = tmp_sock("msec01");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let connect_task = tokio::spawn({
+            let s = sock.clone();
+            async move {
+                let _ = UnixStream::connect(&s).await.unwrap();
+            }
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(
+            peer_uid_matches(&stream),
+            "M-SEC-01: 同 UID 连接应被 LOCAL_PEERCRED 放行"
+        );
+        connect_task.await.unwrap();
+        let _ = std::fs::remove_file(&sock);
+
+        // (2) default_sock_path 落在 HOME 私有目录, 非 /tmp (m-OPS-01 + M-SEC-01)
+        let def = default_sock_path();
+        assert!(
+            !def.starts_with("/tmp/"),
+            "M-SEC-01/m-OPS-01: 默认 socket 不应落在全局可扫描 /tmp: {}",
+            def
+        );
+        assert!(
+            def.ends_with(DEFAULT_SOCK_NAME),
+            "默认 socket 应以 {} 结尾: {}",
+            DEFAULT_SOCK_NAME,
+            def
+        );
+
+        // (3) ensure_sock_dir 在不存在的 HOME 下子目录建 0o700 私有目录
+        let probe = std::env::temp_dir()
+            .join(format!("fe-msec01-probe-{}", std::process::id()))
+            .join("subdir")
+            .join("fe.sock");
+        ensure_sock_dir(&probe);
+        let parent = probe.parent().unwrap();
+        assert!(parent.exists(), "ensure_sock_dir 应建父目录");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "M-SEC-01: 私有 socket 目录应 0o700, 实际 {:#o}",
+                mode
+            );
+        }
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    // M-SEC-01/m-OPS-01: 默认 socket 路径 (~/.fusion-executor/fe.sock) serve 能起 —
+    // 捕获 bind-before-mkdir 顺序 bug: ensure_sock_dir 必须在 UnixListener::bind 前,
+    // 否则父目录不存在时 bind 失败。隔离 HOME 到 tempdir, 走真实 default_sock_path。
+    #[tokio::test]
+    async fn msec01_default_sock_dir_serve_works() {
+        let fake_home = std::env::temp_dir().join(format!("fe-msec01-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+        // 注入 HOME (default_sock_path 读 HOME), 测试结束恢复
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &fake_home);
+
+        let sock = IpcServer::resolve_sock(None);
+        assert!(
+            sock.starts_with(fake_home.display().to_string().as_str()),
+            "resolve_sock(None) 应落在隔离 HOME 下: {}",
+            sock
+        );
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["ok"], true);
+
+        // 私有目录权限 0o700
+        let dir = Path::new(&sock).parent().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "私有 socket 目录应 0o700, 实际 {:#o}", mode);
+        }
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&fake_home);
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

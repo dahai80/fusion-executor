@@ -53,7 +53,10 @@ def test_run_blocks_non_whitelisted_binary(executor: FusionSandboxExecutor):
 
 
 def test_run_allows_python(executor: FusionSandboxExecutor):
-    result = executor.run("python -c \"print('hello')\"")
+    # env 隔离默认 inherit_env=false → 硬化 PATH allowlist (/opt/homebrew/bin...)
+    # 仅含 python3 (无 venv `python` shim), 故用 python3 跑真实执行。
+    # python token 放行由 fe-security 单测 allows_python 覆盖。
+    result = executor.run("python3 -c \"print('hello')\"")
     assert not result.blocked_by_security
     assert result.exit_code == 0
 
@@ -922,7 +925,7 @@ def test_self_healing_closed_loop(executor: FusionSandboxExecutor, tmp_path):
     bug.write_text(BUG_SRC)
 
     # 2. 首次执行 — 应失败, diagnostics 切片定位到 bug.py
-    first = executor.run("python bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
+    first = executor.run("python3 bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
     assert first.exit_code != 0, "故障脚本应非零退出"
     assert not first.blocked_by_security
     assert first.diagnostics is not None, "exit!=0 应触发诊断切片"
@@ -943,7 +946,7 @@ def test_self_healing_closed_loop(executor: FusionSandboxExecutor, tmp_path):
     assert fix.matches == 1
 
     # 4. 二次执行 — 应通过 (闭环收敛)
-    second = executor.run("python bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
+    second = executor.run("python3 bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
     assert second.exit_code == 0, f"修复后应 exit 0: stderr={second.stderr}"
     assert "3" in second.stdout, "修复后应输出 3"
     assert second.diagnostics is None, "exit==0 不应触发诊断"

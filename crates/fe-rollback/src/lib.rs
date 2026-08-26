@@ -304,6 +304,20 @@ impl RollbackManager {
                     warn!(cwd, %baseline, "baseline 非合法 ref, 拒绝 (C-RB-03 flag 注入)");
                     return Ok(false);
                 }
+                // M-SEC-03: reset --hard 销毁快照后累积的 tracked WIP (并发编辑器修改)。
+                // 先 git stash create 捕获当前脏状态为 dangling commit (不入 stash list,
+                // 不违 C-RB-01), 记 SHA + 恢复命令到日志。调用方可 `git stash apply <sha>` 恢复。
+                // untracked 文件 reset --hard 不动, 无需捕获; snapshot_create 亦不含 untracked。
+                let wip_sha = Self::git(cwd, &["stash", "create"])
+                    .await
+                    .unwrap_or_default();
+                if !wip_sha.trim().is_empty() {
+                    warn!(
+                        cwd, wip_sha = %wip_sha.trim(),
+                        "M-SEC-03: reset --hard 前捕获 tracked WIP 为 dangling commit; \
+                         回滚后需恢复并发编辑请执行: git stash apply {}", wip_sha.trim()
+                    );
+                }
                 match Self::git(cwd, &["reset", "--hard", baseline]).await {
                     Ok(_) => {
                         info!(cwd, %baseline, "回滚成功 (head 基线, reset --hard)");
@@ -325,6 +339,17 @@ impl RollbackManager {
                 if !Self::is_valid_ref(baseline) {
                     warn!(cwd, %baseline, "baseline 非合法 ref, 拒绝 (C-RB-03 flag 注入)");
                     return Ok(false);
+                }
+                // M-SEC-03: 同 head 分支 — 捕获快照后 tracked WIP 防 reset --hard 销毁。
+                let wip_sha = Self::git(cwd, &["stash", "create"])
+                    .await
+                    .unwrap_or_default();
+                if !wip_sha.trim().is_empty() {
+                    warn!(
+                        cwd, wip_sha = %wip_sha.trim(),
+                        "M-SEC-03: stash 回滚前捕获 tracked WIP 为 dangling commit; \
+                         回滚后需恢复并发编辑请执行: git stash apply {}", wip_sha.trim()
+                    );
                 }
                 // C-RB-02: 先 reset --hard <baseline> 清工作区到基线 (单步原子, 避半截态)
                 // 然后 stash apply <stash> 恢复快照内容 (基线干净, apply 不冲突)

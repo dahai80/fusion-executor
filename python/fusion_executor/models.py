@@ -115,14 +115,6 @@ class GrepFileCount(BaseModel):
     count: int
 
 
-class GrepOutputMode(BaseModel):
-    model_config = _STRICT
-    mode: str = Field(
-        default="content",
-        description="grep 输出模式: content | files_with_matches | count",
-    )
-
-
 class GrepOptions(BaseModel):
     model_config = _STRICT
     output_mode: str = Field(default="content", description="content | files_with_matches | count")
@@ -147,14 +139,6 @@ class MultiEditItem(BaseModel):
     old_string: str
     new_string: str
     replace_all: bool = Field(default=False, description="True=替换全部匹配; False=唯一匹配 (默认)")
-
-
-class NotebookEditMode(BaseModel):
-    model_config = _STRICT
-    mode: str = Field(
-        default="replace",
-        description="单元格编辑模式: replace | insert | delete",
-    )
 
 
 class TelemetrySample(BaseModel):

@@ -118,10 +118,26 @@ impl Default for SandboxConfig {
 }
 
 /// Issue #9: 最小安全环境基线 — env_clear 后注入, 保证命令可解析 (PATH) + 有临时目录 (TMPDIR) + 有 shell (SHELL)。
-/// PATH 取宿主 PATH (非密钥, 保 python/node/cargo 等工具可解析; 不可用时回退静态 macOS 标准路径)。
 /// 不注入 HOME (多数命令不需; 隔离更彻底)。env_vars 覆盖基线 (调用方显式优先)。
-const SANDBOX_FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const SANDBOX_BASE_SHELL: &str = "/bin/sh";
+
+/// M-SEC-02: 硬化 PATH allowlist — inherit_env=false 时用此 (非宿主 PATH)。
+/// 宿主 PATH 早期恶意条目 (~/.local/bin/python3 包装) 可 shadow 白名单二进制。
+/// allowlist 覆盖 ARM macOS 工具链: /opt/homebrew/bin (pytest/node/cargo/python3/git),
+/// /usr/local/bin, /usr/bin, /bin (echo/sh/git)。nvm/rustup 等 ~ 下工具链用户须 inherit_env=true opt-in。
+/// /usr/sbin:/sbin 保留 (部分系统命令), 不含任何 ~ 下可写路径。
+const SANDBOX_HARDENED_PATH: &str =
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// M-SEC-02: inherit_env=true 时保留宿主 PATH (全量 env 继承语义); false 时返硬化 allowlist。
+/// 宿主 PATH 不可用时回退硬化 allowlist (非旧 SANDBOX_FALLBACK_PATH — 旧漏 /opt/homebrew/bin)。
+fn sandbox_path(inherit_env: bool) -> String {
+    if inherit_env {
+        std::env::var("PATH").unwrap_or_else(|_| SANDBOX_HARDENED_PATH.to_string())
+    } else {
+        SANDBOX_HARDENED_PATH.to_string()
+    }
+}
 
 /// C-SEC-01: env_vars 总量上限 64KB — 防调用方灌超大 env 打爆子进程 env 缓冲 (OOM/Argument list too long)
 const ENV_VARS_TOTAL_CAP: usize = 64 * 1024;
@@ -190,12 +206,11 @@ fn configure_env(cmd: &mut portable_pty::CommandBuilder, cfg: &SandboxConfig) ->
     validate_env_vars(&cfg.env)?;
     if !cfg.inherit_env {
         cmd.env_clear();
-        let path = std::env::var("PATH").unwrap_or_else(|_| SANDBOX_FALLBACK_PATH.to_string());
-        cmd.env("PATH", path);
+        cmd.env("PATH", sandbox_path(false));
         cmd.env("TMPDIR", std::env::temp_dir());
         cmd.env("SHELL", SANDBOX_BASE_SHELL);
         debug!(
-            "env 隔离: env_clear + 基线 PATH/TMPDIR/SHELL ({} env_vars 覆盖)",
+            "env 隔离: env_clear + 硬化 PATH/TMPDIR/SHELL ({} env_vars 覆盖)",
             cfg.env.len()
         );
     }
@@ -211,12 +226,11 @@ fn configure_std_env(cmd: &mut std::process::Command, cfg: &SandboxConfig) -> Re
     validate_env_vars(&cfg.env)?;
     if !cfg.inherit_env {
         cmd.env_clear();
-        let path = std::env::var("PATH").unwrap_or_else(|_| SANDBOX_FALLBACK_PATH.to_string());
-        cmd.env("PATH", path);
+        cmd.env("PATH", sandbox_path(false));
         cmd.env("TMPDIR", std::env::temp_dir());
         cmd.env("SHELL", SANDBOX_BASE_SHELL);
         debug!(
-            "env 隔离 (stdio): env_clear + 基线 PATH/TMPDIR/SHELL ({} env_vars 覆盖)",
+            "env 隔离 (stdio): env_clear + 硬化 PATH/TMPDIR/SHELL ({} env_vars 覆盖)",
             cfg.env.len()
         );
     }
@@ -772,7 +786,8 @@ impl Sandbox {
                 }
             }
 
-            let (timed_out, raw_exit) = exit_done.unwrap();
+            // M-FT-02: cancelled 分支已早 return, 走到此必 Some; unwrap_or_else 防重构破不变量致 panic
+            let (timed_out, raw_exit) = exit_done.unwrap_or((false, -1));
             let raw_output = eof_output.unwrap_or_default();
             let normalized = raw_output.replace("\r\n", "\n");
             let stdout = truncate_output(&normalized, max_output_final);
@@ -808,6 +823,11 @@ impl Default for Sandbox {
 pub fn truncate_output(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
+    }
+    // m-PERF-01: 字节长度短路 — s.len()<=max 则 bytes<=max, 而 chars<=bytes, 故 chars<=max
+    // 必无截断。常见小输出免 O(n) chars().count() 全量遍历。
+    if s.len() <= max {
+        return s.to_string();
     }
     // 一次遍历取所有 char 的字节起点偏移 — 单 Vec<usize> (N*8 字节) 远小于 Vec<char> (N*4)
     // 但 char_indices 已逐 char 产出, 峰值 = 偏移表; 全量 ASCII 64MB → 512MB 偏移表仍大。
@@ -1091,6 +1111,38 @@ mod tests {
             rb.stdout.contains("True"),
             "PATH/TMPDIR/SHELL 基线应存在: stdout={:?}",
             rb.stdout
+        );
+    }
+
+    #[test]
+    fn run_env_isolation_uses_hardened_path_allowlist_m_sec_02() {
+        // M-SEC-02: inherit_env=false (默认) → PATH 必为硬化 allowlist, 非宿主 PATH。
+        // 宿主 PATH 含 ~ 下可写条目 (~/.local/bin) 可 shadow 白名单二进制。allowlist 无 ~ 条目。
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // 宿主 PATH 塞入恶意哨兵目录 (确认不泄漏)
+        let saved = std::env::var("PATH").ok();
+        std::env::set_var(
+            "PATH",
+            "/Users/dahai/.local/bin:/tmp/fe-evil-path:/usr/bin:/bin",
+        );
+        let reflect = "python3 -c \"import os;print(os.environ.get('PATH',''))\"";
+        let r = rt().block_on(Sandbox::new().run(cfg(reflect))).unwrap();
+        // 恢复宿主 PATH
+        match saved {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(r.exit_code, 0, "stderr={:?}", r.stderr);
+        let child_path = r.stdout.trim();
+        assert!(
+            !child_path.contains(".local/bin") && !child_path.contains("fe-evil-path"),
+            "M-SEC-02: 宿主 PATH 恶意条目不应泄漏到隔离子进程: PATH={:?}",
+            child_path
+        );
+        assert_eq!(
+            child_path, SANDBOX_HARDENED_PATH,
+            "M-SEC-02: inherit_env=false 应注入硬化 PATH allowlist, 实际={:?}",
+            child_path
         );
     }
 

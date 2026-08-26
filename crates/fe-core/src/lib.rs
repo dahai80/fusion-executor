@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use fe_diagnostics::Slicer;
-use fe_gui::{GuiAction, GuiController, GuiResult};
+use fe_gui::{GuiAction, GuiConfig, GuiController, GuiResult};
 use fe_rollback::RollbackManager;
 use fe_sandbox::{Sandbox, SandboxConfig};
 use fe_security::{SecurityGuard, SecurityVerdict};
@@ -361,6 +361,15 @@ impl Executor {
     pub fn with_extra_whitelist(mut self, extras: &[&str]) -> Self {
         info!(count = extras.len(), "Executor 扩展白名单 (项目级放行)");
         self.security = self.security.with_extra_whitelist(extras);
+        self
+    }
+
+    /// M-SEC-04: GUI 安全配置 (bundle allowlist + 密码框 type_text 守卫)。
+    /// 默认 Executor::new() 无配置 = 不限 (本地可信调用方, 仅审计日志);
+    /// 企业/多用户场景用此构造器设 allowlist + allow_type_into_secure opt-in。
+    pub fn with_gui_config(mut self, config: GuiConfig) -> Self {
+        info!("Executor 设置 GUI 安全配置 (M-SEC-04)");
+        self.gui = GuiController::new_with_config(config);
         self
     }
 
