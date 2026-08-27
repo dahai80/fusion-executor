@@ -55,6 +55,21 @@ v1.8 COMPLETE (#1 background task API — new `fe-shell` crate, run_in_backgroun
 
 **v0.2.3 #20 (glob E1 spec alignment):** `fe-tools` `glob()` 对齐 fusion-event E1 生态统一 glob 规范 (`fusion-event/docs/glob-spec.md`)。**Bug fix**: globset 默认 `*` 跨 `/` 与 E1 冲突 — `src/*.swift` 误命中 `src/sub/a.swift`。修法: `globset::Glob::new(pattern)` → `GlobBuilder::new(pattern).literal_separator(true).build()`, 收紧 `*`/`?` 不跨 `/`, `**` 仍跨目录 (literal_separator 仅影响单段通配, 不影响 `**` 递归)。spec 权威在 fusion-event (他工程, 只读), fusion-executor glob 实现对齐其语义; 模式匹配相对 cwd 路径 (`strip_prefix(cwd_abs)`), 故 spec 绝对模式 (`/src/*.swift`) 在此适配为相对 (`src/*.swift`)。3 E1 验收测试 (`test_glob_e1_star_within_segment` `src/*.swift` 命中同层不跨 / / `test_glob_e1_doublestar_across_dirs` `src/**/*.swift` 跨目录 / `test_glob_e1_question_one_char` `bin/?s` 单字符不命中 `less`) — **测试先于修复失败暴露真 bug** (Rule 9), `literal_separator` 后全绿。既有 `**/*.py` 跨目录测试保持绿 (literal_separator 不破坏 `**`)。0 新增 unsafe, 0 新依赖。359 Rust + 184 Python (1 skip TCC) green, clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6), fmt/ruff 净, maturin 构建.
 
+**Audit 0827 adversarial hardening (P0-P3 全落地, branch `fix/audit0827-p0-p3`):** 6 路对抗性审计 (`audit/fusion-executor-audit-0827.md` 只读参考, 基线 `deae2c3` v0.2.3) 查 67 findings — 18 CRITICAL (C-1..C-18) + 18 LOGIC-BUG (L-1..L-18) + 12 ARCHITECTURE (A-1..A-12) + 7 PERFORMANCE (P-1..P-7) + 12 MAINTAINABILITY (M-1..M-12, P4 bundled)。12 crate-cluster task #94-#105 全绿:
+- #94 fe-security (C-1 `&`/redirect 绕过 — tokenizer 视 `&` 为 compound 分隔符非 background; C-5/C-6/C-11/C-12/C-13 GUI 越权 scope; A-7; L-4/L-5; P-3)
+- #95 fe-sandbox (C-14 `setsid` 新进程组隔离; C-15 `kill_tree` killpg 递归 reap 无孤儿; C-16 seatbelt SENSITIVE_FS_PATHS file-write deny; A-10/A-11/A-12; L-13)
+- #96 fe-diagnostics (C-17 ReDoS cap + 编译超时 + 长度上限; C-18 symlink TOCTOU canonicalize-on-open; L-16/L-17/L-18; P-6; A-8; M-10)
+- #97 fe-ipc (C-8/C-9/C-10 资源泄漏 — rx-drop abort + saw_done guard + graceful shutdown; L-6/L-7; P-1/P-2; A-6; M-7)
+- #98 fe-gui (C-13; M-12.3/M-12.4)
+- #99 fe-core (C-2/C-4; L-2/L-3; A-5)
+- #100 fe-pyo3 (C-3/C-4 streaming recv timeout + saw_done)
+- #101 fe-rollback (C-7 capture_wip fail-loud; L-1 `RollbackOutcome{applied,skipped_reason,wip_sha}` + `rollback_skipped_reason` 4 层; L-8 `rollback_file` RepoLock)
+- #102 fe-tools+security (L-9 check_size 移锁内; L-10 fail-closed canonicalize; L-11 split peek-ahead; L-12 Insert missing-id 报错非静默 append; A-1; M-12.1/M-12.2)
+- #103 fe-shell (P-4 kill 外锁 / P-5 join 外锁 / M-8 reader catch_unwind / M-9 kill_grace_ms 4 层) + fe-telemetry (L-15 `pid` 字段 / A-9 channel64 + `tx.is_closed()` 防挂死 — **真 bug**: 进程消失路径 `continue` 未查 rx drop → 无限 10ms sleep 循环 → handle 永不完成 → test hang >60s; fix = `tx.is_closed()` check → break / P-7 `new_all` baseline + warn 跳帧 / M-11 `sanitize_gpu`)
+- #104 Python (P-2 `Subscription._buf` 8MB OOM cap; M-4 native ImportError `warn` fail-visible; M-5 cli `_validate_paths` 启动期 fail-fast sys.exit(2); M-6 `run_streaming` 未知帧 type debug 日志)
+- #105 workspace verify + docs
+419 Rust + 190 Python (1 skip TCC) 全绿, clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat), fmt/ruff 净, maturin 构建. 提交链 #94-#105 on `fix/audit0827-p0-p3` (不 push 待命).
+
 See `architecture/fusion-executor-prd.md` §4 for the full `ExecutionRequest` / `ExecutionResult` field list and the Diagnostics Slicer algorithm.
 
 ## Build / Test / Lint
