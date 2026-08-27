@@ -620,7 +620,11 @@ impl Tools {
         let cwd_abs = std::fs::canonicalize(base).unwrap_or_else(|_| PathBuf::from(base));
         // #7: gitignore-aware 遍历 — ignore::WalkBuilder 读 .gitignore + 隐藏文件 + IGNORED_DIRS 基线
         // 旧版 glob::glob 直接匹配文件系统, 不读 .gitignore → 命中 .gitignore'd 文件 (如 dist/产物)
-        let pat = globset::Glob::new(pattern)
+        // #20: literal_separator(true) — `*`/`?` 不跨 `/`, `**` 仍跨目录。对齐 fusion-event E1 生态统一 glob 规范。
+        //   globset 默认 `*` 跨 `/` (与 E1 冲突: `src/*.swift` 会误命中 src/sub/a.swift)。literal_separator 收紧至 E1。
+        let pat = globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
             .map_err(|e| anyhow::anyhow!("glob 模式无效: {}", e))?
             .compile_matcher();
         let mut out = Vec::new();
@@ -2970,5 +2974,74 @@ mod tests {
         assert_eq!(source_to_lines("one"), vec!["one"]);
         assert_eq!(source_to_lines("a\nb\n"), vec!["a\n", "b\n"]);
         assert_eq!(source_to_lines("a\nb"), vec!["a\n", "b"]);
+    }
+
+    // ── E1 生态统一 glob 规范 (issue #20, fusion-event/docs/glob-spec.md) ──
+    // `*` 不跨 `/`, `**` 跨目录, `?` 单个非 `/` 字符。glob 匹配相对 cwd 路径。
+
+    // E1 例 1: `src/*.swift` 命中 src/a.swift, 不命中 src/sub/a.swift (* 不跨 /)
+    #[test]
+    fn test_glob_e1_star_within_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("sub")).unwrap();
+        std::fs::write(dir.path().join("src").join("a.swift"), "").unwrap();
+        std::fs::write(dir.path().join("src").join("sub").join("a.swift"), "").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut paths: Vec<String> = tools
+            .glob("src/*.swift", Some(&cwd))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["src/a.swift"], "* 应仅命中同层, 不跨 /");
+    }
+
+    // E1 例 2: `src/**/*.swift` 命中 src/a.swift + src/x/y/a.swift (** 跨目录)
+    #[test]
+    fn test_glob_e1_doublestar_across_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("x").join("y")).unwrap();
+        std::fs::write(dir.path().join("src").join("a.swift"), "").unwrap();
+        std::fs::write(
+            dir.path().join("src").join("x").join("y").join("a.swift"),
+            "",
+        )
+        .unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut paths: Vec<String> = tools
+            .glob("src/**/*.swift", Some(&cwd))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["src/a.swift", "src/x/y/a.swift"],
+            "** 应跨目录命中多层"
+        );
+    }
+
+    // E1 例 3: `bin/?s` 命中 bin/ls, 不命中 bin/less (? 恰一非 / 字符)
+    #[test]
+    fn test_glob_e1_question_one_char() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin").join("ls"), "").unwrap();
+        std::fs::write(dir.path().join("bin").join("less"), "").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut paths: Vec<String> = tools
+            .glob("bin/?s", Some(&cwd))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["bin/ls"], "? 应恰匹配一字符, 不匹配 less");
     }
 }

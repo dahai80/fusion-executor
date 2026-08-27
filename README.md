@@ -184,7 +184,8 @@ r: EditResult = ex.file_edit("app.py", "x = 1", "x = 99", cwd="/repo")
 assert r.ok and r.matches == 1
 
 # glob — wildcard match, returns paths relative to cwd
-entries: list[GlobEntry] = ex.glob("**/*.py", cwd="/repo")
+# E1 生态统一 glob 规范 (#20): `*` 不跨 `/`, `**` 跨目录, `?` 单个非 `/` 字符。参考 fusion-event/docs/glob-spec.md。
+entries: list[GlobEntry] = ex.glob("**/*.py", cwd="/repo")  # **/*.py 跨目录; src/*.py 仅同层
 
 # grep — regex search over files/dirs (recursive, skips binary, 1000-hit cap)
 hits: list[GrepMatch] = ex.grep(r"^import\s", ["app.py"], cwd="/repo")
