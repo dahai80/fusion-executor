@@ -1,7 +1,7 @@
 // fe-diagnostics — Traceback 提取 + 纯文本行切片 (PRD §4.2)
 //
 // Pipeline: 正则提取多语言 traceback → 末 N 行 + 根因标记行保段头 → 上下 20 行切片
-// (tree-sitter AST 定位为 P5 预留, 当前用纯文本行, 正则 = 生产路径)
+// (0827 A-8: regex-only, 无 AST fallback — tree-sitter 路径 v1.6 已删, 正则 = 唯一生产路径, 单点故障接受)
 // 输出 Diagnostics → ExecutionResult.diagnostics (exit_code != 0 时)
 //
 // 语言:
@@ -14,12 +14,13 @@
 //   Swift    path:line:col: error: <msg>
 //   Go       panic: <msg> ... goroutine ... \tfile.go:line  /  file.go:line:col: <msg>
 
+use std::collections::VecDeque;
 use std::path::Path;
 
 use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use fe_security::SecurityGuard;
 
@@ -32,10 +33,11 @@ pub struct Diagnostics {
     pub raw_trace: Option<String>,
 }
 
-/// 诊断切片器 — 正则 traceback + tree-sitter 定位
+/// 诊断切片器 — 正则 traceback 提取 (纯文本行切片, 0827 A-8: regex-only 无 AST fallback)
 #[derive(Clone)]
 pub struct Slicer {
-    python_re: Regex,
+    python_file_re: Regex,
+    python_err_re: Regex,
     ts_re: Regex,
     ts_dash_re: Regex,
     node_re: Regex,
@@ -47,52 +49,67 @@ pub struct Slicer {
     guard: SecurityGuard,
 }
 
+/// M-10: 正则编译降级 — 编译失败不 panic, 降级为永不匹配 (\b\B 矛盾锚)。
+/// 硬编码模式已知可编译; 此为防御纵深 (未来改模式引入语法错时不致启动崩溃)。
+/// 命中回退时 error! 留痕 (fail-visible), 该语言诊断静默失效 (其他语言不受影响)。
+/// 用法: Regex::new(PAT).unwrap_or_else(|_| degrade_re("name")) — 保 PAT 原样不重写。
+fn degrade_re(name: &str) -> Regex {
+    error!(regex = name, "正则编译失败, 降级为永不匹配");
+    Regex::new(r"\b\B").expect("回退正则 \\b\\B 必可编译")
+}
+
 impl Slicer {
     pub fn new() -> Self {
         info!("Slicer::new() — 编译 8 语言 traceback 正则");
         Self {
             guard: SecurityGuard::new(),
-            // Python: Traceback ... File "path", line N ... <Type>Error: msg
-            // (?ms): m=^按行锚, s=.跨行。.*File 贪心取最深 (最后) File 帧 — M-DIAG-01
-            // 配合 tail_lines 保标记行后, 深 traceback 多帧保留时取最接近根因的栈帧。
-            python_re: Regex::new(
-                r#"(?ms)Traceback \(most recent call last\):.*File "([^"]+)", line (\d+).*?^(\w+(?:Error|Exception|Warning)):\s*([^\n]*)"#,
-            )
-            .expect("python_re 编译失败"),
+            // Python two-pass (0827 C-17: 单正则 .*File.*?^Error 贪心+非贪心量词爆炸,
+            // 10MB 输入实测 1134s ReDoS; 拆两遍逐行匹配, 线性无回溯):
+            // pass1 python_file_re: 找**最后** File 帧 (^\s+File, 无 .* 跨行量词)
+            // pass2 python_err_re: 找错误行 <Type>Error: msg (行锚, 无跨行量词)
+            // extract_python 组合两者 — 同一 traceback 内 File 帧与错误行配对。
+            python_file_re: Regex::new(r#"(?m)^\s+File "([^"]+)", line (\d+)"#)
+                .unwrap_or_else(|_| degrade_re("python_file_re")),
+            python_err_re: Regex::new(r"(?m)^(\w+(?:Error|Exception|Warning)):\s*(.*)")
+                .unwrap_or_else(|_| degrade_re("python_err_re")),
             // TS: path.ts(l,c): error TSxxxx: msg (tsc 括号形式)
             // (?m): ^按行锚; group1=path(.ts/.tsx 等), group2=line, group3=TS 码, group4=msg
             ts_re: Regex::new(
                 r#"(?m)^([^:\s][^:\n]*?)\((\d+),\d+\):\s+error\s+(TS\d+):\s*([^\n]*)"#,
             )
-            .expect("ts_re 编译失败"),
+            .unwrap_or_else(|_| degrade_re("ts_re")),
             // TS watch: path.ts:l:c - error TSxxxx: msg (tsc watch 冒号-短横形式)
             ts_dash_re: Regex::new(
                 r#"(?m)^([^:\s][^:\n]*?):(\d+):\d+\s+-\s+error\s+(TS\d+):\s*([^\n]*)"#,
             )
-            .expect("ts_dash_re 编译失败"),
+            .unwrap_or_else(|_| degrade_re("ts_dash_re")),
             // Node: Error: msg ... at fn (path:line:col)
-            node_re: Regex::new(r"Error:\s*(.*)\n\s+at\s+.*\(([^()]+):(\d+):\d+\)")
-                .expect("node_re 编译失败"),
+            // 0827 L-17: 锚行首 (?m)^ — 否则匹配内联 // Error: foo 注释误报
+            node_re: Regex::new(r"(?m)^Error:\s*(.*)\n\s+at\s+.*\(([^()]+):(\d+):\d+\)")
+                .unwrap_or_else(|_| degrade_re("node_re")),
             // Bun: error: msg ... at path:line:col (小写 error, 裸 at 无括号)
-            bun_re: Regex::new(r"error:\s*(.*)\n\s+at\s+([^()]+):(\d+):\d+")
-                .expect("bun_re 编译失败"),
+            // 0827 L-17: 锚行首 (?m)^ — 同 node_re
+            bun_re: Regex::new(r"(?m)^error:\s*(.*)\n\s+at\s+([^()]+):(\d+):\d+")
+                .unwrap_or_else(|_| degrade_re("bun_re")),
             // Rust: thread 't' panicked at path:line:col
             rust_re: Regex::new(r"thread '.*?' panicked at ([^:\n]+):(\d+):\d+")
-                .expect("rust_re 编译失败"),
+                .unwrap_or_else(|_| degrade_re("rust_re")),
             // Go panic: panic: msg ... goroutine N [running]: ... \tfile.go:line
             // (?s): .跨行; group1=panic msg, group2=file, group3=line (最后一栈帧)
             go_panic_re: Regex::new(
                 r#"(?s)panic:\s*([^\n]*)\n.*?goroutine \d+ \[running\]:.*?\n\t([^:\n]+):(\d+)"#,
             )
-            .expect("go_panic_re 编译失败"),
+            .unwrap_or_else(|_| degrade_re("go_panic_re")),
             // Swift: path:line:col: error: msg
             // (?m): ^按行锚; [^:\n]* 防跨行吞掉上一行
             swift_re: Regex::new(r"(?m)^([^:\s][^:\n]*):(\d+):\d+:\s*error:\s*([^\n]*)")
-                .expect("swift_re 编译失败"),
+                .unwrap_or_else(|_| degrade_re("swift_re")),
             // Go compile: file.go:line:col: msg (无 error 关键字; swift_re 漏因无 "error:")
             // (?m): ^按行锚; group1=file(.go), group2=line, group3=msg
+            // 0827 L-16: regex 裸匹配 file.go:l:c: 误吞测试进度行 (main_test.go:15:3: PASS);
+            // Rust regex 无 lookahead, 故 extract_go_compile 内加消息守卫拒测试状态 token。
             go_compile_re: Regex::new(r"(?m)^([^:\s][^:\n]*\.go):(\d+):\d+:\s*([^\n]*)")
-                .expect("go_compile_re 编译失败"),
+                .unwrap_or_else(|_| degrade_re("go_compile_re")),
         }
     }
 
@@ -138,15 +155,31 @@ impl Slicer {
     }
 
     fn extract_python(&self, tail: &str) -> Option<Diagnostics> {
-        let c = self.python_re.captures(tail)?;
-        let file_path = c.get(1).map(|m| m.as_str().to_string());
-        let line_number = c.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
-        let error_type = c.get(3).map(|m| m.as_str().to_string());
-        let msg = c
-            .get(4)
+        // 0827 C-17: 两遍线性匹配 (无跨行量词爆炸)
+        // pass1: 找**最后** File 帧 (深 traceback 多帧, 取最接近根因的栈帧)
+        // pass2: 找错误行 (<Type>Error: msg)
+        // 二者均锚行首, 无 .* 跨行量词 — 10MB 输入线性, 不回溯爆炸
+        let mut last_file: Option<(String, u32)> = None;
+        for c in self.python_file_re.captures_iter(tail) {
+            let f = c.get(1).map(|m| m.as_str().to_string());
+            let l = c.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+            if let (Some(f), Some(l)) = (f, l) {
+                last_file = Some((f, l));
+            }
+        }
+        let err = self.python_err_re.captures(tail);
+        // 至少有错误行才算 Python traceback (File 帧可缺失, 如顶层抛异常无栈)
+        let ec = err?;
+        let error_type = ec.get(1).map(|m| m.as_str().to_string());
+        let msg = ec
+            .get(2)
             .map(|m| m.as_str().trim().to_string())
             .unwrap_or_default();
         let raw_trace = format!("{}: {}", error_type.as_deref().unwrap_or("Error"), msg);
+        let (file_path, line_number) = match last_file {
+            Some((f, l)) => (Some(f), Some(l)),
+            None => (None, None),
+        };
         Some(Diagnostics {
             error_type,
             file_path,
@@ -264,31 +297,52 @@ impl Slicer {
     }
 
     fn extract_go_compile(&self, tail: &str) -> Option<Diagnostics> {
-        let c = self.go_compile_re.captures(tail)?;
-        let file_path = c.get(1).map(|m| m.as_str().to_string());
-        let line_number = c.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
-        let msg = c
-            .get(3)
-            .map(|m| m.as_str().trim().to_string())
-            .unwrap_or_default();
-        Some(Diagnostics {
-            error_type: Some("compile error".to_string()),
-            file_path,
-            line_number,
-            raw_trace: Some(format!("compile error: {}", msg)),
-            code_snippet: None,
-        })
+        // 0827 L-16: go_compile_re 裸匹配 file.go:l:c: 误吞测试进度行
+        // (main_test.go:15:3: PASS) 与 runtime 日志。遍历所有匹配, 跳测试状态 token
+        // (PASS/FAIL/SKIP/ok/RUN/BENCHMARK 开头), 取首个非状态诊断行。
+        for c in self.go_compile_re.captures_iter(tail) {
+            let file_path = c.get(1).map(|m| m.as_str().to_string());
+            let line_number = c.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+            let msg_raw = c
+                .get(3)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default();
+            // 测试状态 token 不属编译诊断 — 跳过, 继续找下一匹配
+            let is_test_status = matches!(
+                msg_raw
+                    .split_whitespace()
+                    .next()
+                    .map(|s| s.to_ascii_uppercase())
+                    .as_deref(),
+                Some("PASS" | "FAIL" | "SKIP" | "OK" | "RUN" | "BENCHMARK")
+            );
+            if is_test_status {
+                continue;
+            }
+            let msg = msg_raw;
+            return Some(Diagnostics {
+                error_type: Some("compile error".to_string()),
+                file_path,
+                line_number,
+                raw_trace: Some(format!("compile error: {}", msg)),
+                code_snippet: None,
+            });
+        }
+        None
     }
 
     /// 填充 code_snippet — 读文件, 报错行上下 20 行, 报错行标 >
-    /// Blocker 2 (finding 3.3): traceback file_path 经 SecurityGuard 校验敏感路径 + .. 逃逸
-    /// 防止私钥经诊断通道泄 LLM (攻击者构造 traceback 引用 ~/.ssh/id_rsa → enrich 读取 → 入 prompt)
+    /// Blocker 2 (finding 3.3) + 0827 C-18: traceback file_path 经 SecurityGuard 校验
+    /// 敏感路径 + .. 逃逸 + 跨 symlink 旁路, 防私钥经诊断通道泄 LLM。
+    /// 攻击链: 构造 traceback 引用 /tmp/leak.py → symlink → ~/.ssh/id_rsa → enrich
+    /// 读到私钥 → 入 prompt。旧实现只 canonicalize 父目录, 漏: symlink 文件本体解析。
+    /// 修: canonicalize 文件本体 (real), 对 real + real.parent() 双重 validate_cwd,
+    /// is_sensitive_filename(real) 命中即拒, real 与 abs 不一致 (跨 symlink) 额外审慎。
     fn enrich(&self, mut d: Diagnostics, cwd: Option<&str>) -> Diagnostics {
         let (Some(path), Some(line)) = (d.file_path.as_ref(), d.line_number) else {
             return d;
         };
-        // 敏感路径 + .. 逃逸校验 (复用 fe-security)
-        // is_sensitive_path 只检 / ~ 前缀; .. 相对逃逸单独拦
+        // .. 逃逸 — 相对路径 .. 跨 cwd 边界 (validate_cwd 也拦, 此处早期 fail-closed)
         if Path::new(path)
             .components()
             .any(|comp| comp == std::path::Component::ParentDir)
@@ -297,23 +351,48 @@ impl Slicer {
             return d;
         }
         let abs = resolve_path(path, cwd);
-        // 校验 abs 的父目录非敏感 (canonicalize 解符号链接)
+        // 字面父目录校验 (快速, 防 canonicalize 前的敏感前缀)
         let check_dir = Path::new(&abs)
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| abs.clone());
-        // 先字面校验 (快速), 再 canonicalize 校验 (防符号链接旁路)
         let v_lit = self.guard.validate_cwd(&check_dir);
         if !v_lit.allowed {
             warn!(path = %abs, reason = v_lit.reason, "诊断 file_path 敏感 (字面), 拒绝读取");
             return d;
         }
-        if let Ok(canonical) = Path::new(&check_dir).canonicalize() {
-            let v_can = self.guard.validate_cwd(&canonical.to_string_lossy());
-            if !v_can.allowed {
-                warn!(path = %abs, reason = v_can.reason, "诊断 file_path 敏感 (符号链接解析), 拒绝读取");
+        // 0827 C-18: canonicalize 文件本体 — 解 symlink 到真实路径
+        // (旧实现只 canonicalize 父目录, symlink 文件 /tmp/leak.py→~/.ssh/id_rsa 旁路)
+        let real = match Path::new(&abs).canonicalize() {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(path = %abs, "诊断 file_path canonicalize 失败 (跳过 snippet): {}", e);
                 return d;
             }
+        };
+        // 真实文件名敏感 (id_rsa / *.pem / *.key...) — 命中即拒, 不读
+        if self.guard.is_sensitive_filename(&real.to_string_lossy()) {
+            warn!(path = %abs, real = %real.display(), "诊断 file_path 解析为敏感文件名, 拒绝读取");
+            return d;
+        }
+        // 真实路径 + 真实父目录双重敏感校验 (symlink 目标落 ~/.ssh 等)
+        let v_real = self.guard.validate_cwd(&real.to_string_lossy());
+        if !v_real.allowed {
+            warn!(path = %abs, real = %real.display(), reason = v_real.reason, "诊断 file_path 真实路径敏感, 拒绝读取");
+            return d;
+        }
+        let real_parent = real
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| real.to_string_lossy().into_owned());
+        let v_real_parent = self.guard.validate_cwd(&real_parent);
+        if !v_real_parent.allowed {
+            warn!(path = %abs, real = %real.display(), reason = v_real_parent.reason, "诊断 file_path 真实父目录敏感, 拒绝读取");
+            return d;
+        }
+        // 跨 symlink 边界告警 (abs != real) — 非必拒 (合法 symlink 项目结构), 但留审计痕
+        if real.to_string_lossy() != abs {
+            warn!(path = %abs, real = %real.display(), "诊断 file_path 经 symlink 解析, 已双重校验通过");
         }
         let snippet = read_snippet(&abs, line).unwrap_or_else(|e| {
             debug!(path = %abs, "snippet 读取失败: {}", e);
@@ -412,34 +491,68 @@ fn utf8_len(b: u8) -> usize {
 /// `error:` 行首锚) + 标记行的下一行 (Node/Bun `at` 邻接依赖) + 末 N 行,
 /// 按原序去重合并。过保几行无害 (正则仍精确捕), 漏保根因行才有害 — 此处治漏保。
 fn tail_lines(s: &str, n: usize) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    if lines.len() <= n {
-        return lines.join("\n");
-    }
-    let tail_start = lines.len() - n;
-    let mut keep_idx: Vec<usize> = Vec::new();
-    for (i, l) in lines.iter().enumerate() {
-        let is_header = l.starts_with("Traceback (most recent call last)")
-            || l.starts_with("panic:")
-            || l.starts_with("goroutine ");
-        let is_marker = l.contains("Error:")
-            || l.contains("Exception:")
-            || l.contains("Warning:")
-            || l.starts_with("error:");
-        if is_header || is_marker {
-            keep_idx.push(i);
-            if is_marker && i + 1 < lines.len() {
-                keep_idx.push(i + 1);
+    // 0827 P-6: 环形缓冲避全量 Vec — 旧 `s.lines().collect()` 对 10MB 输出分配全量
+    // 行指针 Vec。改 lazy 迭代, 末 N 行入 VecDeque 环形 (cap n), 标记/段头行单独收集
+    // (任意位置保留, 不受截断影响)。
+    // 0827 L-18: is_marker 大小写不敏感 (旧 .contains("Error:") 漏 Bun 小写 error: 及
+    // 各语言变体; English-only 接受 — 诊断关键字均 ASCII) + 加 panic: 标记
+    // (旧 panic: 仅在 is_header, 漏非行首 panic 标记如 `runtime error: ... panic:`)。
+    if n == 0 {
+        // n=0 仅保标记行 (无末尾窗口) — 边界, 实际调用 n=30
+        let mut markers: Vec<&str> = Vec::new();
+        let mut prev_was_marker = false;
+        for l in s.lines() {
+            let low = l.to_ascii_lowercase();
+            let is_header = low.starts_with("traceback (most recent call last")
+                || low.starts_with("panic:")
+                || low.starts_with("goroutine ");
+            let is_marker = low.contains("error:")
+                || low.contains("exception:")
+                || low.contains("warning:")
+                || low.contains("panic:");
+            if is_header || is_marker || prev_was_marker {
+                markers.push(l);
             }
-        } else if i >= tail_start {
-            keep_idx.push(i);
+            prev_was_marker = is_marker;
         }
+        return markers.join("\n");
     }
-    keep_idx.sort();
-    keep_idx.dedup();
-    keep_idx
-        .into_iter()
-        .map(|i| lines[i])
+    let mut tail: VecDeque<(usize, &str)> = VecDeque::with_capacity(n);
+    let mut markers: Vec<(usize, &str)> = Vec::new();
+    let mut prev_was_marker = false;
+    for (i, l) in s.lines().enumerate() {
+        let low = l.to_ascii_lowercase();
+        let is_header = low.starts_with("traceback (most recent call last")
+            || low.starts_with("panic:")
+            || low.starts_with("goroutine ");
+        let is_marker = low.contains("error:")
+            || low.contains("exception:")
+            || low.contains("warning:")
+            || low.contains("panic:");
+        if is_header || is_marker || prev_was_marker {
+            markers.push((i, l));
+        }
+        prev_was_marker = is_marker;
+        if tail.len() == n {
+            tail.pop_front();
+        }
+        tail.push_back((i, l));
+    }
+    // 未截断 (tail 含全量, 首 idx==0) → 直接返, markers 已在其中
+    if tail.front().is_some_and(|(idx, _)| *idx == 0) {
+        return tail
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    // 截断 → 合并 tail + markers, 按原序去重
+    let mut keep: Vec<(usize, &str)> = markers;
+    keep.extend(tail);
+    keep.sort_by_key(|(i, _)| *i);
+    keep.dedup_by_key(|(i, _)| *i);
+    keep.into_iter()
+        .map(|(_, l)| l)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -759,5 +872,129 @@ mod tests {
         let p = std::env::temp_dir().join(format!("fe-diag-test-{}", std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    // 0827 C-17: python_re ReDoS — 旧单正则 .*File.*?^Error 10MB 输入 1134s;
+    // two-pass 无跨行量词, 应线性 (本测 1MB 伪 traceback, 应秒级返, 不挂死)。
+    #[test]
+    fn python_redos_linear_on_large_input() {
+        // 1MB 垃圾行 + 末尾合法 Python traceback — 旧 ReDoS 会回溯爆炸
+        let mut out = String::from("Traceback (most recent call last):\n");
+        // 10 万行非匹配垃圾 (无 File 无 Error) — 逼旧 .*File.*? 跨行回溯
+        for _ in 0..100_000 {
+            out.push_str("    garbage line without any marker aaaaaaaaaaaaaaa\n");
+        }
+        out.push_str("  File \"src/x.py\", line 7, in <module>\n");
+        out.push_str("    raise ValueError('boom')\n");
+        out.push_str("ValueError: boom\n");
+        let d = s().slice(&out, None);
+        assert_eq!(d.error_type.as_deref(), Some("ValueError"));
+        assert_eq!(d.file_path.as_deref(), Some("src/x.py"));
+        assert_eq!(d.line_number, Some(7));
+    }
+
+    // 0827 C-18: symlink 文件本体解析 — traceback 引用 /tmp/leak.py → symlink →
+    // ~/.ssh/id_rsa。旧实现只 canonicalize 父目录, 漏 symlink 文件本体。
+    #[test]
+    fn enrich_rejects_symlink_to_sensitive_file() {
+        let dir = tempfile_dir();
+        let leak = dir.join("leak.py");
+        let home_ssh = std::env::var("HOME").unwrap_or_default();
+        let ssh_key = format!("{}/.ssh/id_rsa", home_ssh);
+        // 建私钥占位 (若存在则跳过建, 仅测 symlink 解析拒读)
+        let _ = std::fs::create_dir_all(format!("{}/.ssh", home_ssh));
+        let _ = std::fs::write(&ssh_key, "FAKE-PRIVATE-KEY-CONTENT\n");
+        // leak.py → symlink → id_rsa
+        let _ = std::fs::remove_file(&leak);
+        if std::os::unix::fs::symlink(&ssh_key, &leak).is_err() {
+            // symlink 建失败 (权限/已存在) — 跳过本测, 不失败
+            let _ = std::fs::remove_file(&ssh_key);
+            return;
+        }
+        let out = format!(
+            "Traceback (most recent call last):\n  File \"{}\", line 3, in <module>\n    x = 1\nTypeError: bad",
+            leak.display()
+        );
+        let d = s().slice(&out, None);
+        // symlink 解析为 id_rsa (敏感文件名) — code_snippet 不应含私钥内容
+        assert!(
+            d.code_snippet.is_none()
+                || !d
+                    .code_snippet
+                    .as_deref()
+                    .unwrap()
+                    .contains("FAKE-PRIVATE-KEY-CONTENT"),
+            "symlink→id_rsa 私钥内容不应泄入 code_snippet: {:?}",
+            d.code_snippet
+        );
+        let _ = std::fs::remove_file(&leak);
+        let _ = std::fs::remove_file(&ssh_key);
+    }
+
+    // 0827 C-18 (反向): 合法 symlink 项目结构 (如 src 链到别处) 应正常 enrich。
+    #[test]
+    fn enrich_allows_legit_symlink_to_source() {
+        let dir = tempfile_dir();
+        let real_src = dir.join("real_src.py");
+        std::fs::write(&real_src, "line1\nline2\nline3\nx = 1\nline5\n").unwrap();
+        let link = dir.join("link_src.py");
+        let _ = std::fs::remove_file(&link);
+        if std::os::unix::fs::symlink(&real_src, &link).is_err() {
+            return;
+        }
+        let out = format!(
+            "Traceback (most recent call last):\n  File \"{}\", line 4, in <module>\n    x = 1\nTypeError: bad",
+            link.display()
+        );
+        let d = s().slice(&out, None);
+        // 合法源 symlink 应读 — code_snippet 含 line4 内容
+        assert!(
+            d.code_snippet.is_some(),
+            "合法 symlink 源文件应 enrich 填 code_snippet"
+        );
+        let _ = std::fs::remove_file(&link);
+    }
+
+    // 0827 L-16: go_compile_re 误吞测试进度行 — main_test.go:15:3: PASS 不应诊断。
+    #[test]
+    fn go_compile_skips_test_status_lines() {
+        let out = "go test ./...\nmain_test.go:15:3: PASS\nmain.go:6:5: undefined: foo";
+        let d = s().slice(out, None);
+        // 应跳 PASS 状态行, 取编译错误 main.go undefined
+        assert_eq!(d.error_type.as_deref(), Some("compile error"));
+        assert_eq!(d.file_path.as_deref(), Some("main.go"));
+        assert_eq!(d.line_number, Some(6));
+    }
+
+    // 0827 L-17: node_re/bun_re 无 ^ 锚会匹配内联 // Error: foo 注释。
+    // 加 (?m)^ 后, 行中 Error: 不匹配 (须行首)。
+    #[test]
+    fn node_re_rejects_inline_error_comment() {
+        let out = "// comment Error: foo here\n    at bar (app.js:5:10)";
+        let d = s().slice(out, None);
+        // 行中 Error: 非行首 → node_re 不匹配; 无其他语言命中 → raw_trace
+        assert!(
+            d.error_type.is_none() || d.error_type.as_deref() != Some("Error"),
+            "内联 // Error: 注释不应匹配 node_re: {:?}",
+            d.error_type
+        );
+    }
+
+    // 0827 L-18: tail_lines is_marker 旧大小写敏感 .contains("Error:") 漏小写 error:;
+    // Bun traceback 小写 error: 行 + 段头应保留在 tail 窗口。
+    #[test]
+    fn tail_lines_keeps_lowercase_error_marker() {
+        // 构造超 30 行输出, 小写 error: 在前部 — 旧 is_marker 漏 (contains("Error:") 大写)
+        let mut out = String::from("bun run\n");
+        for i in 0..35 {
+            out.push_str(&format!("filler line {}\n", i));
+        }
+        out.push_str("error: ENOENT: no such file\n");
+        out.push_str("    at /app/index.js:10:5");
+        let d = s().slice(&out, None);
+        // 小写 error: marker 应保留 → bun_re 应捕到
+        assert_eq!(d.error_type.as_deref(), Some("error"));
+        assert_eq!(d.file_path.as_deref(), Some("/app/index.js"));
+        assert_eq!(d.line_number, Some(10));
     }
 }

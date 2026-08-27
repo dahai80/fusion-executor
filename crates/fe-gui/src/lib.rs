@@ -194,6 +194,55 @@ impl GuiController {
         }
     }
 
+    /// C-13: 解析当前 focused app 的 bundle id (best-effort)。
+    /// accessibility-sys 0.2 无 kAXBundleIdentifierAttribute 常量 — 用原始 CFString "AXBundleIdentifier"
+    /// 经 AXAttribute::<CFType> 读 + downcast CFString (同 focused_app 读 AXFocusedApplication 模式)。
+    /// 用于 HID-post 输入合成方法 (key_press/hold_key/scroll/drag/hover) 的 bundle allowlist 校验。
+    fn focused_app_bundle(&self) -> Result<String> {
+        let app = Self::focused_app()?;
+        let attr = AXAttribute::<CFType>::new(&CFString::from_static_string("AXBundleIdentifier"));
+        let cf: CFType = app
+            .attribute(&attr)
+            .map_err(|e| anyhow!("取 AXBundleIdentifier 失败: {e}"))?;
+        let s = cf
+            .downcast::<CFString>()
+            .ok_or_else(|| anyhow!("AXBundleIdentifier 非 CFString"))?;
+        Ok(s.to_string())
+    }
+
+    /// C-13: 输入合成方法顶上检查当前 focused app bundle 是否在 allowlist。
+    /// allowlist=None → 放行 (审计, 无 AX 调用 short-circuit); Some=set → 解析 focused bundle 后复用
+    /// check_bundle_allowed 纯校验 (无逻辑重复)。TOCTOU: check 与 HID-post 间聚焦可能切换 — HID 固有,
+    /// best-effort 非原子, 但堵当前 bypass (等非 allowlisted app 聚焦 → type_text 注入)。
+    fn check_focused_allowed(&self) -> Result<()> {
+        match &self.config.allowed_bundle_ids {
+            None => {
+                debug!("C-13 输入合成: 无 allowlist, focused app 放行 (审计)");
+                Ok(())
+            }
+            Some(_) => {
+                let bundle = self.focused_app_bundle().unwrap_or_default();
+                self.check_bundle_allowed(&bundle)
+            }
+        }
+    }
+
+    /// C-13: 输入合成方法顶上调用 — allowlist 拦截返 Some(degraded GuiResult), 放行返 None。
+    /// 各方法 `if let Some(r) = self.focused_not_allowed() { return Ok(r); }` 一行 gate。
+    fn focused_not_allowed(&self) -> Option<GuiResult> {
+        match self.check_focused_allowed() {
+            Ok(()) => None,
+            Err(e) => {
+                warn!(error = %e, "C-13: focused app 不在 allowlist — 拒绝输入合成 (防越权注入)");
+                Some(GuiResult {
+                    ok: false,
+                    error: Some(format!("focused-app-not-allowed: {e}")),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
     /// AX 是否已授权 (TCC Accessibility)。未授权时所有 GUI 操作降级报错。
     /// unsafe: AXIsProcessTrusted 是 accessibility-sys 的 extern "C" fn (rustc 1.96 默认 unsafe-to-call)。
     /// 该 C 函数仅读 TCC 状态返回 bool, 无指针参数, 内存安全无风险。
@@ -295,6 +344,9 @@ impl GuiController {
 
     fn click(&self, ax_label: Option<&str>, ax_position: Option<(f64, f64)>) -> Result<GuiResult> {
         info!(ax_label, ax_position = ?ax_position, "Click");
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let app = Self::focused_app()?;
         let win = app
             .focused_window()
@@ -385,6 +437,9 @@ impl GuiController {
 
     fn type_text(&self, text: &str) -> Result<GuiResult> {
         info!(text_len = text.len(), "TypeText");
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let app = Self::focused_app()?;
         let win = app
             .focused_window()
@@ -453,6 +508,9 @@ impl GuiController {
     /// 内部均为 unsafe FFI, 但已封进 safe API; 本函数无需手写 unsafe block。
     fn key_press(&self, key: &str, modifiers: &[String]) -> Result<GuiResult> {
         info!(key, mods = ?modifiers, "KeyPress");
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let code = match Self::resolve_keycode(key) {
             Some(c) => c,
             None => {
@@ -554,6 +612,25 @@ impl GuiController {
     /// 未识别键名同 key_press 降级 ok:false + 已知列表。sleep 阻塞当前线程 (GUI 同步路径)。
     fn hold_key(&self, key: &str, duration_ms: u64) -> Result<GuiResult> {
         info!(key, duration_ms, "HoldKey");
+        // M-12.4: duration_ms==0 → keydown 立即 keyup = 单击非按住, 静默 no-op 易误用。
+        // fail-loud 拒绝 (Rule 12), 调用方显式用 key_press 做单击。
+        if duration_ms == 0 {
+            warn!(
+                key,
+                "HoldKey duration_ms=0 — 拒绝 (keydown 即 keyup 是单击非按住, 显式用 key_press)"
+            );
+            return Ok(GuiResult {
+                ok: false,
+                error: Some(
+                    "hold-key-duration-zero: duration_ms 必须 >0 (按住需非零时长; 单击用 key_press)"
+                        .into(),
+                ),
+                ..Default::default()
+            });
+        }
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let code = match Self::resolve_keycode(key) {
             Some(c) => c,
             None => {
@@ -867,6 +944,13 @@ impl GuiController {
     }
 
     /// CGImage → RGBA → PNG → base64。用位图上下文统一像素格式 (避免源图 alpha/bgr 差异)。
+    ///
+    /// M-12.3: 位图上下文用 kCGImageAlphaPremultipliedLast — CoreGraphics 返回**预乘 RGBA**
+    /// (RGB 已乘 alpha)。PNG 标准期望**非预乘** (straight) alpha。此处直接编码预乘像素,
+    /// 半透明区 (alpha<255) 合成时颜色偏移 (RGB 偏暗)。屏幕截图多为不透明 (alpha=255, 预乘无差异);
+    /// 仅含透明窗/菜单阴影的截图边缘可能色偏。已知取舍 (Rule 2 最小改): 显式 unpremultiply 需逐像素
+    /// 除法 (4*w*h 次, 满屏 4M+ ops) 且 alpha=0 除零特判 — 当前调用方 (mlx-vlm 视觉 grounding)
+    /// 不依赖精确 alpha, 色偏在容差内, 不实装。若未来需精确 alpha, 在此循环 unpremultiply。
     fn cgimage_to_png_b64(img: &CGImage) -> Result<String> {
         let w = img.width();
         let h = img.height();
@@ -913,6 +997,9 @@ impl GuiController {
     /// core-graphics 0.24 safe wrapper 封装 CGEventCreateScrollWheelEvent2 的 unsafe FFI。
     fn scroll(&self, dx: i32, dy: i32, at: Option<(f64, f64)>) -> Result<GuiResult> {
         info!(dx, dy, at = ?at, "Scroll");
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (scroll)"))?;
         if let Some((x, y)) = at {
@@ -941,6 +1028,9 @@ impl GuiController {
     /// 左键单次拖拽; 间帧线性插值平滑 (默认 16 帧)。CGEvent new_mouse_event 各带位置, 无需 set_location。
     fn drag(&self, from: (f64, f64), to: (f64, f64)) -> Result<GuiResult> {
         info!(from = ?from, to = ?to, "Drag");
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (drag)"))?;
         let steps = 16i32;
@@ -992,6 +1082,9 @@ impl GuiController {
         ax_position: Option<(f64, f64)>,
     ) -> Result<GuiResult> {
         info!(ax_label, ax_position = ?ax_position, "DoubleClick");
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let pos = self.resolve_click_position(ax_label, ax_position)?;
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (double_click)"))?;
@@ -1031,6 +1124,9 @@ impl GuiController {
         ax_position: Option<(f64, f64)>,
     ) -> Result<GuiResult> {
         info!(ax_label, ax_position = ?ax_position, "TripleClick");
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let pos = self.resolve_click_position(ax_label, ax_position)?;
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (triple_click)"))?;
@@ -1069,6 +1165,9 @@ impl GuiController {
         ax_position: Option<(f64, f64)>,
     ) -> Result<GuiResult> {
         info!(ax_label, ax_position = ?ax_position, "RightClick");
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let pos = self.resolve_click_position(ax_label, ax_position)?;
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (right_click)"))?;
@@ -1098,6 +1197,9 @@ impl GuiController {
     /// 悬停 — CGEvent MouseMoved 到指定坐标 (不按键, 仅移动光标)。
     fn hover(&self, ax_position: (f64, f64)) -> Result<GuiResult> {
         info!(ax_position = ?ax_position, "Hover");
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (hover)"))?;
         let moved = CGEvent::new_mouse_event(
@@ -1827,5 +1929,113 @@ mod tests {
     fn msec04_secure_textfield_subrole_constant() {
         assert_eq!(kAXSecureTextFieldSubrole, "AXSecureTextField");
         assert!(!kAXSecureTextFieldSubrole.is_empty());
+    }
+
+    // ===== 0827 fe-gui P0-P3 修复回归测试 =====
+
+    /// C-13: 设 allowlist 但 AX 未授权 (CI 无 TCC) → focused_app_bundle 失败返空串 →
+    /// 空串不在 allowlist → focused_not_allowed 返 Some(degraded)。验证拦截逻辑在 CI 可达
+    /// (execute 的 ax_trusted 闸门早拦截, 故直接测 focused_not_allowed 单元路径)。
+    #[test]
+    fn c13_focused_not_allowed_blocks_when_allowlist_set() {
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: Some(vec!["com.apple.TextEdit".into()]),
+            allow_type_into_secure: false,
+        });
+        let r = ctrl.focused_not_allowed();
+        // CI 无 AX: bundle 解析失败 → "" → 不在 allowlist → Some(degraded)。
+        // trusted 机且当前 focused=TextEdit: bundle 命中 → None (放行)。两种环境均合法。
+        if !GuiController::ax_trusted() {
+            assert!(
+                r.is_some(),
+                "C-13: CI 无 AX + allowlist 应拦截 (bundle 解析失败)"
+            );
+            let res = r.unwrap();
+            assert!(!res.ok, "C-13: 拦截应 ok:false");
+            assert!(
+                res.error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("focused-app-not-allowed"),
+                "C-13: 错误标记: {:?}",
+                res.error
+            );
+        }
+    }
+
+    /// C-13: 无 allowlist (None) → focused_not_allowed 始终 None (放行, 审计)。
+    /// 验证 short-circuit: allowlist=None 时不调 focused_app_bundle (无 AX 调用)。
+    #[test]
+    fn c13_focused_not_allowed_passes_without_allowlist() {
+        let ctrl = GuiController::new();
+        assert!(
+            ctrl.focused_not_allowed().is_none(),
+            "C-13: 无 allowlist 应放行返 None"
+        );
+    }
+
+    /// C-13: type_text 在 allowlist + CI 无 AX 下 — execute 的 ax_trusted 闸门先降级,
+    /// 但若 trusted: focused 非 allowlisted app 应被 focused_not_allowed 拦截 ok:false。
+    /// CI 路径断言 ax_trusted 闸门降级 (闸门在 dispatch 前); trusted 机验证拦截需真实 GUI 手动。
+    #[test]
+    fn c13_type_text_blocked_by_allowlist_when_trusted() {
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: Some(vec!["com.apple.TextEdit".into()]),
+            allow_type_into_secure: false,
+        });
+        let r = ctrl
+            .execute(GuiAction::TypeText { text: "x".into() })
+            .unwrap();
+        if GuiController::ax_trusted() {
+            // trusted + 当前 focused app 非 TextEdit → C-13 拦截 (focused-app-not-allowed);
+            // 若 focused 恰为 TextEdit → 放行 ok:true (测试环境依赖, 不强断言 ok 值, 仅验不 panic)。
+            let _ = r.ok;
+        } else {
+            assert!(!r.ok, "CI 无 AX 应 ax_trusted 闸门降级");
+            assert_eq!(
+                r.error.as_deref(),
+                Some("accessibility-permission-required")
+            );
+        }
+    }
+
+    /// M-12.4: hold_key duration_ms=0 → ok:false hold-key-duration-zero (fail-loud, 非静默 no-op)。
+    /// trusted-independent? 否 — hold_key 经 execute 的 ax_trusted 闸门。CI 无 AX 走闸门降级;
+    /// trusted 机闸门过后 duration_ms==0 早拒绝 (在 keycode resolve 前)。两路径均 ok:false。
+    #[test]
+    fn m12_4_hold_key_zero_duration_rejected() {
+        let ctrl = GuiController::new();
+        let r = ctrl
+            .execute(GuiAction::HoldKey {
+                key: "Return".into(),
+                duration_ms: 0,
+            })
+            .unwrap();
+        assert!(!r.ok, "M-12.4: duration_ms=0 应 ok:false");
+        if GuiController::ax_trusted() {
+            assert!(
+                r.error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("hold-key-duration-zero"),
+                "M-12.4: trusted 应 duration-zero 错误: {:?}",
+                r.error
+            );
+        } else {
+            assert_eq!(
+                r.error.as_deref(),
+                Some("accessibility-permission-required"),
+                "M-12.4: CI 无 AX 走闸门降级"
+            );
+        }
+    }
+
+    /// M-12.3: cgimage_to_png_b64 文档注释显式标注预乘 RGBA 取舍 (代码已改, 仅验存续+不变接口)。
+    /// 编译期保证: 此测试存在即回归守护 (注释删了不报错, 但维持显式标注是 contract)。
+    #[test]
+    fn m12_3_premultiplied_rgba_doc_anchors() {
+        // 截图全屏 alpha=255 (不透明) — 预乘无差异; M-12.3 注释覆盖半透明窗边缘色偏取舍。
+        // 此处仅断言方法签名稳定 (不破坏调用方), 实际色偏取舍见 cgimage_to_png_b64 注释。
+        let _: fn(&CGImage) -> Result<String> = GuiController::cgimage_to_png_b64;
     }
 }

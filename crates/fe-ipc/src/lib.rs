@@ -199,6 +199,11 @@ struct BroadcastHub {
     /// M-OPS-04: 活跃连接计数 — handle_conn 入口 fetch_add, drop_conn fetch_sub。无锁, health 读快照。
     active_conns: AtomicU64,
     sub_counter: AtomicU64,
+    /// 0827 C-9: 源生命周期代数 — subscribe 该通道时 fetch_add, 源任务启动捕获本代。
+    /// 源任务 0 订阅拟退出时重比对: 若代未变 (无新订阅进入) 才真退; 代变 (中途有新订阅) 续跑。
+    /// 破旧版竞态: 源 0 订阅 break + trailing take() vs 并发 subscribe ensure 见 slot=running 早 return → 源不启。
+    telemetry_gen: AtomicU64,
+    screenshot_gen: AtomicU64,
     telemetry_task: Mutex<Option<JoinHandle<()>>>,
     screenshot_task: Mutex<Option<JoinHandle<()>>>,
     shutdown: Arc<tokio::sync::Notify>,
@@ -226,6 +231,8 @@ impl BroadcastHub {
             conn_counter: AtomicU64::new(1),
             active_conns: AtomicU64::new(0),
             sub_counter: AtomicU64::new(1),
+            telemetry_gen: AtomicU64::new(0),
+            screenshot_gen: AtomicU64::new(0),
             telemetry_task: Mutex::new(None),
             screenshot_task: Mutex::new(None),
             shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -334,6 +341,7 @@ impl BroadcastHub {
         let sub_id = self.next_sub_id();
         let has_telemetry = channels.contains(CH_TELEMETRY);
         let has_screenshot = channels.contains(CH_SCREENSHOT);
+        // C-9: insert + gen bump 同一 registry 锁内 — 源任务重比对 gen 时见最新代, 续跑不误退。
         {
             let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
             reg.insert(
@@ -345,6 +353,13 @@ impl BroadcastHub {
                     tx,
                 },
             );
+        }
+        // gen bump 在锁外 (AtomicU64, 顺序保证: insert 先于 bump; 源任务读 gen≥本值见新订阅)。
+        if has_telemetry {
+            self.telemetry_gen.fetch_add(1, Ordering::SeqCst);
+        }
+        if has_screenshot {
+            self.screenshot_gen.fetch_add(1, Ordering::SeqCst);
         }
         info!(%sub_id, conn_id, "订阅注册");
         if has_telemetry {
@@ -386,6 +401,7 @@ impl BroadcastHub {
     /// 确保遥测源任务运行 — handle 不在或已结束 (含 panic) 则启动 (C-IPC-02/03)。
     /// 源任务 0 telemetry 订阅自退并清 handle; panic 后 handle.is_finished()=true 触发重启。
     /// interval_ms 由调用方传入 (M-IPC-01), 缺省 DEFAULT_INTERVAL_MS。
+    /// 0827 C-9: 启动时捕获本代 gen — 源任务 0 订阅拟退时重比对 gen, 变化则续跑 (见 run_telemetry_source)。
     fn ensure_telemetry_source(self: &Arc<Self>, interval_ms: u64) {
         let mut slot = self
             .telemetry_task
@@ -399,20 +415,22 @@ impl BroadcastHub {
         } else {
             interval_ms
         };
+        let gen = self.telemetry_gen.load(Ordering::SeqCst);
         let hub = self.clone();
         let handle = tokio::spawn(async move {
-            hub.run_telemetry_source(effective).await;
+            hub.run_telemetry_source(effective, gen).await;
             hub.telemetry_task
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
         });
         *slot = Some(handle);
-        info!(interval_ms = effective, "遥测源任务启动");
+        info!(interval_ms = effective, gen, "遥测源任务启动");
     }
 
     /// 确保截图源任务运行 — 同 telemetry 逻辑 (C-IPC-02/03)。
     /// screenshot_interval_ms 由调用方传入 (M-IPC-01)。
+    /// 0827 C-9: 同 telemetry, 启动捕获 gen 供 run_screenshot_source 重比对。
     fn ensure_screenshot_source(self: &Arc<Self>, screenshot_interval_ms: u64) {
         let mut slot = self
             .screenshot_task
@@ -426,29 +444,42 @@ impl BroadcastHub {
         } else {
             screenshot_interval_ms
         };
+        let gen = self.screenshot_gen.load(Ordering::SeqCst);
         let hub = self.clone();
         let handle = tokio::spawn(async move {
-            hub.run_screenshot_source(effective).await;
+            hub.run_screenshot_source(effective, gen).await;
             hub.screenshot_task
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
         });
         *slot = Some(handle);
-        info!(interval_ms = effective, "截图源任务启动");
+        info!(interval_ms = effective, gen, "截图源任务启动");
     }
 
     /// 遥测源 — executor.telemetry_stream 单流扇出, 0 订阅自退。
-    async fn run_telemetry_source(&self, interval_ms: u64) {
+    /// 0827 C-9: 0 订阅拟退前重比对 gen — gen 变 (中途有新 telemetry 订阅) 则续跑, 不误退漏帧。
+    async fn run_telemetry_source(&self, interval_ms: u64, start_gen: u64) {
         let cfg = TelemetryStreamConfig {
             interval_ms,
             max_samples: 0,
+            // L-15: 广播源采样 executor 自身 (聚合视图), 不绑特定子进程 PID
+            pid: None,
         };
         let (mut rx, handle) = self.executor.telemetry_stream(cfg);
         while let Some(sample) = rx.recv().await {
             let targets = self.collect_targets(CH_TELEMETRY);
             if targets.is_empty() {
-                info!("遥测 0 订阅, 源任务自退");
+                // C-9: 重比对 gen — 变化表示 0 订阅判断后又有新订阅进入, 续跑不退。
+                let cur_gen = self.telemetry_gen.load(Ordering::SeqCst);
+                if cur_gen != start_gen {
+                    info!(
+                        start_gen,
+                        cur_gen, "遥测 0 订阅但 gen 变 (新订阅进入), 续跑"
+                    );
+                    continue;
+                }
+                info!(gen = cur_gen, "遥测 0 订阅且 gen 未变, 源任务自退");
                 break;
             }
             let data = serde_json::to_value(&sample).unwrap_or(json!({}));
@@ -464,14 +495,24 @@ impl BroadcastHub {
     }
 
     /// 截图源 — 周期 gui_action(Screenshot) 扇出, TCC 未授权帧 data.ok=false 不崩。0 订阅自退。
-    async fn run_screenshot_source(&self, interval_ms: u64) {
+    /// 0827 C-9: 0 订阅拟退前重比对 gen — gen 变 (中途有新 screenshot 订阅) 则续跑, 不误退漏帧。
+    async fn run_screenshot_source(&self, interval_ms: u64, start_gen: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
         interval.tick().await;
         loop {
             interval.tick().await;
             let targets = self.collect_targets(CH_SCREENSHOT);
             if targets.is_empty() {
-                info!("截图 0 订阅, 源任务自退");
+                // C-9: 重比对 gen — 变化表示 0 订阅判断后又有新订阅进入, 续跑不退。
+                let cur_gen = self.screenshot_gen.load(Ordering::SeqCst);
+                if cur_gen != start_gen {
+                    info!(
+                        start_gen,
+                        cur_gen, "截图 0 订阅但 gen 变 (新订阅进入), 续跑"
+                    );
+                    continue;
+                }
+                info!(gen = cur_gen, "截图 0 订阅且 gen 未变, 源任务自退");
                 break;
             }
             let executor = self.executor.clone();
@@ -619,6 +660,23 @@ impl IpcServer {
         }
     }
 
+    /// A-4: 共享调用方已持有的 Executor Arc — fe-pyo3 serve() 不再重建 Executor。
+    /// 调用方先在进程内用 with_extra_whitelist 配的白名单 + SIGHUP 重载的 extras 跨 serve-path 持久
+    /// (旧版 with_executor_and_shells 取 owned Executor 再 Arc::new, serve 重建丢 in-process 白名单)。
+    /// registry 同 M-ARCH-1 共享。三参全 Arc — 与 serve()/serve_blocking() 取 self.executor.clone() 兼容。
+    pub fn with_executor_arc_and_shells(
+        executor: Arc<Executor>,
+        shells: Arc<fe_core::shell::ShellRegistry>,
+    ) -> Self {
+        info!("IpcServer::with_executor_arc_and_shells() — 共享 Executor Arc + ShellRegistry");
+        let hub = BroadcastHub::new(executor.clone());
+        Self {
+            executor,
+            hub,
+            shells,
+        }
+    }
+
     /// M-ARCH-1: 暴露 registry 引用 (health probe / dispatch 取用)。
     pub fn shells(&self) -> &Arc<fe_core::shell::ShellRegistry> {
         &self.shells
@@ -645,6 +703,8 @@ impl IpcServer {
             info!(sock = %path.display(), "清理旧 socket");
             let _ = std::fs::remove_file(&path);
         }
+        // C-10: 先建 + 收紧父目录 0o700, 再 bind — 消除 bind→chmod 间窗口。
+        // ensure_sock_dir 内对已存在目录也收紧权限 (旧版早 return 跳过 = 残留宽松目录)。
         ensure_sock_dir(&path);
         let listener = UnixListener::bind(&path)
             .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", path.display(), e))?;
@@ -872,11 +932,18 @@ async fn accept_loop(
     drain_connections(conns, drain_deadline).await;
 }
 
-/// C-OPS-03/M-OPS-03: 优雅 drain — join 所有 in-flight 连接, deadline 内未完则 abort。
+/// C-OPS-03/M-OPS-03 + 0827 C-8/P-1: 优雅 drain — join 所有 in-flight 连接, deadline 内未完则 abort。
 /// deadline 由 serve/serve_blocking 从 FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS 解析 (默认 10s)。
-/// 完成的移出, 超时的 abort (强制停, 防孤儿响应/子进程挂死)。fail-loud 记 abort 数。
+/// C-8 修: (1) 先 drain handles 出锁再放锁 — join/abort 全锁外, 不阻塞 accept_loop 其他路径;
+///   (2) **全局 deadline** — 记 start, 每条 handle 用 shrink 的 remain = deadline - elapsed,
+///   总耗时 ≤ deadline (旧版 per-handle reset deadline → 64 连接最坏 64×10s = 640s)。
+/// &mut h 引用 await (非 move) → 超时分支 h 仍 owned, h.abort() 可调 (drop JoinHandle 仅 detach 不停 task)。
 async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>, deadline: Duration) {
-    let mut handles = conns.lock().await;
+    // C-8: 取出 handles 立即放锁 — 锁外 join/abort。
+    let handles: Vec<JoinHandle<()>> = {
+        let mut g = conns.lock().await;
+        std::mem::take(&mut *g)
+    };
     let total = handles.len();
     if total == 0 {
         return;
@@ -884,34 +951,41 @@ async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>, deadline
     info!(
         in_flight = total,
         deadline_secs = deadline.as_secs(),
-        "drain in-flight 连接"
+        "drain in-flight 连接 (全局 deadline, 锁外 join)"
     );
-    // join_all 带超时: 超时则 abort 剩余未完成的
-    let join_all = async {
-        let mut remaining = Vec::new();
-        for h in handles.drain(..) {
-            remaining.push(h);
+    let start = tokio::time::Instant::now();
+    let mut joined_ok = 0usize;
+    let mut aborted = 0usize;
+    for mut h in handles {
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            // 全局预算已耗尽 — 剩余全部 abort + reap。
+            h.abort();
+            let _ = h.await;
+            aborted += 1;
+            continue;
         }
-        let mut joined_ok = 0usize;
-        for mut h in remaining {
-            if h.is_finished() {
+        let remain = deadline - elapsed;
+        match tokio::time::timeout(remain, &mut h).await {
+            Ok(Ok(())) => joined_ok += 1,
+            Ok(Err(e)) => warn!(error = %e, "连接 task join 失败"),
+            Err(_) => {
+                warn!("连接 drain 全局预算耗尽, abort (强制停)");
+                h.abort();
                 let _ = h.await;
-                joined_ok += 1;
-            } else {
-                match tokio::time::timeout(deadline, &mut h).await {
-                    Ok(Ok(())) => joined_ok += 1,
-                    Ok(Err(e)) => warn!(error = %e, "连接 task join 失败"),
-                    Err(_) => {
-                        warn!("连接 drain 超时, abort (强制停)");
-                        h.abort();
-                    }
-                }
+                aborted += 1;
             }
         }
-        joined_ok
-    };
-    let ok = join_all.await;
-    info!(in_flight = total, drained_ok = ok, "drain 完成");
+    }
+    if aborted > 0 {
+        warn!(aborted, "drain 超时 abort 连接数 (fail-loud)");
+    }
+    info!(
+        in_flight = total,
+        drained_ok = joined_ok,
+        aborted,
+        "drain 完成"
+    );
 }
 
 /// 单连接处理 — DUPLEX (v1.5 #14):
@@ -919,6 +993,14 @@ async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>, deadline
 ///   push_task: 读 push_rx, server-push notification 写 locked writer
 ///   共享 writer = Arc<AsyncMutex<OwnedWriteHalf>>, 行写原子 (锁内 write_all)
 ///   连接断开 → 清订阅 + close push_task
+///
+/// 0827 A-6(1) push 通道模型说明 (deferred):
+///   每连接单 push_tx (容量 128) 多路复用该连接所有订阅 (telemetry/stdio/screenshot)。
+///   风险: 慢消费方 (如 telemetry 帧未读) 占满 128 → 同连接其他通道帧背压。
+///   已缓解: 源端 try_send 满即丢 (P-IPC-01, overflow-drop 不阻塞源任务, 不无界占内存),
+///   丢帧仅 warn 不崩 (fail-visible)。per-sub 独立通道 multiplex 是更大架构改动 (需
+///   push_task 按 sub_id 路由多 rx), 现 try_send 丢帧语义对等 bounded channel, 非安全
+///   缺陷, 按 Rule 2 简单优先暂缓。调用方: 慢消费方应开多连接或 own_conn 隔离 stdio。
 async fn handle_conn(
     stream: UnixStream,
     executor: Arc<Executor>,
@@ -1154,17 +1236,39 @@ async fn handle_subscribe(
     hub: &Arc<BroadcastHub>,
     push_tx: &mpsc::Sender<Value>,
 ) {
+    // L-7 + M-7(1): channels 规范化 + 校验。旧版原样存 (大小写敏感) → "Telemetry" 不匹配
+    // 小写 CH_TELEMETRY, 源任务永不启 = 幽灵订阅 (收不到推帧); 未知通道名也静默接受。
+    // 修: 统一 to_lowercase, 拒非 {telemetry,stdio,screenshot} 通道名 (-32600, fail-loud)。
+    let known_channels = [CH_TELEMETRY, CH_STDIO, CH_SCREENSHOT];
     let channels: HashSet<String> = params
         .get("channels")
         .and_then(|c| c.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
                 .collect()
         })
         .unwrap_or_default();
     if channels.is_empty() {
         let resp = err_resp(id, ERR_INVALID_REQ, "缺少 channels");
+        write_line(writer, resp).await;
+        return;
+    }
+    // M-7(1): 拒未知通道名 (旧版静默接受 → 幽灵订阅)。
+    let unknown: Vec<&str> = channels
+        .iter()
+        .filter(|c| !known_channels.contains(&c.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        let resp = err_resp(
+            id,
+            ERR_INVALID_REQ,
+            &format!(
+                "未知通道: {} (合法: telemetry/stdio/screenshot)",
+                unknown.join(",")
+            ),
+        );
         write_line(writer, resp).await;
         return;
     }
@@ -1182,10 +1286,21 @@ async fn handle_subscribe(
     let scope = if params.get("all").and_then(|v| v.as_bool()).unwrap_or(false) {
         StdioScope::All
     } else if let Some(arr) = params.get("task_ids").and_then(|v| v.as_array()) {
+        // M-7(3): 旧版空 task_ids 静默变空 Tasks 集 (永不匹配 = 死订阅, 收不到任何 stdio, 无信号)。
+        // 修: 空 task_ids → fail-loud -32600 (调用方明显误用, 非"无过滤")。
         let set: HashSet<String> = arr
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
+        if set.is_empty() {
+            let resp = err_resp(
+                id,
+                ERR_INVALID_REQ,
+                "task_ids 非空数组 (空集永不匹配, 用 all=true 或省略 task_ids)",
+            );
+            write_line(writer, resp).await;
+            return;
+        }
         StdioScope::Tasks(set)
     } else {
         StdioScope::OwnConn(conn_id)
@@ -1296,6 +1411,9 @@ async fn handle_execute_stream(
             }
             fe_core::ExecutionStreamEvent::Done(r) => {
                 let result_val = serde_json::to_value(&r).unwrap_or(json!({}));
+                // L-6: streaming exec 完成也记指标 — 旧版漏 record_exec, Prometheus
+                // fe_exec_total 漏计流式执行 (仅非流式 execute 计)。与非流式 handler 对齐。
+                hub.record_exec(&r);
                 hub.broadcast_stdio(
                     json!({
                         "task_id": task_id,
@@ -1319,7 +1437,7 @@ async fn handle_execute_stream(
 
 /// 实时遥测流 (请求发起, 非 subscribe) — 逐帧写出 TelemetrySample, 共用 id。
 /// sample: {"jsonrpc":"2.0","id":id,"result":{"type":"sample",...TelemetrySample}}
-/// params: {interval_ms?:u64, max_samples?:u64} (缺省 10Hz / 无限)
+/// params: {interval_ms?:u64, max_samples?:u64, pid?:u32} (缺省 10Hz / 无限 / executor pid)
 async fn handle_telemetry_stream(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
     id: Value,
@@ -1334,9 +1452,11 @@ async fn handle_telemetry_stream(
         .get("max_samples")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let pid = params.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
     let cfg = TelemetryStreamConfig {
         interval_ms,
         max_samples,
+        pid,
     };
     let (mut rx, handle) = executor.telemetry_stream(cfg);
     while let Some(sample) = rx.recv().await {
@@ -1681,6 +1801,10 @@ async fn handle_method(
                 .get("max_idle_sec")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(fe_core::shell::DEFAULT_MAX_IDLE_SEC);
+            let kill_grace_ms = params
+                .get("kill_grace_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(500);
             let sp = fe_core::shell::ShellStartParams {
                 command,
                 cwd,
@@ -1692,6 +1816,7 @@ async fn handle_method(
                 max_nproc,
                 max_cpu_sec,
                 max_idle_sec,
+                kill_grace_ms,
             };
             let r = executor.shell_start(shells, sp);
             // M-OPS-02: fe_shell_active gauge — list_shells 已 reap finished, running 计数即活跃。
@@ -1744,28 +1869,24 @@ async fn probe_runtime(timeout: Duration) -> bool {
     tokio::time::timeout(timeout, task).await.is_ok()
 }
 
-/// C-OPS-05: 探外部依赖 — `git --version` (rollback/快照依赖 git CLI)。
+/// C-OPS-05 + 0827 P-1: 探外部依赖 — `git --version` (rollback/快照依赖 git CLI)。
 /// 任一依赖缺失 → 服务降级, ok=false。返回 [{name, ok, version?}]。
+/// P-1 修: 旧版 spawn 两次 `git --version` (一次判 ok, 一次取 version) — 合并为单次 spawn。
 async fn probe_dependencies() -> Vec<Value> {
-    let git_ok = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git")
         .arg("--version")
         .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let git_version = if git_ok {
-        tokio::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .await
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    } else {
-        None
-    };
-    let mut d = json!({ "name": "git", "ok": git_ok });
-    if let Some(v) = git_version {
-        d["version"] = json!(v);
+        .await;
+    let mut d = json!({ "name": "git", "ok": false });
+    if let Ok(o) = out {
+        let ok = o.status.success();
+        d["ok"] = json!(ok);
+        if ok {
+            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !v.is_empty() {
+                d["version"] = json!(v);
+            }
+        }
     }
     vec![d]
 }
@@ -1851,9 +1972,10 @@ fn chmod_secure(path: &Path) {
 #[cfg(not(unix))]
 fn chmod_secure(_path: &Path) {}
 
-/// M-SEC-01: 建 socket 父目录 0o700 — 私有目录阻他 UID connect (目录无搜索权限)。
-/// 仅对 HOME 下默认路径生效; 显式 /tmp 覆盖路径不建目录 (退化为 chmod 0o600 单文件)。
-/// 已存在目录不重设权限 (防误改用户定制目录), 仅缺失时 create_dir_all 0o700。
+/// M-SEC-01 + 0827 C-10: 建 socket 父目录 0o700 — 私有目录阻他 UID connect (目录无搜索权限)。
+/// 仅对 HOME 下默认路径生效; 显式 /tmp 覆盖路径走 chmod_secure 0o600 单文件。
+/// C-10 修: 已存在目录**也收紧 0o700** (旧版早 return = 残留宽松目录, 他 UID 可 traverse+connect)。
+/// 仅对本次新建/本服务 socket 父目录收紧; 上级 (HOME 本身) 不动 — 收紧的是 ~/.fusion-executor。
 #[cfg(unix)]
 fn ensure_sock_dir(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -1863,17 +1985,19 @@ fn ensure_sock_dir(path: &Path) {
     if parent.as_os_str().is_empty() {
         return;
     }
-    if parent.exists() {
-        return;
+    if !parent.exists() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!(dir = %parent.display(), error = %e, "M-SEC-01: 建 socket 私有目录失败");
+            return;
+        }
+        info!(dir = %parent.display(), "M-SEC-01: socket 父目录已建");
     }
-    if let Err(e) = std::fs::create_dir_all(parent) {
-        warn!(dir = %parent.display(), error = %e, "M-SEC-01: 建 socket 私有目录失败");
-        return;
-    }
+    // C-10: 无论新建或已存在, 收紧 0o700。已存在宽松目录 (如旧版残留 0o755) → 修。
     if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
         warn!(dir = %parent.display(), error = %e, "M-SEC-01: chmod 0o700 私有目录失败");
+    } else {
+        info!(dir = %parent.display(), "M-SEC-01: socket 父目录收紧 0o700 (阻他 UID traverse/connect)");
     }
-    info!(dir = %parent.display(), "M-SEC-01: socket 私有目录已建 (0o700, 阻他 UID)");
 }
 
 #[cfg(not(unix))]
@@ -3110,5 +3234,222 @@ mod tests {
         std::env::set_var("RUST_LOG", "debug");
         reload_log_level(); // 无 handle → no-op 路径, 不崩; 有 handle → 应接受 debug
         std::env::remove_var("RUST_LOG");
+    }
+
+    // ===== 0827 fe-ipc P0-P3 修复回归测试 =====
+
+    // M-7(1): 未知通道名 → -32600 (旧版静默接受 → 幽灵订阅, 永不收推帧)。
+    #[tokio::test]
+    async fn subscribe_rejects_unknown_channel() {
+        let sock = tmp_sock("sub-unknown");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.subscribe","params":{"channels":["bogus_channel"]}}
+"#,
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["code"], -32600,
+            "未知通道应 -32600 fail-loud: {resp}"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // L-7: 混合大小写通道名 ("Telemetry") 应规范化为小写并收到推帧 (旧版原样存 →
+    // 不匹配小写 CH_TELEMETRY = 幽灵订阅, 源任务永不启)。
+    #[tokio::test]
+    async fn subscribe_lowercases_mixedcase_channel() {
+        let sock = tmp_sock("sub-lower");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let s = UnixStream::connect(&sock).await.unwrap();
+        let (rh, mut writer) = s.into_split();
+        let mut reader = BufReader::new(rh);
+        // 大写 "Telemetry" — 应规范化为 "telemetry" 并匹配源扇出
+        let req = br#"{"jsonrpc":"2.0","id":1,"method":"executor.subscribe","params":{"channels":["Telemetry"],"interval_ms":20}}
+"#;
+        writer.write_all(req).await.unwrap();
+        let resp = read_line(&mut reader).await.unwrap();
+        assert_eq!(
+            resp["result"]["ok"], true,
+            "大写通道应被接受 (规范化): {resp}"
+        );
+        let sub_id = resp["result"]["subscription_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // 首帧应为 telemetry 推送 (订阅生效, 源任务启)
+        let first = read_line(&mut reader).await.unwrap();
+        assert_eq!(
+            first["params"]["subscription_id"], sub_id,
+            "规范化后应收到 telemetry 推帧 (非幽灵订阅): {first}"
+        );
+        assert_eq!(first["params"]["channel"], "telemetry");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // M-7(3): 空 task_ids 数组 → -32600 (旧版静默变空 Tasks 集 = 死订阅, 永不匹配)。
+    #[tokio::test]
+    async fn subscribe_rejects_empty_task_ids() {
+        let sock = tmp_sock("sub-empty-tids");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.subscribe","params":{"channels":["stdio"],"task_ids":[]}}
+"#,
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["code"], -32600,
+            "空 task_ids 应 -32600 (死订阅 fail-loud): {resp}"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // L-6: streaming execute 完成应记指标 — execute_stream 后 metrics_prometheus 含 fe_exec_total。
+    // 旧版 Done 分支漏 record_exec → 流式执行 Prometheus 不可见。
+    #[tokio::test]
+    async fn stream_exec_records_metric() {
+        let sock = tmp_sock("stream-metric");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        // 先取基线 fe_exec_total 文本行 (可能其他测试已 populate, 取基线计数)
+        let base = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.metrics_prometheus","params":{}}"#,
+        )
+        .await;
+        let base_text = base["result"]["text"].as_str().unwrap_or("");
+        let base_count = extract_exec_total(base_text);
+        // 跑一次 execute_stream (echo)
+        let mut s = UnixStream::connect(&sock).await.unwrap();
+        let req = r#"{"jsonrpc":"2.0","id":7,"method":"executor.execute_stream","params":{"command":"echo hi","enable_rollback_snapshot":false}}"#;
+        s.write_all((req.to_string() + "\n").as_bytes())
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(s);
+        let mut got_done = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let mut buf = Vec::new();
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                _ = async {
+                    buf.clear();
+                    let n = reader.read_until(b'\n', &mut buf).await.unwrap();
+                    if n > 0 {
+                        if let Ok(v) = serde_json::from_str::<Value>(String::from_utf8_lossy(&buf).trim()) {
+                            if v["id"] == 7 && v["result"]["type"] == "done" {
+                                got_done = true;
+                            }
+                        }
+                    }
+                } => {}
+            }
+            if got_done {
+                break;
+            }
+        }
+        assert!(got_done, "execute_stream 应收到 done 帧");
+        // 再取 metrics — fe_exec_total 应增 1
+        let after = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":2,"method":"executor.metrics_prometheus","params":{}}"#,
+        )
+        .await;
+        let after_text = after["result"]["text"].as_str().unwrap_or("");
+        let after_count = extract_exec_total(after_text);
+        assert!(
+            after_count > base_count,
+            "L-6: execute_stream 应使 fe_exec_total 递增 ({} → {}), 旧版漏 record_exec 不增",
+            base_count,
+            after_count
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// 从 Prometheus text 提取 fe_exec_total 计数值。
+    fn extract_exec_total(text: &str) -> u64 {
+        for line in text.lines() {
+            if line.starts_with("fe_exec_total ") || line.starts_with("fe_exec_total{") {
+                let num = line
+                    .rsplit(|c: char| c.is_whitespace())
+                    .next()
+                    .unwrap_or("0");
+                return num.parse::<u64>().unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    // C-9: subscribe telemetry 通道应使 telemetry_gen 递增 (源生命周期代数, 供源任务
+    // 0 订阅重比对续跑/自退)。非 telemetry 订阅不动 telemetry_gen。
+    #[tokio::test]
+    async fn telemetry_gen_bumps_on_telemetry_subscribe() {
+        let executor = Arc::new(Executor::new());
+        let hub = BroadcastHub::new(executor);
+        let (tx, _rx) = mpsc::channel::<Value>(8);
+        let before = hub.telemetry_gen.load(Ordering::SeqCst);
+        let mut chans = HashSet::new();
+        chans.insert(CH_TELEMETRY.to_string());
+        // 用大 interval_ms 防 0 订阅自退竞态干扰 gen 断言 (gen bump 在 ensure_source 之前, 源
+        // 启动后立刻 0 订阅会 break — 但 telemetry_stream 单流喂帧, 不 break; gen 已 bump 即断言点)。
+        let _sid = hub.subscribe(1, chans, StdioScope::OwnConn(1), tx, 5000, 1000);
+        let after = hub.telemetry_gen.load(Ordering::SeqCst);
+        assert_eq!(
+            after,
+            before + 1,
+            "C-9: telemetry 订阅应 bump telemetry_gen"
+        );
+        // 非 telemetry 订阅不动 telemetry_gen
+        let (tx2, _rx2) = mpsc::channel::<Value>(8);
+        let mut chans2 = HashSet::new();
+        chans2.insert(CH_STDIO.to_string());
+        let before2 = hub.telemetry_gen.load(Ordering::SeqCst);
+        let _sid2 = hub.subscribe(2, chans2, StdioScope::OwnConn(2), tx2, 5000, 1000);
+        let after2 = hub.telemetry_gen.load(Ordering::SeqCst);
+        assert_eq!(after2, before2, "C-9: stdio 订阅不应动 telemetry_gen");
+        // screenshot 订阅 bump screenshot_gen 非 telemetry_gen
+        let (tx3, _rx3) = mpsc::channel::<Value>(8);
+        let mut chans3 = HashSet::new();
+        chans3.insert(CH_SCREENSHOT.to_string());
+        let _sid3 = hub.subscribe(3, chans3, StdioScope::OwnConn(3), tx3, 5000, 1000);
+        let after3 = hub.telemetry_gen.load(Ordering::SeqCst);
+        assert_eq!(after3, before2, "C-9: screenshot 订阅不应动 telemetry_gen");
+        let shot_after = hub.screenshot_gen.load(Ordering::SeqCst);
+        assert_eq!(
+            shot_after, 1,
+            "C-9: screenshot 订阅应 bump screenshot_gen 到 1"
+        );
+    }
+
+    // C-10: ensure_sock_dir 对已存在的宽松目录 (0o755) 也收紧 0o700 (旧版早 return = 残留宽松)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_sock_dir_tightens_existing_loose_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // 建一个宽松目录 (0o755) 模拟旧版残留
+        let dir = std::env::temp_dir().join(format!(
+            "fe-ipc-sockdir-test-{}-{}",
+            std::process::id(),
+            "loose"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sock_path = dir.join("fe.sock");
+        // 调 ensure_sock_dir — 应收紧 0o700
+        ensure_sock_dir(&sock_path);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "C-10: 已存在宽松目录应被收紧 0o700, 实际 {:#o}",
+            mode
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3,10 +3,25 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+from pathlib import Path
 
-from .executor import FusionSandboxExecutor
+from .executor import DEFAULT_SOCK, FusionSandboxExecutor
 from .models import RollbackPolicy
+
+
+def _validate_paths(cwd: str | None, sock: str | None, *, check_sock: bool = True) -> None:
+    # M-5: 启动期 fail-fast — cwd 不存在 / sock 父目录不可写推迟到首请求难定位
+    if cwd is not None and not Path(cwd).is_dir():
+        print(f"错误: --cwd 目录不存在: {cwd}", file=sys.stderr)
+        sys.exit(2)
+    if check_sock:
+        sock_path = sock or DEFAULT_SOCK
+        parent = Path(sock_path).parent
+        if not parent.is_dir() or not os.access(parent, os.W_OK):
+            print(f"错误: socket 父目录不可写: {parent}", file=sys.stderr)
+            sys.exit(2)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -54,6 +69,8 @@ def main() -> int:
 
     # M-CLI-01: serve 模式
     if args.serve:
+        # M-5: serve 校验 sock 父目录可写 (cwd 用 executor 默认, 不校验)
+        _validate_paths(None, args.sock)
         try:
             FusionSandboxExecutor().serve(args.sock)
         except KeyboardInterrupt:
@@ -64,6 +81,9 @@ def main() -> int:
     if not args.command:
         parser.print_help()
         return 0
+
+    # M-5: 执行模式校验 cwd 存在 (sock 非执行路径, 不校验)
+    _validate_paths(args.cwd, None, check_sock=False)
 
     # M-CLI-01: 包 try/except 退 2 (旧版裸 traceback); -124→124 (旧版 -1/-124 全 → 1)
     try:

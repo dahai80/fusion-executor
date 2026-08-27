@@ -108,6 +108,39 @@ impl RepoLock {
     }
 }
 
+/// L-1 (审计 0827): 回滚结果 — 替代旧 Ok(bool). 区分三态:
+///   applied=true   已回滚 (reset --hard / + stash apply 成功)
+///   applied=false + skipped_reason=Some  需回滚但跳过 (非 repo / 快照失效 / repo 不匹配 /
+///                                        ref 非法 / git 失败) — fail-loud 信号, 旧 bool 折叠成 false
+///   applied=true + wip_sha=Some  回滚前捕获了 tracked WIP (dangling commit SHA), 调用方可
+///                                `git stash apply <sha>` 恢复并发编辑 (C-7/M-SEC-03)
+/// 旧 Ok(false) 将 "跳过(失效)" 与 "无需回滚(调用方未触发)" 折叠, 调用方无法 fail-loud.
+/// skipped_reason 进 ExecutionResult.rollback_skipped_reason 透出 (4 层, 与 L-2 同模式).
+#[derive(Debug, Clone)]
+pub struct RollbackOutcome {
+    pub applied: bool,
+    pub skipped_reason: Option<String>,
+    pub wip_sha: Option<String>,
+}
+
+impl RollbackOutcome {
+    fn applied(wip_sha: Option<String>) -> Self {
+        Self {
+            applied: true,
+            skipped_reason: None,
+            wip_sha,
+        }
+    }
+
+    fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            applied: false,
+            skipped_reason: Some(reason.into()),
+            wip_sha: None,
+        }
+    }
+}
+
 /// 回滚管理器 — git CLI shell
 pub struct RollbackManager {
     guard: SecurityGuard,
@@ -260,18 +293,24 @@ impl RollbackManager {
     /// head 基线: git reset --hard <baseline> (单步原子, C-RB-02)
     /// stash 快照: git reset --hard <baseline> + git stash apply <SHA> (C-RB-02, 恢复快照)
     /// ref 经 is_valid_ref 校验 (C-RB-03); 不用 -- (ref 位 -- 把 ref 当 pathspec → no-op)
-    pub async fn rollback(&self, snapshot_id: &str, cwd: &str) -> Result<bool> {
+    /// L-1 (审计 0827): 返 RollbackOutcome — 区分 "已回滚" / "需回滚但跳过(附原因)" /
+    /// "无 WIP". 旧 Ok(bool) 将 "跳过(快照失效)" 与 "无需回滚" 折叠成同一 false,
+    /// 调用方 (AutoRollbackGuard) 无法 fail-loud. skipped_reason = Some 即 fail-loud 信号.
+    /// C-7 (审计 0827): WIP 捕获 (reset --hard 前救 tracked 改动) 旧 .unwrap_or_default()
+    /// 静默吞 git Err → reset --hard 照毁 WIP 无日志. capture_wip 现显式记 warn! + 返 None,
+    /// 回滚继续 (安全路径, 中止 reset --hard 留半截态更糟); wip_sha 进 outcome 供调用方恢复.
+    pub async fn rollback(&self, snapshot_id: &str, cwd: &str) -> Result<RollbackOutcome> {
         self.validate_cwd(cwd)?;
         if !Self::is_repo(cwd).await {
             warn!(cwd, "非 git repo, 无法回滚");
-            return Ok(false);
+            return Ok(RollbackOutcome::skipped("非 git 仓库"));
         }
         // Blocker 9 (审计 2.7b): 空 snapshot_id — 旧版 checkout -- . 静默清空 WIP。
         // cwd 实是 repo (竞态: snapshot_create 返空因 git 临时不可用), 此处 fail-loud
         // 拒绝, 不丢用户工作。调用方应重试 snapshot_create 或显式决定。
         if snapshot_id.is_empty() {
             warn!(cwd, "空 snapshot_id, 拒绝回滚 (防静默清空 WIP, 审计 2.7b)");
-            return Ok(false);
+            return Ok(RollbackOutcome::skipped("空 snapshot_id"));
         }
         // Blocker 9 (审计 2.7a): 进程级锁防并发回滚双应用冲突。
         let _lock = RepoLock::acquire(cwd)?;
@@ -279,7 +318,7 @@ impl RollbackManager {
             Some(v) => v,
             None => {
                 warn!(%snapshot_id, cwd, "无法解析 snapshot_id, 跳过回滚");
-                return Ok(false);
+                return Ok(RollbackOutcome::skipped("snapshot_id 解析失败"));
             }
         };
         // Blocker 9 (审计 2.7c): repo:<hash> 比对 — 快照含 repo 标识时, cwd 仓库哈希须匹配。
@@ -288,11 +327,11 @@ impl RollbackManager {
             let actual = repo_id(cwd).await;
             if actual.is_empty() {
                 warn!(cwd, %expected, "cwd repo 标识不可解析, 拒绝 (无法验证跨节点一致性)");
-                return Ok(false);
+                return Ok(RollbackOutcome::skipped("cwd repo 标识不可解析"));
             }
             if actual != expected {
                 warn!(cwd, %expected, %actual, "snapshot_id repo 标识不匹配 cwd, 拒绝 (跨节点防盲回滚)");
-                return Ok(false);
+                return Ok(RollbackOutcome::skipped("repo 标识不匹配 cwd"));
             }
             info!(cwd, %expected, "repo 标识匹配, 允许回滚");
         }
@@ -302,30 +341,28 @@ impl RollbackManager {
                 let baseline = base.unwrap_or("HEAD");
                 if !Self::is_valid_ref(baseline) {
                     warn!(cwd, %baseline, "baseline 非合法 ref, 拒绝 (C-RB-03 flag 注入)");
-                    return Ok(false);
+                    return Ok(RollbackOutcome::skipped("baseline 非合法 ref"));
                 }
-                // M-SEC-03: reset --hard 销毁快照后累积的 tracked WIP (并发编辑器修改)。
-                // 先 git stash create 捕获当前脏状态为 dangling commit (不入 stash list,
-                // 不违 C-RB-01), 记 SHA + 恢复命令到日志。调用方可 `git stash apply <sha>` 恢复。
-                // untracked 文件 reset --hard 不动, 无需捕获; snapshot_create 亦不含 untracked。
-                let wip_sha = Self::git(cwd, &["stash", "create"])
-                    .await
-                    .unwrap_or_default();
-                if !wip_sha.trim().is_empty() {
+                // C-7 (审计 0827) + M-SEC-03: reset --hard 前捕获 tracked WIP 为 dangling commit
+                // (不入 stash list, 不违 C-RB-01)。capture_wip 显式区分 Err (fail-loud warn!,
+                // 返 None) vs 空树 (无 WIP), 旧 .unwrap_or_default() 把 Err 静默吞成空串 →
+                // reset --hard 照毁 WIP 无日志。回滚继续 (安全路径); wip_sha 进 outcome 供恢复。
+                let wip_sha = Self::capture_wip(cwd).await;
+                if let Some(sha) = wip_sha.as_ref() {
                     warn!(
-                        cwd, wip_sha = %wip_sha.trim(),
+                        cwd, wip_sha = %sha,
                         "M-SEC-03: reset --hard 前捕获 tracked WIP 为 dangling commit; \
-                         回滚后需恢复并发编辑请执行: git stash apply {}", wip_sha.trim()
+                         回滚后需恢复并发编辑请执行: git stash apply {}", sha
                     );
                 }
                 match Self::git(cwd, &["reset", "--hard", baseline]).await {
                     Ok(_) => {
                         info!(cwd, %baseline, "回滚成功 (head 基线, reset --hard)");
-                        Ok(true)
+                        Ok(RollbackOutcome::applied(wip_sha))
                     }
                     Err(e) => {
                         warn!(cwd, %baseline, "reset --hard 失败: {}", e);
-                        Ok(false)
+                        Ok(RollbackOutcome::skipped("reset --hard 失败"))
                     }
                 }
             }
@@ -333,29 +370,27 @@ impl RollbackManager {
                 let stash_sha = stash.unwrap_or("");
                 if stash_sha.is_empty() || !Self::is_valid_ref(stash_sha) {
                     warn!(cwd, %stash_sha, "stash SHA 非合法 ref, 拒绝 (C-RB-03)");
-                    return Ok(false);
+                    return Ok(RollbackOutcome::skipped("stash SHA 非合法 ref"));
                 }
                 let baseline = base.unwrap_or("HEAD");
                 if !Self::is_valid_ref(baseline) {
                     warn!(cwd, %baseline, "baseline 非合法 ref, 拒绝 (C-RB-03 flag 注入)");
-                    return Ok(false);
+                    return Ok(RollbackOutcome::skipped("baseline 非合法 ref"));
                 }
-                // M-SEC-03: 同 head 分支 — 捕获快照后 tracked WIP 防 reset --hard 销毁。
-                let wip_sha = Self::git(cwd, &["stash", "create"])
-                    .await
-                    .unwrap_or_default();
-                if !wip_sha.trim().is_empty() {
+                // C-7 + M-SEC-03: 同 head 分支 — capture_wip 捕获快照后 tracked WIP。
+                let wip_sha = Self::capture_wip(cwd).await;
+                if let Some(sha) = wip_sha.as_ref() {
                     warn!(
-                        cwd, wip_sha = %wip_sha.trim(),
+                        cwd, wip_sha = %sha,
                         "M-SEC-03: stash 回滚前捕获 tracked WIP 为 dangling commit; \
-                         回滚后需恢复并发编辑请执行: git stash apply {}", wip_sha.trim()
+                         回滚后需恢复并发编辑请执行: git stash apply {}", sha
                     );
                 }
                 // C-RB-02: 先 reset --hard <baseline> 清工作区到基线 (单步原子, 避半截态)
                 // 然后 stash apply <stash> 恢复快照内容 (基线干净, apply 不冲突)
                 if let Err(e) = Self::git(cwd, &["reset", "--hard", baseline]).await {
                     warn!(cwd, %baseline, "stash 回滚: reset --hard 失败: {}", e);
-                    return Ok(false);
+                    return Ok(RollbackOutcome::skipped("stash 回滚 reset --hard 失败"));
                 }
                 match Self::git(cwd, &["stash", "apply", stash_sha]).await {
                     Ok(_) => {
@@ -363,29 +398,58 @@ impl RollbackManager {
                         // 也无法 drop (drop -- <sha> 报 "不是一个储藏引用"). 无界增长不发生,
                         // 由 test_stash_list_stays_empty_across_rollback_cycles 守护.
                         info!(cwd, %stash_sha, "回滚成功 (reset --hard + stash apply)");
-                        Ok(true)
+                        Ok(RollbackOutcome::applied(wip_sha))
                     }
                     Err(e) => {
                         warn!(cwd, %stash_sha, "stash apply 失败 (已 reset --hard): {}", e);
-                        Ok(false)
+                        Ok(RollbackOutcome::skipped("stash apply 失败"))
                     }
                 }
             }
             _ => {
                 warn!(%kind, cwd, "未知快照类型, 跳过");
-                Ok(false)
+                Ok(RollbackOutcome::skipped("未知快照类型"))
+            }
+        }
+    }
+
+    /// C-7 (审计 0827): WIP 捕获 — reset --hard 前救当前 tracked 改动为 dangling commit。
+    /// `git stash create` 成功返 SHA (空树返空串→无 WIP→None); 失败 (Err) 旧 .unwrap_or_default()
+    /// 静默吞 → reset --hard 毁 WIP 无日志。现 fail-loud: warn! 记 git Err + 返 None, 调用方
+    /// (rollback) 继续 (安全路径, 中止 reset --hard 留半截态更糟)。wip_sha 进 RollbackOutcome
+    /// 供上层 (AutoRollbackGuard → result) 暴露给调用方恢复。
+    async fn capture_wip(cwd: &str) -> Option<String> {
+        match Self::git(cwd, &["stash", "create"]).await {
+            Ok(s) => {
+                let s = s.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            }
+            Err(e) => {
+                warn!(
+                    cwd, error = %e,
+                    "C-7: WIP 捕获 (stash create) 失败 — reset --hard 可能丢失未保存的 tracked 改动 (fail-loud; 回滚继续)"
+                );
+                None
             }
         }
     }
 
     /// 单文件回滚 — git checkout -- <path> (PRD "单文件 checkout")
     /// C-RB-03: -- 隔离 pathspec (path 形如 --foo 不被当 flag; path 是 pathspec 位, -- 正确)
+    /// L-8 (审计 0827): 持 RepoLock — 旧版仅 rollback() 持锁, rollback_file 不持 → 并发
+    /// rollback (reset --hard) 与 rollback_file (checkout --) 争 git index, 半截态/丢改动。
+    /// 共用同 .git/fe-rollback.lock flock, 与 rollback 互斥。
     pub async fn rollback_file(&self, path: &str, cwd: &str) -> Result<bool> {
         self.validate_cwd(cwd)?;
         if !Self::is_repo(cwd).await {
             warn!(cwd, "非 git repo, 无法回滚单文件");
             return Ok(false);
         }
+        let _lock = RepoLock::acquire(cwd)?;
         match Self::git(cwd, &["checkout", "--", path]).await {
             Ok(_) => {
                 info!(cwd, %path, "单文件回滚成功");
@@ -465,7 +529,7 @@ mod tests {
         // 进一步破坏 → 回滚到快照
         fs::write(dir.join("app.py"), "WORSE\n").unwrap();
         let ok = mgr.rollback(&snap, cwd).await.unwrap();
-        assert!(ok, "回滚成功");
+        assert!(ok.applied, "回滚成功");
         let restored = fs::read_to_string(dir.join("app.py")).unwrap();
         assert_eq!(restored, "BROKEN\n", "回滚到快照内容");
         let _ = fs::remove_dir_all(&dir);
@@ -544,7 +608,11 @@ mod tests {
                 snap
             );
             fs::write(dir.join("app.py"), format!("WORSE{}\n", i)).unwrap();
-            assert!(mgr.rollback(&snap, cwd).await.unwrap(), "轮 {} 回滚成功", i);
+            assert!(
+                mgr.rollback(&snap, cwd).await.unwrap().applied,
+                "轮 {} 回滚成功",
+                i
+            );
         }
         // C-RB-01 不变量: stash list 仍空 (dangling commit 不入栈)
         let list = git_list_stash(cwd).await;
@@ -574,7 +642,7 @@ mod tests {
         git_commit(&dir, &["add", "app.py"], "v2");
         // 回滚到 head 基线 (v1)
         let ok = mgr.rollback(&snap, cwd).await.unwrap();
-        assert!(ok, "head 基线回滚成功");
+        assert!(ok.applied, "head 基线回滚成功");
         assert_eq!(
             fs::read_to_string(dir.join("app.py")).unwrap(),
             "v1\n",
@@ -593,12 +661,12 @@ mod tests {
         let mgr = RollbackManager::new();
         // --foo 非 head:/stash: 前缀 → parse_snapshot 返回 None → 安全跳过 (ok=false)
         assert!(
-            !mgr.rollback("--foo", cwd).await.unwrap(),
+            !mgr.rollback("--foo", cwd).await.unwrap().applied,
             "flag-like snapshot_id 应被拒"
         );
         // head:--foo → parse 成功但 is_valid_ref 拒 baseline → ok=false
         assert!(
-            !mgr.rollback("head:--foo", cwd).await.unwrap(),
+            !mgr.rollback("head:--foo", cwd).await.unwrap().applied,
             "head:--foo baseline 非合法 ref 应拒"
         );
         // 文件未动
@@ -709,7 +777,7 @@ mod tests {
         assert!(msg.contains("敏感"), "/etc 应被 validate_cwd 拒: {}", msg);
         // /tmp/正常 repo → validate 通过, 回滚成功
         assert!(
-            mgr.rollback(&snap, cwd).await.unwrap(),
+            mgr.rollback(&snap, cwd).await.unwrap().applied,
             "正常 repo 应可回滚"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -735,9 +803,14 @@ mod tests {
         // WIP 改动待保留
         fs::write(dir.join("app.py"), "WIP-重要工作\n").unwrap();
         let mgr = RollbackManager::new();
-        // 空 snapshot_id → 拒绝 (返 false), 不静默清空 WIP
+        // L-1 (审计 0827): 空 snapshot_id → RollbackOutcome::skipped (applied=false + 原因)。
+        // 旧 Ok(false) 与 "无需回滚" 折叠, 调用方无法 fail-loud; 现 skipped_reason 暴露原因。
         let ok = mgr.rollback("", cwd).await.unwrap();
-        assert!(!ok, "空 snapshot_id 应拒绝回滚");
+        assert!(!ok.applied, "空 snapshot_id 应拒绝回滚");
+        assert!(
+            ok.skipped_reason.is_some(),
+            "L-1: 跳过应有原因 (fail-loud), 非 silent false"
+        );
         // WIP 未被破坏
         assert_eq!(
             fs::read_to_string(dir.join("app.py")).unwrap(),
@@ -761,15 +834,17 @@ mod tests {
         assert!(snap.contains(",repo:"), "snapshot 应含 repo 标识: {}", snap);
         // 正确 snapshot → 可回滚
         fs::write(dir.join("app.py"), "WORSE\n").unwrap();
-        assert!(
-            mgr.rollback(&snap, cwd).await.unwrap(),
-            "正确 repo 标识应可回滚"
-        );
-        // 伪造: 替换 repo:<hash> 为假哈希 → 拒绝
+        let ok = mgr.rollback(&snap, cwd).await.unwrap();
+        assert!(ok.applied, "正确 repo 标识应可回滚");
+        // 伪造: 替换 repo:<hash> 为假哈希 → 拒绝 (L-1: skipped 暴露原因)
         let fake = "head:deadbeefdeadbeef,repo:0000000000000000".to_string();
         fs::write(dir.join("app.py"), "WORSE2\n").unwrap();
         let ok = mgr.rollback(&fake, cwd).await.unwrap();
-        assert!(!ok, "repo 标识不匹配应拒绝回滚");
+        assert!(!ok.applied, "repo 标识不匹配应拒绝回滚");
+        assert!(
+            ok.skipped_reason.is_some(),
+            "L-1: repo 不匹配跳过应有原因 (fail-loud)"
+        );
         // 文件未被回滚 (仍是 WORSE2)
         assert_eq!(
             fs::read_to_string(dir.join("app.py")).unwrap(),
@@ -802,7 +877,7 @@ mod tests {
         git_commit(&dir, &["add", "app.py"], "v2");
         // legacy id 无 repo 标识 → 放行 (向后兼容, 不比对)
         assert!(
-            mgr.rollback(&legacy, cwd).await.unwrap(),
+            mgr.rollback(&legacy, cwd).await.unwrap().applied,
             "无 repo 标识的 legacy id 应放行"
         );
         assert_eq!(
@@ -830,7 +905,7 @@ mod tests {
         // rollback 应能再次获取锁 (前次已释放)
         fs::write(dir.join("app.py"), "WORSE\n").unwrap();
         assert!(
-            mgr.rollback(&snap, cwd).await.unwrap(),
+            mgr.rollback(&snap, cwd).await.unwrap().applied,
             "锁释放后 rollback 应成功"
         );
         let _ = fs::remove_dir_all(&dir);

@@ -29,6 +29,8 @@ logger = logging.getLogger("fusion_executor")
 
 DEFAULT_SOCK = "/tmp/fusion-executor.sock"
 SUB_CHANNELS = ("telemetry", "stdio", "screenshot")
+# P-2: subscription 行缓冲上限 — 损坏流 (无 newline) / 超巨帧防护, 超则丢缓冲当流结束
+_SUB_BUF_MAX_BYTES = 8 * 1024 * 1024
 
 
 class FusionSandboxExecutor:
@@ -129,15 +131,19 @@ class FusionSandboxExecutor:
             snapshot_id=native.snapshot_id,
             diagnostics=diag,
             auto_rolled_back=native.auto_rolled_back,
+            rollback_unavailable=native.rollback_unavailable,
+            rollback_skipped_reason=native.rollback_skipped_reason,
             trace_id=native.trace_id,
         )
         logger.info(
-            "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s dur=%.3fs",
+            "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s rb_unavail=%s rb_skipped=%s dur=%.3fs",
             result.exit_code,
             result.blocked_by_security,
             result.timed_out,
             result.diagnostics.error_type if result.diagnostics else None,
             result.auto_rolled_back,
+            result.rollback_unavailable,
+            result.rollback_skipped_reason,
             result.duration_sec,
         )
         return result
@@ -224,6 +230,9 @@ class FusionSandboxExecutor:
                 )
                 yield result
                 return
+            else:
+                # M-6: 未知帧 type (协议演进新帧/损坏帧) — 不抛保向前兼容, 但 debug 记录可追溯
+                logger.debug("未知流帧 type=%r, 跳过 (向前兼容)", ftype)
 
     def _native_result(self, payload: dict) -> ExecutionResult:
         # L-PY-02: 严格校验 (旧 .get(default) 吞缺失字段, Rust 改字段名/serde bug 时
@@ -316,17 +325,21 @@ class FusionSandboxExecutor:
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
         max_idle_sec: int = 3600,
+        kill_grace_ms: int = 500,
     ) -> ShellStartResult:
         if not isinstance(max_idle_sec, int) or max_idle_sec < 0:
             raise ValueError(f"max_idle_sec 必须为非负 int, 得 {max_idle_sec!r}")
+        if not isinstance(kill_grace_ms, int) or kill_grace_ms < 0:
+            raise ValueError(f"kill_grace_ms 必须为非负 int, 得 {kill_grace_ms!r}")
         logger.debug(
-            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s",
+            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s kill_grace_ms=%s",
             command,
             cwd,
             task_id,
             seatbelt,
             inherit_env,
             max_idle_sec,
+            kill_grace_ms,
         )
         native = self._native.shell_start(
             command,
@@ -339,6 +352,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_idle_sec,
+            kill_grace_ms,
         )
         result = ShellStartResult.model_validate(native.to_dict())
         logger.info(
@@ -539,9 +553,15 @@ class FusionSandboxExecutor:
         *,
         interval_ms: int = 100,
         max_samples: int = 0,
+        pid: int | None = None,
     ) -> Iterator[TelemetrySample]:
-        logger.debug("telemetry_stream interval_ms=%s max_samples=%s", interval_ms, max_samples)
-        it = self._native.telemetry_stream(interval_ms, max_samples)
+        logger.debug(
+            "telemetry_stream interval_ms=%s max_samples=%s pid=%s",
+            interval_ms,
+            max_samples,
+            pid,
+        )
+        it = self._native.telemetry_stream(interval_ms, max_samples, pid)
         for count, frame in enumerate(it, start=1):
             # 3.11: 严格 model_validate (旧 frame.get("ts_ms", 0) 默认 0 — Rust 改字段名/
             # serde bug 时静默吞缺失字段, ts_ms=0/cpu=0 假数据进融合)。Blocker 11 _STRICT
@@ -740,6 +760,12 @@ class Subscription:
             if not chunk:
                 return None
             self._buf += chunk
+            # P-2: 行缓冲无界增长防护 — 损坏流 (无 newline) 或超巨帧会撑爆 _buf。
+            # 截断丢缓冲并 warn, 当流结束 (比 OOM 强; 下次 recv 无 \n 仍 None)。
+            if len(self._buf) > _SUB_BUF_MAX_BYTES:
+                logger.warning("subscription _buf 超 %d 字节, 丢弃 (损坏流/超巨帧)", _SUB_BUF_MAX_BYTES)
+                self._buf = b""
+                return None
         line, self._buf = self._buf.split(b"\n", 1)
         text = line.decode("utf-8").strip()
         if not text:

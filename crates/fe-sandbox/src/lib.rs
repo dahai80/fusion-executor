@@ -7,6 +7,7 @@
 // PTY 合并 stdout+stderr → 全入 stdout (stderr 空; traceback 在 tail 可读)
 
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
@@ -376,10 +377,10 @@ impl Sandbox {
             }
             _ = sleep => {
                 warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组");
-                let exit = kill_tree_async(pid).await;
+                let res = kill_process_group_async(pid).await;
                 drop(_writer);
                 drop(pair.master);
-                (true, exit)
+                (true, res.exit_code)
             }
         };
 
@@ -429,10 +430,14 @@ impl Sandbox {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // C-14: stdio 路径无 setsid (portable-pty PTY 路径有), 子进程继承 executor pgid。
+        // process_group(0) = exec 前 setpgid(0,0) 使 child pgid = child pid, killpg(-pid) 同 PTY 路径生效。
+        // CommandExt::process_group (Rust 1.64+ stable) 在 pre_exec 设新进程组。
+        cmd.process_group(0);
 
         let mut child = cmd.spawn().context("spawn (stdio) 失败")?;
         let pid: Option<u32> = Some(child.id());
-        debug!(?pid, "child spawned (stdio)");
+        debug!(?pid, "child spawned (stdio), pgid = pid (process_group(0))");
         // 取出 stdout/stderr handle 后移走 child 剩余引用供 wait
         let mut stdout_handle = child.stdout.take().context("stdout piped 失败")?;
         let mut stderr_handle = child.stderr.take().context("stderr piped 失败")?;
@@ -518,8 +523,8 @@ impl Sandbox {
             }
             _ = sleep => {
                 warn!(?pid, timeout_sec = effective_timeout, "超时 (stdio), kill 进程组");
-                let exit = kill_tree_async(pid).await;
-                (true, exit)
+                let res = kill_process_group_async(pid).await;
+                (true, res.exit_code)
             }
         };
 
@@ -689,10 +694,10 @@ impl Sandbox {
                     }
                     _ = tokio::time::sleep(timeout_dur) => {
                         warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组 (streaming)");
-                        let exit = kill_tree_async(pid).await;
+                        let res = kill_process_group_async(pid).await;
                         drop(_writer);
                         drop(pair.master);
-                        (true, exit)
+                        (true, res.exit_code)
                     }
                 }
             });
@@ -712,7 +717,7 @@ impl Sandbox {
                     // Blocker 6: 消费者断开 outer_rx (即使无输出静默期) → closed() 就绪 → kill 子进程
                     _ = outer_tx.closed() => {
                         warn!(?pid_for_cancel, "streaming 消费者断开 (closed), kill 子进程防孤儿 (Blocker 6)");
-                        let _ = kill_tree_async(pid_for_cancel).await;
+                        let _ = kill_process_group_async(pid_for_cancel).await;
                         cancelled = true;
                         break;
                     }
@@ -722,7 +727,7 @@ impl Sandbox {
                                 // Blocker 6: send 失败 = 消费者断开 outer_rx → kill 子进程, 跳出
                                 if outer_tx.send(StreamEvent::Chunk { data: c }).await.is_err() {
                                     warn!(?pid_for_cancel, "streaming 消费者断开, kill 子进程防孤儿 (Blocker 6)");
-                                    let _ = kill_tree_async(pid_for_cancel).await;
+                                    let _ = kill_process_group_async(pid_for_cancel).await;
                                     cancelled = true;
                                     break;
                                 }
@@ -925,34 +930,75 @@ pub fn effective_output_cap(cfg_max: usize) -> usize {
     cfg_max.min(HARD_CEILING)
 }
 
-/// C-SB-01/04: 进程树杀 — SIGINT (graceful) → KILL_GRACE_MS → 仍活 → SIGKILL
-/// portable-pty setsid 使子进程为组长, killpg(-pid) 杀整组 (含孙子)
-/// pid=None (spawn 失败) → 无操作返回 -1
-/// P-SB-04: kill EPERM/EINVAL 报错, ESRCH (进程已退) 当 ok
-/// 返回 -124 (超时约定) 或子进程被信号杀的退出码
-pub fn kill_tree(pid: Option<u32>) -> i32 {
+/// A-11: kill_process_group 的结构化结果 — 区分"已成功信号"与"已回收僵尸"与"退出码"。
+/// signaled=true  = 至少一路信号 (SIGINT 或 SIGKILL) 成功投递 (killpg 返 Ok 或非 ESRCH)。
+/// reaped=true    = 最终阻塞 waitpid 在本调用内回收了僵尸 (reap=true 时)。
+/// exit_code      = -124 (超时约定, 调用方区分"主动杀"用 exit_code.is_signal 报告) 或子进程被信号杀的码。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KillResult {
+    pub signaled: bool,
+    pub reaped: bool,
+    pub exit_code: i32,
+}
+
+/// A-10: 封装 BSD 负-pid 进程组信号, 隐藏双否定。
+/// 负 pid = 进程组 (BSD 扩展, macOS 支持; POSIX killpg 语义)。killpg(pgid, sig) 等价 kill(-pgid, sig)。
+/// 返回 true = 信号投递成功 (Ok); false = 进程组已不存在 (ESRCH) 或权限不足 (EPERM/EINVAL 报 warn)。
+fn kill_pgid(pgid: Pid, sig: Signal, pid: u32) -> bool {
+    match nix::sys::signal::killpg(pgid, sig) {
+        Ok(()) => {
+            debug!(?pid, ?sig, "killpg 已发 (负 pid = 进程组, BSD 扩展)");
+            true
+        }
+        Err(nix::errno::Errno::ESRCH) => {
+            debug!(?pid, ?sig, "killpg: 进程组已不存在 (ESRCH)");
+            false
+        }
+        Err(e) => {
+            warn!(?pid, ?sig, "killpg 失败: {e}");
+            false
+        }
+    }
+}
+
+/// C-14/C-15/L-13/A-11: 进程组杀 — SIGINT (graceful) → grace_ms → 仍活 → SIGKILL (forceful)。
+///
+/// **仅杀一层进程组** (child pid 对应的组, 由 setsid/`process_group(0)` 使 pgid == child pid)。
+/// A-11 固有限制: setsid 孙进程 (child 再调 setsid 建新会话/组) 逃逸 — macOS 无 cgroups,
+/// POSIX killpg 非递归, 此为平台固有限制, 文档化而非修复。
+///
+/// C-14: `reap` 控制最终阻塞 waitpid。PTY 超时路径 caller 持 `spawn_blocking(child.wait())`
+/// (L-13 双重回收竞争), 故 kill 时 `reap=false` — 仅信号不回收, 让 caller 的 wait 路径回收。
+/// stdio 路径同理。fe-shell (自管 child.wait) 同样 reap=false。仅独立 kill (无 caller wait) 时 reap=true。
+///
+/// C-14 ESRCH 早返修复: SIGINT 返 ESRCH (组不存在) 不再短路返回 -124 — 继续 SIGKILL 兜底,
+/// 因 stdio 路径 `process_group(0)` 失败或 setsid 漏设时组 id 不匹配, SIGINT ESRCH 不代表子进程已死。
+///
+/// grace_ms 可配 (A-11, 默认 KILL_GRACE_MS 500ms); 0 = 跳 grace 直接 SIGKILL。
+/// 返回 KillResult; exit_code=-124 为超时/主动杀约定 (调用方按需区分)。
+/// pid=None (spawn 失败) → KillResult{exit_code: -1}。
+pub fn kill_process_group(pid: Option<u32>, reap: bool, grace_ms: u64) -> KillResult {
     let Some(pid) = pid else {
-        warn!("kill_tree: 无 pid (spawn 失败?), 跳过");
-        return -1;
+        warn!("kill_process_group: 无 pid (spawn 失败?), 跳过");
+        return KillResult {
+            signaled: false,
+            reaped: false,
+            exit_code: -1,
+        };
     };
     let pgid = Pid::from_raw(-(pid as i32));
     let pid_nix = Pid::from_raw(pid as i32);
 
-    // SIGINT 优雅终止
-    match nix::sys::signal::killpg(pgid, Signal::SIGINT) {
-        Ok(()) => debug!(?pid, "killpg SIGINT 已发"),
-        Err(nix::errno::Errno::ESRCH) => {
-            debug!(?pid, "SIGINT: 进程已退 (ESRCH)");
-            return -124;
-        }
-        Err(e) => {
-            warn!(?pid, "killpg SIGINT 失败: {e}");
-            // 不立即放弃 — 继续 SIGKILL 兜底
-        }
+    let mut signaled = false;
+    // SIGINT 优雅终止 — C-14: ESRCH 不短路, 继续走 SIGKILL 兜底 (可能组 id 错但进程活)
+    if kill_pgid(pgid, Signal::SIGINT, pid) {
+        signaled = true;
     }
 
-    // grace window 等优雅退出
-    std::thread::sleep(Duration::from_millis(KILL_GRACE_MS));
+    // grace window 等优雅退出 (grace_ms=0 跳过, 直接 SIGKILL)
+    if grace_ms > 0 {
+        std::thread::sleep(Duration::from_millis(grace_ms));
+    }
 
     // try_wait (WNOHANG) — 仍活则 SIGKILL
     let still_alive = matches!(
@@ -961,30 +1007,44 @@ pub fn kill_tree(pid: Option<u32>) -> i32 {
     );
     if still_alive {
         debug!(?pid, "SIGINT grace 后仍活, 发 SIGKILL");
-        match nix::sys::signal::killpg(pgid, Signal::SIGKILL) {
-            Ok(()) => debug!(?pid, "killpg SIGKILL 已发"),
-            Err(nix::errno::Errno::ESRCH) => debug!(?pid, "SIGKILL: 进程已退 (ESRCH)"),
-            Err(e) => warn!(?pid, "killpg SIGKILL 失败: {e}"),
+        if kill_pgid(pgid, Signal::SIGKILL, pid) {
+            signaled = true;
         }
     }
-    // 回收僵尸 — 阻塞 waitpid (子进程已死, 立即返回)
-    let _ = nix::sys::wait::waitpid(pid_nix, None);
 
-    -124
+    // 回收僵尸 — L-13: reap=false 时跳过, 让 caller 的 wait 路径回收 (避免 ECHILD 竞态)
+    let mut reaped = false;
+    if reap {
+        let _ = nix::sys::wait::waitpid(pid_nix, None);
+        reaped = true;
+        debug!(
+            ?pid,
+            "kill_process_group: 阻塞 waitpid 回收僵尸 (reap=true)"
+        );
+    }
+
+    KillResult {
+        signaled,
+        reaped,
+        exit_code: -124,
+    }
 }
 
-/// C-PERF-02: async 进程树杀 — 把 kill_tree 的 500ms grace sleep 移出 worker 线程。
-/// kill_tree 内 `std::thread::sleep(KILL_GRACE_MS)` 直接阻塞 tokio worker, 高并发下
-/// 多条超时命令串行占满 worker 池 (worker_threads 默认仅 available_parallelism)。
+/// C-PERF-02: async 进程组杀 — 把 grace sleep 移出 worker 线程。
 /// spawn_blocking 把阻塞段丢给专用阻塞线程池, worker 线程 grace 期间空闲可服务其他任务。
-/// 返回 -124 (超时约定) 或 JoinHandle panic 兜底 -1。
-/// 同步 kill_tree 保留给 fe-shell (std::thread 无 tokio runtime, 不可 await)。
-pub async fn kill_tree_async(pid: Option<u32>) -> i32 {
-    match tokio::task::spawn_blocking(move || kill_tree(pid)).await {
-        Ok(exit) => exit,
+/// 返回 KillResult (exit_code=-124) 或 JoinHandle panic 兜底 -1。
+/// 同步 kill_process_group 保留给 fe-shell (std::thread 无 tokio runtime, 不可 await)。
+/// reap=false: 超时路径 caller 持 spawn_blocking(child.wait), 避 L-13 双重回收竞争。
+pub async fn kill_process_group_async(pid: Option<u32>) -> KillResult {
+    match tokio::task::spawn_blocking(move || kill_process_group(pid, false, KILL_GRACE_MS)).await {
+        Ok(res) => res,
         Err(e) => {
-            warn!("kill_tree_async: spawn_blocking panic: {e}");
-            -1
+            warn!("kill_process_group_async: spawn_blocking panic: {e}");
+            KillResult {
+                signaled: false,
+                reaped: false,
+                exit_code: -1,
+            }
         }
     }
 }
@@ -1421,10 +1481,13 @@ mod tests {
         assert_eq!(effective_output_cap(HARD_CEILING), HARD_CEILING);
     }
 
-    // C-SB-01/04: kill_tree 无 pid 返回 -1
+    // C-SB-01/04: kill_process_group 无 pid 返回 exit_code -1
     #[test]
-    fn kill_tree_none_pid_returns_neg1() {
-        assert_eq!(kill_tree(None), -1);
+    fn kill_process_group_none_pid_returns_neg1() {
+        let res = kill_process_group(None, true, KILL_GRACE_MS);
+        assert_eq!(res.exit_code, -1);
+        assert!(!res.signaled);
+        assert!(!res.reaped);
     }
 
     // 审计 2.5: nth_char_byte_offset 多字节边界正确 (取代 Vec<char> 的零物化实现)
@@ -1503,45 +1566,63 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        // 子进程应存活 (kill -0 探测, 不发信号)
-        let alive_before =
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
+        // 子进程应存活 (waitpid WNOHANG 探测 — L-13: reap=false 后 kill -0 对僵尸误报存活,
+        // 用 waitpid(WNOHANG) 区分 StillAlive vs Exited/zombie)
+        let pid_nix = nix::unistd::Pid::from_raw(pid as i32);
+        let alive_before = matches!(
+            nix::sys::wait::waitpid(pid_nix, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Ok(nix::sys::wait::WaitStatus::StillAlive)
+        );
         assert!(alive_before, "drop 前 sleep 子进程应存活, pid={}", pid);
         // Blocker 6: drop receiver 模拟消费者断开 → 协调任务 send 失败 → kill 子进程
         drop(rx);
         // 等协调任务收尾 (子进程被 kill 后 handle 应结束)
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        // 验证 sleep 进程已死 (kill -0 应 ESRCH)
-        let still_alive =
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
+        // 验证 sleep 进程已死/退出 (waitpid WNOHANG: 非 StillAlive = 已 kill/退出/僵尸已收)。
+        // L-13 reap=false 可能留僵尸; wait_fut 后台回收。给回收宽限, 轮询直到非 StillAlive。
+        let mut dead = false;
+        for _ in 0..20 {
+            let s = nix::sys::wait::waitpid(pid_nix, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+            if !matches!(s, Ok(nix::sys::wait::WaitStatus::StillAlive)) {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(
-            !still_alive,
+            dead,
             "消费者断开后 sleep 子进程应已被 kill (Blocker 6), pid={}",
             pid
         );
         let _ = std::fs::remove_file(&pidfile);
     }
 
-    // Blocker 1 / 1.1: seatbelt 运行时隔离 — 真实 sandbox-exec 拦截测试
-    // 审计 #1 攻击: os.execve('/bin/rm') 穿透静态白名单 → seatbelt process-exec deny 兜底
+    // A-12 (0827): seatbelt process-exec denylist 已删 — 二进制隔离由 fe-security allowlist 主导。
+    // rm 不再被 seatbelt process-exec 拦 (denylist 删除); /bin/rm 仍在 fe-security 白名单外
+    // (非 python/node/cargo/...), Stage-2 静态层即拦, 根本到不了 seatbelt 运行层。
+    // 此测试验证 seatbelt 不再拦 rm (A-12 回归守卫): rm 在沙箱内能执行 (无 process-exec deny)。
     #[test]
-    fn seatbelt_blocks_rm_execve() {
+    fn seatbelt_a12_drops_process_exec_denylist() {
         let sb = Sandbox::new();
+        let tmp = format!("/tmp/fe-seatbelt-a12-{}", std::process::id());
+        let _ = std::fs::write(&tmp, "x");
         let cfg = SandboxConfig {
-            command: "/bin/rm -f /tmp/fe-seatbelt-ghost 2>/dev/null; echo rm_exit=$?".to_string(),
+            command: format!("/bin/rm -f {} 2>/dev/null; echo rm_exit=$?", tmp),
             timeout_sec: 15.0,
             seatbelt: true,
             ..Default::default()
         };
         let r = rt().block_on(sb.run(cfg));
         let r = r.unwrap();
-        // /bin/rm 被 process-exec deny → exit 126 (Operation not permitted), echo 仍能跑
+        // A-12: seatbelt 不再 process-exec deny rm → rm_exit 非 126 (0 或 rm 自身行为)。
+        // 注: 沙箱 run 不经 fe-security 校验 (直传 shell), 故 rm 直达; seatbelt 无 deny → 执行。
         assert!(
-            r.stdout.contains("rm_exit=126"),
-            "rm 应被 seatbelt 拦 (exit 126), 实际 stdout={}",
+            !r.stdout.contains("rm_exit=126"),
+            "A-12: seatbelt 不应再 process-exec deny rm (denylist 已删), 实际 stdout={}",
             r.stdout
         );
-        info!(stdout = %r.stdout, exit = r.exit_code, "seatbelt rm 拦截验证");
+        info!(stdout = %r.stdout, exit = r.exit_code, "seatbelt A-12 回归: rm 未被 process-exec 拦");
+        let _ = std::fs::remove_file(&tmp);
     }
 
     // Blocker 1: seatbelt 禁网 — /dev/tcp 外泄被拦

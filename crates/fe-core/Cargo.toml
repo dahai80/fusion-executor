@@ -21,6 +21,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+futures.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
