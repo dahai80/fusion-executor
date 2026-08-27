@@ -292,10 +292,20 @@ def test_run_streaming_trace_id(executor: FusionSandboxExecutor):
 
 
 def test_run_injects_rlimits(executor: FusionSandboxExecutor):
-    probe = 'python3 -c \'import resource; print("NPROC", resource.getrlimit(resource.RLIMIT_NPROC)[0]); print("CPU", resource.getrlimit(resource.RLIMIT_CPU)[0])\''
+    # 注入经 `ulimit -u/-t`; setrlimit 软上限不能超硬上限 — CI runner 硬上限可能 < 请求值 (如 1333),
+    # 内核静默 clamp。断言观测值 ≤ 请求 且受内核硬限约束, 不写死 2048。
+    probe = (
+        "python3 -c 'import resource; "
+        'print("NPROC", resource.getrlimit(resource.RLIMIT_NPROC)[0], resource.getrlimit(resource.RLIMIT_NPROC)[1]); '
+        'print("CPU", resource.getrlimit(resource.RLIMIT_CPU)[0])\''
+    )
     result = executor.run(probe, max_nproc=2048, max_cpu_sec=15)
     assert result.exit_code == 0, f"probe 应 exit 0, stdout={result.stdout}"
-    assert "NPROC 2048" in result.stdout, f"应观测注入 NPROC=2048, stdout={result.stdout}"
+    nproc_line = next(ln for ln in result.stdout.splitlines() if ln.startswith("NPROC"))
+    nproc_soft, nproc_hard = nproc_line.split()[1], nproc_line.split()[2]
+    assert int(nproc_soft) <= 2048, f"软 NPROC 应 ≤ 请求 2048, 得 {nproc_soft}"
+    assert int(nproc_soft) <= int(nproc_hard), f"软 NPROC 应 ≤ 硬上限, soft={nproc_soft} hard={nproc_hard}"
+    assert int(nproc_soft) > 0, f"注入后 NPROC 应非零, 得 {nproc_soft}"
     assert "CPU 15" in result.stdout, f"应观测注入 CPU=15, stdout={result.stdout}"
 
 
@@ -317,11 +327,16 @@ def test_run_rejects_negative_nproc(executor: FusionSandboxExecutor):
 
 
 def test_run_streaming_injects_rlimits(executor: FusionSandboxExecutor):
-    probe = "python3 -c 'import resource; print(\"NPROC\", resource.getrlimit(resource.RLIMIT_NPROC)[0])'"
+    # 同 test_run_injects_rlimits: 软上限受内核硬限 clamp, 不写死 2048。
+    probe = "python3 -c 'import resource; print(\"NPROC\", resource.getrlimit(resource.RLIMIT_NPROC)[0], resource.getrlimit(resource.RLIMIT_NPROC)[1])'"
     _chunks, result = _consume_stream(executor, probe, max_nproc=2048)
     assert result is not None
     assert result.exit_code == 0
-    assert "NPROC 2048" in result.stdout
+    nproc_line = next(ln for ln in result.stdout.splitlines() if ln.startswith("NPROC"))
+    nproc_soft, nproc_hard = nproc_line.split()[1], nproc_line.split()[2]
+    assert int(nproc_soft) <= 2048, f"软 NPROC 应 ≤ 请求 2048, 得 {nproc_soft}"
+    assert int(nproc_soft) <= int(nproc_hard), f"软 NPROC 应 ≤ 硬上限, soft={nproc_soft} hard={nproc_hard}"
+    assert int(nproc_soft) > 0, f"注入后 NPROC 应非零, 得 {nproc_soft}"
 
 
 # ── 原生文件工具 (fe-tools) ──
