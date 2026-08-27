@@ -855,17 +855,21 @@ impl PyExecutor {
         Ok(PyStreamIterator::new(rx, handle))
     }
 
-    /// telemetry_stream(interval_ms=100, max_samples=0) -> NativeTelemetryIterator
+    /// telemetry_stream(interval_ms=100, max_samples=0, pid=None) -> NativeTelemetryIterator
     /// 迭代 yield TelemetrySample dict (ts_ms/cpu_pct/mem_mb/gpu_pct/gpu_mem_mb/task_id)
     /// 默认 10Hz 无限采样; max_samples>0 达此值后结束
+    /// pid=None 采样 executor 自身 (默认); 传入沙箱子进程 PID 采样真实任务 (L-15)
+    #[pyo3(signature = (interval_ms=100, max_samples=0, pid=None))]
     fn telemetry_stream(
         &self,
-        interval_ms: Option<u64>,
-        max_samples: Option<u64>,
+        interval_ms: u64,
+        max_samples: u64,
+        pid: Option<u32>,
     ) -> PyResult<PyTelemetryIterator> {
         let cfg = TelemetryConfig {
-            interval_ms: interval_ms.unwrap_or(100),
-            max_samples: max_samples.unwrap_or(0),
+            interval_ms,
+            max_samples,
+            pid,
         };
         let (rx, handle) = self.inner.telemetry_stream(cfg);
         Ok(PyTelemetryIterator {
@@ -925,6 +929,7 @@ impl PyExecutor {
     /// -> NativeShellStartResult — 后台持久 shell 启动 (#1, run_in_background parity)
     /// 安全校验在 fe-core (fail-closed); blocked → ok=false, shell_id=None
     /// max_idle_sec (m-SEC-01): 无输出超此值 (秒) 自动 kill; 0=不限。默认 3600。
+    /// kill_grace_ms (M-9): kill 宽限期 (毫秒), SIGINT→grace→SIGKILL 间隔; 0=立即 SIGKILL。默认 500。
     #[pyo3(signature = (
         command,
         cwd=None,
@@ -936,6 +941,7 @@ impl PyExecutor {
         max_nproc=1024,
         max_cpu_sec=0,
         max_idle_sec=fe_core::shell::DEFAULT_MAX_IDLE_SEC,
+        kill_grace_ms=500,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn shell_start(
@@ -951,6 +957,7 @@ impl PyExecutor {
         max_nproc: u32,
         max_cpu_sec: u32,
         max_idle_sec: u64,
+        kill_grace_ms: u64,
     ) -> PyResult<Py<PyShellStartResult>> {
         let env: std::collections::HashMap<String, String> = match env_vars {
             Some(obj) => {
@@ -980,6 +987,7 @@ impl PyExecutor {
             max_nproc,
             max_cpu_sec,
             max_idle_sec,
+            kill_grace_ms,
         };
         let r: RsShellStartResult = self.inner.shell_start(&self.shells, sp);
         let raw = serde_json::to_string(&r)

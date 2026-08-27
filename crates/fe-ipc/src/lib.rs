@@ -463,6 +463,8 @@ impl BroadcastHub {
         let cfg = TelemetryStreamConfig {
             interval_ms,
             max_samples: 0,
+            // L-15: 广播源采样 executor 自身 (聚合视图), 不绑特定子进程 PID
+            pid: None,
         };
         let (mut rx, handle) = self.executor.telemetry_stream(cfg);
         while let Some(sample) = rx.recv().await {
@@ -1435,7 +1437,7 @@ async fn handle_execute_stream(
 
 /// 实时遥测流 (请求发起, 非 subscribe) — 逐帧写出 TelemetrySample, 共用 id。
 /// sample: {"jsonrpc":"2.0","id":id,"result":{"type":"sample",...TelemetrySample}}
-/// params: {interval_ms?:u64, max_samples?:u64} (缺省 10Hz / 无限)
+/// params: {interval_ms?:u64, max_samples?:u64, pid?:u32} (缺省 10Hz / 无限 / executor pid)
 async fn handle_telemetry_stream(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
     id: Value,
@@ -1450,9 +1452,14 @@ async fn handle_telemetry_stream(
         .get("max_samples")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let pid = params
+        .get("pid")
+        .and_then(|v| v.as_u64())
+        .map(|p| p as u32);
     let cfg = TelemetryStreamConfig {
         interval_ms,
         max_samples,
+        pid,
     };
     let (mut rx, handle) = executor.telemetry_stream(cfg);
     while let Some(sample) = rx.recv().await {
@@ -1797,6 +1804,7 @@ async fn handle_method(
                 .get("max_idle_sec")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(fe_core::shell::DEFAULT_MAX_IDLE_SEC);
+            let kill_grace_ms = params.get("kill_grace_ms").and_then(|v| v.as_u64()).unwrap_or(500);
             let sp = fe_core::shell::ShellStartParams {
                 command,
                 cwd,
@@ -1808,6 +1816,7 @@ async fn handle_method(
                 max_nproc,
                 max_cpu_sec,
                 max_idle_sec,
+                kill_grace_ms,
             };
             let r = executor.shell_start(shells, sp);
             // M-OPS-02: fe_shell_active gauge — list_shells 已 reap finished, running 计数即活跃。

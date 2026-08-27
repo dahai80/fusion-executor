@@ -1510,6 +1510,7 @@ mod tests {
             let cfg = TelemetryConfig {
                 interval_ms: 20,
                 max_samples: 4,
+                pid: None,
             };
             let (mut rx, handle) = ex.telemetry_stream(cfg);
             let mut samples = Vec::new();

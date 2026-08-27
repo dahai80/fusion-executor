@@ -320,17 +320,21 @@ class FusionSandboxExecutor:
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
         max_idle_sec: int = 3600,
+        kill_grace_ms: int = 500,
     ) -> ShellStartResult:
         if not isinstance(max_idle_sec, int) or max_idle_sec < 0:
             raise ValueError(f"max_idle_sec 必须为非负 int, 得 {max_idle_sec!r}")
+        if not isinstance(kill_grace_ms, int) or kill_grace_ms < 0:
+            raise ValueError(f"kill_grace_ms 必须为非负 int, 得 {kill_grace_ms!r}")
         logger.debug(
-            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s",
+            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s kill_grace_ms=%s",
             command,
             cwd,
             task_id,
             seatbelt,
             inherit_env,
             max_idle_sec,
+            kill_grace_ms,
         )
         native = self._native.shell_start(
             command,
@@ -343,6 +347,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_idle_sec,
+            kill_grace_ms,
         )
         result = ShellStartResult.model_validate(native.to_dict())
         logger.info(
@@ -543,9 +548,15 @@ class FusionSandboxExecutor:
         *,
         interval_ms: int = 100,
         max_samples: int = 0,
+        pid: int | None = None,
     ) -> Iterator[TelemetrySample]:
-        logger.debug("telemetry_stream interval_ms=%s max_samples=%s", interval_ms, max_samples)
-        it = self._native.telemetry_stream(interval_ms, max_samples)
+        logger.debug(
+            "telemetry_stream interval_ms=%s max_samples=%s pid=%s",
+            interval_ms,
+            max_samples,
+            pid,
+        )
+        it = self._native.telemetry_stream(interval_ms, max_samples, pid)
         for count, frame in enumerate(it, start=1):
             # 3.11: 严格 model_validate (旧 frame.get("ts_ms", 0) 默认 0 — Rust 改字段名/
             # serde bug 时静默吞缺失字段, ts_ms=0/cpu=0 假数据进融合)。Blocker 11 _STRICT
