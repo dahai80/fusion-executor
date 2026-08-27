@@ -6,14 +6,20 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = ["gui", "telemetry", "diagnostics"]
+gui = ["dep:fe-gui"]
+telemetry = ["dep:fe-telemetry"]
+diagnostics = ["dep:fe-diagnostics"]
+
 [dependencies]
 fe-security.workspace = true
 fe-sandbox.workspace = true
 fe-rollback.workspace = true
-fe-diagnostics.workspace = true
-fe-gui.workspace = true
+fe-diagnostics = { workspace = true, optional = true }
+fe-gui = { workspace = true, optional = true }
 fe-tools.workspace = true
-fe-telemetry.workspace = true
+fe-telemetry = { workspace = true, optional = true }
 fe-shell.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,6 +30,7 @@ tracing.workspace = true
 futures.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+metrics.workspace = true
 
 [lints]
 workspace = true

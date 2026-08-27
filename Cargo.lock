@@ -507,6 +507,7 @@ dependencies = [
  "fe-telemetry",
  "fe-tools",
  "futures",
+ "metrics",
  "serde",
  "serde_json",
  "tempfile",

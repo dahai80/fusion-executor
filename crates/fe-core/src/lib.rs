@@ -15,25 +15,32 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "diagnostics")]
 use fe_diagnostics::Slicer;
+#[cfg(feature = "gui")]
 use fe_gui::{GuiAction, GuiConfig, GuiController, GuiResult};
 use fe_rollback::RollbackManager;
 use fe_sandbox::{Sandbox, SandboxConfig};
 use fe_security::{SecurityGuard, SecurityVerdict};
 use fe_shell::{ShellInfo, ShellOutput, ShellRegistry, ShellStartParams, ShellStartResult};
+#[cfg(feature = "telemetry")]
 use fe_telemetry::{start_stream as start_telemetry, TelemetryConfig, TelemetrySample};
 use fe_tools::{
     EditResult, GlobEntry, GrepMatch, GrepOptions, GrepOutput, MultiEditItem, NotebookEditMode,
     Tools,
 };
 
+#[cfg(feature = "diagnostics")]
 pub use fe_diagnostics as diagnostics;
+#[cfg(feature = "gui")]
 pub use fe_gui as gui;
 pub use fe_rollback as rollback;
 pub use fe_sandbox as sandbox;
 pub use fe_security as security;
 pub use fe_shell as shell;
+#[cfg(feature = "telemetry")]
 pub use fe_telemetry as telemetry;
+#[cfg(feature = "telemetry")]
 pub use fe_telemetry::{
     TelemetryConfig as TelemetryStreamConfig, TelemetrySample as TelemetryFrame,
 };
@@ -78,6 +85,7 @@ pub const EXIT_TIMEOUT: i32 = -124;
 pub const EXIT_BLOCKED: i32 = -1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionRequest {
     pub command: String,
     #[serde(default)]
@@ -93,8 +101,9 @@ pub struct ExecutionRequest {
     #[serde(default)]
     pub auto_rollback_policy: Option<RollbackPolicy>,
     /// Blocker 1 / 1.1: macOS seatbelt 运行时隔离 — sandbox-exec 包装子进程 (禁网 + 危险二进制 execve deny)。
-    /// 默认 false — 调用方显式开启; 透传 SandboxConfig.seatbelt。
-    #[serde(default)]
+    /// 默认 true — 商用安全默认 (audit ARCH-1); 透传 SandboxConfig.seatbelt。
+    /// 调用方显式传 false 关闭隔离 (受信本地 opt-out, 须文档化逃逸风险)。
+    #[serde(default = "default_true")]
     pub seatbelt: bool,
     /// Issue #9: 环境隔离。默认 false → 子进程 env_clear + 仅最小基线 (PATH/TMPDIR/SHELL) + env_vars,
     /// 不泄漏宿主密钥 (AWS_SECRET_ACCESS_KEY/ANTHROPIC_API_KEY 等)。
@@ -135,6 +144,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Diagnostics {
     pub error_type: Option<String>,
     pub file_path: Option<String>,
@@ -147,6 +157,7 @@ pub struct Diagnostics {
 /// Executor 保持无状态 — guard 在单次 execute_async 内构造, 不跨请求累积计数。
 /// max_consecutive_failures: 连续失败上限 (达此值触发回滚); file_damage_check: 检测文件毁损触发回滚。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackPolicy {
     /// Issue #12.3 / A4: 此字段在 wire 上接受 (调用方表达策略意图), 但 Rust 永不读 —
     /// 连续失败计数归 caller 自愈循环 (Executor 无状态, PRD §重构 明确; 接入需跨请求状态违反 NFR)。
@@ -188,6 +199,7 @@ fn is_false(b: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionResult {
     pub exit_code: i32,
     pub stdout: String,
@@ -248,6 +260,23 @@ impl ExecutionResult {
             trace_id,
             ..Default::default()
         }
+    }
+}
+
+/// ARCH-4: 进程内执行路径 (fe-pyo3 execute_sync 直调 fe-core, 绕过 fe-ipc) 的可观测性补齐。
+/// 镜像 fe-ipc BroadcastHub::record_exec 的 metrics::counter 分支, 仅记 Prometheus 全局计数器
+/// (AtomicU64 快照归 fe-ipc hub, 此处不碰 — 进程内路径无 hub, 只补 Prometheus 侧)。
+/// fe-ipc record_exec 保留自有 AtomicU64 + 调此 helper (去重, 避免双计); fe-pyo3 execute_sync 调此 helper。
+pub fn record_exec_outcome(r: &ExecutionResult) {
+    metrics::counter!("fe_exec_total").increment(1);
+    if r.blocked_by_security {
+        metrics::counter!("fe_exec_blocked").increment(1);
+    } else if r.timed_out || r.exit_code == -124 {
+        metrics::counter!("fe_exec_timeout").increment(1);
+    } else if r.exit_code == 0 {
+        metrics::counter!("fe_exec_success").increment(1);
+    } else {
+        metrics::counter!("fe_exec_failed").increment(1);
     }
 }
 
@@ -429,8 +458,10 @@ impl AutoRollbackGuard {
 pub struct Executor {
     security: SecurityGuard,
     sandbox: Sandbox,
+    #[cfg(feature = "diagnostics")]
     slicer: Slicer,
     rollback: RollbackManager,
+    #[cfg(feature = "gui")]
     gui: GuiController,
     tools: Tools,
     // M-ARCH-1: ShellRegistry 不再属 Executor — 移到 IpcServer/PyExecutor (与 BroadcastHub 并列)。
@@ -450,8 +481,10 @@ impl Executor {
         Self {
             security: SecurityGuard::new(),
             sandbox: Sandbox::new(),
+            #[cfg(feature = "diagnostics")]
             slicer: Slicer::new(),
             rollback: RollbackManager::new(),
+            #[cfg(feature = "gui")]
             gui: GuiController::new(),
             tools: Tools::new(),
         }
@@ -475,6 +508,7 @@ impl Executor {
     /// M-SEC-04: GUI 安全配置 (bundle allowlist + 密码框 type_text 守卫)。
     /// 默认 Executor::new() 无配置 = 不限 (本地可信调用方, 仅审计日志);
     /// 企业/多用户场景用此构造器设 allowlist + allow_type_into_secure opt-in。
+    #[cfg(feature = "gui")]
     pub fn with_gui_config(mut self, config: GuiConfig) -> Self {
         info!("Executor 设置 GUI 安全配置 (M-SEC-04)");
         self.gui = GuiController::new_with_config(config);
@@ -482,6 +516,7 @@ impl Executor {
     }
 
     /// GUI 动作 (P4 FR-05) — 同步入口, 供 fe-pyo3/fe-ipc 调用
+    #[cfg(feature = "gui")]
     pub fn gui_action(&self, action: GuiAction) -> Result<GuiResult> {
         self.gui.execute(action)
     }
@@ -726,6 +761,7 @@ impl Executor {
         // 诊断切片 — exit_code != 0 且非拦截/超时时填充 (PRD §4.2)
         // Issue #4: use_pty=false 时 stderr 独立 → Slicer 优先吃 stderr (error channel);
         // PTY 模式 stderr 恒空 → 退回 stdout (traceback 在 tail)
+        #[cfg(feature = "diagnostics")]
         let diag = if sb.exit_code != 0 && !sb.timed_out {
             let cwd_ref = req.cwd.as_deref();
             let diag_src = if !sb.stderr.is_empty() {
@@ -737,6 +773,8 @@ impl Executor {
         } else {
             None
         };
+        #[cfg(not(feature = "diagnostics"))]
+        let diag: Option<Diagnostics> = None;
 
         let sid_filtered = snapshot_id.as_ref().filter(|s| !s.is_empty()).cloned();
         let mut result = ExecutionResult {
@@ -888,6 +926,7 @@ impl Executor {
         info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg)?;
 
+        #[cfg(feature = "diagnostics")]
         let slicer = self.slicer.clone();
         let cwd_for_diag = req.cwd.clone();
         let task_id_for_done = req.task_id.clone();
@@ -920,6 +959,7 @@ impl Executor {
                         }
                         fe_sandbox::StreamEvent::Done(sb) => {
                             // 诊断切片 — exit_code != 0 且非超时 (PRD §4.2, 同 execute_async)
+                            #[cfg(feature = "diagnostics")]
                             let diag = if sb.exit_code != 0 && !sb.timed_out {
                                 let cwd_ref = cwd_for_diag.as_deref();
                                 // Issue #4: stdio 模式 stderr 独立 → 优先吃 stderr
@@ -932,6 +972,8 @@ impl Executor {
                             } else {
                                 None
                             };
+                            #[cfg(not(feature = "diagnostics"))]
+                            let diag: Option<Diagnostics> = None;
                             let sid_filtered =
                                 snapshot_id.as_ref().filter(|s| !s.is_empty()).cloned();
                             let mut result = ExecutionResult {
