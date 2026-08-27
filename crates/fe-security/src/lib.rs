@@ -8,7 +8,10 @@
 // 返回 SecurityVerdict { allowed, reason, stage }
 
 use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -151,15 +154,29 @@ const WHITELIST: &[&str] = &[
 const MAX_COMMAND_LEN: usize = 1_000_000;
 
 /// Security Guard — 两级校验
-#[derive(Clone)]
 pub struct SecurityGuard {
     blocklist: Vec<(Regex, &'static str)>,
     // 白名单 — 基线 (WHITELIST) + 项目扩展 (with_extra_whitelist)。Issue #10:
     // 项目可声明额外允许的二进制 (如项目专用工具), 基线不可被收缩 (仅追加)。
-    whitelist: HashSet<String>,
+    // m-OPS-02: ArcSwap 内部可变性 — SIGHUP 运行时热重载 (reload_extras) 经 store(&self),
+    // 无需 &mut self。validate 经 load() 读取, 无锁读路径。
+    whitelist: ArcSwap<HashSet<String>>,
     sensitive_paths: Vec<String>,
     sensitive_paths_exp: Vec<String>,
     redirect_re: Regex,
+}
+
+impl Clone for SecurityGuard {
+    fn clone(&self) -> Self {
+        Self {
+            blocklist: self.blocklist.clone(),
+            // ArcSwap 无 Clone — clone 内部快照重建 (热重载语义下, clone 反映当前白名单)。
+            whitelist: ArcSwap::from_pointee((**self.whitelist.load()).clone()),
+            sensitive_paths: self.sensitive_paths.clone(),
+            sensitive_paths_exp: self.sensitive_paths_exp.clone(),
+            redirect_re: self.redirect_re.clone(),
+        }
+    }
 }
 
 impl Default for SecurityGuard {
@@ -180,7 +197,7 @@ impl SecurityGuard {
         let redirect_re = Regex::new(r"(?:\d)?>>?\s*(\S+)").expect("重定向正则编译失败");
         Self {
             blocklist,
-            whitelist,
+            whitelist: ArcSwap::from_pointee(whitelist),
             sensitive_paths,
             sensitive_paths_exp,
             redirect_re,
@@ -191,23 +208,21 @@ impl SecurityGuard {
     /// 调用方 (fusion-code/CLI) 按项目声明专用工具; 基线 WHITELIST 恒在。
     /// 安全约束: 扩展项不得含 shell 解释器/危险内建 (sh/bash/zsh/fish/exec/eval/source/.),
     /// 否则忽略并记日志 (防项目配置自我后门)。
-    pub fn with_extra_whitelist(mut self, extras: &[&str]) -> Self {
-        const DENY_EXTEND: &[&str] = &[
-            "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "exec", "eval", "source",
-            ".", "system", "sudo", "doas",
-        ];
-        for name in extras {
-            let n = name.trim();
-            if n.is_empty() {
-                continue;
-            }
-            if DENY_EXTEND.contains(&n) {
-                debug!(binary = n, "白名单扩展拒绝危险解释器/内建");
-                continue;
-            }
-            self.whitelist.insert(n.to_string());
-        }
+    pub fn with_extra_whitelist(self, extras: &[&str]) -> Self {
+        let next = merge_whitelist(&self.whitelist, extras);
+        self.whitelist.store(Arc::new(next));
         self
+    }
+
+    /// m-OPS-02: SIGHUP 运行时白名单热重载 — 从基线 WHITELIST + 新 extras 重建 (非累加)。
+    /// 语义: 丢弃旧扩展, 以 extras 为新项目扩展集 (基线恒在)。无锁写 (ArcSwap store),
+    /// 读路径 (validate) 无感切换。extras 为空 → 回退纯基线 (项目扩展清空)。
+    /// 区别 with_extra_whitelist: 后者累加 (builder 链, 构造期); reload 重建 (丢弃旧扩展)。
+    pub fn reload_extras(&self, extras: &[&str]) {
+        let base: HashSet<String> = WHITELIST.iter().map(|s| (*s).to_string()).collect();
+        let next = merge_into(base, extras);
+        self.whitelist.store(Arc::new(next));
+        debug!(extras = extras.len(), "SIGHUP 白名单热重载完成 (基线重建)");
     }
 
     /// 校验入口 — 先正则快筛，再 token 解析防链式绕过
@@ -304,7 +319,7 @@ impl SecurityGuard {
         let binary_basename = basename(binary);
 
         // 白名单校验
-        if !self.whitelist.contains(binary_basename) {
+        if !self.whitelist.load().contains(binary_basename) {
             return Err(format!("二进制程序不在白名单: {}", binary));
         }
 
@@ -335,6 +350,12 @@ impl SecurityGuard {
 
     /// argv 级约束
     fn validate_argv(&self, binary: &str, args: &[String]) -> Result<(), String> {
+        // C-SEC-03 威胁模型边界 (设计取舍, 审计 §4 显式声明):
+        // `python -c` / `node -e` / `ruby -e` 等内联代码执行绕过文件审计白名单语义 —
+        // 解释器本身在白名单 (跑脚本文件), -c/-e 使参数变任意代码, regex 无法枚举所有危险 one-liner。
+        // 但本工具为单用户 local-first trusted-caller 模型 (人作者写命令), 此为已知接受取舍;
+        // 企业多用户/Agent 驱动场景应叠加 seatbelt (C-SEC-02) + UDS 鉴权 (M-SEC-01) 纵深, 非此处封堵。
+        // (拒绝 -c 会破坏沙箱测试机制 — 56 处测试依赖 python3 -c。)
         match binary {
             "mv" | "cp" => {
                 let dest = args
@@ -420,6 +441,13 @@ impl SecurityGuard {
                             binary, a
                         ));
                     }
+                    // C-SEC-03: 凭据文件名模式 (id_rsa* / *.pem / *.key 等) — cwd 内或任意绝对路径
+                    if self.is_sensitive_filename(a) {
+                        return Err(format!(
+                            "{} 读源为凭据文件 (敏感文件名模式): {} (C-SEC-03)",
+                            binary, a
+                        ));
+                    }
                     // .. 逃逸嫌疑 — 路径含 .. 组件拒绝 (绕过 cwd)
                     if std::path::Path::new(a)
                         .components()
@@ -449,6 +477,25 @@ impl SecurityGuard {
         false
     }
 
+    /// C-SEC-03: 文件名模式敏感校验 — 捕获 cwd 内或任意绝对路径的凭据文件
+    /// (路径前缀校验只拦 ~/.ssh/* 等目录, 漏 cwd 内 id_rsa / 任意位置 *.pem/*.key)
+    /// 匹配: id_rsa* (含 .pub 之外的私钥/备份) / *.pem / *.key / *.p12 / *.pfx / *.keystore
+    /// 注: *.pub 公钥不拦 (非机密); trusted-caller 模型下 cwd 内私钥读仍为纵深防御
+    pub fn is_sensitive_filename(&self, path: &str) -> bool {
+        let fname = Path::new(path)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if fname.is_empty() {
+            return false;
+        }
+        if fname == "id_rsa" || fname.starts_with("id_rsa.") || fname.starts_with("id_rsa_") {
+            return !fname.ends_with(".pub");
+        }
+        let suffixes = [".pem", ".key", ".p12", ".pfx", ".keystore", ".htpasswd"];
+        suffixes.iter().any(|s| fname.ends_with(s))
+    }
+
     /// git 子命令约束 — C-SEC-02: 拒 config/-c/alias.*/core.*
     fn validate_git_argv(&self, args: &[String]) -> Result<(), String> {
         for a in args.iter() {
@@ -467,8 +514,35 @@ impl SecurityGuard {
 
     #[cfg(test)]
     fn whitelist_contains(&self, name: &str) -> bool {
-        self.whitelist.contains(name)
+        self.whitelist.load().contains(name)
     }
+}
+
+/// 白名单扩展共用过滤 — 拒危险解释器/内建 (sh/bash/zsh/exec/eval/source/. 等), 空项跳过。
+/// with_extra_whitelist (累加, clone 当前快照) 与 reload_extras (重建, 传基线 set) 共用。
+const DENY_EXTEND: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "exec", "eval", "source", ".",
+    "system", "sudo", "doas",
+];
+
+fn merge_into(mut base: HashSet<String>, extras: &[&str]) -> HashSet<String> {
+    for name in extras {
+        let n = name.trim();
+        if n.is_empty() {
+            continue;
+        }
+        if DENY_EXTEND.contains(&n) {
+            debug!(binary = n, "白名单扩展拒绝危险解释器/内建");
+            continue;
+        }
+        base.insert(n.to_string());
+    }
+    base
+}
+
+/// with_extra_whitelist 用 — clone 当前白名单快照 (基线 + 已有扩展) 再追加 extras (累加)。
+fn merge_whitelist(current: &ArcSwap<HashSet<String>>, extras: &[&str]) -> HashSet<String> {
+    merge_into((**current.load()).clone(), extras)
 }
 
 /// 构建正则黑名单
@@ -685,6 +759,60 @@ mod tests {
         let v = guard().validate("cat ../../etc/shadow");
         assert!(!v.allowed, "cat 含 .. 逃逸应被拦截");
         assert!(v.reason.as_deref().unwrap().contains(".."));
+    }
+
+    // ── C-SEC-03: 凭据文件名模式读拦截 (cwd 内 / 任意位置) ──
+
+    #[test]
+    fn is_sensitive_filename_blocks_credential_patterns() {
+        let g = guard();
+        assert!(g.is_sensitive_filename("secrets.pem"), "pem 应拦");
+        assert!(g.is_sensitive_filename("/tmp/x.key"), "绝对 .key 应拦");
+        assert!(g.is_sensitive_filename("id_rsa"), "id_rsa 应拦");
+        assert!(g.is_sensitive_filename("id_rsa_backup"), "id_rsa_ 前缀应拦");
+        assert!(g.is_sensitive_filename("cert.p12"), "p12 应拦");
+        assert!(g.is_sensitive_filename("server.pfx"), "pfx 应拦");
+        assert!(g.is_sensitive_filename("CA.keystore"), "keystore 应拦");
+        assert!(
+            g.is_sensitive_filename("./creds/agent.key"),
+            "相对 .key 应拦"
+        );
+    }
+
+    #[test]
+    fn is_sensitive_filename_allows_public_key_and_normal() {
+        let g = guard();
+        assert!(!g.is_sensitive_filename("id_rsa.pub"), "公钥 .pub 不拦");
+        assert!(!g.is_sensitive_filename("app.py"), "普通文件不拦");
+        assert!(!g.is_sensitive_filename("README.md"), "普通文件不拦");
+        assert!(!g.is_sensitive_filename(""), "空名不拦");
+        assert!(!g.is_sensitive_filename("not_a_key.pem.txt"), "伪后缀不拦");
+    }
+
+    #[test]
+    fn blocks_cat_credential_filename() {
+        let v = guard().validate("cat cert.pem");
+        assert!(!v.allowed, "cat cert.pem 应被拦截");
+        assert!(v.reason.as_deref().unwrap().contains("凭据文件"));
+    }
+
+    #[test]
+    fn blocks_grep_id_rsa_filename() {
+        let v = guard().validate("grep foo id_rsa");
+        assert!(!v.allowed, "grep id_rsa 应被拦截");
+        assert!(v.reason.as_deref().unwrap().contains("C-SEC-03"));
+    }
+
+    #[test]
+    fn blocks_head_credential_filename() {
+        let v = guard().validate("head secret.key");
+        assert!(!v.allowed, "head secret.key 应被拦截");
+    }
+
+    #[test]
+    fn allows_cat_id_rsa_pub() {
+        let v = guard().validate("cat id_rsa.pub");
+        assert!(v.allowed, "cat 公钥 id_rsa.pub 不应被拦截");
     }
 
     #[test]
@@ -1377,5 +1505,53 @@ mod tests {
         // heredoc 主体含 rm -rf / 应被正则拦截 (无绕过)
         let v = guard().validate("cat <<EOF\nrm -rf /\nEOF");
         assert!(!v.allowed, "heredoc 内 rm -rf 应被拦");
+    }
+
+    #[test]
+    fn reload_extras_replaces_not_accumulates() {
+        // m-OPS-02: reload 重建语义 — 旧扩展丢弃, 新 extras 生效, 基线恒在
+        let g = SecurityGuard::new().with_extra_whitelist(&["tool-a", "tool-b"]);
+        assert!(g.whitelist_contains("tool-a") && g.whitelist_contains("tool-b"));
+        // reload 仅给 tool-c → tool-a/tool-b 应消失 (非累加), tool-c 在, 基线 python 在
+        g.reload_extras(&["tool-c"]);
+        assert!(
+            !g.whitelist_contains("tool-a"),
+            "reload 应丢弃旧扩展 tool-a"
+        );
+        assert!(
+            !g.whitelist_contains("tool-b"),
+            "reload 应丢弃旧扩展 tool-b"
+        );
+        assert!(g.whitelist_contains("tool-c"), "reload 应含新扩展 tool-c");
+        assert!(g.whitelist_contains("python"), "基线恒在");
+        // 验证放行生效
+        assert!(
+            g.validate("tool-c --version").allowed,
+            "新扩展 tool-c 应放行"
+        );
+        assert!(
+            !g.validate("tool-a --version").allowed,
+            "旧扩展 tool-a 应已拦"
+        );
+    }
+
+    #[test]
+    fn reload_extras_empty_clears_extras_keeps_baseline() {
+        // 空 extras → 回退纯基线
+        let g = SecurityGuard::new().with_extra_whitelist(&["tool-x"]);
+        assert!(g.whitelist_contains("tool-x"));
+        g.reload_extras(&[]);
+        assert!(!g.whitelist_contains("tool-x"), "空 reload 应清项目扩展");
+        assert!(g.whitelist_contains("python"), "基线恒在");
+        assert!(!g.validate("tool-x run").allowed, "清后 tool-x 应拦");
+    }
+
+    #[test]
+    fn reload_extras_rejects_dangerous_interpreter() {
+        // reload 同样拒危险解释器/内建
+        let g = SecurityGuard::new();
+        g.reload_extras(&["bash", "tool-ok"]);
+        assert!(!g.whitelist_contains("bash"), "reload 不可后门 bash");
+        assert!(g.whitelist_contains("tool-ok"), "正常扩展应入");
     }
 }

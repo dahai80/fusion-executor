@@ -17,8 +17,8 @@ use accessibility::AXUIElementActions as _;
 use accessibility::AXUIElementAttributes as _;
 use accessibility_sys::{
     kAXCloseButtonAttribute, kAXFocusedApplicationAttribute, kAXMinimizeButtonAttribute,
-    kAXPositionAttribute, kAXSizeAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize,
-    kAXZoomButtonAttribute, AXIsProcessTrusted, AXValueGetValue, AXValueRef,
+    kAXPositionAttribute, kAXSecureTextFieldSubrole, kAXSizeAttribute, kAXValueTypeCGPoint,
+    kAXValueTypeCGSize, kAXZoomButtonAttribute, AXIsProcessTrusted, AXValueGetValue, AXValueRef,
 };
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -140,12 +140,58 @@ struct UiNode {
 /// 点击候选 — (节点, label, 位置)
 type ClickCandidate = (AXUIElement, Option<String>, Option<(f64, f64)>);
 
-pub struct GuiController;
+/// M-SEC-04: GUI 安全配置。
+/// - allowed_bundle_ids: None=不限 (本地可信调用方默认, 仅审计日志); Some=set=仅放行集合内 bundle。
+/// - allow_type_into_secure: false (默认) 时拒绝向 AXSecureTextField (密码框) type_text;
+///   true 显式 opt-in (受控场景)。无论取值都记审计 WARN (bundle + 文本长度, 不记文本)。
+#[derive(Debug, Clone, Default)]
+pub struct GuiConfig {
+    pub allowed_bundle_ids: Option<Vec<String>>,
+    pub allow_type_into_secure: bool,
+}
+
+pub struct GuiController {
+    config: GuiConfig,
+}
 
 impl GuiController {
     pub fn new() -> Self {
         info!("GuiController::new() — AXUIElement + CoreGraphics (P4)");
-        Self
+        Self {
+            config: GuiConfig::default(),
+        }
+    }
+
+    /// M-SEC-04: 带安全配置构造 (企业/多用户场景设 bundle allowlist + secure flag)。
+    pub fn new_with_config(config: GuiConfig) -> Self {
+        info!(
+            allowlist = ?config.allowed_bundle_ids.as_ref().map(|v| v.len()),
+            allow_secure = config.allow_type_into_secure,
+            "GuiController::new_with_config (M-SEC-04)"
+        );
+        Self { config }
+    }
+
+    /// M-SEC-04: bundle 放行校验。allowlist=None 始终放行 (仅审计日志); Some=set 须命中。
+    fn check_bundle_allowed(&self, bundle_id: &str) -> Result<()> {
+        match &self.config.allowed_bundle_ids {
+            None => {
+                debug!(bundle_id, "M-SEC-04 bundle 无 allowlist, 放行 (审计)");
+                Ok(())
+            }
+            Some(set) => {
+                if set.iter().any(|b| b == bundle_id) {
+                    debug!(bundle_id, "M-SEC-04 bundle 命中 allowlist");
+                    Ok(())
+                } else {
+                    warn!(
+                        bundle_id,
+                        "M-SEC-04 bundle 不在 allowlist — 拒绝 (防越权驱动任意 app)"
+                    );
+                    Err(anyhow!("bundle-not-allowed: {bundle_id}"))
+                }
+            }
+        }
     }
 
     /// AX 是否已授权 (TCC Accessibility)。未授权时所有 GUI 操作降级报错。
@@ -202,12 +248,26 @@ impl GuiController {
                 width,
                 height,
             } => self.window_resize(bundle_id, width, height),
-            GuiAction::Wait { .. } => unreachable!("Wait 已在 ax_trusted 前处理"),
+            // m-FT-04: Wait 已在 ax_trusted 前早 return, 走到此说明 early-return 被重构破;
+            // 不 panic, fail-loud 返回错误 (调用方可见, 非 crash)
+            GuiAction::Wait { .. } => Ok(GuiResult {
+                ok: false,
+                error: Some("internal: Wait 未在 early-return 处理 (invariant 破坏)".into()),
+                ..Default::default()
+            }),
         }
     }
 
     fn focus_app(&self, bundle_id: &str) -> Result<GuiResult> {
         info!(bundle_id, "FocusApp");
+        // M-SEC-04: bundle 放行校验 (防越权驱动任意 app)。
+        if self.check_bundle_allowed(bundle_id).is_err() {
+            return Ok(GuiResult {
+                ok: false,
+                error: Some(format!("bundle-not-allowed: {bundle_id}")),
+                ..Default::default()
+            });
+        }
         let app = AXUIElement::application_with_bundle(bundle_id)
             .map_err(|e| anyhow!("定位 app 失败 {bundle_id}: {e}"))?;
         app.set_frontmost(CFBoolean::true_value())
@@ -331,6 +391,36 @@ impl GuiController {
             .or_else(|_| app.main_window())
             .map_err(|e| anyhow!("取 focused window 失败: {e}"))?;
         let target = Self::find_text_field(&win)?;
+        // M-SEC-04: 密码框保护 — AXSecureTextField 是 AXTextField 角色 + AXSecureTextField 子角色。
+        // 拒绝向密码框 type_text 除非显式 allow_type_into_secure (防凭据窃取注入)。
+        // 审计日志记文本长度 (不记文本本身, 防凭据落盘日志)。
+        let is_secure = target
+            .subrole()
+            .map(|s| s == kAXSecureTextFieldSubrole)
+            .unwrap_or(false);
+        if is_secure {
+            warn!(
+                text_len = text.len(),
+                allow_secure = self.config.allow_type_into_secure,
+                "M-SEC-04: 目标为 AXSecureTextField (密码框) — type_text 审计"
+            );
+            if !self.config.allow_type_into_secure {
+                warn!("M-SEC-04: 拒绝向密码框 type_text (未显式 allow_type_into_secure)");
+                return Ok(GuiResult {
+                    ok: false,
+                    error: Some(
+                        "secure-text-field-rejected: 目标为密码框, type_text 被拒 (M-SEC-04)"
+                            .into(),
+                    ),
+                    ..Default::default()
+                });
+            }
+        } else {
+            debug!(
+                text_len = text.len(),
+                "M-SEC-04: type_text 目标非密码框, 审计文本长度"
+            );
+        }
         let settable = target
             .is_settable(&accessibility::AXAttribute::value())
             .unwrap_or(false);
@@ -1050,6 +1140,16 @@ impl GuiController {
     /// 安全: accessibility 0.2 safe wrapper (attribute/press), 零手写 unsafe。
     fn window_button(&self, bundle_id: Option<String>, which: &str) -> Result<GuiResult> {
         info!(bundle_id = ?bundle_id, which, "WindowButton");
+        // M-SEC-04: bundle 给定时校验放行 (防越权操作任意 app 窗口); None=当前 focused app, 放行+审计。
+        if let Some(b) = bundle_id.as_deref() {
+            if self.check_bundle_allowed(b).is_err() {
+                return Ok(GuiResult {
+                    ok: false,
+                    error: Some(format!("bundle-not-allowed: {b}")),
+                    ..Default::default()
+                });
+            }
+        }
         let app = match bundle_id.as_deref() {
             Some(b) => AXUIElement::application_with_bundle(b)
                 .map_err(|e| anyhow!("定位 app 失败 {b}: {e}"))?,
@@ -1092,6 +1192,16 @@ impl GuiController {
         height: f64,
     ) -> Result<GuiResult> {
         info!(bundle_id = ?bundle_id, width, height, "WindowResize");
+        // M-SEC-04: bundle 给定时校验放行 (防越权 resize 任意 app 窗口); None=focused app 放行+审计。
+        if let Some(b) = bundle_id.as_deref() {
+            if self.check_bundle_allowed(b).is_err() {
+                return Ok(GuiResult {
+                    ok: false,
+                    error: Some(format!("bundle-not-allowed: {b}")),
+                    ..Default::default()
+                });
+            }
+        }
         let app = match bundle_id.as_deref() {
             Some(b) => AXUIElement::application_with_bundle(b)
                 .map_err(|e| anyhow!("定位 app 失败 {b}: {e}"))?,
@@ -1662,5 +1772,60 @@ mod tests {
         let ctrl = GuiController::new();
         let r = ctrl.execute(GuiAction::Wait { seconds: -5.0 }).unwrap();
         assert!(r.ok, "负值 Wait 应裁 0 后 ok=true");
+    }
+
+    /// M-SEC-04: 默认无 allowlist → 任意 bundle 放行 (仅审计日志), 不拒。
+    #[test]
+    fn msec04_no_allowlist_allows_any_bundle() {
+        let ctrl = GuiController::new();
+        assert!(ctrl.check_bundle_allowed("com.evil.keylogger").is_ok());
+        assert!(ctrl.check_bundle_allowed("com.apple.TextEdit").is_ok());
+    }
+
+    /// M-SEC-04: 设 allowlist → 仅集合内 bundle 放行, 集合外拒绝。
+    #[test]
+    fn msec04_allowlist_rejects_unlisted_bundle() {
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: Some(vec![
+                "com.apple.TextEdit".into(),
+                "com.apple.Terminal".into(),
+            ]),
+            allow_type_into_secure: false,
+        });
+        assert!(ctrl.check_bundle_allowed("com.apple.TextEdit").is_ok());
+        assert!(ctrl.check_bundle_allowed("com.apple.Terminal").is_ok());
+        assert!(
+            ctrl.check_bundle_allowed("com.evil.keylogger").is_err(),
+            "未列入 allowlist 的 bundle 应被拒"
+        );
+        assert!(
+            ctrl.check_bundle_allowed("").is_err(),
+            "空 bundle 非白名单应拒"
+        );
+    }
+
+    /// M-SEC-04: GuiConfig default = 无限制 (向后兼容本地可信调用方)。
+    #[test]
+    fn msec04_gui_config_default_unrestricted() {
+        let cfg = GuiConfig::default();
+        assert!(cfg.allowed_bundle_ids.is_none(), "默认无 allowlist");
+        assert!(!cfg.allow_type_into_secure, "默认拒绝向密码框 type_text");
+    }
+
+    /// M-SEC-04: allow_type_into_secure=true 显式 opt-in 可构造。
+    #[test]
+    fn msec04_allow_type_into_secure_opt_in() {
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: None,
+            allow_type_into_secure: true,
+        });
+        assert!(ctrl.config.allow_type_into_secure);
+    }
+
+    /// M-SEC-04: kAXSecureTextFieldSubrole 常量正确 (AXSecureTextField, 非空)。
+    #[test]
+    fn msec04_secure_textfield_subrole_constant() {
+        assert_eq!(kAXSecureTextFieldSubrole, "AXSecureTextField");
+        assert!(!kAXSecureTextFieldSubrole.is_empty());
     }
 }

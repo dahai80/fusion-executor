@@ -24,7 +24,15 @@ use fe_sandbox::{kill_tree, spawn_pty, SpawnedPty};
 const TAIL_CAP: usize = 100_000;
 
 /// 注册表上限 — 超 MAX_SHELLS 时自动回收已退 shell (最旧优先), 防长寿命 serve() 内存单调增长
-const MAX_SHELLS: usize = 256;
+/// pub: M-OPS-05 health 告警阈值需读此值 (fe-ipc probe_health_depth)。
+pub const MAX_SHELLS: usize = 256;
+
+/// m-SEC-02: 已退 shell 保留上限 — 每次 shell_start/list_shells 回收超出此数的已退 shell (最旧优先),
+/// 防 256 个已退 shell 各 100KB tail 累积 (最坏 25MB)。保留近 MAX_FINISHED_RETAINED 个供调用方查 exit_code。
+const MAX_FINISHED_RETAINED: usize = 32;
+
+/// m-SEC-01: 默认空闲超时 (秒) — 无输出超此值的后台 shell 自动 kill (调用方忘 kill 不永跑)。0 = 不限。
+pub const DEFAULT_MAX_IDLE_SEC: u64 = 3600;
 
 /// 后台 shell 启动结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +78,8 @@ pub struct ShellStartParams {
     pub inherit_env: bool,
     pub max_nproc: u32,
     pub max_cpu_sec: u32,
+    /// m-SEC-01: 空闲超时 (秒) — 无输出超此值的 shell 自动 kill。0 = 不限 (向后兼容)。
+    pub max_idle_sec: u64,
 }
 
 struct ShellHandle {
@@ -80,6 +90,13 @@ struct ShellHandle {
     command: String,
     started_at_ms: u128,
     finished: Arc<std::sync::atomic::AtomicBool>,
+    /// m-SEC-01: 最近一次输出/启动时间 (ms since epoch)。空闲超时判定 = now - last_output_ms > max_idle_sec*1000。
+    last_output_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// m-SEC-01: 该 shell 的空闲超时 (秒); 0 = 不限。存 handle 供 list_shells/Drop 无参 expire 判定。
+    max_idle_sec: u64,
+    // m-PERF-02: 持有 reader/waiter 线程 handle, Drop 时 join 回收 (防 detach 线程泄漏)
+    reader_thread: Option<std::thread::JoinHandle<()>>,
+    waiter_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 pub struct ShellRegistry {
@@ -137,19 +154,20 @@ impl ShellRegistry {
         let tail = Arc::new(Mutex::new(String::new()));
         let exit = Arc::new(OnceLock::new());
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let started_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        info!(%shell_id, ?pid, command = %p.command, "后台 shell 已起");
+        // m-SEC-01: idle 计时起点 = 启动时刻 (无输出也算空闲流逝)
+        let started_at_ms = now_ms() as u128;
+        let last_output = Arc::new(std::sync::atomic::AtomicU64::new(started_at_ms as u64));
+        info!(%shell_id, ?pid, command = %p.command, max_idle_sec = p.max_idle_sec, "后台 shell 已起");
 
         // reader 线程 — 累积 tail (超 TAIL_CAP 留尾), EOF 时 drop master, 然后 mark finished
         // finished 由 reader 置位 (非 waiter) — 保证 running=false 时 tail 已全部落地, 调用方轮询无末段丢失
         let tail_r = Arc::clone(&tail);
         let finished_r = Arc::clone(&finished);
+        // m-SEC-01: 每次输出刷新 last_output_ms, 供 idle-timeout 判定 (now - last_output_ms > max_idle_sec*1000)
+        let last_output_r = Arc::clone(&last_output);
         let mut reader = spawned.reader;
         let master = spawned.master;
-        std::thread::spawn(move || {
+        let reader_thread = std::thread::spawn(move || {
             let mut tmp = [0u8; 4096];
             let mut pending: Vec<u8> = Vec::new();
             loop {
@@ -163,6 +181,8 @@ impl ShellRegistry {
                         pending = combined[safe..].to_vec();
                         let chunk = String::from_utf8_lossy(decodable).replace("\r\n", "\n");
                         if !chunk.is_empty() {
+                            // m-SEC-01: 输出到达即刷新 idle 计时
+                            last_output_r.store(now_ms(), Ordering::Release);
                             let mut g = match tail_r.lock() {
                                 Ok(g) => g,
                                 Err(e) => {
@@ -192,7 +212,7 @@ impl ShellRegistry {
         // waiter 线程 — 仅阻塞 child.wait → 记 exit_code (finished 由 reader 置, 不在此)
         let exit_w = Arc::clone(&exit);
         let child = spawned.child;
-        std::thread::spawn(move || {
+        let waiter_thread = std::thread::spawn(move || {
             let mut child = child;
             let status = child.wait();
             let code = match status {
@@ -217,10 +237,17 @@ impl ShellRegistry {
             command: p.command,
             started_at_ms,
             finished: Arc::clone(&finished),
+            last_output_ms: Arc::clone(&last_output),
+            max_idle_sec: p.max_idle_sec,
+            reader_thread: Some(reader_thread),
+            waiter_thread: Some(waiter_thread),
         };
         {
-            let mut g = self.shells.lock().unwrap();
+            let mut g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
+            // m-SEC-02: 每次注册前回收超 MAX_FINISHED_RETAINED 的已退 shell (不仅超 256 ceiling)
+            // m-SEC-01: 空闲超时 shell 自动 kill (idle > max_idle_sec), 逐 shell 判定 (0=不限跳过)
             reap_finished(&mut g);
+            expire_idle(&mut g);
             g.insert(shell_id.clone(), handle);
         }
         ShellStartResult {
@@ -234,15 +261,15 @@ impl ShellRegistry {
 
     /// 轮询 tail 快照 + 运行/退出状态
     pub fn shell_output(&self, shell_id: &str) -> Result<ShellOutput> {
-        let g = self.shells.lock().unwrap();
+        let g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
         let h = g
             .get(shell_id)
             .with_context(|| format!("shell 未找到: {shell_id}"))?;
         let output = match h.tail.lock() {
             Ok(s) => s.clone(),
             Err(e) => {
-                warn!(error = %e, %shell_id, "shell_output tail lock poisoned, 返回空 (可能丢数据)");
-                String::new()
+                warn!(error = %e, %shell_id, "shell_output tail lock poisoned, 返回哨兵标记 (可能丢数据)");
+                "\n<lock-poisoned-output-lost>\n".to_string()
             }
         };
         let exit_code = h.exit.get().copied();
@@ -260,14 +287,14 @@ impl ShellRegistry {
     /// (kill 场景调用方期望终止非末段输出, 末段丢失可接受)
     pub fn kill_shell(&self, shell_id: &str) -> Result<bool> {
         let pid = {
-            let g = self.shells.lock().unwrap();
+            let g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
             let h = g
                 .get(shell_id)
                 .with_context(|| format!("shell 未找到: {shell_id}"))?;
             h.pid
         };
         let exit = kill_tree(pid);
-        let g = self.shells.lock().unwrap();
+        let g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(h) = g.get(shell_id) {
             h.finished.store(true, Ordering::Release);
             let _ = h.exit.set(exit);
@@ -276,10 +303,11 @@ impl ShellRegistry {
         Ok(true)
     }
 
-    /// 列出全部 shell (含已退) — 超上限自动回收已退 shell (最旧优先)
+    /// 列出全部 shell (含已退) — 回收超 MAX_FINISHED_RETAINED 已退 (最旧优先) + 空闲超时 kill
     pub fn list_shells(&self) -> Vec<ShellInfo> {
-        let mut g = self.shells.lock().unwrap();
+        let mut g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
         reap_finished(&mut g);
+        expire_idle(&mut g);
         g.iter()
             .map(|(id, h)| ShellInfo {
                 shell_id: id.clone(),
@@ -294,16 +322,51 @@ impl ShellRegistry {
     }
 }
 
+/// C-OPS-02: ShellRegistry drop 时 kill 所有活跃 shell, 防 serve() 退出孤儿进程泄漏。
+/// 进程退出 (signal/crash) 时 registry drop → 遍历 finished==false 的 shell kill_tree,
+/// reader/waiter 线程随 PTY 关闭自然退出。fail-loud: 记录 kill 失败, 不静默吞。
+impl Drop for ShellRegistry {
+    fn drop(&mut self) {
+        let mut g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
+        let active: Vec<(String, Option<u32>)> = g
+            .iter()
+            .filter(|(_, h)| !h.finished.load(Ordering::Acquire))
+            .map(|(id, h)| (id.clone(), h.pid))
+            .collect();
+        if active.is_empty() {
+            return;
+        }
+        info!(count = active.len(), "ShellRegistry drop: drain 活跃 shell");
+        for (shell_id, pid) in active {
+            if let Some(pid) = pid {
+                let exit = kill_tree(Some(pid));
+                info!(%shell_id, pid, kill_exit = exit, "drop drain kill 完成");
+            } else {
+                warn!(%shell_id, "drop drain: shell 无 pid, 跳过 kill");
+            }
+        }
+        // m-PERF-02: kill 后 join 全部 shell 的 reader/waiter 线程回收 (PTY 关闭后线程速退)
+        join_all_threads(&mut g);
+    }
+}
+
 impl Default for ShellRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// 回收已退 shell — 超 MAX_SHELLS 时按 started_at_ms 最旧优先移除 finished 且 exit_code 已知的条目
-/// (running=false 尚无 exit_code 的过渡态保留, 防 waiter 落后于 reader 误删)
+/// 回收已退 shell (m-SEC-02) — 每次 shell_start/list_shells 触发 (不再仅超 MAX_SHELLS):
+/// 1. 超 MAX_SHELLS ceiling 必收 (防无界注册);
+/// 2. 已退条目超 MAX_FINISHED_RETAINED 时按 started_at_ms 最旧优先收 (防 256×100KB=25MB tail 累积)。
+///
+/// 仅移除 finished 且 exit_code 已知的条目 (running=false 尚无 exit_code 过渡态保留, 防 waiter 落后误删)。
 fn reap_finished(shells: &mut HashMap<String, ShellHandle>) {
-    if shells.len() <= MAX_SHELLS {
+    let finished_count = shells
+        .values()
+        .filter(|h| h.finished.load(Ordering::Acquire) && h.exit.get().is_some())
+        .count();
+    if shells.len() <= MAX_SHELLS && finished_count <= MAX_FINISHED_RETAINED {
         return;
     }
     let mut finished: Vec<(String, u128)> = shells
@@ -315,11 +378,73 @@ fn reap_finished(shells: &mut HashMap<String, ShellHandle>) {
         return;
     }
     finished.sort_unstable_by_key(|(_, t)| *t);
-    let remove_count = shells.len().saturating_sub(MAX_SHELLS);
+    // 收到 ceiling 之下且已退保留数 <= MAX_FINISHED_RETAINED: 至少收 (总-上限) 或 (已退-保留)
+    let over_ceiling = shells.len().saturating_sub(MAX_SHELLS);
+    let over_retained = finished_count.saturating_sub(MAX_FINISHED_RETAINED);
+    let remove_count = over_ceiling.max(over_retained);
     for (id, _) in finished.into_iter().take(remove_count) {
-        if shells.remove(&id).is_some() {
-            debug!(%id, "reap_finished: 已退 shell 已回收");
+        if let Some(mut h) = shells.remove(&id) {
+            join_handle_threads(&mut h, &id);
+            debug!(%id, "reap_finished: 已退 shell 已回收 (线程已 join)");
         }
+    }
+}
+
+/// m-SEC-01: 空闲超时回收 — 无输出超 max_idle_sec 的活跃 shell 自动 kill_tree。
+/// 逐 shell 读自身 max_idle_sec (0=不限跳过); 已退 shell 不处理 (reap_finished 负责)。
+/// kill 后置 finished + exit(-124 超时惯例), reader 线程随 PTY 关闭速退, 线程 join 在 reap/Drop 阶段。
+fn expire_idle(shells: &mut HashMap<String, ShellHandle>) {
+    let now = now_ms();
+    let expired: Vec<String> = shells
+        .iter()
+        .filter(|(_, h)| {
+            if h.finished.load(Ordering::Acquire) || h.max_idle_sec == 0 {
+                return false;
+            }
+            let last = h.last_output_ms.load(Ordering::Acquire);
+            now.saturating_sub(last) > h.max_idle_sec * 1000
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in expired {
+        if let Some(h) = shells.get(&id) {
+            let pid = h.pid;
+            let exit = kill_tree(pid);
+            h.finished.store(true, Ordering::Release);
+            let _ = h.exit.set(exit);
+            warn!(%id, ?pid, max_idle_sec = h.max_idle_sec, kill_exit = exit,
+                "m-SEC-01: 空闲超时 shell 已自动 kill (调用方忘 kill 不永跑)");
+        }
+    }
+}
+
+/// m-SEC-01: 当前 ms since epoch (reader 线程刷新 last_output_ms + idle 判定用)
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// m-PERF-02: join 一个 shell 的 reader/waiter 线程回收 (防 detach 线程泄漏)。
+/// 已退 shell join 即返; 活跃 shell 调用方应先 kill (PTY 关闭后线程速退)。
+fn join_handle_threads(h: &mut ShellHandle, shell_id: &str) {
+    if let Some(t) = h.reader_thread.take() {
+        if let Err(e) = t.join() {
+            warn!(%shell_id, error = ?e, "reader 线程 join 失败 (panic?)");
+        }
+    }
+    if let Some(t) = h.waiter_thread.take() {
+        if let Err(e) = t.join() {
+            warn!(%shell_id, error = ?e, "waiter 线程 join 失败 (panic?)");
+        }
+    }
+}
+
+/// m-PERF-02: join registry 内全部 shell 线程 (ShellRegistry drop 用)
+fn join_all_threads(shells: &mut HashMap<String, ShellHandle>) {
+    for (id, h) in shells.iter_mut() {
+        join_handle_threads(h, id);
     }
 }
 
@@ -369,6 +494,7 @@ mod tests {
             inherit_env: true,
             max_nproc: 0,
             max_cpu_sec: 0,
+            max_idle_sec: 0,
         }
     }
 
@@ -503,6 +629,101 @@ mod tests {
             "reap 后应 <= {} 条, 实际 {}",
             MAX_SHELLS,
             list.len()
+        );
+    }
+
+    /// C-OPS-02: ShellRegistry drop 必须 kill 活跃 shell, 防孤儿进程。
+    /// 起一个 sleep 长任务, drop registry 后确认子进程不再存活 (kill -0 退出码非 0)。
+    #[test]
+    fn drop_drains_active_shells() {
+        let pid = {
+            let reg = ShellRegistry::new();
+            let id = reg
+                .shell_start(params("python3 -c 'import time; time.sleep(60)'", None))
+                .shell_id
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let out = reg.shell_output(&id).unwrap();
+            assert!(out.running, "drop 前长任务应仍在跑");
+            // pid 在 ShellInfo (list_shells), 不在 ShellOutput
+            reg.list_shells()
+                .into_iter()
+                .find(|i| i.shell_id == id)
+                .and_then(|i| i.pid)
+                .expect("shell 应有 pid")
+        };
+        // reg 离作用域 → Drop 触发 kill_tree; 等待 kill 生效
+        std::thread::sleep(Duration::from_millis(1500));
+        // kill -0 探进程存活: 存活返 exit 0, 不存在返非 0 (无 unsafe, 走子进程)
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .expect("kill 命令应可执行");
+        assert!(
+            !status.success(),
+            "drop 后子进程 pid={} 应被 kill, kill -0 仍成功 = 孤儿进程",
+            pid
+        );
+    }
+
+    /// m-SEC-01: 空闲超时自动 kill — max_idle_sec=1, 无输出 sleep 30s 任务,
+    /// 启动另一 shell 触发 expire_idle, 超时 shell 应被 kill (running=false)。
+    /// exit_code 可能是 kill_tree 的 -124 或 waiter 线程 race 先记的信号杀码 (OnceLock first-wins);
+    /// 关键断言 = 不再 running (kill 生效), 非具体码值。
+    #[test]
+    fn msec01_idle_timeout_kills_silent_shell() {
+        let reg = ShellRegistry::new();
+        let mut p = params("python3 -c 'import time; time.sleep(30)'", None);
+        p.max_idle_sec = 1;
+        let id = reg.shell_start(p).shell_id.unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let mid = reg.shell_output(&id).unwrap();
+        assert!(mid.running, "触发前长任务应仍在跑");
+        // 等 idle > 1s, 再起另一 shell 触发 shell_start 内 expire_idle
+        std::thread::sleep(Duration::from_millis(1500));
+        let _trigger = reg.shell_start(params("echo trigger", None));
+        std::thread::sleep(Duration::from_millis(500));
+        let out = reg.shell_output(&id).unwrap();
+        assert!(
+            !out.running,
+            "m-SEC-01: 空闲超时 shell 应被自动 kill, 仍 running = {}",
+            out.running
+        );
+    }
+
+    /// m-SEC-01: max_idle_sec=0 (默认) 不限 — 持续输出的 shell 不被 idle 误杀。
+    #[test]
+    fn msec01_zero_idle_no_kill() {
+        let reg = ShellRegistry::new();
+        let id = reg
+            .shell_start(params("python3 -c 'import time; time.sleep(2)'", None))
+            .shell_id
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        // 触发 expire_idle (max_idle_sec=0 → 跳过)
+        let _ = reg.list_shells();
+        std::thread::sleep(Duration::from_millis(200));
+        let out = reg.shell_output(&id).unwrap();
+        assert!(out.running, "m-SEC-01: max_idle_sec=0 不应 kill 活跃 shell");
+    }
+
+    /// m-SEC-02: 每次 shell_start 回收超 MAX_FINISHED_RETAINED 的已退 shell (不积 25MB)。
+    /// 起 MAX_FINISHED_RETAINED+N 个快速退出 shell, 末次 shell_start 后已退数应 <= MAX_FINISHED_RETAINED。
+    #[test]
+    fn msec02_reap_finished_beyond_retention() {
+        let reg = ShellRegistry::new();
+        let extra = 10;
+        for _ in 0..(MAX_FINISHED_RETAINED + extra) {
+            let _ = reg.shell_start(params("echo x", None)).shell_id.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        let list = reg.list_shells();
+        let finished_count = list.iter().filter(|i| i.finished).count();
+        assert!(
+            finished_count <= MAX_FINISHED_RETAINED,
+            "m-SEC-02: 已退 shell 应 <= 保留上限 {}, 实际 {}",
+            MAX_FINISHED_RETAINED,
+            finished_count
         );
     }
 }

@@ -620,7 +620,11 @@ impl Tools {
         let cwd_abs = std::fs::canonicalize(base).unwrap_or_else(|_| PathBuf::from(base));
         // #7: gitignore-aware 遍历 — ignore::WalkBuilder 读 .gitignore + 隐藏文件 + IGNORED_DIRS 基线
         // 旧版 glob::glob 直接匹配文件系统, 不读 .gitignore → 命中 .gitignore'd 文件 (如 dist/产物)
-        let pat = globset::Glob::new(pattern)
+        // #20: literal_separator(true) — `*`/`?` 不跨 `/`, `**` 仍跨目录。对齐 fusion-event E1 生态统一 glob 规范。
+        //   globset 默认 `*` 跨 `/` (与 E1 冲突: `src/*.swift` 会误命中 src/sub/a.swift)。literal_separator 收紧至 E1。
+        let pat = globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
             .map_err(|e| anyhow::anyhow!("glob 模式无效: {}", e))?
             .compile_matcher();
         let mut out = Vec::new();
@@ -1099,7 +1103,18 @@ fn guard_path(
     // abs 不存在 → canonicalize(abs 的父目录) (新文件在 cwd 内创建合法)
     let cwd_abs = cwd.and_then(|c| std::fs::canonicalize(c).ok());
     let (escape_check, sensitive_check) = match abs.canonicalize() {
-        Ok(canonical) => (canonical.clone(), canonical),
+        Ok(canonical) => {
+            // C-SEC-03: 文件已存在 = 读场景 (file_edit/grep 老文件), 拒读凭据文件名模式
+            // (id_rsa* / *.pem / *.key 等) — 路径前缀已拦 ~/.ssh/*, 此处补 cwd 内/任意位置凭据文件。
+            // 创建新文件 (cert.pem) 走 Err 分支不拦 — 仅阻读已有凭据。
+            if guard.is_sensitive_filename(&canonical.to_string_lossy()) {
+                return Err(ToolsError::PathBlocked(format!(
+                    "拒绝读取凭据文件 (敏感文件名模式): {} (C-SEC-03)",
+                    raw
+                )));
+            }
+            (canonical.clone(), canonical)
+        }
         Err(_) => {
             // abs 不存在 — 取父目录 canonicalize (符号链接在父段)
             match abs.parent().and_then(|p| p.canonicalize().ok()) {
@@ -1367,7 +1382,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("无父目录: {}", path.display()))?;
-    // NamedTempFile 随机名, 写后 persist 原子 rename 到 path
+    // NamedTempFile 随机名 (避同进程并发互踩), 在目标同目录 (同 FS → rename 原子)
     let tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("创建临时文件失败 (dir={})", dir.display()))?;
     std::fs::write(tmp.path(), content)
@@ -1375,19 +1390,31 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     match tmp.persist(path) {
         Ok(_) => Ok(()),
         Err(e) => {
-            // persist 失败常因 EXDEV (跨文件系统); 降级非原子写
-            warn!(error = %e, target = %path.display(), "persist 失败, 降级 rename");
-            // NamedTempFile 已 drop; 重新走 std 写 (非原子, 兜底)
-            let fallback = dir.join(format!(".fe-tmp-fb-{}", std::process::id()));
-            std::fs::write(&fallback, content)
-                .with_context(|| format!("降级写 {} 失败", fallback.display()))?;
-            std::fs::rename(&fallback, path).with_context(|| {
-                format!(
-                    "降级 rename {} -> {} 失败",
-                    fallback.display(),
-                    path.display()
+            // m-SEC-03: persist 失败 — 复用同一随机名 NamedTempFile (非旧固定名 .fe-tmp-fb-{pid}
+            // 会同进程并发互踩), 仍在目标同目录 (同 FS), 走 std::fs::rename (同 FS 原子)。
+            // PersistError { file: NamedTempFile, error: io::Error } — 取出 file 重试 rename。
+            let persist_err = e.error;
+            let tmp_retry = e.file;
+            warn!(
+                error = %persist_err,
+                target = %path.display(),
+                "persist 失败, 重试 std::fs::rename (同目录, 同 FS 原子)"
+            );
+            let tmp_path = tmp_retry.path().to_path_buf();
+            // std::fs::rename 同 FS 原子; 真 EXDEV (不同 FS) 则 fail-loud Err (不静默降级非原子写)
+            if let Err(rename_err) = std::fs::rename(&tmp_path, path) {
+                return Err(anyhow::anyhow!(
+                    "atomic_write rename 失败 ({} -> {}): persist={}; rename={}",
+                    tmp_path.display(),
+                    path.display(),
+                    persist_err,
+                    rename_err
                 )
-            })?;
+                .context("m-SEC-03: 拒绝降级非原子写, fail-loud"));
+            }
+            // rename 成功 → forget 防 drop 删文件 (rename 后原路径已空, 但 NamedTempFile
+            // drop 会尝试删旧 path; forget 仅清 handle 不动已 rename 走的文件)
+            std::mem::forget(tmp_retry);
             Ok(())
         }
     }
@@ -2060,6 +2087,81 @@ mod tests {
         // /etc 在 SENSITIVE_PATHS 内 → validate_cwd 拒 → glob 返回空
         let r = tools.glob("/etc/passwd", Some("/tmp")).unwrap();
         assert!(r.is_empty(), "敏感路径 /etc/passwd 应被过滤: {:?}", r);
+    }
+
+    // ── C-SEC-03: guard_path 拒读 cwd 内凭据文件名模式 ──
+
+    #[test]
+    fn guard_path_blocks_read_existing_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("secrets.pem");
+        std::fs::write(&fp, "PRIVATE\n").unwrap();
+        let guard = SecurityGuard::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = guard_path(&guard, "secrets.pem", Some(&cwd));
+        assert!(r.is_err(), "读已有 secrets.pem 应被拦截");
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("凭据文件"), "应含凭据文件提示: {}", msg);
+    }
+
+    #[test]
+    fn guard_path_blocks_read_existing_id_rsa() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("id_rsa");
+        std::fs::write(&fp, "KEY\n").unwrap();
+        let guard = SecurityGuard::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = guard_path(&guard, "id_rsa", Some(&cwd));
+        assert!(r.is_err(), "读已有 id_rsa 应被拦截");
+    }
+
+    #[test]
+    fn guard_path_allows_read_id_rsa_pub() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("id_rsa.pub");
+        std::fs::write(&fp, "PUBLIC\n").unwrap();
+        let guard = SecurityGuard::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = guard_path(&guard, "id_rsa.pub", Some(&cwd));
+        assert!(r.is_ok(), "读公钥 id_rsa.pub 不应被拦截");
+    }
+
+    #[test]
+    fn guard_path_allows_create_new_pem() {
+        // 创建新 cert.pem (文件不存在 → Err 分支) 不拦 — 仅阻读已有凭据
+        let dir = tempfile::tempdir().unwrap();
+        let guard = SecurityGuard::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = guard_path(&guard, "newcert.pem", Some(&cwd));
+        assert!(r.is_ok(), "创建新 newcert.pem 不应被拦截");
+    }
+
+    #[test]
+    fn file_edit_blocks_read_credential_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("server.key");
+        std::fs::write(&fp, "secret\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        // guard_path Err 经 anyhow 透传 (不降级为 EditResult) — 安全校验失败 fail-loud
+        let r = tools.file_edit("server.key", "secret", "x", Some(&cwd), false);
+        assert!(r.is_err(), "file_edit 读 server.key 应被拦截 (Err)");
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("凭据文件"), "应含凭据文件提示: {}", msg);
+    }
+
+    #[test]
+    fn grep_blocks_read_credential_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("agent.pem");
+        std::fs::write(&fp, "data\n").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        // grep 走 guard_path → PathBlocked → Err (propagate), 不读文件
+        let r = tools.grep("data", &["agent.pem".to_string()], Some(&cwd));
+        assert!(r.is_err(), "grep agent.pem 应被拦截 (Err): {:?}", r);
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("凭据文件"), "应含凭据文件提示: {}", msg);
     }
 
     // C-TOOLS-02: 全文件重写 (删全部+加全部) 应被拒 (旧启发式漏判)
@@ -2872,5 +2974,74 @@ mod tests {
         assert_eq!(source_to_lines("one"), vec!["one"]);
         assert_eq!(source_to_lines("a\nb\n"), vec!["a\n", "b\n"]);
         assert_eq!(source_to_lines("a\nb"), vec!["a\n", "b"]);
+    }
+
+    // ── E1 生态统一 glob 规范 (issue #20, fusion-event/docs/glob-spec.md) ──
+    // `*` 不跨 `/`, `**` 跨目录, `?` 单个非 `/` 字符。glob 匹配相对 cwd 路径。
+
+    // E1 例 1: `src/*.swift` 命中 src/a.swift, 不命中 src/sub/a.swift (* 不跨 /)
+    #[test]
+    fn test_glob_e1_star_within_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("sub")).unwrap();
+        std::fs::write(dir.path().join("src").join("a.swift"), "").unwrap();
+        std::fs::write(dir.path().join("src").join("sub").join("a.swift"), "").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut paths: Vec<String> = tools
+            .glob("src/*.swift", Some(&cwd))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["src/a.swift"], "* 应仅命中同层, 不跨 /");
+    }
+
+    // E1 例 2: `src/**/*.swift` 命中 src/a.swift + src/x/y/a.swift (** 跨目录)
+    #[test]
+    fn test_glob_e1_doublestar_across_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("x").join("y")).unwrap();
+        std::fs::write(dir.path().join("src").join("a.swift"), "").unwrap();
+        std::fs::write(
+            dir.path().join("src").join("x").join("y").join("a.swift"),
+            "",
+        )
+        .unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut paths: Vec<String> = tools
+            .glob("src/**/*.swift", Some(&cwd))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["src/a.swift", "src/x/y/a.swift"],
+            "** 应跨目录命中多层"
+        );
+    }
+
+    // E1 例 3: `bin/?s` 命中 bin/ls, 不命中 bin/less (? 恰一非 / 字符)
+    #[test]
+    fn test_glob_e1_question_one_char() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin").join("ls"), "").unwrap();
+        std::fs::write(dir.path().join("bin").join("less"), "").unwrap();
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut paths: Vec<String> = tools
+            .glob("bin/?s", Some(&cwd))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["bin/ls"], "? 应恰匹配一字符, 不匹配 less");
     }
 }

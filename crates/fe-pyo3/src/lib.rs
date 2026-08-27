@@ -3,11 +3,13 @@
 // 产出 fusion_executor._native 扩展, 纯 Python executor.py 包装
 // P1: 最小 execute_sync; 后续暴露 rollback/gui/serve
 
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 
 use fe_core::gui::{GuiAction, GuiResult as RsGuiResult};
-use fe_core::shell::{ShellStartParams, ShellStartResult as RsShellStartResult};
+use fe_core::shell::{ShellRegistry, ShellStartParams, ShellStartResult as RsShellStartResult};
 use fe_core::telemetry::{TelemetryConfig, TelemetrySample};
 use fe_core::tools::{
     EditResult as RsEditResult, GlobEntry as RsGlobEntry, GrepMatch as RsGrepMatch,
@@ -75,6 +77,9 @@ struct PyExecutionResult {
     diagnostics: Option<PyDiagnostics>,
     #[pyo3(get)]
     auto_rolled_back: bool,
+    /// M-OPS-06: 跨层关联 id (回填请求侧或入口自动生成)
+    #[pyo3(get)]
+    trace_id: Option<String>,
 }
 
 impl From<RsResult> for PyExecutionResult {
@@ -92,6 +97,7 @@ impl From<RsResult> for PyExecutionResult {
             snapshot_id: r.snapshot_id,
             diagnostics: r.diagnostics.map(PyDiagnostics::from),
             auto_rolled_back: r.auto_rolled_back,
+            trace_id: r.trace_id,
         }
     }
 }
@@ -489,6 +495,9 @@ impl PyTelemetryIterator {
 struct PyExecutor {
     inner: Executor,
     extra_whitelist: Vec<String>,
+    // M-ARCH-1: ShellRegistry 归 PyExecutor (非 Executor)。serve() 时 self.shells.clone()
+    // (Arc 浅拷) 共享进 IpcServer — in-process path 与 serve-path 同一 registry, serve 重启不丢句柄。
+    shells: Arc<ShellRegistry>,
 }
 
 #[pymethods]
@@ -511,6 +520,7 @@ impl PyExecutor {
         Self {
             inner,
             extra_whitelist: extra_whitelist.unwrap_or_default(),
+            shells: Arc::new(ShellRegistry::new()),
         }
     }
 
@@ -521,7 +531,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None))]
+                        max_nproc=None, max_cpu_sec=None, trace_id=None))]
     fn execute_sync(
         &self,
         py: Python<'_>,
@@ -537,6 +547,7 @@ impl PyExecutor {
         use_pty: Option<bool>,
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
+        trace_id: Option<String>,
     ) -> PyResult<PyExecutionResult> {
         // L-PYO3-02: policy 入参无效应 fail-loud (旧版 warn+None 静默吞错, 调用方以为开了回滚实则没开)
         let policy = match auto_rollback_policy {
@@ -571,6 +582,7 @@ impl PyExecutor {
             use_pty: use_pty.unwrap_or(true),
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
+            trace_id,
         };
         // M-PYO3-02: 内部错误 fail-loud (旧版伪造 exit_code=-1 ExecutionResult, 调用方无法区分
         // 安全拦截与 executor bug; execute 仅在 sandbox 内部异常返 Err, 应上抛)
@@ -685,7 +697,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None))]
+                        max_nproc=None, max_cpu_sec=None, trace_id=None))]
     fn execute_streaming(
         &self,
         py: Python<'_>,
@@ -701,6 +713,7 @@ impl PyExecutor {
         use_pty: Option<bool>,
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
+        trace_id: Option<String>,
     ) -> PyResult<PyStreamIterator> {
         let policy = match auto_rollback_policy {
             None => None,
@@ -734,6 +747,7 @@ impl PyExecutor {
             use_pty: use_pty.unwrap_or(true),
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
+            trace_id,
         }; // L-PYO3-01: execute_streaming async → 释 GIL 后在 BLOCKING_RT block_on (旧版持 GIL
            // 整个 spawn + 校验期间, 阻塞 Python 线程; detach 后 Python 可并发跑其他协程)
         let (rx, handle) = py
@@ -809,9 +823,11 @@ impl PyExecutor {
     }
 
     /// shell_start(command, cwd=None, env_vars=None, task_id=None, max_output_chars=100000,
-    ///             seatbelt=False, inherit_env=False, max_nproc=1024, max_cpu_sec=0)
+    ///             seatbelt=False, inherit_env=False, max_nproc=1024, max_cpu_sec=0,
+    ///             max_idle_sec=3600)
     /// -> NativeShellStartResult — 后台持久 shell 启动 (#1, run_in_background parity)
     /// 安全校验在 fe-core (fail-closed); blocked → ok=false, shell_id=None
+    /// max_idle_sec (m-SEC-01): 无输出超此值 (秒) 自动 kill; 0=不限。默认 3600。
     #[pyo3(signature = (
         command,
         cwd=None,
@@ -822,6 +838,7 @@ impl PyExecutor {
         inherit_env=false,
         max_nproc=1024,
         max_cpu_sec=0,
+        max_idle_sec=fe_core::shell::DEFAULT_MAX_IDLE_SEC,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn shell_start(
@@ -836,6 +853,7 @@ impl PyExecutor {
         inherit_env: bool,
         max_nproc: u32,
         max_cpu_sec: u32,
+        max_idle_sec: u64,
     ) -> PyResult<Py<PyShellStartResult>> {
         let env: std::collections::HashMap<String, String> = match env_vars {
             Some(obj) => {
@@ -864,8 +882,9 @@ impl PyExecutor {
             inherit_env,
             max_nproc,
             max_cpu_sec,
+            max_idle_sec,
         };
-        let r: RsShellStartResult = self.inner.shell_start(sp);
+        let r: RsShellStartResult = self.inner.shell_start(&self.shells, sp);
         let raw = serde_json::to_string(&r)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("序列化失败: {e}")))?;
         Py::new(py, PyShellStartResult { raw })
@@ -873,7 +892,7 @@ impl PyExecutor {
 
     /// shell_output(shell_id) -> NativeShellOutput — 轮询 tail 快照 + 运行/退出状态 (#1)
     fn shell_output(&self, py: Python<'_>, shell_id: String) -> PyResult<Py<PyShellOutput>> {
-        match self.inner.shell_output(&shell_id) {
+        match Executor::shell_output(&self.shells, &shell_id) {
             Ok(out) => {
                 let raw = serde_json::to_string(&out).map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("序列化失败: {e}"))
@@ -888,14 +907,13 @@ impl PyExecutor {
 
     /// kill_shell(shell_id) -> bool — kill 进程树 (#1, KillShell parity)
     fn kill_shell(&self, shell_id: String) -> PyResult<bool> {
-        self.inner
-            .kill_shell(&shell_id)
+        Executor::kill_shell(&self.shells, &shell_id)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("kill_shell 失败: {e}")))
     }
 
     /// list_shells() -> list[NativeShellInfo] — 列出全部后台 shell (#1)
     fn list_shells(&self) -> PyResult<Vec<PyShellInfo>> {
-        let list = self.inner.list_shells();
+        let list = Executor::list_shells(&self.shells);
         let mut out = Vec::with_capacity(list.len());
         for info in list {
             let raw = serde_json::to_string(&info).map_err(|e| {
@@ -1102,6 +1120,9 @@ impl PyExecutor {
     /// 故 serve 的 IPC 请求与进程内 self.inner.execute 语义等价。隔离避免长驻 serve 影响
     /// 调用方持有的 self.inner (如 serve 内命令改动 cwd 影响进程内调用)。
     fn serve(&self, py: pyo3::Python<'_>, sock_path: Option<String>) -> PyResult<()> {
+        // M-OPS-01: fe_ipc::logging init_tracing — JSON+滚动文件 (FE_LOG_DIR) + stderr,
+        // EnvFilter 运行时可 reload (SIGHUP, m-OPS-02)。幂等, handle 存 fe-ipc 静态。
+        let _ = fe_ipc::logging::init_tracing();
         let sock = IpcServer::resolve_sock(sock_path.as_deref());
         let extras: Vec<&str> = self.extra_whitelist.iter().map(String::as_str).collect();
         let exec = if extras.is_empty() {
@@ -1109,7 +1130,7 @@ impl PyExecutor {
         } else {
             Executor::new().with_extra_whitelist(&extras)
         };
-        let server = IpcServer::with_executor(exec);
+        let server = IpcServer::with_executor_and_shells(exec, self.shells.clone());
         tracing::info!(sock = %sock, "PyO3 serve() — 启动 IPC 服务器 (释 GIL, 信号可停)");
         // C-PYO3-02: 释 GIL 跑 serve_blocking — Rust 侧 tokio::signal 监听 SIGINT/SIGTERM
         // 中断 accept_loop (不依赖 Python 信号 handler, 后者在 GIL 持有时不执行)。
@@ -1122,6 +1143,17 @@ impl PyExecutor {
             ))),
         })
     }
+}
+
+/// C-OPS-06: 版本/构建信息 — build.rs 注入 FE_GIT_SHA/FE_BUILD_TIME, 版本取 CARGO_PKG_VERSION
+/// Python __init__.py 经此读 __version__; IPC health 经 fe-ipc 读 (fe-ipc 自身 env! CARGO_PKG_VERSION)
+#[pyfunction]
+fn version_info() -> (String, String, String) {
+    (
+        env!("CARGO_PKG_VERSION").to_string(),
+        env!("FE_GIT_SHA").to_string(),
+        env!("FE_BUILD_TIME").to_string(),
+    )
 }
 
 #[pymodule]
@@ -1138,5 +1170,6 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShellOutput>()?;
     m.add_class::<PyShellInfo>()?;
     m.add_class::<PyExecutor>()?;
+    m.add_function(wrap_pyfunction!(version_info, m)?)?;
     Ok(())
 }

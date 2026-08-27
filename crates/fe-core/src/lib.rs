@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use fe_diagnostics::Slicer;
-use fe_gui::{GuiAction, GuiController, GuiResult};
+use fe_gui::{GuiAction, GuiConfig, GuiController, GuiResult};
 use fe_rollback::RollbackManager;
 use fe_sandbox::{Sandbox, SandboxConfig};
 use fe_security::{SecurityGuard, SecurityVerdict};
@@ -102,6 +102,9 @@ pub struct ExecutionRequest {
     /// >0 到顶 SIGXCPU (CPU 死循环防御)。Darwin 实测生效。
     #[serde(default)]
     pub max_cpu_sec: u32,
+    /// M-OPS-06: 跨层关联 id。None 时 execute 入口自动生成 uuid v4, 贯穿日志/IPC/结果。
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 fn default_use_pty() -> bool {
@@ -186,6 +189,9 @@ pub struct ExecutionResult {
     pub diagnostics: Option<Diagnostics>,
     #[serde(default)]
     pub auto_rolled_back: bool,
+    /// M-OPS-06: 跨层关联 id — 回填请求侧 trace_id (None 时入口自动生成)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
 
 impl ExecutionResult {
@@ -198,11 +204,12 @@ impl ExecutionResult {
         }
     }
 
-    /// 带 task_id/command 的拦截结果 (PRD §4.1 — result 回填请求侧标识)
+    /// 带 task_id/command/trace_id 的拦截结果 (PRD §4.1 — result 回填请求侧标识; M-OPS-06 trace_id)
     pub fn blocked_with(
         reason: impl Into<String>,
         task_id: Option<String>,
         command: Option<String>,
+        trace_id: Option<String>,
     ) -> Self {
         Self {
             exit_code: EXIT_BLOCKED,
@@ -210,6 +217,7 @@ impl ExecutionResult {
             security_reason: Some(reason.into()),
             task_id,
             command,
+            trace_id,
             ..Default::default()
         }
     }
@@ -334,7 +342,9 @@ pub struct Executor {
     rollback: RollbackManager,
     gui: GuiController,
     tools: Tools,
-    shell: ShellRegistry,
+    // M-ARCH-1: ShellRegistry 不再属 Executor — 移到 IpcServer/PyExecutor (与 BroadcastHub 并列)。
+    // Executor 保持 per-task 无状态: IPC 层重启 Executor 不丢后台 shell 句柄; serve-path 与
+    // in-process path 共享同一 registry。安在校验留此层 (self.security), registry 由调用方传引用。
 }
 
 impl Default for Executor {
@@ -353,7 +363,6 @@ impl Executor {
             rollback: RollbackManager::new(),
             gui: GuiController::new(),
             tools: Tools::new(),
-            shell: ShellRegistry::new(),
         }
     }
 
@@ -361,6 +370,23 @@ impl Executor {
     pub fn with_extra_whitelist(mut self, extras: &[&str]) -> Self {
         info!(count = extras.len(), "Executor 扩展白名单 (项目级放行)");
         self.security = self.security.with_extra_whitelist(extras);
+        self
+    }
+
+    /// m-OPS-02: SIGHUP 运行时白名单热重载 — 从基线 + extras 重建 (非累加)。
+    /// &self (Executor 无状态约定, 仅透传 SecurityGuard.reload_extras 的 ArcSwap store)。
+    /// fe-ipc SIGHUP 处理器读 FUSION_EXECUTOR_EXTRA_WHITELIST env → 逗号分割 → 调此。
+    pub fn reload_whitelist(&self, extras: &[&str]) {
+        info!(count = extras.len(), "SIGHUP 白名单热重载 (基线重建)");
+        self.security.reload_extras(extras);
+    }
+
+    /// M-SEC-04: GUI 安全配置 (bundle allowlist + 密码框 type_text 守卫)。
+    /// 默认 Executor::new() 无配置 = 不限 (本地可信调用方, 仅审计日志);
+    /// 企业/多用户场景用此构造器设 allowlist + allow_type_into_secure opt-in。
+    pub fn with_gui_config(mut self, config: GuiConfig) -> Self {
+        info!("Executor 设置 GUI 安全配置 (M-SEC-04)");
+        self.gui = GuiController::new_with_config(config);
         self
     }
 
@@ -389,7 +415,8 @@ impl Executor {
 
     /// 后台 shell — 启动持久 shell (#1, Claude Code run_in_background parity)
     /// 安全校验在此层 (fail-closed): blocked → ShellStartResult{ok:false, blocked_by_security:true}
-    pub fn shell_start(&self, p: ShellStartParams) -> ShellStartResult {
+    /// M-ARCH-1: registry 由调用方传引用 (Executor 无状态; registry 归 IpcServer/PyExecutor)。
+    pub fn shell_start(&self, registry: &ShellRegistry, p: ShellStartParams) -> ShellStartResult {
         let v = self.security.validate(&p.command);
         if !v.allowed {
             warn!(command = %p.command, reason = ?v.reason, "shell_start 被安全守卫拦截");
@@ -401,22 +428,25 @@ impl Executor {
                 error: None,
             };
         }
-        self.shell.shell_start(p)
+        registry.shell_start(p)
     }
 
     /// 后台 shell — 轮询 tail 快照 + 运行/退出状态 (#1)
-    pub fn shell_output(&self, shell_id: &str) -> Result<ShellOutput> {
-        self.shell.shell_output(shell_id)
+    /// M-ARCH-1: registry 由调用方传引用。
+    pub fn shell_output(registry: &ShellRegistry, shell_id: &str) -> Result<ShellOutput> {
+        registry.shell_output(shell_id)
     }
 
     /// 后台 shell — kill 进程树 (#1, Claude Code KillShell parity)
-    pub fn kill_shell(&self, shell_id: &str) -> Result<bool> {
-        self.shell.kill_shell(shell_id)
+    /// M-ARCH-1: registry 由调用方传引用。
+    pub fn kill_shell(registry: &ShellRegistry, shell_id: &str) -> Result<bool> {
+        registry.kill_shell(shell_id)
     }
 
     /// 后台 shell — 列出全部 shell (#1)
-    pub fn list_shells(&self) -> Vec<ShellInfo> {
-        self.shell.list_shells()
+    /// M-ARCH-1: registry 由调用方传引用。
+    pub fn list_shells(registry: &ShellRegistry) -> Vec<ShellInfo> {
+        registry.list_shells()
     }
 
     /// 原生文件工具 — multi_edit 同文件原子批量编辑 (#6)
@@ -502,6 +532,18 @@ impl Executor {
 
     /// 异步执行 — 校验 → 沙箱执行 → return
     pub async fn execute_async(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
+        // M-OPS-06/m-OPS-03: 入口解析 trace_id (None 自动 uuid v4), span 包整条请求链 — 日志带 span 上下文
+        let trace_id = req
+            .trace_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let span = tracing::span!(
+            tracing::Level::INFO,
+            "execute",
+            trace_id = %trace_id,
+            command = %req.command
+        );
+        let _enter = span.enter();
         info!(command = %req.command, "execute_async — 校验中");
         let start = Instant::now();
         let verdict = self.security.validate(&req.command);
@@ -512,6 +554,7 @@ impl Executor {
                 reason,
                 req.task_id.clone(),
                 Some(req.command.clone()),
+                Some(trace_id),
             ));
         }
         // cwd 校验
@@ -524,6 +567,7 @@ impl Executor {
                     reason,
                     req.task_id.clone(),
                     Some(req.command.clone()),
+                    Some(trace_id),
                 ));
             }
         }
@@ -609,6 +653,7 @@ impl Executor {
             timed_out: sb.timed_out,
             snapshot_id: sid_filtered.clone(),
             diagnostics: diag,
+            trace_id: Some(trace_id),
             ..Default::default()
         };
 
@@ -642,6 +687,18 @@ impl Executor {
         &self,
         req: ExecutionRequest,
     ) -> Result<(mpsc::Receiver<ExecutionStreamEvent>, JoinHandle<()>)> {
+        // M-OPS-06/m-OPS-03: 入口解析 trace_id + span (同 execute_async)
+        let trace_id = req
+            .trace_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let span = tracing::span!(
+            tracing::Level::INFO,
+            "execute_stream",
+            trace_id = %trace_id,
+            command = %req.command
+        );
+        let _enter = span.enter();
         info!(command = %req.command, "execute_streaming — 校验中");
         let start = Instant::now();
         let verdict = self.security.validate(&req.command);
@@ -656,6 +713,7 @@ impl Executor {
                             reason,
                             req.task_id.clone(),
                             Some(req.command.clone()),
+                            Some(trace_id),
                         ),
                     )))
                     .await;
@@ -675,6 +733,7 @@ impl Executor {
                                 reason,
                                 req.task_id.clone(),
                                 Some(req.command.clone()),
+                                Some(trace_id),
                             ),
                         )))
                         .await;
@@ -734,6 +793,7 @@ impl Executor {
         let cwd_for_diag = req.cwd.clone();
         let task_id_for_done = req.task_id.clone();
         let command_for_done = req.command.clone();
+        let trace_id_for_done = trace_id.clone();
         let policy_for_done = req.auto_rollback_policy.clone();
         let cwd_for_guard = req.cwd.clone();
         let pre_status_for_guard = pre_status.clone();
@@ -776,6 +836,7 @@ impl Executor {
                             timed_out: sb.timed_out,
                             snapshot_id: sid_filtered.clone(),
                             diagnostics: diag,
+                            trace_id: Some(trace_id_for_done.clone()),
                             ..Default::default()
                         };
                         // 自动回滚 (FR-04, 同 execute_async; pre_status diff C-CORE-01)
@@ -857,6 +918,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut combined = String::new();
@@ -877,6 +939,119 @@ mod tests {
     }
 
     #[test]
+    fn trace_id_auto_generated_on_none() {
+        // M-OPS-06: 请求不带 trace_id → 入口自动生成 uuid v4, 回填 result
+        rt().block_on(async {
+            let ex = Executor::new();
+            let req = ExecutionRequest {
+                command: "echo t".to_string(),
+                task_id: None,
+                cwd: None,
+                timeout_sec: 10.0,
+                env_vars: None,
+                enable_rollback_snapshot: false,
+                auto_rollback_policy: None,
+                seatbelt: false,
+                inherit_env: false,
+                use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
+                trace_id: None,
+            };
+            let r = ex.execute_async(req).await.unwrap();
+            assert_eq!(r.exit_code, 0);
+            assert!(r.trace_id.is_some(), "trace_id 应自动生成");
+            let tid = r.trace_id.as_ref().unwrap();
+            assert_eq!(tid.len(), 36, "uuid v4 长度 36, 得 {tid}");
+            assert_eq!(tid.matches('-').count(), 4, "uuid v4 含 4 段分隔, 得 {tid}");
+        });
+    }
+
+    #[test]
+    fn trace_id_forwarded_when_provided() {
+        // M-OPS-06: 调用方传 trace_id → 原样回填 result
+        rt().block_on(async {
+            let ex = Executor::new();
+            let req = ExecutionRequest {
+                command: "echo t".to_string(),
+                task_id: None,
+                cwd: None,
+                timeout_sec: 10.0,
+                env_vars: None,
+                enable_rollback_snapshot: false,
+                auto_rollback_policy: None,
+                seatbelt: false,
+                inherit_env: false,
+                use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
+                trace_id: Some("caller-tid-123".to_string()),
+            };
+            let r = ex.execute_async(req).await.unwrap();
+            assert_eq!(r.trace_id.as_deref(), Some("caller-tid-123"));
+        });
+    }
+
+    #[test]
+    fn trace_id_present_on_blocked() {
+        // M-OPS-06: 拦截结果也带 trace_id (blocked_with 转发)
+        rt().block_on(async {
+            let ex = Executor::new();
+            let req = ExecutionRequest {
+                command: "rm -rf /".to_string(),
+                task_id: Some("tk".to_string()),
+                cwd: None,
+                timeout_sec: 10.0,
+                env_vars: None,
+                enable_rollback_snapshot: false,
+                auto_rollback_policy: None,
+                seatbelt: false,
+                inherit_env: false,
+                use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
+                trace_id: Some("blk-tid".to_string()),
+            };
+            let r = ex.execute_async(req).await.unwrap();
+            assert!(r.blocked_by_security);
+            assert_eq!(r.trace_id.as_deref(), Some("blk-tid"));
+        });
+    }
+
+    #[test]
+    fn trace_id_streaming_done_carries_it() {
+        // M-OPS-06: 流式 Done 帧带 trace_id
+        rt().block_on(async {
+            let ex = Executor::new();
+            let req = ExecutionRequest {
+                command: "echo s".to_string(),
+                task_id: None,
+                cwd: None,
+                timeout_sec: 10.0,
+                env_vars: None,
+                enable_rollback_snapshot: false,
+                auto_rollback_policy: None,
+                seatbelt: false,
+                inherit_env: false,
+                use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
+                trace_id: Some("stream-tid".to_string()),
+            };
+            let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
+            let mut done = None;
+            while let Some(ev) = rx.recv().await {
+                if let ExecutionStreamEvent::Done(r) = ev {
+                    done = Some(r);
+                }
+            }
+            handle.await.unwrap();
+            let done = done.expect("应收到 Done");
+            assert_eq!(done.trace_id.as_deref(), Some("stream-tid"));
+        });
+    }
+
+    #[test]
     fn execute_streaming_blocked_single_done_frame() {
         rt().block_on(async {
             let ex = Executor::new();
@@ -893,6 +1068,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut frames = 0;
@@ -928,6 +1104,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -960,6 +1137,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
             let mut done = None;
@@ -1014,6 +1192,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                trace_id: None,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -1045,6 +1224,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                trace_id: None,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -1074,6 +1254,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                trace_id: None,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -1110,6 +1291,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                trace_id: None,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
@@ -1150,6 +1332,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                trace_id: None,
             };
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();

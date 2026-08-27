@@ -53,7 +53,10 @@ def test_run_blocks_non_whitelisted_binary(executor: FusionSandboxExecutor):
 
 
 def test_run_allows_python(executor: FusionSandboxExecutor):
-    result = executor.run("python -c \"print('hello')\"")
+    # env 隔离默认 inherit_env=false → 硬化 PATH allowlist (/opt/homebrew/bin...)
+    # 仅含 python3 (无 venv `python` shim), 故用 python3 跑真实执行。
+    # python token 放行由 fe-security 单测 allows_python 覆盖。
+    result = executor.run("python3 -c \"print('hello')\"")
     assert not result.blocked_by_security
     assert result.exit_code == 0
 
@@ -256,16 +259,53 @@ def test_run_streaming_done_has_schema_fields(executor: FusionSandboxExecutor):
     assert result.duration_sec > 0.0
 
 
+# ── M-OPS-06: trace_id 跨层关联 (auto-gen + forwarded + blocked + streaming) ──
+
+
+def test_run_trace_id_auto_generated(executor: FusionSandboxExecutor):
+    result = executor.run("echo t")
+    assert result.trace_id is not None
+    assert len(result.trace_id) == 36
+    assert result.trace_id.count("-") == 4
+
+
+def test_run_trace_id_forwarded(executor: FusionSandboxExecutor):
+    result = executor.run("echo t", trace_id="caller-tid-999")
+    assert result.trace_id == "caller-tid-999"
+
+
+def test_run_trace_id_on_blocked(executor: FusionSandboxExecutor):
+    result = executor.run("rm -rf /", trace_id="blk-tid-1")
+    assert result.blocked_by_security
+    assert result.trace_id == "blk-tid-1"
+
+
+def test_run_streaming_trace_id(executor: FusionSandboxExecutor):
+    _chunks, result = _consume_stream(executor, "echo s", trace_id="stream-tid-1")
+    assert result is not None
+    assert result.trace_id == "stream-tid-1"
+
+
 # ── Issue #3: RLIMIT_NPROC/CPU 注入 (run + run_streaming 4-layer 端到端) ──
 # Darwin RLIMIT_NPROC per-UID spread-limiter: 低值令 sh 自身 fork python3 EAGAIN,
 # 故测可观测 rlimit (python resource.getrlimit 读回注入值), 确定性无 fork 依赖。
 
 
 def test_run_injects_rlimits(executor: FusionSandboxExecutor):
-    probe = 'python3 -c \'import resource; print("NPROC", resource.getrlimit(resource.RLIMIT_NPROC)[0]); print("CPU", resource.getrlimit(resource.RLIMIT_CPU)[0])\''
+    # 注入经 `ulimit -u/-t`; setrlimit 软上限不能超硬上限 — CI runner 硬上限可能 < 请求值 (如 1333),
+    # 内核静默 clamp。断言观测值 ≤ 请求 且受内核硬限约束, 不写死 2048。
+    probe = (
+        "python3 -c 'import resource; "
+        'print("NPROC", resource.getrlimit(resource.RLIMIT_NPROC)[0], resource.getrlimit(resource.RLIMIT_NPROC)[1]); '
+        'print("CPU", resource.getrlimit(resource.RLIMIT_CPU)[0])\''
+    )
     result = executor.run(probe, max_nproc=2048, max_cpu_sec=15)
     assert result.exit_code == 0, f"probe 应 exit 0, stdout={result.stdout}"
-    assert "NPROC 2048" in result.stdout, f"应观测注入 NPROC=2048, stdout={result.stdout}"
+    nproc_line = next(ln for ln in result.stdout.splitlines() if ln.startswith("NPROC"))
+    nproc_soft, nproc_hard = nproc_line.split()[1], nproc_line.split()[2]
+    assert int(nproc_soft) <= 2048, f"软 NPROC 应 ≤ 请求 2048, 得 {nproc_soft}"
+    assert int(nproc_soft) <= int(nproc_hard), f"软 NPROC 应 ≤ 硬上限, soft={nproc_soft} hard={nproc_hard}"
+    assert int(nproc_soft) > 0, f"注入后 NPROC 应非零, 得 {nproc_soft}"
     assert "CPU 15" in result.stdout, f"应观测注入 CPU=15, stdout={result.stdout}"
 
 
@@ -287,11 +327,16 @@ def test_run_rejects_negative_nproc(executor: FusionSandboxExecutor):
 
 
 def test_run_streaming_injects_rlimits(executor: FusionSandboxExecutor):
-    probe = "python3 -c 'import resource; print(\"NPROC\", resource.getrlimit(resource.RLIMIT_NPROC)[0])'"
+    # 同 test_run_injects_rlimits: 软上限受内核硬限 clamp, 不写死 2048。
+    probe = "python3 -c 'import resource; print(\"NPROC\", resource.getrlimit(resource.RLIMIT_NPROC)[0], resource.getrlimit(resource.RLIMIT_NPROC)[1])'"
     _chunks, result = _consume_stream(executor, probe, max_nproc=2048)
     assert result is not None
     assert result.exit_code == 0
-    assert "NPROC 2048" in result.stdout
+    nproc_line = next(ln for ln in result.stdout.splitlines() if ln.startswith("NPROC"))
+    nproc_soft, nproc_hard = nproc_line.split()[1], nproc_line.split()[2]
+    assert int(nproc_soft) <= 2048, f"软 NPROC 应 ≤ 请求 2048, 得 {nproc_soft}"
+    assert int(nproc_soft) <= int(nproc_hard), f"软 NPROC 应 ≤ 硬上限, soft={nproc_soft} hard={nproc_hard}"
+    assert int(nproc_soft) > 0, f"注入后 NPROC 应非零, 得 {nproc_soft}"
 
 
 # ── 原生文件工具 (fe-tools) ──
@@ -922,7 +967,7 @@ def test_self_healing_closed_loop(executor: FusionSandboxExecutor, tmp_path):
     bug.write_text(BUG_SRC)
 
     # 2. 首次执行 — 应失败, diagnostics 切片定位到 bug.py
-    first = executor.run("python bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
+    first = executor.run("python3 bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
     assert first.exit_code != 0, "故障脚本应非零退出"
     assert not first.blocked_by_security
     assert first.diagnostics is not None, "exit!=0 应触发诊断切片"
@@ -943,7 +988,7 @@ def test_self_healing_closed_loop(executor: FusionSandboxExecutor, tmp_path):
     assert fix.matches == 1
 
     # 4. 二次执行 — 应通过 (闭环收敛)
-    second = executor.run("python bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
+    second = executor.run("python3 bug.py", cwd=str(tmp_path), timeout_sec=15.0, enable_rollback_snapshot=False)
     assert second.exit_code == 0, f"修复后应 exit 0: stderr={second.stderr}"
     assert "3" in second.stdout, "修复后应输出 3"
     assert second.diagnostics is None, "exit==0 不应触发诊断"

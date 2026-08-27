@@ -58,6 +58,10 @@ class ExecutionRequest(BaseModel):
         default=0,
         description="CPU 秒上限 (RLIMIT_CPU, 经 ulimit -t 注入); >0 到顶 SIGXCPU (CPU 死循环防御); 0=不限 (依赖 timeout_sec watchdog); Darwin 实测生效",
     )
+    trace_id: str | None = Field(
+        default=None,
+        description="跨层关联 id; None 时执行入口自动生成 uuid v4, 贯穿日志/IPC/结果 (M-OPS-06)",
+    )
 
 
 class ExecutionResult(BaseModel):
@@ -74,6 +78,9 @@ class ExecutionResult(BaseModel):
     snapshot_id: str | None = None
     diagnostics: Diagnostics | None = None
     auto_rolled_back: bool = False
+    trace_id: str | None = Field(
+        default=None, description="跨层关联 id — 回填请求侧 trace_id 或入口自动生成 (M-OPS-06)"
+    )
 
 
 class GuiResult(BaseModel):
@@ -115,14 +122,6 @@ class GrepFileCount(BaseModel):
     count: int
 
 
-class GrepOutputMode(BaseModel):
-    model_config = _STRICT
-    mode: str = Field(
-        default="content",
-        description="grep 输出模式: content | files_with_matches | count",
-    )
-
-
 class GrepOptions(BaseModel):
     model_config = _STRICT
     output_mode: str = Field(default="content", description="content | files_with_matches | count")
@@ -147,14 +146,6 @@ class MultiEditItem(BaseModel):
     old_string: str
     new_string: str
     replace_all: bool = Field(default=False, description="True=替换全部匹配; False=唯一匹配 (默认)")
-
-
-class NotebookEditMode(BaseModel):
-    model_config = _STRICT
-    mode: str = Field(
-        default="replace",
-        description="单元格编辑模式: replace | insert | delete",
-    )
 
 
 class TelemetrySample(BaseModel):

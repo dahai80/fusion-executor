@@ -69,7 +69,7 @@ def test_rollback_without_cwd_raises():
 
 def test_cli_timeout_exit_code_124():
     # M-CLI-01: -124 超时映射 124 (旧版 -1/-124 全 → 1, 超时身份丢失)
-    code, out = _run_main(["fusion-executor", "python -c 'import time; time.sleep(30)'", "--timeout-sec", "1"])
+    code, out = _run_main(["fusion-executor", "python3 -c 'import time; time.sleep(30)'", "--timeout-sec", "1"])
     assert code == 124, f"超时应退 124, 得 {code}"
     data = json.loads(out)
     assert data["exit_code"] == -124
@@ -90,7 +90,7 @@ def test_cli_env_flag_invalid_returns_2():
 
 def test_cli_env_flag_passes_value():
     code, out = _run_main(
-        ["fusion-executor", "python -c 'import os; print(os.environ.get(\"FE_FLAG\"))'", "--env", "FE_FLAG=on"]
+        ["fusion-executor", "python3 -c 'import os; print(os.environ.get(\"FE_FLAG\"))'", "--env", "FE_FLAG=on"]
     )
     assert code == 0
     assert "on" in json.loads(out)["stdout"]

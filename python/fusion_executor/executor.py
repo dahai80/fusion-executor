@@ -60,6 +60,7 @@ class FusionSandboxExecutor:
         use_pty: bool = True,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
+        trace_id: str | None = None,
     ) -> ExecutionResult:
         # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
         if not isinstance(command, str):
@@ -103,6 +104,7 @@ class FusionSandboxExecutor:
             use_pty,
             max_nproc,
             max_cpu_sec,
+            trace_id,
         )
         diag = None
         if native.diagnostics is not None:
@@ -127,6 +129,7 @@ class FusionSandboxExecutor:
             snapshot_id=native.snapshot_id,
             diagnostics=diag,
             auto_rolled_back=native.auto_rolled_back,
+            trace_id=native.trace_id,
         )
         logger.info(
             "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s dur=%.3fs",
@@ -160,6 +163,7 @@ class FusionSandboxExecutor:
         use_pty: bool = True,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
+        trace_id: str | None = None,
     ) -> Iterator[str | ExecutionResult]:
         # M-PY-01: 同 run() 前置校验
         if not isinstance(command, str):
@@ -199,6 +203,7 @@ class FusionSandboxExecutor:
             use_pty,
             max_nproc,
             max_cpu_sec,
+            trace_id,
         )
         for frame in it:
             # L-PY-02: 严格键 (旧 .get(default) 吞 serde bug, 缺字段静默成功看像 blocked)
@@ -310,14 +315,18 @@ class FusionSandboxExecutor:
         inherit_env: bool = False,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
+        max_idle_sec: int = 3600,
     ) -> ShellStartResult:
+        if not isinstance(max_idle_sec, int) or max_idle_sec < 0:
+            raise ValueError(f"max_idle_sec 必须为非负 int, 得 {max_idle_sec!r}")
         logger.debug(
-            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s",
+            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s",
             command,
             cwd,
             task_id,
             seatbelt,
             inherit_env,
+            max_idle_sec,
         )
         native = self._native.shell_start(
             command,
@@ -329,6 +338,7 @@ class FusionSandboxExecutor:
             inherit_env,
             max_nproc,
             max_cpu_sec,
+            max_idle_sec,
         )
         result = ShellStartResult.model_validate(native.to_dict())
         logger.info(
@@ -576,6 +586,60 @@ class FusionSandboxExecutor:
         sub._open()
         return sub
 
+    def metrics(self, sock_path: str | None = None) -> dict:
+        # C-OPS-05: 运维指标 — 经 UDS 调 executor.metrics 读服务器运行态计数
+        # (exec_total/blocked/timeout/success/failed + duration/stdio 聚合 + rollback)。
+        # 须对运行中的 serve() 实例调用 (无 server → ConnectionRefused)。
+        path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        req = {"jsonrpc": "2.0", "id": 1, "method": "executor.metrics", "params": {}}
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
+        try:
+            sock.connect(path)
+            sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0].decode("utf-8").strip()
+            resp = json.loads(line) if line else {}
+            if "error" in resp:
+                raise RuntimeError(f"metrics 失败: {resp['error']}")
+            logger.info("metrics ok: %s", resp.get("result"))
+            return resp.get("result", {})
+        finally:
+            sock.close()
+
+    def metrics_prometheus(self, sock_path: str | None = None) -> str:
+        # M-OPS-02: Prometheus text format — 经 UDS 调 executor.metrics_prometheus 拉
+        # scrape 文本 (fe_exec_total/fe_shell_active/fe_connections... + HELP/TYPE 头)。
+        # 不开 HTTP 端口 (保 M-SEC-01 UDS-only); 调用方喂自家 exporter 或直接展板。
+        # recorder install 失败 → -32603, 调用方降级用 metrics() JSON。
+        path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        req = {"jsonrpc": "2.0", "id": 1, "method": "executor.metrics_prometheus", "params": {}}
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
+        try:
+            sock.connect(path)
+            sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0].decode("utf-8").strip()
+            resp = json.loads(line) if line else {}
+            if "error" in resp:
+                raise RuntimeError(f"metrics_prometheus 失败: {resp['error']}")
+            text = resp.get("result", {}).get("text", "")
+            logger.info("metrics_prometheus ok: %d bytes", len(text))
+            return text
+        finally:
+            sock.close()
+
     def serve(self, sock_path: str | None = None) -> None:
         # C-PYO3-02: 旧版裸 self._native.serve() — fe-pyo3 serve_blocking 无 shutdown
         # 句柄, SIGINT/SIGTERM 不解 socket 残留。改信号处理 + try/finally 清理:
@@ -585,6 +649,8 @@ class FusionSandboxExecutor:
         # 与 finally 清理用的 path (env 解析) 不同源, 虽 Rust 亦解析 env 凑巧一致, 但显式
         # 传 path 消除隐式 env 依赖, 清理与监听严格同一路径。
         path = sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        # C-SEC-02: seatbelt 治理 — 默认关闭, 生产环境须在 ExecutionRequest 透传 seatbelt:true
+        logger.warning("⚠️ seatbelt 默认关闭 — 子进程无 macOS sandbox-exec 隔离。生产部署须透传 seatbelt:true。")
         logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (信号可停)", path)
         old_int = signal.getsignal(signal.SIGINT)
         old_term = signal.getsignal(signal.SIGTERM)

@@ -36,7 +36,15 @@ futures = "0.3"
 
 # 日志追踪
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# 指标 (M-OPS-02)
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+# 运行时可重载配置 (m-OPS-02 SIGHUP)
+arc-swap = "1"
 
 # 通用工具
 regex = "1"
