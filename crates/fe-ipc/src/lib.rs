@@ -659,10 +659,13 @@ impl IpcServer {
         let executor = self.executor.clone();
         let hub = self.hub.clone();
         let shells = self.shells.clone();
+        // m-OPS-02: SIGHUP 配置热重载任务 — 与 accept_loop 并行, 退出时 abort
+        let sighup_task = tokio::spawn(handle_sighup_reload(executor.clone()));
         // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
         let drain_deadline = resolve_shutdown_timeout();
         let join = tokio::spawn(async move {
             accept_loop(listener, executor, hub, shells, shutdown_rx, drain_deadline).await;
+            sighup_task.abort();
             let _ = std::fs::remove_file(&path);
         });
         Ok((shutdown_tx, join))
@@ -696,11 +699,14 @@ impl IpcServer {
             let (_tx, rx) = oneshot::channel::<()>();
             // 信号任务: 收 SIGINT/SIGTERM → notify_waiters, accept_loop 自行退出并 drain
             let signal_task = tokio::spawn(wait_signal_and_notify(hub.clone()));
+            // m-OPS-02: SIGHUP 配置热重载任务 — 重载日志级别 + 白名单 (不触发退出)
+            let sighup_task = tokio::spawn(handle_sighup_reload(executor.clone()));
             // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
             let drain_deadline = resolve_shutdown_timeout();
             // accept_loop 运行至 shutdown_notify (信号) 或 shutdown_rx 触发, 内部 drain in-flight
             accept_loop(listener, executor, hub, shells, rx, drain_deadline).await;
             signal_task.abort();
+            sighup_task.abort();
             let _ = std::fs::remove_file(&p);
             Ok(())
         })
@@ -733,6 +739,68 @@ async fn wait_signal_and_notify(hub: Arc<BroadcastHub>) {
     }
     info!("收到 SIGINT/SIGTERM, 触发优雅 drain");
     hub.shutdown.notify_waiters();
+}
+
+/// m-OPS-02: SIGHUP 配置热重载 — 重读 RUST_LOG (日志级别) + FUSION_EXECUTOR_EXTRA_WHITELIST (白名单)。
+/// 与 wait_signal_and_notify 并列 (后者管 SIGINT/SIGTERM 退出; SIGHUP 不退出, 仅重载)。
+/// 无配置 → no-op (不报错); tracing 未 init → 跳过日志重载; env 缺失 → 跳过白名单重载。
+/// 遵守 Executor 无状态约定: executor: Arc<Executor> 经 reload_whitelist(&self) 透传 ArcSwap store。
+async fn handle_sighup_reload(executor: Arc<Executor>) {
+    #[cfg(unix)]
+    {
+        let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "SIGHUP 注册失败, 配置热重载不可用");
+                return;
+            }
+        };
+        loop {
+            sighup.recv().await;
+            info!("收到 SIGHUP, 重载配置 (日志级别 + 白名单)");
+            reload_log_level();
+            reload_extra_whitelist(&executor);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // 非 unix 无 SIGHUP — 永久挂起 (不耗 CPU)。
+        std::future::pending::<()>().await;
+    }
+}
+
+/// SIGHUP: 重读 RUST_LOG env, 经 FilterHandle.reload_log_filter 换日志级别。
+/// 未设 RUST_LOG → 回退 DEFAULT_FILTER_DIRECTIVE (info); tracing 未 init (handle None) → 跳过。
+fn reload_log_level() {
+    let directive = std::env::var("RUST_LOG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| logging::DEFAULT_FILTER_DIRECTIVE.to_string());
+    match logging::current_handle() {
+        Some(handle) => match handle.reload_log_filter(&directive) {
+            Ok(()) => info!(directive = %directive, "SIGHUP 日志级别重载完成"),
+            Err(e) => warn!(error = %e, "SIGHUP 日志级别重载失败 (fail-loud, 当前级别不变)"),
+        },
+        None => warn!("SIGHUP 日志重载: tracing 未初始化, 跳过 (init_tracing 未调)"),
+    }
+}
+
+/// SIGHUP: 重读 FUSION_EXECUTOR_EXTRA_WHITELIST env (逗号分割) → Executor.reload_whitelist。
+/// 未设 / 空 → 传空切片 (回退纯基线白名单); Executor 透传 SecurityGuard.reload_extras (基线重建)。
+fn reload_extra_whitelist(executor: &Arc<Executor>) {
+    let extras: Vec<String> = std::env::var("FUSION_EXECUTOR_EXTRA_WHITELIST")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let extras_ref: Vec<&str> = extras.iter().map(|s| s.as_str()).collect();
+    executor.reload_whitelist(&extras_ref);
+    info!(count = extras.len(), "SIGHUP 白名单重载完成 (基线 + 扩展)");
 }
 
 impl Default for IpcServer {
@@ -2976,5 +3044,71 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    // m-OPS-02: env-var 测试串行化 (set_var/remove_var 跨并行测试竞态)。
+    static MOPS02_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // m-OPS-02: reload_extra_whitelist 解析 FUSION_EXECUTOR_EXTRA_WHITELIST (逗号分割/去空白/去空) → Executor 白名单更新。
+    #[test]
+    fn mops02_reload_extra_whitelist_parses_env() {
+        let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let executor = Arc::new(Executor::new());
+        // 先用 validate 断言非基线工具默认被拦
+        let v = executor.validate("sighup-tool-xyz --version");
+        assert!(!v.allowed, "扩展前 sighup-tool-xyz 应被拦");
+        // 设 env → reload → 应放行
+        std::env::set_var(
+            "FUSION_EXECUTOR_EXTRA_WHITELIST",
+            " sighup-tool-xyz ,,other-tool ",
+        );
+        reload_extra_whitelist(&executor);
+        let v = executor.validate("sighup-tool-xyz --version");
+        assert!(v.allowed, "SIGHUP 重载后 sighup-tool-xyz 应放行");
+        let v = executor.validate("other-tool run");
+        assert!(v.allowed, "逗号第二项 other-tool 应放行");
+        // 基线恒在
+        let v = executor.validate("python3 --version");
+        assert!(v.allowed, "基线 python3 恒放行");
+        std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
+    }
+
+    // m-OPS-02: 空 env → 回退纯基线 (项目扩展清空)。
+    #[test]
+    fn mops02_reload_extra_whitelist_empty_clears_extras() {
+        let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let executor = Arc::new(Executor::new());
+        // 先加扩展
+        std::env::set_var("FUSION_EXECUTOR_EXTRA_WHITELIST", "temp-tool");
+        reload_extra_whitelist(&executor);
+        assert!(
+            executor.validate("temp-tool run").allowed,
+            "先加 temp-tool 放行"
+        );
+        // 清 env → reload → 回退基线
+        std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
+        reload_extra_whitelist(&executor);
+        assert!(
+            !executor.validate("temp-tool run").allowed,
+            "空 reload 后 temp-tool 应已拦 (回退基线)"
+        );
+        assert!(executor.validate("python3 --version").allowed, "基线恒在");
+    }
+
+    // m-OPS-02: reload_log_level 无 handle (tracing 未 init) → 不 panic, 仅 warn。
+    #[test]
+    fn mops02_reload_log_level_no_panic_without_handle() {
+        // 不调 init_tracing (避免污染全局 subscriber) → current_handle() 多为 None。
+        // 无论 None 或 Some, reload_log_level 不应 panic。
+        reload_log_level();
+    }
+
+    // m-OPS-02: reload_log_level 读 RUST_LOG env (合法 directive 经 handle 不崩)。
+    #[test]
+    fn mops02_reload_log_level_reads_rust_log() {
+        let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RUST_LOG", "debug");
+        reload_log_level(); // 无 handle → no-op 路径, 不崩; 有 handle → 应接受 debug
+        std::env::remove_var("RUST_LOG");
     }
 }

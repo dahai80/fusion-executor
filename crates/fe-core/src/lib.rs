@@ -373,6 +373,14 @@ impl Executor {
         self
     }
 
+    /// m-OPS-02: SIGHUP 运行时白名单热重载 — 从基线 + extras 重建 (非累加)。
+    /// &self (Executor 无状态约定, 仅透传 SecurityGuard.reload_extras 的 ArcSwap store)。
+    /// fe-ipc SIGHUP 处理器读 FUSION_EXECUTOR_EXTRA_WHITELIST env → 逗号分割 → 调此。
+    pub fn reload_whitelist(&self, extras: &[&str]) {
+        info!(count = extras.len(), "SIGHUP 白名单热重载 (基线重建)");
+        self.security.reload_extras(extras);
+    }
+
     /// M-SEC-04: GUI 安全配置 (bundle allowlist + 密码框 type_text 守卫)。
     /// 默认 Executor::new() 无配置 = 不限 (本地可信调用方, 仅审计日志);
     /// 企业/多用户场景用此构造器设 allowlist + allow_type_into_secure opt-in。
