@@ -658,6 +658,23 @@ impl IpcServer {
         }
     }
 
+    /// A-4: 共享调用方已持有的 Executor Arc — fe-pyo3 serve() 不再重建 Executor。
+    /// 调用方先在进程内用 with_extra_whitelist 配的白名单 + SIGHUP 重载的 extras 跨 serve-path 持久
+    /// (旧版 with_executor_and_shells 取 owned Executor 再 Arc::new, serve 重建丢 in-process 白名单)。
+    /// registry 同 M-ARCH-1 共享。三参全 Arc — 与 serve()/serve_blocking() 取 self.executor.clone() 兼容。
+    pub fn with_executor_arc_and_shells(
+        executor: Arc<Executor>,
+        shells: Arc<fe_core::shell::ShellRegistry>,
+    ) -> Self {
+        info!("IpcServer::with_executor_arc_and_shells() — 共享 Executor Arc + ShellRegistry");
+        let hub = BroadcastHub::new(executor.clone());
+        Self {
+            executor,
+            hub,
+            shells,
+        }
+    }
+
     /// M-ARCH-1: 暴露 registry 引用 (health probe / dispatch 取用)。
     pub fn shells(&self) -> &Arc<fe_core::shell::ShellRegistry> {
         &self.shells

@@ -4,6 +4,7 @@
 // P1: 最小 execute_sync; 后续暴露 rollback/gui/serve
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
@@ -20,6 +21,18 @@ use fe_core::{
     Executor, RollbackPolicy,
 };
 use fe_ipc::IpcServer;
+
+/// C-3: 流式迭代器 __next__ 每帧 recv 超时 (秒)。沙箱 timeout_sec 上限 DEFAULT_TIMEOUT_CAP_SEC=120s
+/// (fe-sandbox, 私有不导出), 加 10s grace 给转发任务发 Done → 130s。超时 → PyTimeoutError
+/// (非 StopIteration — 超时是错, 非干净 EOF)。病态命令卡转发任务 (PTY 死锁/D 态/runtime 饱和/满通道)
+/// 时, recv() 永久阻塞 → Python 消费者楔死。此 deadline 守 IPC 桥, 不守叶子 (沙箱心跳守叶子)。
+pub const STREAM_RECV_TIMEOUT_SECS: u64 = 130;
+
+/// C-3: Done 帧后 join 转发任务的超时 (秒)。超时 → abort (避免 Python 消费者等悬挂任务)。
+pub const JOIN_TIMEOUT_SECS: u64 = 5;
+
+/// C-3: 遥测迭代器 __next__ idle 超时 (秒)。遥测源 10Hz (interval_ms=100), idle 30s 无帧 = 源任务死。
+pub const TELEMETRY_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// Python 可见诊断 — 镜像 Rust Diagnostics
 #[pyclass(name = "NativeDiagnostics", skip_from_py_object)]
@@ -77,6 +90,10 @@ struct PyExecutionResult {
     diagnostics: Option<PyDiagnostics>,
     #[pyo3(get)]
     auto_rolled_back: bool,
+    /// L-2: 回滚保障失效标记 — guard 出错时置 true (fail-loud, 不静默)。
+    /// 与 auto_rolled_back 互补: 后者表 "已回滚", 此字段表 "本应回滚但保障不可用"。
+    #[pyo3(get)]
+    rollback_unavailable: bool,
     /// M-OPS-06: 跨层关联 id (回填请求侧或入口自动生成)
     #[pyo3(get)]
     trace_id: Option<String>,
@@ -97,6 +114,7 @@ impl From<RsResult> for PyExecutionResult {
             snapshot_id: r.snapshot_id,
             diagnostics: r.diagnostics.map(PyDiagnostics::from),
             auto_rolled_back: r.auto_rolled_back,
+            rollback_unavailable: r.rollback_unavailable,
             trace_id: r.trace_id,
         }
     }
@@ -352,11 +370,15 @@ impl PyShellInfo {
 }
 
 /// chunk: {"type":"chunk","data":"..."} / done: {"type":"done","result":{...ExecutionResult}}
-/// 通道关闭 → StopIteration
+/// 通道关闭 + saw_done → StopIteration; 通道关闭 + !saw_done → PyRuntimeError (C-4)
 #[pyclass(name = "NativeStreamIterator", skip_from_py_object)]
 struct PyStreamIterator {
     rx: Option<tokio::sync::mpsc::Receiver<ExecutionStreamEvent>>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    /// C-4: 是否已发 Done 帧。recv()→None (通道关闭) 时, !saw_done = 转发任务 panic/abort
+    /// 未发 Done (fe-core catch_unwind 兜底但仍可能通道先关), 抛 PyRuntimeError 非 StopIteration
+    /// (干净 EOF vs 任务崩不可区分 → 都当干净吞结果, Agent 循环看似成功无结果)。
+    saw_done: bool,
 }
 
 impl PyStreamIterator {
@@ -367,6 +389,7 @@ impl PyStreamIterator {
         Self {
             rx: Some(rx),
             handle: Some(handle),
+            saw_done: false,
         }
     }
 
@@ -397,19 +420,46 @@ impl PyStreamIterator {
             Some(rx) => rx,
             None => return Err(pyo3::exceptions::PyStopIteration::new_err("exhausted")),
         };
-        // detach GIL, 在 BLOCKING_RT 上收帧 (与 execute_sync 同 runtime, 避免嵌套 panic)
-        let ev = py.detach(|| fe_core::BLOCKING_RT.block_on(rx.recv()));
-        let ev: ExecutionStreamEvent = match ev {
-            Some(e) => e,
-            None => {
-                // 通道关闭 → 释放 handle, 抛 StopIteration
-                self.rx = None;
-                if let Some(h) = self.handle.take() {
-                    fe_core::BLOCKING_RT.block_on(async {
-                        let _ = h.await;
-                    });
+        // C-3: 每帧 recv deadline — 病态命令卡转发任务时 recv() 永久阻塞楔死 Python 消费者。
+        // 超时 → PyTimeoutError (非 StopIteration — 超时是错, 非干净 EOF)。沙箱心跳守叶子,
+        // 此 deadline 守 IPC 桥 (PTY 死锁/D 态/runtime 饱和/满通道 不会让 recv() 返)。
+        // C-4: 三态显式区分 — Ok(Some)=帧, Ok(None)=通道关, Err(Elapsed)=超时。
+        // 通道关 + !saw_done = 转发任务 panic/abort 未发 Done → PyRuntimeError (非 StopIteration)。
+        // fe-core catch_unwind 兜底发显式 Done, 但 spawn 任务被 abort (Drop) 时通道先关仍可能无 Done。
+        let outcome: Result<Option<ExecutionStreamEvent>, ()> = py.detach(|| {
+            // C-3: timeout 须在 block_on 的 async 块内构造 — 外层构造的 tokio::time::timeout
+            // 的 Sleep 在 block_on 前 poll 时无 reactor (panic "no reactor running")。
+            let secs = STREAM_RECV_TIMEOUT_SECS;
+            fe_core::BLOCKING_RT.block_on(async {
+                match tokio::time::timeout(Duration::from_secs(secs), rx.recv()).await {
+                    Ok(opt) => Ok(opt),
+                    Err(_elapsed) => {
+                        tracing::error!(secs, "流式 recv 超时 — 转发任务楔死, 抛 PyTimeoutError");
+                        Err(())
+                    }
                 }
-                return Err(pyo3::exceptions::PyStopIteration::new_err("done"));
+            })
+        });
+        let ev = match outcome {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                // 通道关闭: saw_done=干净 EOF→StopIteration; !saw_done=任务崩未发 Done→PyRuntimeError
+                self.rx = None;
+                self.join_forward_task();
+                if self.saw_done {
+                    return Err(pyo3::exceptions::PyStopIteration::new_err("done"));
+                }
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "stream ended without Done frame — 转发任务 panic/abort 未发 Done, 结果丢失",
+                ));
+            }
+            Err(()) => {
+                // C-3: 超时 — 通道未关, 但转发任务楔死。abort 任务, 抛 PyTimeoutError。
+                self.rx = None;
+                self.join_forward_task();
+                return Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "流式 recv 超时 ({STREAM_RECV_TIMEOUT_SECS}s) — 转发任务楔死"
+                )));
             }
         };
         // serde → JSON 字符串 → python json.loads → dict (与 gui_action 路径一致)
@@ -420,14 +470,23 @@ impl PyStreamIterator {
             .call_method1("loads", (json_str,))?
             .unbind();
         if matches!(ev, ExecutionStreamEvent::Done(_)) {
+            self.saw_done = true;
             self.rx = None;
-            if let Some(h) = self.handle.take() {
-                fe_core::BLOCKING_RT.block_on(async {
-                    let _ = h.await;
-                });
-            }
+            self.join_forward_task();
         }
         Ok(obj)
+    }
+
+    /// C-3: join 转发任务带 5s 超时, 超时 abort (避免 Python 消费者等悬挂任务)。
+    fn join_forward_task(&mut self) {
+        if let Some(h) = self.handle.take() {
+            let joined = fe_core::BLOCKING_RT.block_on(async {
+                tokio::time::timeout(Duration::from_secs(JOIN_TIMEOUT_SECS), h).await
+            });
+            if joined.is_err() {
+                tracing::warn!("join 转发任务超时 {JOIN_TIMEOUT_SECS}s, abort");
+            }
+        }
     }
 }
 
@@ -467,17 +526,35 @@ impl PyTelemetryIterator {
             Some(rx) => rx,
             None => return Err(pyo3::exceptions::PyStopIteration::new_err("exhausted")),
         };
-        let sample = py.detach(|| fe_core::BLOCKING_RT.block_on(rx.recv()));
-        let sample: TelemetrySample = match sample {
-            Some(s) => s,
-            None => {
-                self.rx = None;
-                if let Some(h) = self.handle.take() {
-                    fe_core::BLOCKING_RT.block_on(async {
-                        let _ = h.await;
-                    });
+        // C-3: idle 超时 — 遥测源 10Hz (interval_ms=100), TELEMETRY_IDLE_TIMEOUT_SECS 无帧 = 源任务死。
+        // 三态: Ok(Some)=帧, Ok(None)=通道关 (干净 EOF→StopIteration), Err(Elapsed)=idle 超时→PyTimeoutError。
+        let outcome: Result<Option<TelemetrySample>, ()> = py.detach(|| {
+            // C-3: timeout 须在 block_on 的 async 块内构造 (同 PyStreamIterator — 外层构造的
+            // tokio::time::timeout Sleep 在 block_on 前 poll 时无 reactor, panic)。
+            let secs = TELEMETRY_IDLE_TIMEOUT_SECS;
+            fe_core::BLOCKING_RT.block_on(async {
+                match tokio::time::timeout(Duration::from_secs(secs), rx.recv()).await {
+                    Ok(opt) => Ok(opt),
+                    Err(_elapsed) => {
+                        tracing::error!(secs, "遥测 idle 超时 — 采样任务死, 抛 PyTimeoutError");
+                        Err(())
+                    }
                 }
+            })
+        });
+        let sample = match outcome {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                self.rx = None;
+                self.join_sampler();
                 return Err(pyo3::exceptions::PyStopIteration::new_err("done"));
+            }
+            Err(()) => {
+                self.rx = None;
+                self.join_sampler();
+                return Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "遥测 idle 超时 ({TELEMETRY_IDLE_TIMEOUT_SECS}s) — 采样任务死"
+                )));
             }
         };
         let json_str = serde_json::to_string(&sample).map_err(|e| {
@@ -489,12 +566,26 @@ impl PyTelemetryIterator {
             .unbind();
         Ok(obj)
     }
+
+    /// C-3: join 采样任务带 5s 超时, 超时 abort。
+    fn join_sampler(&mut self) {
+        if let Some(h) = self.handle.take() {
+            let joined = fe_core::BLOCKING_RT.block_on(async {
+                tokio::time::timeout(Duration::from_secs(JOIN_TIMEOUT_SECS), h).await
+            });
+            if joined.is_err() {
+                tracing::warn!("join 采样任务超时 {JOIN_TIMEOUT_SECS}s, abort");
+            }
+        }
+    }
 }
 
 #[pyclass(name = "NativeExecutor", skip_from_py_object)]
 struct PyExecutor {
-    inner: Executor,
-    extra_whitelist: Vec<String>,
+    // A-4: Arc<Executor> — serve() 共享同一 Arc 而非重建 Executor。SIGHUP 重载白名单
+    // (reload_extra_whitelist 改 Executor 内 ArcSwap) 跨 in-process 与 serve-path 持久;
+    // 旧版 serve 重建 Executor → in-process self.inner 白名单与 serve-path 离婚。
+    inner: Arc<Executor>,
     // M-ARCH-1: ShellRegistry 归 PyExecutor (非 Executor)。serve() 时 self.shells.clone()
     // (Arc 浅拷) 共享进 IpcServer — in-process path 与 serve-path 同一 registry, serve 重启不丢句柄。
     shells: Arc<ShellRegistry>,
@@ -505,6 +596,8 @@ impl PyExecutor {
     #[new]
     #[pyo3(signature = (extra_whitelist=None))]
     fn new(extra_whitelist: Option<Vec<String>>) -> Self {
+        // extra_whitelist 经 with_extra_whitelist 烘焙进 inner 的 ArcSwap; A-4 后 serve() 共享
+        // inner, 无需单独存。SIGHUP reload 从 FUSION_EXECUTOR_EXTRA_WHITELIST env 读 (m-OPS-02)。
         let extras: Vec<&str> = extra_whitelist
             .as_deref()
             .unwrap_or(&[])
@@ -518,8 +611,7 @@ impl PyExecutor {
             Executor::new().with_extra_whitelist(&extras)
         };
         Self {
-            inner,
-            extra_whitelist: extra_whitelist.unwrap_or_default(),
+            inner: Arc::new(inner),
             shells: Arc::new(ShellRegistry::new()),
         }
     }
@@ -1115,23 +1207,17 @@ impl PyExecutor {
     }
 
     /// serve(sock_path=None) — 启动 UDS JSON-RPC 2.0 服务器, 永驻直到进程退出
-    /// P-PYO3-01: serve 用独立 Executor::new() 而非 self.inner — Executor 每任务无状态
-    /// (CLAUDE.md 约定: consecutive-failure counting owned by caller), 跨调用无共享状态,
-    /// 故 serve 的 IPC 请求与进程内 self.inner.execute 语义等价。隔离避免长驻 serve 影响
-    /// 调用方持有的 self.inner (如 serve 内命令改动 cwd 影响进程内调用)。
+    /// A-4: 共享 self.inner (Arc<Executor>) 而非重建 — SIGHUP 重载白名单跨 in-process/serve 持久。
+    /// Executor 每任务无状态 (CLAUDE.md), Arc 共享不改无状态语义; 仅白名单 (ArcSwap 内部可变) 共享。
     fn serve(&self, py: pyo3::Python<'_>, sock_path: Option<String>) -> PyResult<()> {
         // M-OPS-01: fe_ipc::logging init_tracing — JSON+滚动文件 (FE_LOG_DIR) + stderr,
         // EnvFilter 运行时可 reload (SIGHUP, m-OPS-02)。幂等, handle 存 fe-ipc 静态。
         let _ = fe_ipc::logging::init_tracing();
         let sock = IpcServer::resolve_sock(sock_path.as_deref());
-        let extras: Vec<&str> = self.extra_whitelist.iter().map(String::as_str).collect();
-        let exec = if extras.is_empty() {
-            Executor::new()
-        } else {
-            Executor::new().with_extra_whitelist(&extras)
-        };
-        let server = IpcServer::with_executor_and_shells(exec, self.shells.clone());
-        tracing::info!(sock = %sock, "PyO3 serve() — 启动 IPC 服务器 (释 GIL, 信号可停)");
+        // A-4: 共享 Executor Arc — in-process path 与 serve-path 同一白名单 (SIGHUP 重载两者皆生效)。
+        let server =
+            IpcServer::with_executor_arc_and_shells(self.inner.clone(), self.shells.clone());
+        tracing::info!(sock = %sock, "PyO3 serve() — 启动 IPC 服务器 (共享 Executor Arc, 释 GIL, 信号可停)");
         // C-PYO3-02: 释 GIL 跑 serve_blocking — Rust 侧 tokio::signal 监听 SIGINT/SIGTERM
         // 中断 accept_loop (不依赖 Python 信号 handler, 后者在 GIL 持有时不执行)。
         // py.detach 释 GIL 期间 Python 信号 handler 亦可运行; 双路皆干净退出。

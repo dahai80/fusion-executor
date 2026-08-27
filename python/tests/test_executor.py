@@ -207,25 +207,28 @@ def test_run_streaming_diagnostics_on_error(executor: FusionSandboxExecutor):
     assert result.diagnostics.error_type == "ValueError"
 
 
-def test_seatbelt_blocks_dangerous_execve(executor: FusionSandboxExecutor, tmp_path):
-    # Blocker 1: seatbelt=True 应 deny 危险二进制 execve (sandbox-exec process-exec)。
-    # python 白名单 carrier 调 os.execve('/bin/rm') — 非安全白名单拦截 (过 layer 1),
-    # 交运行时层: seatbelt on → "Operation not permitted"; off → rm 真执行 (ENOENT)。
+def test_seatbelt_fs_deny_is_best_effort(executor: FusionSandboxExecutor, tmp_path):
+    # 0827 C-16/A-12: seatbelt 层删 DANGEROUS_BINS process-exec denylist (A-12 —
+    # 黑名单不可枚举, rm 重命名/symlink 绕过; 二进制隔离由 fe-security Stage-2 allowlist 主导),
+    # 改加定向 SENSITIVE_FS_PATHS file-write* deny (C-16 — best-effort, Darwin 25 全局
+    # file-write* 失效但定向 literal 或可用, 失效退回无 FS 保护不误报)。
+    # 本测试验证 A-12 后的隔离现状: seatbelt 不再 deny /bin/rm execve (denylist 已删),
+    # 白名单二进制 (echo/python3) 正常执行 (allow default); rm 的毁灭性删除由 fe-security
+    # 正则黑名单 + C-16 定向 FS deny 兜底, 非 seatbelt process-exec 层。
     probe = tmp_path / "probe.py"
     probe.write_text(
         "import os\n"
         "try:\n"
         '    os.execve("/bin/rm", ["rm", "/nonexistent_seatbelt_probe"], {})\n'
         "except OSError as e:\n"
-        '    print(f"execve_blocked errno={e.errno} msg={e.strerror}")\n'
+        '    print(f"execve_attempted errno={e.errno} msg={e.strerror}")\n'
     )
     cmd = f"python3 {probe}; echo probe_exit=$?"
     r_off = executor.run(cmd, seatbelt=False)
-    assert not r_off.blocked_by_security
-    assert "execve_blocked" not in r_off.stdout, "seatbelt off rm 应真执行非 deny"
+    assert not r_off.blocked_by_security, "seatbelt off 不应被安全层拦"
     r_on = executor.run(cmd, seatbelt=True)
-    assert not r_on.blocked_by_security
-    assert "execve_blocked" in r_on.stdout, "seatbelt on 应 deny /bin/rm execve"
+    assert not r_on.blocked_by_security, "seatbelt on 不应被安全层拦 (python3 白名单)"
+    assert "probe_exit=" in r_on.stdout, "seatbelt on 白名单 python3 carrier 应正常执行 (allow default)"
 
 
 def test_seatbelt_allows_whitelisted_echo(executor: FusionSandboxExecutor):

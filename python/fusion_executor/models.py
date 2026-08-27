@@ -78,6 +78,10 @@ class ExecutionResult(BaseModel):
     snapshot_id: str | None = None
     diagnostics: Diagnostics | None = None
     auto_rolled_back: bool = False
+    rollback_unavailable: bool = Field(
+        default=False,
+        description="回滚保障失效标记 — guard 出错时置 true (fail-loud, 不静默); 与 auto_rolled_back 互补",
+    )
     trace_id: str | None = Field(
         default=None, description="跨层关联 id — 回填请求侧 trace_id 或入口自动生成 (M-OPS-06)"
     )

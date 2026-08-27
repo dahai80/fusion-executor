@@ -129,15 +129,17 @@ class FusionSandboxExecutor:
             snapshot_id=native.snapshot_id,
             diagnostics=diag,
             auto_rolled_back=native.auto_rolled_back,
+            rollback_unavailable=native.rollback_unavailable,
             trace_id=native.trace_id,
         )
         logger.info(
-            "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s dur=%.3fs",
+            "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s rb_unavail=%s dur=%.3fs",
             result.exit_code,
             result.blocked_by_security,
             result.timed_out,
             result.diagnostics.error_type if result.diagnostics else None,
             result.auto_rolled_back,
+            result.rollback_unavailable,
             result.duration_sec,
         )
         return result
