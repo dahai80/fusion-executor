@@ -1611,8 +1611,10 @@ mod tests {
     #[test]
     fn nproc_cpu_injection_observable() {
         let sb = Sandbox::new();
+        // 注入经 `ulimit -u/-t`; setrlimit 软上限不能超硬上限 — CI runner 硬上限可能 < 请求值
+        // (如 1333), 内核静默 clamp。探测 soft+hard, 断言 soft ≤ 请求 且 ≤ 硬上限, 不写死 2048。
         let cfg = SandboxConfig {
-            command: "python3 -c 'import resource; print(\"NPROC\", resource.getrlimit(resource.RLIMIT_NPROC)[0]); print(\"CPU\", resource.getrlimit(resource.RLIMIT_CPU)[0])'".to_string(),
+            command: "python3 -c 'import resource; print(\"NPROC\", resource.getrlimit(resource.RLIMIT_NPROC)[0], resource.getrlimit(resource.RLIMIT_NPROC)[1]); print(\"CPU\", resource.getrlimit(resource.RLIMIT_CPU)[0])'".to_string(),
             timeout_sec: 20.0,
             // nproc=2048: 够 sh+python3 spawn (Darwin RLIMIT_NPROC per-UID, 系统占用高),
             // 但值经 ulimit -u 注入后 setrlimit 跨 exec 继承, python3 读回确证注入生效。
@@ -1633,9 +1635,28 @@ mod tests {
             "rlimit 探测应 exit 0, exit={} stdout={}",
             r.exit_code, r.stdout
         );
+        let nproc_line = r
+            .stdout
+            .lines()
+            .find(|ln| ln.starts_with("NPROC"))
+            .unwrap_or_else(|| panic!("stdout 应含 NPROC 行, stdout={}", r.stdout));
+        let parts: Vec<&str> = nproc_line.split_whitespace().collect();
+        assert_eq!(parts.len(), 3, "NPROC 行应有 soft+hard, 得 {nproc_line}");
+        let nproc_soft: u64 = parts[1].parse().expect("soft NPROC 应为数字");
+        let nproc_hard: u64 = parts[2].parse().expect("hard NPROC 应为数字");
         assert!(
-            r.stdout.contains("NPROC 2048"),
-            "子进程应观测到注入的 RLIMIT_NPROC=2048, stdout={}",
+            nproc_soft <= 2048,
+            "软 NPROC 应 ≤ 请求 2048, 得 {nproc_soft} stdout={}",
+            r.stdout
+        );
+        assert!(
+            nproc_soft <= nproc_hard,
+            "软 NPROC 应 ≤ 硬上限, soft={nproc_soft} hard={nproc_hard} stdout={}",
+            r.stdout
+        );
+        assert!(
+            nproc_soft > 0,
+            "注入后 NPROC 应非零, 得 {nproc_soft} stdout={}",
             r.stdout
         );
         assert!(
