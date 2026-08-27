@@ -1611,3 +1611,142 @@ def test_list_shells_over_uds_roundtrip(uds_server: str):
     assert isinstance(lst["result"], list)
     assert len(lst["result"]) >= 1
     assert all("shell_id" in e and "command" in e for e in lst["result"])
+
+
+# ── #104 P-2/M-4/M-6 Python 层修复 ──
+
+
+def test_m4_native_import_failure_warns(monkeypatch):
+    # M-4: _native 导入失败应 warn (fail-visible), 非静默吞 ABI/链接错误。
+    # 模拟 native 扩展缺失: importlib 触发 ImportError → __init__ 回退 + warn。
+    import importlib
+
+    # 用独立模块名重载 __init__, 隔离对全局已加载 fusion_executor 的影响:
+    # 直接 monkeypatch sys.modules 注入坏 _native, 再 reload。
+    import sys
+    import warnings
+
+    import fusion_executor
+
+    class _BrokenNative:
+        def __getattr__(self, name):
+            raise ImportError(f"模拟 native 加载失败: {name}")
+
+    monkeypatch.setitem(sys.modules, "fusion_executor._native", _BrokenNative())
+    # __init__ 的 try/except 用 `from ._native import version_info`, 触发 ImportError
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        importlib.reload(fusion_executor)
+    monkeypatch.delitem(sys.modules, "fusion_executor._native", raising=False)
+    # 还原真实 _native (后续测试依赖), reload 回真实扩展
+    importlib.reload(fusion_executor)
+    # 断言: warn 发出 RuntimeWarning 提及 native 加载失败
+    rw = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert any("native" in str(w.message) or "加载" in str(w.message) for w in rw), (
+        f"native 导入失败应 warn, 得 {[str(w.message) for w in caught]}"
+    )
+
+
+def test_m6_run_streaming_unknown_frame_skipped(executor: FusionSandboxExecutor, caplog):
+    # M-6: run_streaming 收未知帧 type 不抛 (向前兼容), debug 记录可追溯。
+    # 用 monkeypatch 替换 _native.execute_streaming 返回未知帧序列 + 正常 done 帧。
+    import logging
+
+    class _FakeStream:
+        def __init__(self):
+            self._frames = [
+                {"type": "chunk", "data": "ok-chunk"},
+                {"type": "future_frame_kind", "payload": {"x": 1}},  # 未知 type
+                {
+                    "type": "done",
+                    "exit_code": 0,
+                    "stdout": "ok-chunk",
+                    "stderr": "",
+                    "blocked_by_security": False,
+                    "timed_out": False,
+                },
+            ]
+            self._i = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._i >= len(self._frames):
+                raise StopIteration
+            f = self._frames[self._i]
+            self._i += 1
+            return f
+
+    orig_native = executor._native
+
+    class _FakeNative:
+        def execute_streaming(self, *a, **k):
+            return _FakeStream()
+
+    executor._native = _FakeNative()  # type: ignore[assignment]
+    try:
+        chunks: list[str] = []
+        result = None
+        with caplog.at_level(logging.DEBUG, logger="fusion_executor"):
+            for frame in executor.run_streaming("echo hi", enable_rollback_snapshot=False):
+                if isinstance(frame, ExecutionResult):
+                    result = frame
+                else:
+                    chunks.append(frame)
+    finally:
+        executor._native = orig_native  # type: ignore[assignment]
+    assert result is not None
+    assert result.exit_code == 0
+    assert chunks == ["ok-chunk"], "未知帧应跳过不抛, 仅 chunk 产出"
+    # M-6 核心: debug 日志记录未知 type (可追溯)
+    assert any("future_frame_kind" in rec.getMessage() for rec in caplog.records), "未知帧 type 应 debug 记录"
+
+
+def test_p2_subscription_buf_cap_returns_none():
+    # P-2: _buf 超 _SUB_BUF_MAX_BYTES → 丢弃缓冲返 None (当流结束), 不 OOM。
+    # 构造一个 Subscription (不连真实 socket), monkeypatch recv 返无 newline 超大块。
+    from fusion_executor.executor import _SUB_BUF_MAX_BYTES, Subscription
+
+    sub = Subscription.__new__(Subscription)
+    sub._buf = b""
+
+    class _FakeSock:
+        def __init__(self):
+            self.calls = 0
+
+        def recv(self, n):
+            self.calls += 1
+            if self.calls == 1:
+                # 单块超 cap (无 newline) → 触发截断
+                return b"x" * (_SUB_BUF_MAX_BYTES + 1024)
+            return b""
+
+    sub._sock = _FakeSock()
+    out = sub._read_json()
+    assert out is None, "超 cap 损坏流应返 None 当流结束"
+    assert sub._buf == b"", "截断后 _buf 清空"
+
+
+def test_p2_subscription_buf_normal_line_still_works():
+    # P-2: cap 不影响正常 newline 分帧 (回归守卫)。
+    from fusion_executor.executor import Subscription
+
+    sub = Subscription.__new__(Subscription)
+    sub._buf = b""
+
+    class _FakeSock:
+        def __init__(self):
+            self.sent = False
+
+        def recv(self, n):
+            if not self.sent:
+                self.sent = True
+                return b'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'
+            return b""
+
+    sub._sock = _FakeSock()
+    out = sub._read_json()
+    assert out is not None
+    assert out["id"] == 1
+    assert out["result"]["ok"] is True

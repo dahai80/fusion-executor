@@ -29,6 +29,8 @@ logger = logging.getLogger("fusion_executor")
 
 DEFAULT_SOCK = "/tmp/fusion-executor.sock"
 SUB_CHANNELS = ("telemetry", "stdio", "screenshot")
+# P-2: subscription 行缓冲上限 — 损坏流 (无 newline) / 超巨帧防护, 超则丢缓冲当流结束
+_SUB_BUF_MAX_BYTES = 8 * 1024 * 1024
 
 
 class FusionSandboxExecutor:
@@ -228,6 +230,9 @@ class FusionSandboxExecutor:
                 )
                 yield result
                 return
+            else:
+                # M-6: 未知帧 type (协议演进新帧/损坏帧) — 不抛保向前兼容, 但 debug 记录可追溯
+                logger.debug("未知流帧 type=%r, 跳过 (向前兼容)", ftype)
 
     def _native_result(self, payload: dict) -> ExecutionResult:
         # L-PY-02: 严格校验 (旧 .get(default) 吞缺失字段, Rust 改字段名/serde bug 时
@@ -755,6 +760,12 @@ class Subscription:
             if not chunk:
                 return None
             self._buf += chunk
+            # P-2: 行缓冲无界增长防护 — 损坏流 (无 newline) 或超巨帧会撑爆 _buf。
+            # 截断丢缓冲并 warn, 当流结束 (比 OOM 强; 下次 recv 无 \n 仍 None)。
+            if len(self._buf) > _SUB_BUF_MAX_BYTES:
+                logger.warning("subscription _buf 超 %d 字节, 丢弃 (损坏流/超巨帧)", _SUB_BUF_MAX_BYTES)
+                self._buf = b""
+                return None
         line, self._buf = self._buf.split(b"\n", 1)
         text = line.decode("utf-8").strip()
         if not text:

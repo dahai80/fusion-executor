@@ -96,6 +96,24 @@ def test_cli_env_flag_passes_value():
     assert "on" in json.loads(out)["stdout"]
 
 
+def test_cli_m5_bad_cwd_exits_2():
+    # M-5: --cwd 目录不存在 → 启动期 fail-fast sys.exit(2), 非延迟到首请求
+    import pytest
+
+    with pytest.raises(SystemExit) as ei:
+        _run_main(["fusion-executor", "echo hi", "--cwd", "/nonexistent/m5/cwd/xyz"])
+    assert ei.value.code == 2
+
+
+def test_cli_m5_bad_sock_parent_exits_2():
+    # M-5: --sock 父目录不存在 → serve 模式 fail-fast sys.exit(2)
+    import pytest
+
+    with pytest.raises(SystemExit) as ei:
+        _run_main(["fusion-executor", "--serve", "--sock", "/nonexistent/m5/sock/parent/fe.sock"])
+    assert ei.value.code == 2
+
+
 def test_cli_serve_flag_starts_and_cleans_socket():
     # M-CLI-01 + C-PYO3-02: --serve 启 UDS server, SIGTERM 后 finally 清理 socket
     import os
