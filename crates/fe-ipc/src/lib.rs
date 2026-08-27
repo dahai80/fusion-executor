@@ -1452,10 +1452,7 @@ async fn handle_telemetry_stream(
         .get("max_samples")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let pid = params
-        .get("pid")
-        .and_then(|v| v.as_u64())
-        .map(|p| p as u32);
+    let pid = params.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
     let cfg = TelemetryStreamConfig {
         interval_ms,
         max_samples,
@@ -1804,7 +1801,10 @@ async fn handle_method(
                 .get("max_idle_sec")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(fe_core::shell::DEFAULT_MAX_IDLE_SEC);
-            let kill_grace_ms = params.get("kill_grace_ms").and_then(|v| v.as_u64()).unwrap_or(500);
+            let kill_grace_ms = params
+                .get("kill_grace_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(500);
             let sp = fe_core::shell::ShellStartParams {
                 command,
                 cwd,
