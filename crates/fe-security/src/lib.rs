@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Error)]
 pub enum SecurityError {
@@ -77,6 +77,14 @@ const SENSITIVE_PATHS: &[&str] = &[
 ];
 
 /// 命令白名单 — 二进制程序白名单 (argv[0] 校验)
+/// A-1: validate_argv 默认 arm — 公认只读无害二进制 (无专门 argv arm 但不改 fs/不执行任意命令/
+/// 不网络), 显式枚举走 Ok。其余白名单二进制 (解释器/构建链/SIGHUP extras) 走 warn 分支暴露校验缺口。
+/// 判据: 是否 "按设计就执行任意代码/联网/改文件系统" — 是则不列入 (交 seatbelt+UDS 纵深 + warn 日志)。
+const READONLY_NOARM_BINARY: &[&str] = &[
+    "ls", "echo", "pwd", "which", "file", "wc", "sort", "uniq", "stat", "du", "df", "tr", "cut",
+    "diff", "cmp", "fd", "exa", "true", "false", "test", "rmdir", "mkdir", "touch",
+];
+
 const WHITELIST: &[&str] = &[
     "python",
     "python3",
@@ -513,7 +521,25 @@ impl SecurityGuard {
                 Ok(())
             }
             "git" => self.validate_git_argv(args),
-            _ => Ok(()),
+            // A-1: 默认 arm — 旧版 `_ => Ok(())` 对任何无专门 arm 的白名单二进制零 argv 校验,
+            // 新增白名单二进制 (SIGHUP extra / builder) 立获 "零校验" 待遇。Stage-2 whitelist 只校验
+            // 二进制名不校验参数, 危险在参数 (rm -rf 的危险在 -rf 不在 rm)。把 "未知" 当 "安全" 违反 fail-closed。
+            // 修正: 公认只读无害工具 (不改 fs/不执行任意命令/不网络) 显式枚举 → Ok;
+            // 其余 (含 SIGHUP extras) 记 warn 暴露 argv 校验缺口 → 仍 Ok (不破 trusted-caller 工具链,
+            // 真实威胁由 seatbelt C-SEC-02 + UDS 鉴权 M-SEC-01 纵深封堵, 见 C-SEC-03 边界注释)。
+            // warn 是 fail-loud 的 "log 证据" — 运维可见 extra 工具零校验, 决定是否加专门 arm 或叠加 seatbelt。
+            other => {
+                if READONLY_NOARM_BINARY.contains(&other) {
+                    Ok(())
+                } else {
+                    warn!(
+                        binary = other,
+                        argc = args.len(),
+                        "argv 校验缺口: 白名单二进制无专门 argv 守卫 (extra/toolchain); 依赖 seatbelt+UDS 鉴权纵深"
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -1783,5 +1809,48 @@ mod tests {
         // `su root -`
         let v = guard().validate("su root -");
         assert!(!v.allowed, "su root - 应拦");
+    }
+
+    // ── 0827 审计 A-1 回归 (validate_argv 默认 arm) ──
+
+    // A-1: 只读无害二进制 (ls) 无专门 arm → Ok (READONLY_NOARM_BINARY 静默放行)
+    #[test]
+    fn a1_readonly_noarm_binary_allowed() {
+        let v = guard().validate("ls -la /tmp");
+        assert!(v.allowed, "只读 ls 应允许, reason={:?}", v.reason);
+        assert_eq!(v.stage, None, "通过校验无拦截 stage");
+    }
+
+    // A-1: 工具链二进制 (cargo, 白名单内) 无专门 arm → warn 但 Ok (不破 trusted-caller 工具链)
+    // 真实威胁由 seatbelt C-SEC-02 + UDS 鉴权 M-SEC-01 纵深封堵, 非 argv 校验
+    #[test]
+    fn a1_toolchain_noarm_binary_warn_but_allowed() {
+        let v = guard().validate("cargo build --release");
+        assert!(
+            v.allowed,
+            "cargo 工具链应 warn 但 Ok (不破 trusted-caller), reason={:?}",
+            v.reason
+        );
+    }
+
+    // A-1: extra 白名单二进制 (SIGHUP 注入) 无专门 arm → warn 但 Ok
+    #[test]
+    fn a1_extra_whitelist_noarm_warn_but_allowed() {
+        let g = SecurityGuard::new().with_extra_whitelist(&["jq"]);
+        let v = g.validate("jq '.field' input.json");
+        assert!(
+            v.allowed,
+            "extra jq 应 warn 但 Ok (SIGHUP 注入工具链), reason={:?}",
+            v.reason
+        );
+    }
+
+    // A-1: READONLY_NOARM_BINARY 不含危险解释器 — 被拦截的是 Stage-1 regex / DENY_EXTEND, 非 argv arm
+    #[test]
+    fn a1_dangerous_interpreter_still_blocked_by_regex() {
+        // bash 在 DENY_EXTEND, 即使强行加 extra 也不入白名单 → Stage-2 拦
+        let g = SecurityGuard::new().with_extra_whitelist(&["bash"]);
+        let v = g.validate("bash -c 'rm -rf /'");
+        assert!(!v.allowed, "bash 不入白名单, 应被 Stage-2 拦");
     }
 }

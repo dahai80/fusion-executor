@@ -224,15 +224,8 @@ impl Tools {
                 matches: 0,
             });
         }
-        // Blocker 8 / 3.5: 预检大小防 OOM (锁前查 metadata, 锁内不重复 stat)
-        if let Err(e) = check_size(&abs) {
-            return Ok(EditResult {
-                ok: false,
-                path: Some(path.to_string()),
-                error: Some(e.to_string()),
-                matches: 0,
-            });
-        }
+        // L-9: 先取锁再 check_size — 锁前查 metadata 留 TOCTOU 窗口 (并发方在 check→read 间扩文件过限,
+        // check Ok 但 read OOM)。锁内查大小: 并发 RMW 方亦持同 sidecar 锁, check→read 间文件大小稳定。
         // Blocker 8 / 3.4: flock LOCK_EX 包 RMW, 防并发编辑静默丢改动
         let lock = match FileLock::exclusive(&abs) {
             Ok(l) => l,
@@ -245,6 +238,15 @@ impl Tools {
                 });
             }
         };
+        // Blocker 8 / 3.5: 锁内预检大小防 OOM
+        if let Err(e) = check_size(&abs) {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(e.to_string()),
+                matches: 0,
+            });
+        }
         let content = FileLock::read_data_to_string(&abs)
             .with_context(|| format!("读取 {} 失败", abs.display()))?;
         let count = content.matches(old_string).count();
@@ -365,14 +367,7 @@ impl Tools {
                 matches: 0,
             });
         }
-        if let Err(e) = check_size(&abs) {
-            return Ok(EditResult {
-                ok: false,
-                path: Some(path.to_string()),
-                error: Some(e.to_string()),
-                matches: 0,
-            });
-        }
+        // L-9: 先取锁再 check_size (锁前查留 TOCTOU 窗口)
         let lock = match FileLock::exclusive(&abs) {
             Ok(l) => l,
             Err(e) => {
@@ -384,6 +379,14 @@ impl Tools {
                 });
             }
         };
+        if let Err(e) = check_size(&abs) {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(e.to_string()),
+                matches: 0,
+            });
+        }
         let mut buffer = FileLock::read_data_to_string(&abs)
             .with_context(|| format!("读取 {} 失败", abs.display()))?;
         let mut total_matches: u32 = 0;
@@ -466,14 +469,7 @@ impl Tools {
                 matches: 0,
             });
         }
-        if let Err(e) = check_size(&abs) {
-            return Ok(EditResult {
-                ok: false,
-                path: Some(path.to_string()),
-                error: Some(e.to_string()),
-                matches: 0,
-            });
-        }
+        // L-9: 先取锁再 check_size (锁前查留 TOCTOU 窗口)
         let lock = match FileLock::exclusive(&abs) {
             Ok(l) => l,
             Err(e) => {
@@ -485,6 +481,14 @@ impl Tools {
                 });
             }
         };
+        if let Err(e) = check_size(&abs) {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(e.to_string()),
+                matches: 0,
+            });
+        }
         let raw = FileLock::read_data_to_string(&abs)
             .with_context(|| format!("读取 {} 失败", abs.display()))?;
         let mut nb: serde_json::Value =
@@ -560,10 +564,30 @@ impl Tools {
                         n as usize
                     }
                     None => {
-                        // 无 cell_number 时, 有 cell_id → 定位后插其后; 否则追加末尾
-                        match locate(cells) {
-                            Ok(i) => i + 1,
-                            Err(_) => cells.len(),
+                        // L-12: 无 cell_number 时按 cell_id 定位后插其后。
+                        // 旧版 `Err(_) => cells.len()` 把 "cell_id 未找到" 与 "无 id 无 num" 合并静默 append —
+                        // 调用方传 id="bad" 想插特定位置, id 不存在却被静默追加末尾, API 契约三态不一致
+                        // (Replace/Delete 都报 missing-id)。修: cell_id 给了但没找到 → 报错 (同 Replace/Delete);
+                        // 调用方要 "插入或 append" 应显式传 cell_number=Some(cells.len())。
+                        if let Some(id) = cell_id {
+                            match cells
+                                .iter()
+                                .position(|c| c.get("id").and_then(|v| v.as_str()) == Some(id))
+                            {
+                                Some(i) => i + 1,
+                                None => {
+                                    drop(lock);
+                                    return Ok(EditResult {
+                                        ok: false,
+                                        path: Some(path.to_string()),
+                                        error: Some(format!("cell_id={} 未找到 (Insert 模式)", id)),
+                                        matches: 0,
+                                    });
+                                }
+                            }
+                        } else {
+                            // 无 cell_id 无 cell_number → 追加末尾 (显式 append 语义)
+                            cells.len()
                         }
                     }
                 };
@@ -890,15 +914,7 @@ impl Tools {
                     matches: total_hunks,
                 });
             }
-            // Blocker 8 / 3.5: 预检大小防 OOM
-            if let Err(e) = check_size(&abs) {
-                return Ok(EditResult {
-                    ok: false,
-                    path: Some(target_path.clone()),
-                    error: Some(e.to_string()),
-                    matches: total_hunks,
-                });
-            }
+            // L-9: 先取锁再 check_size (锁前查留 TOCTOU 窗口)
             // Blocker 8 / 3.4: flock LOCK_EX 包 RMW
             let lock = match FileLock::exclusive(&abs) {
                 Ok(l) => l,
@@ -911,6 +927,15 @@ impl Tools {
                     });
                 }
             };
+            // Blocker 8 / 3.5: 锁内预检大小防 OOM
+            if let Err(e) = check_size(&abs) {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(target_path.clone()),
+                    error: Some(e.to_string()),
+                    matches: total_hunks,
+                });
+            }
             let original = FileLock::read_data_to_string(&abs)
                 .with_context(|| format!("读取 {} 失败", abs.display()))?;
             let original_lines = original.lines().count();
@@ -939,16 +964,19 @@ impl Tools {
 
             let updated = diffy::apply(&original, &patch)
                 .map_err(|e| anyhow::anyhow!("patch 应用失败 ({}): {}", target_path, e))?;
-            // 安全校验: 确认输出文件仍 cwd 内 (防止 patch 改路径)
-            if let Ok(canonical) = abs.canonicalize() {
-                if !canonical.starts_with(&cwd_abs) {
-                    return Ok(EditResult {
-                        ok: false,
-                        path: Some(target_path),
-                        error: Some("patch 目标逃逸 cwd".to_string()),
-                        matches: total_hunks,
-                    });
-                }
+            // L-10: 安全校验 fail-closed — 确认输出文件仍 cwd 内 (防止 patch 改路径)。
+            // 旧版 `if let Ok(canonical)` 在 canonicalize 失败时静默跳过校验 (fail-open),
+            // 文件 symlink/IO 异常时逃逸检测被绕过。canonicalize 失败即无法确认边界 → 显式拒。
+            let canonical = abs
+                .canonicalize()
+                .with_context(|| format!("patch 目标路径解析失败: {}", abs.display()))?;
+            if !canonical.starts_with(&cwd_abs) {
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(target_path),
+                    error: Some("patch 目标逃逸 cwd".to_string()),
+                    matches: total_hunks,
+                });
             }
             atomic_write(&abs, &updated)?;
             drop(lock);
@@ -971,7 +999,9 @@ impl Tools {
     /// replace_function — tree-sitter 定位函数定义, 用 new_body 整体替换该函数
     /// (PRD §DeepSeek 外科补丁: 函数级替换, 避免全文件重写)
     /// new_body 为完整函数定义文本 (含签名 + 体), 替换原同函数名的定义
-    /// 支持语言: py/js/ts/rs; 按扩展选 grammar
+    /// 支持语言: py/js/ts/rs; 按扩展选 grammar。
+    /// M-12.1: 无 grammar 的扩展名 (go/sh/lua/...) **不回退正则** — 正则边界不可靠会误匹配同名
+    /// 方法/嵌套函数 + 结束边界靠猜会损坏文件, 已 fail-loud 拒绝 (改用 file_edit/apply_patch)。
     pub fn replace_function(
         &self,
         path: &str,
@@ -988,15 +1018,7 @@ impl Tools {
                 matches: 0,
             });
         }
-        // Blocker 8 / 3.5: 预检大小防 OOM (replace_function 尤甚: 读全文件 + 全量 parse)
-        if let Err(e) = check_size(&abs) {
-            return Ok(EditResult {
-                ok: false,
-                path: Some(path.to_string()),
-                error: Some(e.to_string()),
-                matches: 0,
-            });
-        }
+        // L-9: 先取锁再 check_size (锁前查留 TOCTOU 窗口)
         // Blocker 8 / 3.4: flock LOCK_EX 包 RMW
         let lock = match FileLock::exclusive(&abs) {
             Ok(l) => l,
@@ -1009,6 +1031,15 @@ impl Tools {
                 });
             }
         };
+        // Blocker 8 / 3.5: 锁内预检大小防 OOM (replace_function 尤甚: 读全文件 + 全量 parse)
+        if let Err(e) = check_size(&abs) {
+            return Ok(EditResult {
+                ok: false,
+                path: Some(path.to_string()),
+                error: Some(e.to_string()),
+                matches: 0,
+            });
+        }
         let content = FileLock::read_data_to_string(&abs)
             .with_context(|| format!("读取 {} 失败", abs.display()))?;
         let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -1362,8 +1393,11 @@ impl FileLock {
     }
 
     /// 从数据文件 (非锁文件) 读全内容 — 锁已持, 读 data_path 安全
+    /// M-12.2: 旧版裸 `std::fs::read_to_string` 错误消息 (如 "stream did not contain valid UTF-8")
+    /// 无文件名上下文 — 非 UTF-8 文件 (Latin-1/二进制配置) 失败时难定位。加文件名前缀到 io::Error。
     fn read_data_to_string(data_path: &Path) -> std::io::Result<String> {
         std::fs::read_to_string(data_path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {}", data_path.display(), e)))
     }
 }
 
@@ -1452,7 +1486,7 @@ fn locate_function(content: &str, ext: &str, fn_name: &str) -> Result<Option<Byt
     let kind = match function_node_kind(ext) {
         Some(k) => k,
         None => {
-            // 审计 3.12: 无 grammar 正则回退 — locate_function_regex 结束边界找下一行
+            // 审计 3.12 / M-12.1: 无 grammar 时无正则回退 — 正则结束边界靠找下一行
             // def/fn/function/export, 命中目标函数内部嵌套定义 → span 提前结束, 只换前几行,
             // 余下旧函数体 + 嵌套定义残留 → 文件语法损坏。无 AST 边界不可靠, fail-loud 拒绝。
             warn!(ext = ext, fn_name = %fn_name, "replace_function 无 grammar (ext={ext}), 拒绝正则回退 (边界不可靠, 损坏文件)");
@@ -1524,20 +1558,31 @@ fn count_hunk_lines(hunk: &diffy::Hunk<'_, str>) -> (u32, u32) {
     (added, removed)
 }
 
-/// 按 `--- ` 文件头切分多文件 unified diff 为单文件 diff 片段 (审计 3.8)。
+/// 按 `--- /+++ ` 文件头切分多文件 unified diff 为单文件 diff 片段 (审计 3.8)。
 ///
 /// diffy 0.4 `Patch::from_str` 在第二个 `--- ` 行报 "multiple '---' lines" 拒多文件。
 /// 真实 `git diff` 多文件工作流含多对 `--- /+++` 头, 须先切分再逐片段 from_str。
 ///
-/// 切分规则: 按行扫描, 每个 `--- ` 行起一个新文件片段 (含该 `--- ` 行 + 其后所有行,
-/// 直到下一个 `--- ` 行前)。跳过 `diff --git`/`index` 等 git 扩展头 (它们在首 `--- ` 前)。
-/// 单文件 diff (无第二个 `--- `) → 返回 1 元素 Vec。
+/// 切分规则: 按行扫描, 每个 `--- ` 行 (L-11: **且后跟 `+++ ` 行** 才算文件头) 起一个新文件片段
+/// (含该 `--- ` 行 + 其后所有行, 直到下一个 `--- `+`+++ ` 头前)。跳过 `diff --git`/`index` 等
+/// git 扩展头 (它们在首 `--- ` 前)。
+///
+/// L-11: 旧版仅 `starts_with("--- ")` 判头 — unified diff 删除行前缀 `-`, 若原源码行是 `-- foo`
+/// (Lua/SQL 注释/printf 格式串), diff 删除行 `--- foo` 匹配 `starts_with("--- ")` 触发 hunk 中段
+/// 误拆 → 两段皆畸形 → from_str 失败 → 合法 diff 被拒。修: peek ahead, 仅当 `--- ` 后跟 `+++ `
+/// 才算文件头 (文件头必成对, 删除行后的行非 `+++ `)。
+/// 单文件 diff (无第二个 `--- `+`+++ ` 头) → 返回 1 元素 Vec。
 fn split_multi_file_diff(diff: &str) -> Vec<String> {
     let lines: Vec<&str> = diff.lines().collect();
     let mut segments: Vec<String> = Vec::new();
     let mut current: Option<String> = None;
-    for line in &lines {
-        if line.starts_with("--- ") {
+    for i in 0..lines.len() {
+        let line = lines[i];
+        // L-11: 仅当 `--- ` 行后跟 `+++ ` 行才算新文件头 (成对出现),
+        // 避免误判删除行 `--- foo` (原源码 `-- foo`) 为头, 防 hunk 中段误拆。
+        let is_file_header =
+            line.starts_with("--- ") && i + 1 < lines.len() && lines[i + 1].starts_with("+++ ");
+        if is_file_header {
             // 新文件片段起点: 把已积累的片段推入, 开新片段
             if let Some(seg) = current.take() {
                 segments.push(seg);
@@ -3043,5 +3088,198 @@ mod tests {
             .collect();
         paths.sort();
         assert_eq!(paths, vec!["bin/ls"], "? 应恰匹配一字符, 不匹配 less");
+    }
+
+    // ── 0827 审计 P1 回归 (L-9/L-10/L-11/L-12/M-12.2) ──
+
+    // L-9: check_size 在锁内执行 — 超大文件 file_edit 仍被拒, 文件未变。
+    // TOCTOU 直接复现难 (需并发方在 check→read 间扩文件), 测不变量: 锁内 check 路径与原行为等价 (超限拒, 内容不变)。
+    #[test]
+    fn l9_check_size_under_lock_rejects_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("big.txt");
+        std::fs::write(&fp, "x = 1\n").unwrap();
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&fp).unwrap();
+            f.set_len(WRITE_FILE_MAX_BYTES + 1024).unwrap();
+        }
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools
+            .file_edit("big.txt", "x = 1", "x = 2", Some(&cwd), false)
+            .unwrap();
+        assert!(!r.ok, "超 64MB 应被锁内 check_size 拒");
+        assert!(r.error.unwrap().contains("超大小上限"));
+        // 内容未变 — 锁内拒不写
+        let s = std::fs::read_to_string(&fp).unwrap();
+        assert!(s.starts_with("x = 1"), "拒绝时不应改动文件");
+        // sidecar 锁文件残留 0 字节 (永不删), 但 data 文件未被 rename
+        assert!(fp.exists(), "data 文件应仍在原处");
+    }
+
+    // L-9: multi_edit 锁内 check_size 拒超大文件
+    #[test]
+    fn l9_multi_edit_check_size_under_lock_rejects_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("big.txt");
+        std::fs::write(&fp, "a\nb\n").unwrap();
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&fp).unwrap();
+            f.set_len(WRITE_FILE_MAX_BYTES + 512).unwrap();
+        }
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools
+            .multi_edit(
+                "big.txt",
+                &[MultiEditItem {
+                    old_string: "a".to_string(),
+                    new_string: "A".to_string(),
+                    replace_all: false,
+                }],
+                Some(&cwd),
+            )
+            .unwrap();
+        assert!(!r.ok, "超 64MB multi_edit 应被锁内 check_size 拒");
+        assert!(r.error.unwrap().contains("超大小上限"));
+    }
+
+    // L-10: apply_patch 旧版 `if let Ok(canonical)` 在 canonicalize 失败时静默跳过 cwd 校验 (fail-open)。
+    // 现版 fail-closed (`with_context?`)。symlink 逃逸由 guard_path (第一道门, 见 line 1189) 拦截,
+    // L-10 的 apply 后 canonicalize 是纵深冗余。测两路:
+    //   (a) cwd 内正常文件 apply_patch 仍成功 (fail-closed 不破正常路径)
+    //   (b) symlink 指向 cwd 外 → guard_path 拦 (纵深防御不漏)
+    #[test]
+    fn l10_apply_patch_normal_path_still_works_and_symlink_blocked() {
+        // (a) 正常路径不破
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("app.py");
+        std::fs::write(&fp, "ctx\nold\nctxb\n").unwrap();
+        let diff = "--- a/app.py\n+++ b/app.py\n@@ -1,3 +1,3 @@\n ctx\n-old\n+new\n ctxb\n";
+        let tools = Tools::new();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let r = tools.apply_patch(diff, Some(&cwd)).unwrap();
+        assert!(r.ok, "cwd 内正常 apply_patch 应成功: {:?}", r.error);
+        assert_eq!(std::fs::read_to_string(&fp).unwrap(), "ctx\nnew\nctxb\n");
+
+        // (b) symlink 逃逸 — guard_path 第一道门拦, apply_patch 返 Err (非 EditResult)
+        let dir2 = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real_file = outside.path().join("real.py");
+        std::fs::write(&real_file, "ctx\nold\nctxb\n").unwrap();
+        let link = dir2.path().join("link.py");
+        std::os::unix::fs::symlink(&real_file, &link).unwrap();
+        let diff2 = "--- a/link.py\n+++ b/link.py\n@@ -1,3 +1,3 @@\n ctx\n-old\n+new\n ctxb\n";
+        let cwd2 = dir2.path().to_string_lossy().to_string();
+        let res = tools.apply_patch(diff2, Some(&cwd2));
+        assert!(
+            res.is_err(),
+            "symlink 逃逸应被 guard_path 拦 (Err 非 EditResult)"
+        );
+        // 真实文件未变
+        assert_eq!(
+            std::fs::read_to_string(&real_file).unwrap(),
+            "ctx\nold\nctxb\n"
+        );
+    }
+
+    // L-11: 删除行 `--- foo` (原源码 `-- foo` Lua/SQL 注释) 不应被误判为新文件头。
+    // 旧版 starts_with("--- ") 误拆 hunk 中段 → 两片段均畸形 → Patch::from_str 拒。
+    // 现版 peek-ahead: `--- ` 仅当后跟 `+++ ` 才算头 → 单文件单片段, 补丁成功。
+    #[test]
+    fn l11_split_no_misjudge_deletion_line_as_header() {
+        // hunk 内含 `--- foo` 删除行 (后无 +++ ) — 应被当作删除行, 非新文件头
+        let diff =
+            "--- a/app.lua\n+++ b/app.lua\n@@ -1,3 +1,2 @@\n local x = 1\n--- foo\n+local x = 2\n";
+        let segs = split_multi_file_diff(diff);
+        assert_eq!(segs.len(), 1, "删除行 --- foo 不应误拆为新文件头");
+        assert!(segs[0].contains("--- foo"), "删除行应留在片段内");
+    }
+
+    // L-11: 真实多文件补丁 (含 hunk 内删除行) 仍正确拆 N 段
+    // 源码行 `-- c1` (注释) → diff 删除行 `--- c1` (diff 标记 - + 源码 -- c1) — 旧版误判此为头
+    #[test]
+    fn l11_multi_file_with_deletion_lines_still_splits() {
+        let diff = "--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,2 @@\n ctx\n--- c1\n+ctx\n--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,1 @@\n--- c2\n+ok\n";
+        let segs = split_multi_file_diff(diff);
+        assert_eq!(segs.len(), 2, "两文件头各成一段 (删除行 --- c1 不误拆)");
+        assert!(segs[0].starts_with("--- a/a.py"));
+        assert!(segs[1].starts_with("--- a/b.py"));
+        // 删除行 --- c1/--- c2 (源码 -- c1/-- c2 经 diff 编码) 留在各自片段
+        assert!(segs[0].contains("--- c1"), "删除行应留在片段 0");
+        assert!(segs[1].contains("--- c2"), "删除行应留在片段 1");
+    }
+
+    // L-12: Insert 模式 cell_id 不存在 → fail-loud 报错 (旧版静默 append 末尾)
+    #[test]
+    fn l12_insert_missing_cell_id_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("nb.ipynb");
+        write_minimal_nb(&fp);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .notebook_edit(
+                "nb.ipynb",
+                Some("no-such-id"),
+                None,
+                "import os\n",
+                NotebookEditMode::Insert,
+                Some(&cwd),
+            )
+            .unwrap();
+        assert!(!r.ok, "Insert 缺失 cell_id 应失败, 非静默 append: {r:?}");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("cell_id=no-such-id") && err.contains("未找到"),
+            "应报 cell_id 未找到: {err}"
+        );
+        // 文件未变 (未静默 append)
+        let nb: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fp).unwrap()).unwrap();
+        assert_eq!(
+            nb["cells"].as_array().unwrap().len(),
+            2,
+            "不应静默追加单元格"
+        );
+    }
+
+    // L-12: Insert 模式无 id 无 num → 追加末尾 (显式 append 语义保留)
+    #[test]
+    fn l12_insert_no_id_no_num_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("nb.ipynb");
+        write_minimal_nb(&fp);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .notebook_edit(
+                "nb.ipynb",
+                None,
+                None,
+                "import os\n",
+                NotebookEditMode::Insert,
+                Some(&cwd),
+            )
+            .unwrap();
+        assert!(r.ok, "无 id 无 num Insert 应 append 末尾: {r:?}");
+        let nb: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fp).unwrap()).unwrap();
+        let cells = nb["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 3, "应追加一个单元格");
+        assert_eq!(cells[2]["source"][0].as_str().unwrap(), "import os\n");
+    }
+
+    // M-12.2: read_data_to_string 非 UTF-8 文件错误含文件名
+    #[test]
+    fn m12_2_read_data_to_string_error_has_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("latin1.txt");
+        // 写入非 UTF-8 字节 (0xFF 非 ASCII 起始字节, 无效 UTF-8 序列)
+        std::fs::write(&fp, b"before\xff\xfeafter").unwrap();
+        let err = FileLock::read_data_to_string(&fp).err().unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("latin1.txt"), "错误消息应含文件名, got: {msg}");
+        assert!(!msg.is_empty(), "应保留原始 UTF-8 错误描述, got: {msg}");
     }
 }
