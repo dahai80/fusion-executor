@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use fe_sandbox::{kill_tree, spawn_pty, SpawnedPty};
+use fe_sandbox::{kill_process_group, spawn_pty, SpawnedPty};
 
 /// 尾部输出上限 — 防 OOM (同 fe-sandbox DEFAULT_MAX_OUTPUT/HARD_CEILING 语义)
 const TAIL_CAP: usize = 100_000;
@@ -282,9 +282,10 @@ impl ShellRegistry {
         })
     }
 
-    /// kill 进程树 — 复用 fe_sandbox::kill_tree (SIGINT→grace→SIGKILL)
+    /// kill 进程组 — 复用 fe_sandbox::kill_process_group (SIGINT→grace→SIGKILL)
     /// finished 正常由 reader EOF 置位; kill 强制置 finished 防 reader 在死 PTY 上阻塞永挂
     /// (kill 场景调用方期望终止非末段输出, 末段丢失可接受)
+    /// reap=false: fe-shell 自管 waiter 线程 child.wait 回收, 避 L-13 双重 waitpid 竞态
     pub fn kill_shell(&self, shell_id: &str) -> Result<bool> {
         let pid = {
             let g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
@@ -293,7 +294,8 @@ impl ShellRegistry {
                 .with_context(|| format!("shell 未找到: {shell_id}"))?;
             h.pid
         };
-        let exit = kill_tree(pid);
+        let res = kill_process_group(pid, false, 500);
+        let exit = res.exit_code;
         let g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(h) = g.get(shell_id) {
             h.finished.store(true, Ordering::Release);
@@ -323,8 +325,9 @@ impl ShellRegistry {
 }
 
 /// C-OPS-02: ShellRegistry drop 时 kill 所有活跃 shell, 防 serve() 退出孤儿进程泄漏。
-/// 进程退出 (signal/crash) 时 registry drop → 遍历 finished==false 的 shell kill_tree,
+/// 进程退出 (signal/crash) 时 registry drop → 遍历 finished==false 的 shell kill_process_group,
 /// reader/waiter 线程随 PTY 关闭自然退出。fail-loud: 记录 kill 失败, 不静默吞。
+/// reap=false: drop 阶段 waiter 线程随 PTY 关闭速退并回收, 此处仅信号不重复回收。
 impl Drop for ShellRegistry {
     fn drop(&mut self) {
         let mut g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
@@ -339,8 +342,8 @@ impl Drop for ShellRegistry {
         info!(count = active.len(), "ShellRegistry drop: drain 活跃 shell");
         for (shell_id, pid) in active {
             if let Some(pid) = pid {
-                let exit = kill_tree(Some(pid));
-                info!(%shell_id, pid, kill_exit = exit, "drop drain kill 完成");
+                let res = kill_process_group(Some(pid), false, 500);
+                info!(%shell_id, pid, kill_exit = res.exit_code, "drop drain kill 完成");
             } else {
                 warn!(%shell_id, "drop drain: shell 无 pid, 跳过 kill");
             }
@@ -390,9 +393,10 @@ fn reap_finished(shells: &mut HashMap<String, ShellHandle>) {
     }
 }
 
-/// m-SEC-01: 空闲超时回收 — 无输出超 max_idle_sec 的活跃 shell 自动 kill_tree。
+/// m-SEC-01: 空闲超时回收 — 无输出超 max_idle_sec 的活跃 shell 自动 kill_process_group。
 /// 逐 shell 读自身 max_idle_sec (0=不限跳过); 已退 shell 不处理 (reap_finished 负责)。
 /// kill 后置 finished + exit(-124 超时惯例), reader 线程随 PTY 关闭速退, 线程 join 在 reap/Drop 阶段。
+/// reap=false: waiter 线程自管回收, 避 L-13 双重 waitpid 竞态。
 fn expire_idle(shells: &mut HashMap<String, ShellHandle>) {
     let now = now_ms();
     let expired: Vec<String> = shells
@@ -409,7 +413,8 @@ fn expire_idle(shells: &mut HashMap<String, ShellHandle>) {
     for id in expired {
         if let Some(h) = shells.get(&id) {
             let pid = h.pid;
-            let exit = kill_tree(pid);
+            let res = kill_process_group(pid, false, 500);
+            let exit = res.exit_code;
             h.finished.store(true, Ordering::Release);
             let _ = h.exit.set(exit);
             warn!(%id, ?pid, max_idle_sec = h.max_idle_sec, kill_exit = exit,

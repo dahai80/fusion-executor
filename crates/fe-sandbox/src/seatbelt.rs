@@ -1,15 +1,24 @@
-// fe-sandbox seatbelt — macOS 运行时隔离 (审计 Blocker 1 / 1.1)
+// fe-sandbox seatbelt — macOS 运行时隔离 (审计 Blocker 1 / 1.1, 0827 C-16/A-12)
 //
 // Darwin 25 (macOS 26) 实测结论 (2026-08-25):
-//   - sandbox-exec `file-write*` deny 完全失效 (literal/subpath 均不拦写/删) — 留之无益, 不写入 profile
-//   - `process-exec` deny 生效: (deny process-exec (literal "/bin/rm")) → execve 拦截 exit 126
-//     → 兜底 fe-security 静态正则挡不住的运行时 execve 穿透 (审计 #1 攻击 os.execve('/bin/rm'))
-//   - `network-outbound` deny 生效: 拦 /dev/tcp 外泄 + curl|sh 载体出网
+//   - sandbox-exec **全局** `file-write*` deny 完全失效 (literal/subpath 均不拦写/删)。
+//   - **定向** `file-write*` deny (literal 特定敏感路径) — 注释旧结论只说全局坏, 定向未实测。
+//     0827 C-16: 注入定向 deny 作 best-effort 纵深防御 (失效则退回无 FS deny, 不误报隔离)。
+//   - `process-exec` deny 生效: (deny process-exec (literal "/bin/rm")) → execve 拦截 exit 126。
+//   - `network-outbound` deny 生效: 拦 /dev/tcp 外泄 + curl|sh 载体出网。
 //
-// 策略 (用户锁定 "进程级 deny 列表 + 禁网"):
-//   profile = (version 1)(allow default)(deny network-outbound)(deny process-exec (literal "<bin>"))...
-//   危险二进制黑名单对齐 fe-security 正则黑名单: rm/sudo/su/doas/diskutil/mkfs/dd/nc
-//   allow default 透传其余 (白名单二进制 python/node/cargo... 正常跑)
+// 0827 A-12 修正: 删 DANGEROUS_BINS process-exec denylist — 黑名单天然不可枚举 (rm 重命名/
+// symlink 绕过), fe-security Stage-2 allowlist (更强, 白名单外的二进制全拦) 已覆盖二进制隔离。
+// seatbelt denylist 是冗余弱防线, 留之给"双重保护"错觉。seatbelt 仅留 network-outbound +
+// 定向 FS deny (C-16), 二进制隔离由 fe-security allowlist 主导。
+//
+// 0827 C-16 文档 (FS 非隔离显式声明):
+//   seatbelt 层**非完整 FS 隔离** — whitelist 二进制 (python3/node/cargo) 的 syscall
+//   (unlink/rmdir/open/write) 经定向 deny 守高价值路径, 但**不**全 FS deny。
+//   全局 file-write* Darwin 25 失效; 定向 deny best-effort (未实测, 失效退回无 FS 保护)。
+//   实际隔离项: (1) network-outbound (实测生效), (2) 定向敏感路径 file-write* (best-effort),
+//   (3) 二进制 exec 由 fe-security allowlist 主导 (非 seatbelt)。
+//   全 FS 隔离需 OS 级 — 专用受限 macOS 用户账号 (非 seatbelt 能力)。
 //
 // 无 unsafe: sandbox-exec 是 /usr/bin 子进程, 走 portable-pty CommandBuilder spawn。
 // crate 仍 unsafe_code="deny" (fe-sandbox 未开 allow)。
@@ -31,52 +40,31 @@ use portable_pty::CommandBuilder;
 use std::process::Command;
 use tracing::{debug, info};
 
-/// 危险二进制黑名单 — 运行时 process-exec deny 目标。
-/// 对齐 fe-security::build_blocklist 的毁灭/特权/磁盘/远程脚本类。
-/// Issue #3 扩展: 加进程管理 (shutdown/reboot/halt/kill/pkill/killall/launchctl) +
-/// 权限变更 (chown/chgrp/chmod) + 远程下载 (curl/wget) — 纵深防御 (这些二进制本不在
-/// fe-security 白名单, Stage-2 已拦; seatbelt 层再 deny 运行时 execve 穿透兜底)。
-/// 路径为 macOS 标准位置; 多变体 (bin/sbin/usr) 逐条列 (literal 精确匹配, 无通配)。
-const DANGEROUS_BINS: &[&str] = &[
-    // 毁灭性删除
-    "/bin/rm",
-    "/usr/bin/rm",
-    // 特权提升
-    "/usr/bin/sudo",
-    "/usr/bin/su",
-    "/usr/bin/doas",
-    // 磁盘格式化/擦除
-    "/usr/sbin/diskutil",
-    "/sbin/diskutil",
-    "/sbin/mkfs",
-    "/usr/sbin/mkfs",
-    "/bin/dd",
-    "/usr/bin/dd",
-    // 远程 shell 管道
-    "/usr/bin/nc",
-    "/bin/nc",
-    // Issue #3: 进程/系统管理 (关机/重启/杀进程/launchd 控制)
-    "/sbin/shutdown",
-    "/sbin/reboot",
-    "/sbin/halt",
-    "/bin/kill",
-    "/usr/bin/pkill",
-    "/usr/bin/killall",
-    "/bin/launchctl",
-    // Issue #3: 权限变更 (chown/chgrp/chmod)
-    "/usr/sbin/chown",
-    "/usr/bin/chgrp",
-    "/bin/chmod",
-    // Issue #3: 远程下载 (curl|sh 载体; 白名单本不含, 运行时兜底)
-    "/usr/bin/curl",
-    "/usr/bin/wget",
+/// 0827 C-16: 定向 FS deny 的高价值敏感路径 — best-effort 防 whitelist 二进制 syscall 删/读写。
+/// 全局 file-write* Darwin 25 失效; 定向 (literal 特定路径) 注入作纵深防御。
+/// 路径基于 $HOME 展开 (调用时替换); 覆盖凭据 (~/.ssh)、模型缓存 (~/.fusion-mlx)、
+/// 系统敏感区 (/etc, /var/db)。失效退回无 FS 保护, 不误报隔离 (Rule 12)。
+const SENSITIVE_FS_PATHS: &[&str] = &[
+    "HOME/.ssh",
+    "HOME/.fusion-mlx",
+    "HOME/.claude",
+    "/etc",
+    "/var/db",
+    "/Library/Keychains",
 ];
 
-/// 构建 seatbelt profile 字符串 — allow default + 禁网 + 危险二进制 process-exec deny
+/// 0827 A-12: (已删 DANGEROUS_BINS process-exec denylist) — 二进制隔离由 fe-security
+/// allowlist 主导 (更强: 白名单外全拦), seatbelt denylist 冗余且弱 (rm 重命名/symlink 绕过)。
+//
+/// 构建 seatbelt profile 字符串 — allow default + 禁网 + 定向敏感路径 file-write* deny。
+/// 0827 C-16/A-12: 删 process-exec denylist (fe-security allowlist 覆盖), 加定向 FS deny。
 fn build_profile() -> String {
     let mut p = String::from("(version 1)(allow default)(deny network-outbound)");
-    for bin in DANGEROUS_BINS {
-        p.push_str(&format!("(deny process-exec (literal \"{}\"))", bin));
+    let home = std::env::var("HOME").unwrap_or_default();
+    for path in SENSITIVE_FS_PATHS {
+        let resolved = path.replacen("HOME", &home, 1);
+        // file-write* 覆盖 write/unlink/rmdir 等; literal 精确路径 (非 subpath, 避免过拦子目录误报)
+        p.push_str(&format!("(deny file-write* (literal \"{}\"))", resolved));
     }
     p
 }
@@ -120,8 +108,8 @@ pub fn build_command(command: &str, seatbelt: bool, nproc: u32, cpu_sec: u32) ->
         let profile = build_profile();
         info!(
             profile_len = profile.len(),
-            bins = DANGEROUS_BINS.len(),
-            "seatbelt 运行时隔离启用 — sandbox-exec 包装"
+            fs_paths = SENSITIVE_FS_PATHS.len(),
+            "seatbelt 运行时隔离启用 — sandbox-exec 包装 (禁网 + 定向 FS deny)"
         );
         debug!(profile = %profile, "seatbelt profile");
         let mut cmd = CommandBuilder::new("sandbox-exec");
@@ -150,8 +138,8 @@ pub fn build_std_command(command: &str, seatbelt: bool, nproc: u32, cpu_sec: u32
         let profile = build_profile();
         info!(
             profile_len = profile.len(),
-            bins = DANGEROUS_BINS.len(),
-            "seatbelt (stdio) 运行时隔离启用 — sandbox-exec 包装"
+            fs_paths = SENSITIVE_FS_PATHS.len(),
+            "seatbelt (stdio) 运行时隔离启用 — sandbox-exec 包装 (禁网 + 定向 FS deny)"
         );
         let mut cmd = Command::new("sandbox-exec");
         cmd.arg("-p")
@@ -173,43 +161,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn profile_blocks_network_and_dangerous_bins() {
+    fn profile_blocks_network_and_sensitive_fs() {
         let p = build_profile();
         assert!(p.contains("(deny network-outbound)"), "profile 必须禁网");
+        // C-16: 定向 FS deny 覆盖高价值路径
+        let home = std::env::var("HOME").unwrap_or_default();
         assert!(
-            p.contains("(deny process-exec (literal \"/bin/rm\"))"),
-            "profile 必须拦 /bin/rm"
+            p.contains(&format!("(deny file-write* (literal \"{}/.ssh\"))", home)),
+            "profile 必须定向 deny ~/.ssh 写"
         );
         assert!(
-            p.contains("(deny process-exec (literal \"/usr/bin/sudo\"))"),
-            "profile 必须拦 sudo"
-        );
-        // Issue #3: 新增进程管理 + 权限变更 + 远程下载二进制入列
-        assert!(
-            p.contains("(deny process-exec (literal \"/sbin/shutdown\"))"),
-            "profile 必须拦 shutdown"
+            p.contains("(deny file-write* (literal \"/etc\"))"),
+            "profile 必须定向 deny /etc 写"
         );
         assert!(
-            p.contains("(deny process-exec (literal \"/usr/bin/pkill\"))"),
-            "profile 必须拦 pkill"
+            p.contains("(deny file-write* (literal \"/Library/Keychains\"))"),
+            "profile 必须定向 deny Keychains 写"
         );
+        // A-12: process-exec denylist 已删 (fe-security allowlist 覆盖)
         assert!(
-            p.contains("(deny process-exec (literal \"/usr/sbin/chown\"))"),
-            "profile 必须拦 chown"
+            !p.contains("(deny process-exec"),
+            "A-12: process-exec denylist 应已删除 (fe-security allowlist 主导)"
         );
-        assert!(
-            p.contains("(deny process-exec (literal \"/usr/bin/curl\"))"),
-            "profile 必须拦 curl"
-        );
-        // 危险二进制全部入列
-        for bin in DANGEROUS_BINS {
+        assert!(p.starts_with("(version 1)(allow default)"));
+    }
+
+    #[test]
+    fn profile_covers_all_sensitive_paths() {
+        let p = build_profile();
+        let home = std::env::var("HOME").unwrap_or_default();
+        for path in SENSITIVE_FS_PATHS {
+            let resolved = path.replacen("HOME", &home, 1);
             assert!(
-                p.contains(&format!("(literal \"{}\")", bin)),
-                "profile 缺危险二进制: {}",
-                bin
+                p.contains(&format!("(deny file-write* (literal \"{}\"))", resolved)),
+                "profile 缺敏感路径 deny: {}",
+                resolved
             );
         }
-        assert!(p.starts_with("(version 1)(allow default)"));
     }
 
     #[test]

@@ -85,7 +85,14 @@ fn build_subscriber() -> Option<FilterHandle> {
         .with_filter(reload_filter);
 
     let registry = Registry::default().with(fmt_layer);
-    let _ = registry.try_init();
+    // M-7(2): 旧版 `let _ = registry.try_init();` 静默吞 Err — 若已被其他 subscriber 占用
+    // (测试并发 init) 或 set_global_default 失败, 无任何信号 → 日志静默丢失。fail-loud。
+    if let Err(e) = registry.try_init() {
+        eprintln!(
+            "fe-ipc logging: tracing subscriber init 失败 (可能已被占用): {e} \
+             — 日志输出可能不生效"
+        );
+    }
 
     Some(FilterHandle {
         inner: reload_handle,
