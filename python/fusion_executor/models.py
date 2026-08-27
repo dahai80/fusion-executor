@@ -82,6 +82,11 @@ class ExecutionResult(BaseModel):
         default=False,
         description="回滚保障失效标记 — guard 出错时置 true (fail-loud, 不静默); 与 auto_rolled_back 互补",
     )
+    rollback_skipped_reason: str | None = Field(
+        default=None,
+        description="回滚跳过原因 — rollback 尝试过但跳过 (快照失效/解析失败/非 git/repo 不匹配); "
+        "区分 '未回滚(无需)' 与 '未回滚(快照失效)' (fail-loud); 与 auto_rolled_back/rollback_unavailable 互补",
+    )
     trace_id: str | None = Field(
         default=None, description="跨层关联 id — 回填请求侧 trace_id 或入口自动生成 (M-OPS-06)"
     )

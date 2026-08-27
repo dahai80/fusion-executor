@@ -209,6 +209,14 @@ pub struct ExecutionResult {
     /// 与 auto_rolled_back 互补: 后者表 "已回滚", 此字段表 "本应回滚但保障不可用"。
     #[serde(default, skip_serializing_if = "is_false")]
     pub rollback_unavailable: bool,
+    /// L-1 (审计 0827): 回滚跳过原因 — rollback() 尝试过但跳过 (快照失效/解析失败/非 git 仓库/
+    /// repo 标识不匹配) 时填充, 调用方可 fail-loud 区分 "未回滚 (无需)" 与 "未回滚 (快照失效)"。
+    /// 与 auto_rolled_back/rollback_unavailable 互补, 三轴独立:
+    ///   auto_rolled_back=true        已回滚
+    ///   rollback_unavailable=true    回滚保障不可用 (guard 出错)
+    ///   rollback_skipped_reason=Some 回滚尝试过但跳过 (rollback 内部判定)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_skipped_reason: Option<String>,
     /// M-OPS-06: 跨层关联 id — 回填请求侧 trace_id (None 时入口自动生成)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
@@ -390,12 +398,28 @@ impl AutoRollbackGuard {
             exit_code = result.exit_code,
             "检测到命令导致文件改动, 触发自动回滚"
         );
-        let ok = self.rollback.rollback(&self.snapshot_id, &self.cwd).await?;
-        if ok {
+        // L-1 (审计 0827): rollback() 现返 RollbackOutcome{applied, skipped_reason, wip_sha}。
+        // applied=true → auto_rolled_back=true (已回滚); applied=false + skipped_reason=Some →
+        // 填 rollback_skipped_reason 让调用方 fail-loud 区分 "未回滚(无需)" 与 "未回滚(快照失效)"。
+        let outcome = self.rollback.rollback(&self.snapshot_id, &self.cwd).await?;
+        if outcome.applied {
             result.auto_rolled_back = true;
-            info!(snapshot = %self.snapshot_id, "自动回滚成功");
+            if let Some(wip) = &outcome.wip_sha {
+                info!(snapshot = %self.snapshot_id, wip = %wip, "自动回滚成功 — 已捕获 tracked WIP (C-7)");
+            } else {
+                info!(snapshot = %self.snapshot_id, "自动回滚成功");
+            }
+        } else if let Some(reason) = &outcome.skipped_reason {
+            // L-1: 跳过有原因 — 暴露给调用方 (fail-loud), 不静默 false。
+            result.rollback_skipped_reason = Some(reason.clone());
+            warn!(
+                snapshot = %self.snapshot_id,
+                reason = %reason,
+                "自动回滚跳过 (rollback 判定) — rollback_skipped_reason 已置位 (L-1)"
+            );
         } else {
-            warn!(snapshot = %self.snapshot_id, "自动回滚未生效 (rollback 返回 false)");
+            // applied=false + 无原因 — 理论上不达 (skipped 必带原因), 防御性 warn。
+            warn!(snapshot = %self.snapshot_id, "自动回滚未生效 (rollback 返回 applied=false 无原因)");
         }
         Ok(())
     }
@@ -587,9 +611,14 @@ impl Executor {
         self.rollback.snapshot_create(cwd).await
     }
 
-    /// 回滚 — 公开供 fe-pyo3 直接调用
+    /// 回滚 — 公开供 fe-pyo3 直接调用。
+    /// L-1 (审计 0827): rollback() 内部返 RollbackOutcome; 此包装映射 .applied → bool
+    /// 保持 IPC/PyO3/Python 侧 bool 契约不变 (skipped_reason 细节经 ExecutionResult 4 层流通)。
     pub async fn rollback_async(&self, snapshot_id: &str, cwd: &str) -> Result<bool> {
-        self.rollback.rollback(snapshot_id, cwd).await
+        self.rollback
+            .rollback(snapshot_id, cwd)
+            .await
+            .map(|o| o.applied)
     }
 
     /// 校验命令 — 公开供 fe-ipc/fe-pyo3 直接调用
@@ -1640,6 +1669,43 @@ mod tests {
         )
         .unwrap();
         assert!(!back.rollback_unavailable, "缺字段反序列化应默认 false");
+    }
+
+    /// L-1 (审计 0827): rollback_skipped_reason 字段默认 None, 序列化省略 (skip_serializing_if
+    /// Option::is_none)。区分 "未回滚(无需)" (None) 与 "未回滚(快照失效)" (Some) — fail-loud。
+    #[test]
+    fn l1_rollback_skipped_reason_default_and_skip_serialize() {
+        let r = ExecutionResult::default();
+        assert!(r.rollback_skipped_reason.is_none(), "默认 None");
+        // None 时 skip (wire 省位)
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("rollback_skipped_reason"),
+            "None 时应 skip: {json}"
+        );
+        // Some 时序列化
+        let r2 = ExecutionResult {
+            rollback_skipped_reason: Some("snapshot_id 解析失败".to_string()),
+            ..Default::default()
+        };
+        let json2 = serde_json::to_string(&r2).unwrap();
+        assert!(
+            json2.contains("rollback_skipped_reason"),
+            "Some 时应序列化: {json2}"
+        );
+        assert!(
+            json2.contains("snapshot_id 解析失败"),
+            "原因值应在 wire: {json2}"
+        );
+        // 反序列化兼容 (缺字段 → default None)
+        let back: ExecutionResult = serde_json::from_str(
+            r#"{"exit_code":0,"stdout":"","stderr":"","timed_out":false,"blocked_by_security":false}"#,
+        )
+        .unwrap();
+        assert!(
+            back.rollback_skipped_reason.is_none(),
+            "缺字段反序列化应默认 None"
+        );
     }
 
     /// A-5: BLOCKING_RT panic 信息含构建原因 + 不可恢复提示 (文档锚点, 不触发真 panic)。

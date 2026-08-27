@@ -94,6 +94,10 @@ struct PyExecutionResult {
     /// 与 auto_rolled_back 互补: 后者表 "已回滚", 此字段表 "本应回滚但保障不可用"。
     #[pyo3(get)]
     rollback_unavailable: bool,
+    /// L-1 (审计 0827): 回滚跳过原因 — rollback 尝试过但跳过 (快照失效/解析失败/非 git/repo 不匹配)
+    /// 时填充。与 auto_rolled_back/rollback_unavailable 互补, 三轴独立 (fail-loud)。
+    #[pyo3(get)]
+    rollback_skipped_reason: Option<String>,
     /// M-OPS-06: 跨层关联 id (回填请求侧或入口自动生成)
     #[pyo3(get)]
     trace_id: Option<String>,
@@ -115,6 +119,7 @@ impl From<RsResult> for PyExecutionResult {
             diagnostics: r.diagnostics.map(PyDiagnostics::from),
             auto_rolled_back: r.auto_rolled_back,
             rollback_unavailable: r.rollback_unavailable,
+            rollback_skipped_reason: r.rollback_skipped_reason.clone(),
             trace_id: r.trace_id,
         }
     }
