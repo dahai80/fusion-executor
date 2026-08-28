@@ -113,6 +113,7 @@ class FusionSandboxExecutor:
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
         max_nofile: int = 1024,
+        rss_limit_mb: int = 2048,
         trace_id: str | None = None,
     ) -> ExecutionResult:
         # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
@@ -134,8 +135,10 @@ class FusionSandboxExecutor:
             raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
         if not isinstance(max_nofile, int) or max_nofile < 0:
             raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
+        if not isinstance(rss_limit_mb, int) or rss_limit_mb < 0:
+            raise ValueError(f"rss_limit_mb 必须为非负 int, 得 {rss_limit_mb!r}")
         logger.debug(
-            "run command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s",
+            "run command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s rss_limit_mb=%s",
             command,
             timeout_sec,
             cwd,
@@ -145,6 +148,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_nofile,
+            rss_limit_mb,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         native = self._native.execute_sync(
@@ -161,6 +165,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_nofile,
+            rss_limit_mb,
             trace_id,
         )
         diag = None
@@ -189,13 +194,15 @@ class FusionSandboxExecutor:
             rollback_unavailable=native.rollback_unavailable,
             rollback_skipped_reason=native.rollback_skipped_reason,
             trace_id=native.trace_id,
+            oom_killed=native.oom_killed,
             pid=native.pid,
         )
         logger.info(
-            "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s rb_unavail=%s rb_skipped=%s dur=%.3fs",
+            "run done exit=%s blocked=%s timed_out=%s oom=%s diag=%s rolled_back=%s rb_unavail=%s rb_skipped=%s dur=%.3fs",
             result.exit_code,
             result.blocked_by_security,
             result.timed_out,
+            result.oom_killed,
             result.diagnostics.error_type if result.diagnostics else None,
             result.auto_rolled_back,
             result.rollback_unavailable,
@@ -227,6 +234,7 @@ class FusionSandboxExecutor:
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
         max_nofile: int = 1024,
+        rss_limit_mb: int = 2048,
         trace_id: str | None = None,
     ) -> Iterator[str | ExecutionResult]:
         # M-PY-01: 同 run() 前置校验
@@ -240,12 +248,14 @@ class FusionSandboxExecutor:
             raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
         if not isinstance(max_nofile, int) or max_nofile < 0:
             raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
+        if not isinstance(rss_limit_mb, int) or rss_limit_mb < 0:
+            raise ValueError(f"rss_limit_mb 必须为非负 int, 得 {rss_limit_mb!r}")
         # 流式后端仅 PTY: use_pty=False 暂无 stdio 流式实现 (run_streaming 走 portable-pty,
         # 保 ANSI/Traceback 保真 — 流式主要目的)。需独立 stderr 分流用 run(use_pty=False)。
         if not use_pty:
             raise ValueError("run_streaming 暂不支持 use_pty=False (无 stdio 流式后端; 用 run() 分流)")
         logger.debug(
-            "run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s",
+            "run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s rss_limit_mb=%s",
             command,
             timeout_sec,
             cwd,
@@ -255,6 +265,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_nofile,
+            rss_limit_mb,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         it = self._native.execute_streaming(
@@ -271,6 +282,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_nofile,
+            rss_limit_mb,
             trace_id,
         )
         for frame in it:

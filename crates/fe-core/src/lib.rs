@@ -126,6 +126,11 @@ pub struct ExecutionRequest {
     /// 拦 FD 耗尽攻击 (海量打开 fd 击杀宿主)。0=不限 (受信场景 opt-out)。Darwin 实测生效 (errno 24 EMFILE)。
     #[serde(default = "default_nofile")]
     pub max_nofile: u32,
+    /// D3-4 (审计 0827 product): per-task RSS 上限 (MB)。Darwin RLIMIT_AS/RLIMIT_DATA 平台无效,
+    /// 改 sysinfo 轮询子进程树 RSS, 超限 kill 进程树 (exit_code -124, oom_killed=true)。
+    /// 默认 2048 — 拦内存炸弹击杀宿主。0=禁用 watchdog (受信 opt-out)。
+    #[serde(default = "default_rss_limit")]
+    pub rss_limit_mb: u32,
     /// M-OPS-06: 跨层关联 id。None 时 execute 入口自动生成 uuid v4, 贯穿日志/IPC/结果。
     #[serde(default)]
     pub trace_id: Option<String>,
@@ -141,6 +146,10 @@ fn default_nproc() -> u32 {
 
 fn default_nofile() -> u32 {
     1024
+}
+
+fn default_rss_limit() -> u32 {
+    2048
 }
 
 fn default_timeout() -> f64 {
@@ -240,6 +249,10 @@ pub struct ExecutionResult {
     /// M-OPS-06: 跨层关联 id — 回填请求侧 trace_id (None 时入口自动生成)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// D3-4 (审计 0827 product): RSS watchdog 触发标记 — 子进程树 RSS 超 rss_limit_mb 被 kill。
+    /// 默认 false 省略 (skip_serializing_if is_false); exit_code 伴随 -124 (kill 约定)。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oom_killed: bool,
     /// RUN-11: 沙箱子进程 PID — 从 SandboxResult.pid 回填, 调用方据此传给 telemetry_stream
     /// 采样真实任务进程 (非 executor 自身)。stdio 路径有 pid; 拦截/超时路径无 → None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -802,6 +815,7 @@ impl Executor {
             max_nproc: req.max_nproc,
             max_cpu_sec: req.max_cpu_sec,
             max_nofile: req.max_nofile,
+            rss_limit_mb: req.rss_limit_mb,
         };
         info!(
             seatbelt = req.seatbelt,
@@ -840,7 +854,8 @@ impl Executor {
             snapshot_id: sid_filtered.clone(),
             diagnostics: diag,
             trace_id: Some(trace_id),
-            pid: sb.pid, // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
+            oom_killed: sb.oom_killed, // D3-4: RSS watchdog 触发回填
+            pid: sb.pid,               // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
             ..Default::default()
         };
 
@@ -976,6 +991,7 @@ impl Executor {
             max_nproc: req.max_nproc,
             max_cpu_sec: req.max_cpu_sec,
             max_nofile: req.max_nofile,
+            rss_limit_mb: req.rss_limit_mb,
         };
         info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg)?;
@@ -1041,6 +1057,7 @@ impl Executor {
                                 snapshot_id: sid_filtered.clone(),
                                 diagnostics: diag,
                                 trace_id: Some(trace_id_for_done.clone()),
+                                oom_killed: sb.oom_killed, // D3-4: RSS watchdog 触发回填
                                 pid: sb.pid, // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
                                 ..Default::default()
                             };
@@ -1169,6 +1186,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1208,6 +1226,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1238,6 +1257,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: Some("caller-tid-123".to_string()),
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1264,6 +1284,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: Some("blk-tid".to_string()),
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1291,6 +1312,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: Some("stream-tid".to_string()),
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1324,6 +1346,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1361,6 +1384,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1395,6 +1419,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1451,6 +1476,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
@@ -1484,6 +1510,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let ex = Executor::new();
@@ -1515,6 +1542,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
@@ -1553,6 +1581,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
@@ -1595,6 +1624,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
@@ -1701,6 +1731,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
@@ -1742,6 +1773,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);

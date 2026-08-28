@@ -101,6 +101,9 @@ struct PyExecutionResult {
     /// M-OPS-06: 跨层关联 id (回填请求侧或入口自动生成)
     #[pyo3(get)]
     trace_id: Option<String>,
+    /// D3-4 (审计 0827 product): RSS watchdog 触发标记 (子进程树超 rss_limit_mb 被 kill)
+    #[pyo3(get)]
+    oom_killed: bool,
     /// RUN-11: 沙箱子进程 PID (调用方据此传 telemetry_stream 采样真实任务)
     #[pyo3(get)]
     pid: Option<u32>,
@@ -124,6 +127,7 @@ impl From<RsResult> for PyExecutionResult {
             rollback_unavailable: r.rollback_unavailable,
             rollback_skipped_reason: r.rollback_skipped_reason.clone(),
             trace_id: r.trace_id,
+            oom_killed: r.oom_killed,
             pid: r.pid,
         }
     }
@@ -690,7 +694,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None, max_nofile=None, trace_id=None))]
+                        max_nproc=None, max_cpu_sec=None, max_nofile=None, rss_limit_mb=None, trace_id=None))]
     fn execute_sync(
         &self,
         py: Python<'_>,
@@ -707,6 +711,7 @@ impl PyExecutor {
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
         max_nofile: Option<u32>,
+        rss_limit_mb: Option<u32>,
         trace_id: Option<String>,
     ) -> PyResult<PyExecutionResult> {
         // L-PYO3-02: policy 入参无效应 fail-loud (旧版 warn+None 静默吞错, 调用方以为开了回滚实则没开)
@@ -746,6 +751,7 @@ impl PyExecutor {
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
             max_nofile: max_nofile.unwrap_or(1024),
+            rss_limit_mb: rss_limit_mb.unwrap_or(2048),
             trace_id,
         };
         // M-PYO3-02: 内部错误 fail-loud (旧版伪造 exit_code=-1 ExecutionResult, 调用方无法区分
@@ -883,7 +889,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None, max_nofile=None, trace_id=None))]
+                        max_nproc=None, max_cpu_sec=None, max_nofile=None, rss_limit_mb=None, trace_id=None))]
     fn execute_streaming(
         &self,
         py: Python<'_>,
@@ -900,6 +906,7 @@ impl PyExecutor {
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
         max_nofile: Option<u32>,
+        rss_limit_mb: Option<u32>,
         trace_id: Option<String>,
     ) -> PyResult<PyStreamIterator> {
         let policy = match auto_rollback_policy {
@@ -938,6 +945,7 @@ impl PyExecutor {
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
             max_nofile: max_nofile.unwrap_or(1024),
+            rss_limit_mb: rss_limit_mb.unwrap_or(2048),
             trace_id,
         }; // L-PYO3-01: execute_streaming async → 释 GIL 后在 BLOCKING_RT block_on (旧版持 GIL
            // 整个 spawn + 校验期间, 阻塞 Python 线程; detach 后 Python 可并发跑其他协程)

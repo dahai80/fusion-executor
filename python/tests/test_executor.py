@@ -1752,3 +1752,39 @@ def test_p2_subscription_buf_normal_line_still_works():
     assert out is not None
     assert out["id"] == 1
     assert out["result"]["ok"] is True
+
+
+# D3-4 (审计 0827 product): per-task RSS watchdog — 子进程树 RSS 超 rss_limit_mb
+# 被 sysinfo 轮询 kill (exit_code -124, oom_killed=true)。Darwin RLIMIT_AS/RLIMIT_DATA
+# 平台无效, 改轮询缓解。inline 解释器经 D3-1 opt-in 网关放行 (fixture allow_inline_interpreter)。
+def test_run_rss_watchdog_kills_memory_bomb(executor: FusionSandboxExecutor):
+    bomb = "python3 -c \"x=[bytearray(b'a'*10**7) for _ in range(100)]; import time; time.sleep(5)\""
+    r = executor.run(bomb, rss_limit_mb=256, timeout_sec=10.0, enable_rollback_snapshot=False)
+    assert r.oom_killed, f"内存炸弹应触发 oom_killed, exit={r.exit_code}"
+    assert r.exit_code == -124, f"OOM kill exit 应 -124, got {r.exit_code}"
+
+
+def test_run_rss_watchdog_zero_disables(executor: FusionSandboxExecutor):
+    # rss_limit_mb=0 禁用 watchdog — 较小分配正常完成 (受信 opt-out)
+    r = executor.run(
+        "python3 -c \"x=[bytearray(b'a'*10**6) for _ in range(10)]; print(len(x))\"",
+        rss_limit_mb=0,
+        timeout_sec=15.0,
+        enable_rollback_snapshot=False,
+    )
+    assert not r.oom_killed, "rss_limit_mb=0 不应触发 oom_killed"
+    assert r.exit_code == 0, f"正常完成 exit 0, got {r.exit_code}"
+
+
+def test_run_rss_watchdog_normal_unaffected(executor: FusionSandboxExecutor):
+    r = executor.run("echo hi", rss_limit_mb=256, enable_rollback_snapshot=False)
+    assert r.exit_code == 0, f"echo 应 exit 0, got {r.exit_code}"
+    assert not r.oom_killed, "echo 不应触发 oom_killed"
+
+
+def test_run_streaming_rss_watchdog(executor: FusionSandboxExecutor):
+    bomb = "python3 -c \"x=[bytearray(b'a'*10**7) for _ in range(100)]; import time; time.sleep(5)\""
+    _chunks, result = _consume_stream(executor, bomb, rss_limit_mb=256, timeout_sec=10.0)
+    assert result is not None
+    assert result.oom_killed, f"流式 Done 帧 oom_killed 应 true, exit={result.exit_code}"
+    assert result.exit_code == -124, f"流式 OOM exit 应 -124, got {result.exit_code}"

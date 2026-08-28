@@ -35,6 +35,16 @@ const HARD_CEILING: usize = 64 * 1024 * 1024;
 const KILL_GRACE_MS: u64 = 500;
 /// C-SB-02/03: kill 后收 reader 输出超时 — 子进程忽略信号时 reader 永不 EOF
 const READER_RECV_TIMEOUT_MS: u64 = 2000;
+/// D3-4 (审计 0827 product): RSS watchdog 轮询间隔。Darwin RLIMIT_AS/RLIMIT_DATA 平台无效,
+/// 改 sysinfo 每 ~200ms 采样子进程树 RSS, 超限 oneshot 通知 select 杀进程树 (缓解非纯修)。
+const RSS_POLL_MS: u64 = 200;
+/// D3-4: RSS watchdog 默认上限 (MB)。SandboxConfig.rss_limit_mb=0 禁用 watchdog。
+const DEFAULT_RSS_LIMIT_MB: u32 = 2048;
+
+/// D3-4: serde skip_serializing_if 辅助 — oom_killed=false 时不序列化 (wire 省字节)。
+fn is_false(b: &bool) -> bool {
+    !b
+}
 
 /// C-PERF-02/C-SB-06: macOS openpty 进程级串行锁 — 高并发 (多线程 BLOCKING_RT 并发 execute,
 /// 或并行测试) 下 openpty 偶返 ENXIO (code -6, 无空闲 PTY 设备)。仅锁 openpty 设备分配临界区,
@@ -64,6 +74,10 @@ pub struct SandboxResult {
     /// use_pty=true (PTY 默认) 时 PTY 合并 stdout+stderr, 本字段恒空, Slicer 吃 stdout tail。
     pub stderr: String,
     pub timed_out: bool,
+    /// D3-4: RSS watchdog 触发超内存 kill。true → 进程树 RSS 超 rss_limit_mb 被 watchdog 杀,
+    /// exit_code=-124 (与 timeout 共用杀约定, timed_out=false)。false → 未达上限或 watchdog 禁用。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oom_killed: bool,
     /// RUN-11: 沙箱子进程 PID — 调用方据此传 telemetry_stream 采样真实任务进程 (非 executor 自身)。
     /// PTY/stdio spawn 路径有; 拦截/空命令/取消收尾路径视情形 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,6 +120,10 @@ pub struct SandboxConfig {
     /// RUN-10 (审计 0827): 文件描述符上限 (RLIMIT_NOFILE, 经 ulimit -n 注入)。默认 1024 —
     /// 拦 FD 耗尽攻击 (海量打开 fd 击杀宿主)。0=不限 (受信场景 opt-out)。Darwin 实测生效 (errno 24 EMFILE)。
     pub max_nofile: u32,
+    /// D3-4 (审计 0827 product): 每任务 RSS 上限 (MB)。Darwin RLIMIT_AS/RLIMIT_DATA 平台无效,
+    /// 改 sysinfo 轮询子进程树 RSS, 超限 kill 进程树 (exit_code=-124, oom_killed=true)。
+    /// 默认 DEFAULT_RSS_LIMIT_MB (2048)。0=禁用 watchdog (受信场景 opt-out, 仅靠 timeout 兜底)。
+    pub rss_limit_mb: u32,
 }
 
 impl Default for SandboxConfig {
@@ -122,6 +140,7 @@ impl Default for SandboxConfig {
             max_nproc: 1024,
             max_cpu_sec: 0,
             max_nofile: 1024,
+            rss_limit_mb: DEFAULT_RSS_LIMIT_MB,
         }
     }
 }
@@ -378,22 +397,45 @@ impl Sandbox {
         let timeout_dur = Duration::from_secs_f64(effective_timeout);
         let sleep = tokio::time::sleep(timeout_dur);
 
-        let (timed_out, raw_exit) = tokio::select! {
+        // D3-4: RSS watchdog — rss_limit_mb=0 禁用。oneshot 通知 select 第 3 分支杀进程树。
+        let (oom_tx, mut oom_rx) = tokio::sync::oneshot::channel::<()>();
+        let oom_handle = if cfg.rss_limit_mb > 0 {
+            let pid_oom = pid.unwrap_or(0);
+            Some(tokio::spawn(rss_watchdog(
+                pid_oom,
+                cfg.rss_limit_mb,
+                oom_tx,
+            )))
+        } else {
+            None
+        };
+
+        let (timed_out, oom_killed, raw_exit) = tokio::select! {
             biased; // L-SB-01: wait 优先 — 干净退出时不误报 -124
             join_res = wait_fut => {
+                if let Some(h) = oom_handle { h.abort(); }
                 drop(_writer);
                 drop(pair.master);
                 let status = join_res
                     .map_err(|e| anyhow::anyhow!("wait 线程 panic: {e}"))?
                     .context("wait 失败")?;
-                (false, status.exit_code() as i32)
+                (false, false, status.exit_code() as i32)
+            }
+            _oom = &mut oom_rx => {
+                // D3-4: OOM 在 timeout 之前触发 (内存炸弹可能先于超时)。干净退出仍优 (biased)。
+                warn!(?pid, rss_limit_mb = cfg.rss_limit_mb, "RSS watchdog 超限, kill 进程组 (OOM)");
+                let res = kill_process_group_async(pid).await;
+                drop(_writer);
+                drop(pair.master);
+                (false, true, res.exit_code)
             }
             _ = sleep => {
+                if let Some(h) = oom_handle { h.abort(); }
                 warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组");
                 let res = kill_process_group_async(pid).await;
                 drop(_writer);
                 drop(pair.master);
-                (true, res.exit_code)
+                (true, false, res.exit_code)
             }
         };
 
@@ -424,6 +466,7 @@ impl Sandbox {
             stdout,
             stderr: String::new(),
             timed_out,
+            oom_killed,
             pid, // RUN-11: 回填子进程 PID (PTY 路径 child.process_id())
         })
     }
@@ -532,18 +575,41 @@ impl Sandbox {
         let wait_fut = tokio::task::spawn_blocking(move || child.wait());
         let sleep = tokio::time::sleep(timeout_dur);
 
-        let (timed_out, raw_exit) = tokio::select! {
+        // D3-4: RSS watchdog (stdio 路径同 PTY)
+        let (oom_tx, mut oom_rx) = tokio::sync::oneshot::channel::<()>();
+        // pid 此处恒 Some (child.id() spawn 后必有), 但下游 kill_process_group_async/recv_output/
+        // result.pid 需 Option<u32>; 保持 Option 兼容, allow clippy unnecessary_literal_unwrap。
+        #[allow(clippy::unnecessary_literal_unwrap)]
+        let pid_oom = pid.unwrap_or(0);
+        let oom_handle = if cfg.rss_limit_mb > 0 {
+            Some(tokio::spawn(rss_watchdog(
+                pid_oom,
+                cfg.rss_limit_mb,
+                oom_tx,
+            )))
+        } else {
+            None
+        };
+
+        let (timed_out, oom_killed, raw_exit) = tokio::select! {
             biased;
             join_res = wait_fut => {
+                if let Some(h) = oom_handle { h.abort(); }
                 let status = join_res
                     .map_err(|e| anyhow::anyhow!("wait 线程 panic: {e}"))?
                     .context("wait 失败")?;
-                (false, status.code().unwrap_or(-1))
+                (false, false, status.code().unwrap_or(-1))
+            }
+            _oom = &mut oom_rx => {
+                warn!(?pid, rss_limit_mb = cfg.rss_limit_mb, "RSS watchdog 超限, kill 进程组 (OOM, stdio)");
+                let res = kill_process_group_async(pid).await;
+                (false, true, res.exit_code)
             }
             _ = sleep => {
+                if let Some(h) = oom_handle { h.abort(); }
                 warn!(?pid, timeout_sec = effective_timeout, "超时 (stdio), kill 进程组");
                 let res = kill_process_group_async(pid).await;
-                (true, res.exit_code)
+                (true, false, res.exit_code)
             }
         };
 
@@ -564,6 +630,7 @@ impl Sandbox {
             stdout,
             stderr,
             timed_out,
+            oom_killed,
             pid, // RUN-11: 回填子进程 PID (stdio 路径 child.id())
         })
     }
@@ -695,6 +762,8 @@ impl Sandbox {
         };
         let timeout_dur = Duration::from_secs_f64(effective_timeout);
         let max_output_final = effective_output_cap(cfg.max_output_chars);
+        // D3-4: rss_limit_mb (u32 Copy) 提前捕获 — cfg.command 在 build_command 时 move, 此处仅读剩余字段
+        let rss_limit_mb = cfg.rss_limit_mb;
 
         // 协调任务 — 转发 chunk 到 outer; wait/timeout 并行; EOF+exit 后发 Done
         let (outer_tx, outer_rx) = mpsc::channel::<StreamEvent>(64);
@@ -702,7 +771,17 @@ impl Sandbox {
         // (exit_fut 闭包也需 pid 作超时 kill, 克隆避免 move 后无法引用)
         let pid_for_cancel = pid;
         let handle = tokio::spawn(async move {
-            // exit future: wait 或 timeout, 先到者决定 (timed_out, raw_exit)
+            // D3-4: RSS watchdog — exit_fut 内持 oom_rx 第 3 分支, 超限先于 timeout 杀进程树。
+            // oneshot 在 exit_fut 内创建, 保证 watchdog 任务与 exit_fut 同 spawn 作用域生命周期一致。
+            let (oom_tx, mut oom_rx) = tokio::sync::oneshot::channel::<()>();
+            // D3-4: handle detach — watchdog 在 oom_tx drop 后 (exit_fut 释放) 自退, 无需显式 abort。
+            let _oom_handle_stream = if rss_limit_mb > 0 {
+                let pid_oom = pid_for_cancel.unwrap_or(0);
+                Some(tokio::spawn(rss_watchdog(pid_oom, rss_limit_mb, oom_tx)))
+            } else {
+                None
+            };
+            // exit future: wait 或 timeout, 先到者决定 (timed_out, oom_killed, raw_exit)
             let mut exit_fut = Box::pin(async move {
                 tokio::select! {
                     biased; // L-SB-01: wait 优先
@@ -710,25 +789,32 @@ impl Sandbox {
                         drop(_writer);
                         drop(pair.master);
                         match join_res {
-                            Ok(Ok(status)) => (false, status.exit_code() as i32),
+                            Ok(Ok(status)) => (false, false, status.exit_code() as i32),
                             _ => {
                                 warn!("wait 线程 panic/失败");
-                                (false, -1)
+                                (false, false, -1)
                             }
                         }
+                    }
+                    _oom = &mut oom_rx => {
+                        warn!(?pid, rss_limit_mb, "RSS watchdog 超限, kill 进程组 (OOM, streaming)");
+                        let res = kill_process_group_async(pid).await;
+                        drop(_writer);
+                        drop(pair.master);
+                        (false, true, res.exit_code)
                     }
                     _ = tokio::time::sleep(timeout_dur) => {
                         warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组 (streaming)");
                         let res = kill_process_group_async(pid).await;
                         drop(_writer);
                         drop(pair.master);
-                        (true, res.exit_code)
+                        (true, false, res.exit_code)
                     }
                 }
             });
 
             let mut eof_output: Option<String> = None;
-            let mut exit_done: Option<(bool, i32)> = None;
+            let mut exit_done: Option<(bool, bool, i32)> = None;
             // Blocker 6: 消费者断开标志 — send 失败后 kill 子进程并跳出
             let mut cancelled = false;
 
@@ -781,6 +867,7 @@ impl Sandbox {
                         stdout,
                         stderr: String::new(),
                         timed_out: false,
+                        oom_killed: false, // D3-4: 取消路径无 OOM (kill 由消费者断开触发非 watchdog)
                         pid: pid_for_cancel, // RUN-11: 回填子进程 PID (取消收尾, 子已 kill)
                     }))
                     .await;
@@ -818,13 +905,13 @@ impl Sandbox {
             }
 
             // M-FT-02: cancelled 分支已早 return, 走到此必 Some; unwrap_or_else 防重构破不变量致 panic
-            let (timed_out, raw_exit) = exit_done.unwrap_or((false, -1));
+            let (timed_out, oom_killed, raw_exit) = exit_done.unwrap_or((false, false, -1));
             let raw_output = eof_output.unwrap_or_default();
             let normalized = raw_output.replace("\r\n", "\n");
             let stdout = truncate_output(&normalized, max_output_final);
             debug!(
                 out_len = stdout.len(),
-                timed_out, "sandbox run_streaming 完成"
+                timed_out, oom_killed, "sandbox run_streaming 完成"
             );
             let _ = outer_tx
                 .send(StreamEvent::Done(SandboxResult {
@@ -832,6 +919,7 @@ impl Sandbox {
                     stdout,
                     stderr: String::new(),
                     timed_out,
+                    oom_killed,
                     pid: pid_for_cancel, // RUN-11: 回填子进程 PID (正常完成)
                 }))
                 .await;
@@ -996,6 +1084,55 @@ fn kill_pid(pid: u32, sig: Signal) -> bool {
         Err(e) => {
             warn!(pid, ?sig, "kill 单 pid 失败: {e}");
             false
+        }
+    }
+}
+
+/// D3-4 (审计 0827 product): RSS watchdog — sysinfo 轮询子进程树 RSS, 超限返回总 MB。
+/// Darwin RLIMIT_AS/RLIMIT_DATA 无效, 用 sysinfo 每 ~200ms 采 root + 后代 RSS 之和。
+/// 返回 Some(total_mb) 超限 (调用方据此 oneshot 通知 select 杀进程树); None 未超限或进程消失。
+/// 单次快照遍历, 进程树在遍历期间 fork 新后代由下轮轮询兜底 (与 collect_descendants 同 best-effort)。
+async fn rss_watchdog(root_pid: u32, limit_mb: u32, oom_tx: tokio::sync::oneshot::Sender<()>) {
+    let poll = Duration::from_millis(RSS_POLL_MS);
+    let limit_bytes = (limit_mb as u64).saturating_mul(1024 * 1024);
+    loop {
+        tokio::time::sleep(poll).await;
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let Some(root_proc) = sys.process(sysinfo::Pid::from_u32(root_pid)) else {
+            debug!(root_pid, "RSS watchdog: root 进程已退出, 自退");
+            return;
+        };
+        let mut total: u64 = root_proc.memory();
+        let mut frontier = vec![root_pid];
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(root_pid);
+        while let Some(cur) = frontier.pop() {
+            for (pid, proc) in sys.processes() {
+                let pid_u32 = pid.as_u32();
+                if seen.contains(&pid_u32) {
+                    continue;
+                }
+                if proc.parent().map(|p| p.as_u32()) == Some(cur) {
+                    seen.insert(pid_u32);
+                    total = total.saturating_add(proc.memory());
+                    frontier.push(pid_u32);
+                }
+            }
+        }
+        if total >= limit_bytes {
+            let mb = total / 1024 / 1024;
+            warn!(
+                root_pid,
+                limit_mb,
+                rss_mb = mb,
+                "D3-4 RSS watchdog 触发: 进程树 RSS 超限, oneshot 通知 select 杀进程树"
+            );
+            let _ = oom_tx.send(());
+            return;
+        }
+        if oom_tx.is_closed() {
+            return;
         }
     }
 }
@@ -1651,6 +1788,7 @@ mod tests {
             max_nproc: 1024,
             max_cpu_sec: 0,
             max_nofile: 1024,
+            rss_limit_mb: DEFAULT_RSS_LIMIT_MB,
         };
         let (mut rx, handle) = sb.run_streaming(cfg).unwrap();
         // 收首块 (含 "started"), 确认子进程已起
@@ -2078,5 +2216,83 @@ mod tests {
             "DYLD 注入应被 run() 拦: {}",
             err
         );
+    }
+
+    // D3-4 (审计 0827 product): per-task RSS watchdog — sysinfo 轮询子进程树 RSS
+    // 超 rss_limit_mb kill (exit_code -124, oom_killed=true)。Darwin RLIMIT_AS/RLIMIT_DATA
+    // 平台无效, 改轮询缓解 (非纯代码修堆限制)。exit_code -124 复用超时约定。
+    #[test]
+    fn rss_watchdog_kills_memory_bomb() {
+        // 内存炸弹: 100 × 10MB 独立 bytearray (各占实内存) → RSS 膨胀触发 watchdog (256MB 上限)
+        let start = std::time::Instant::now();
+        let mut c = cfg("python3 -c \"x=[bytearray(b'a'*10**7) for _ in range(100)]; import time; time.sleep(5)\"");
+        c.rss_limit_mb = 256;
+        c.timeout_sec = 10.0;
+        let r = rt().block_on(Sandbox::new().run(c)).unwrap();
+        assert!(
+            r.oom_killed,
+            "内存炸弹应触发 oom_killed, got exit={}",
+            r.exit_code
+        );
+        assert_eq!(r.exit_code, -124, "OOM kill exit 应 -124");
+        assert!(
+            start.elapsed().as_secs() < 8,
+            "watchdog 应在超时前触发: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn rss_watchdog_zero_disables() {
+        // rss_limit_mb=0 禁用 watchdog — 内存炸弹不被 OOM kill (受信 opt-out)
+        let mut c = cfg("python3 -c \"x=[' '*10**7]*10**2; print(len(x))\"");
+        c.rss_limit_mb = 0;
+        c.timeout_sec = 15.0;
+        let r = rt().block_on(Sandbox::new().run(c)).unwrap();
+        assert!(!r.oom_killed, "rss_limit_mb=0 不应触发 oom_killed");
+        assert_eq!(r.exit_code, 0, "正常完成 exit 0, got {}", r.exit_code);
+    }
+
+    #[test]
+    fn rss_watchdog_normal_task_unaffected() {
+        // 常规任务 + 限额 → 不误杀
+        let mut c = cfg("echo hi");
+        c.rss_limit_mb = 256;
+        let r = rt().block_on(Sandbox::new().run(c)).unwrap();
+        assert_eq!(r.exit_code, 0, "echo 应 exit 0");
+        assert!(!r.oom_killed, "echo 不应触发 oom_killed");
+        assert!(r.stdout.contains("hi"), "stdout={:?}", r.stdout);
+    }
+
+    #[tokio::test]
+    async fn rss_watchdog_streaming_path() {
+        // 流式路径 watchdog 同样生效 — run_streaming Done 帧 oom_killed=true
+        let sb = Sandbox::new();
+        let cfg = SandboxConfig {
+            command: "python3 -c \"x=[bytearray(b'a'*10**7) for _ in range(100)]; import time; time.sleep(5)\"".to_string(),
+            cwd: None,
+            env: std::collections::HashMap::new(),
+            timeout_sec: 10.0,
+            max_output_chars: 100_000,
+            seatbelt: false,
+            inherit_env: false,
+            use_pty: true,
+            max_nproc: 1024,
+            max_cpu_sec: 0,
+            max_nofile: 1024,
+            rss_limit_mb: 256,
+        };
+        let (mut rx, handle) = sb.run_streaming(cfg).unwrap();
+        let mut done_oom = false;
+        let mut exit_code = -999;
+        while let Some(ev) = rx.recv().await {
+            if let StreamEvent::Done(res) = ev {
+                done_oom = res.oom_killed;
+                exit_code = res.exit_code;
+            }
+        }
+        let _ = handle.await;
+        assert!(done_oom, "流式 Done 帧应 oom_killed=true");
+        assert_eq!(exit_code, -124, "流式 OOM exit 应 -124");
     }
 }
