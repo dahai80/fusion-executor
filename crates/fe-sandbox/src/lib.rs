@@ -64,6 +64,10 @@ pub struct SandboxResult {
     /// use_pty=true (PTY 默认) 时 PTY 合并 stdout+stderr, 本字段恒空, Slicer 吃 stdout tail。
     pub stderr: String,
     pub timed_out: bool,
+    /// RUN-11: 沙箱子进程 PID — 调用方据此传 telemetry_stream 采样真实任务进程 (非 executor 自身)。
+    /// PTY/stdio spawn 路径有; 拦截/空命令/取消收尾路径视情形 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// 流式事件 — Chunk (实时 stdio 分块) / Done (最终结果, 含截断后 stdout)
@@ -420,6 +424,7 @@ impl Sandbox {
             stdout,
             stderr: String::new(),
             timed_out,
+            pid, // RUN-11: 回填子进程 PID (PTY 路径 child.process_id())
         })
     }
 
@@ -559,6 +564,7 @@ impl Sandbox {
             stdout,
             stderr,
             timed_out,
+            pid, // RUN-11: 回填子进程 PID (stdio 路径 child.id())
         })
     }
 
@@ -775,6 +781,7 @@ impl Sandbox {
                         stdout,
                         stderr: String::new(),
                         timed_out: false,
+                        pid: pid_for_cancel, // RUN-11: 回填子进程 PID (取消收尾, 子已 kill)
                     }))
                     .await;
                 return;
@@ -825,6 +832,7 @@ impl Sandbox {
                     stdout,
                     stderr: String::new(),
                     timed_out,
+                    pid: pid_for_cancel, // RUN-11: 回填子进程 PID (正常完成)
                 }))
                 .await;
         });

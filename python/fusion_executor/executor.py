@@ -39,12 +39,15 @@ class FusionSandboxExecutor:
         sock_path: str | None = None,
         *,
         extra_whitelist: list[str] | None = None,
+        disable_bundle_allowlist: bool = False,
     ) -> None:
         try:
             from ._native import NativeExecutor
         except ImportError as e:
             raise ImportError("fusion_executor._native 未加载 — 运行 `maturin develop` 编译原生扩展") from e
-        self._native = NativeExecutor(extra_whitelist)
+        # RUN-12: disable_bundle_allowlist=True 关闭 GUI 焦点 app 白名单 (无限制 opt-in, 仅审计日志);
+        #         默认 False 走安全默认集 (Terminal/TextEdit/finder)。测试机 drive 任意 app 时传 True。
+        self._native = NativeExecutor(extra_whitelist, disable_bundle_allowlist)
         self._sock_path = sock_path
 
     def run(
@@ -139,6 +142,7 @@ class FusionSandboxExecutor:
             rollback_unavailable=native.rollback_unavailable,
             rollback_skipped_reason=native.rollback_skipped_reason,
             trace_id=native.trace_id,
+            pid=native.pid,
         )
         logger.info(
             "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s rb_unavail=%s rb_skipped=%s dur=%.3fs",

@@ -545,9 +545,8 @@ impl GuiController {
     /// 内部均为 unsafe FFI, 但已封进 safe API; 本函数无需手写 unsafe block。
     fn key_press(&self, key: &str, modifiers: &[String]) -> Result<GuiResult> {
         info!(key, mods = ?modifiers, "KeyPress");
-        if let Some(r) = self.focused_not_allowed() {
-            return Ok(r);
-        }
+        // RUN-12: trusted-independent 输入校验先行 — 未知键名/修饰键降级与焦点 app 无关,
+        // 放在 focused_not_allowed 闸门之前 (keycode/modifier 解析不触 AX 焦点读)。
         let code = match Self::resolve_keycode(key) {
             Some(c) => c,
             None => {
@@ -601,6 +600,10 @@ impl GuiController {
                     });
                 }
             }
+        }
+        // RUN-12: 输入校验已过 (trusted-independent), 再查焦点 app 白名单 — 非白名单 app 拒绝合成事件
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
         }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (CGEventSourceCreate 返回 null)"))?;
@@ -665,9 +668,7 @@ impl GuiController {
                 ..Default::default()
             });
         }
-        if let Some(r) = self.focused_not_allowed() {
-            return Ok(r);
-        }
+        // RUN-12: trusted-independent keycode 校验先行 (与 key_press 同理)
         let code = match Self::resolve_keycode(key) {
             Some(c) => c,
             None => {
@@ -685,6 +686,10 @@ impl GuiController {
                 });
             }
         };
+        // RUN-12: 焦点 app 白名单 — keycode 已过, 非白名单 app 拒绝合成事件
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (hold_key)"))?;
         // keydown
@@ -1515,11 +1520,15 @@ mod tests {
     fn execute_degrades_without_ax_trust() {
         let ctrl = GuiController::new();
         let r = ctrl.execute(GuiAction::Screenshot {}).unwrap();
-        assert!(!r.ok, "未授权应降级");
         // IMPL-9: screenshot 走 Screen Recording TCC (CoreGraphics), 非 Accessibility 闸门。
-        // CI 无 Screen Recording → screen-recording-permission-required;
-        // trusted 机有 Screen Recording → ok:true (PNG)。两路径均合法, 不强断言 error 字面。
+        // 两路径均合法, 不强断言 ok 字面:
+        //   CI 无 Screen Recording → ok:false + screen-recording-permission-required;
+        //   trusted 机有 Screen Recording → ok:true (PNG)。
         if !GuiController::ax_trusted() {
+            assert!(
+                !r.ok,
+                "IMPL-9: 未授权 (无 Screen Recording) 应降级 ok:false"
+            );
             assert!(
                 r.error.is_some(),
                 "IMPL-9: 未授权应降级 (Screen Recording 或 encode 错误)"

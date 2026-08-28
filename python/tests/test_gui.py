@@ -28,8 +28,10 @@ def _ax_access_trusted() -> bool:
     # 探测 TCC Accessibility (非 Screen Recording) — Rust !ax_trusted() 降级闸门用此权限。
     # hover 仅带坐标, 不走 AX 树遍历: trusted→ok=True, untrusted→ok=False+accessibility-permission-required。
     # 与 _ax_trusted() (screenshot=Screen Recording) 分离 — 两 TCC 权限独立。
+    # RUN-12: 关闭焦点 app 白名单 (disable_bundle_allowlist=True) — 否则默认白名单先拦 hover,
+    #         误判 trusted 机为 untrusted, 降级测试在 trusted 机误跑。探测须纯净测 AX 权限。
     try:
-        ex = FusionSandboxExecutor()
+        ex = FusionSandboxExecutor(disable_bundle_allowlist=True)
         r = ex.gui_action({"kind": "hover", "ax_position": [0.0, 0.0]})
         return r.ok
     except Exception:
@@ -158,7 +160,9 @@ def test_gui_action_screenshot_when_trusted():
 def test_gui_action_keypress_when_trusted():
     if not _ax_trusted():
         pytest.skip("AX 未授权 — 跳过真实按键合成测试 (CI 路径)")
-    ex = FusionSandboxExecutor()
+    # RUN-12: 关闭默认白名单 — 测试机聚焦 app (pytest 进程的终端) 不一定在默认安全集内,
+    #         白名单会先拦 key_press 合成。显式 disable 走真实 CGEvent 路径验 ok=True。
+    ex = FusionSandboxExecutor(disable_bundle_allowlist=True)
     # 已知键名 → CGEvent 合成 keydown+keyup, post HID; 应 ok=True
     r = ex.gui_action({"kind": "key_press", "key": "Tab"})
     assert isinstance(r, GuiResult)
@@ -169,7 +173,8 @@ def test_gui_action_keypress_when_trusted():
 def test_gui_action_keypress_chord_when_trusted():
     if not _ax_trusted():
         pytest.skip("AX 未授权 — 跳过真实修饰键和弦测试 (CI 路径)")
-    ex = FusionSandboxExecutor()
+    # RUN-12: 同 keypress_when_trusted — 关闭默认白名单走真实 CGEvent 和弦路径。
+    ex = FusionSandboxExecutor(disable_bundle_allowlist=True)
     # 修饰键和弦 (Cmd+Tab) — 已知键 + 已知修饰键 → ok=True
     r = ex.gui_action({"kind": "key_press", "key": "Tab", "modifiers": ["command"]})
     assert isinstance(r, GuiResult)
@@ -247,7 +252,8 @@ def test_gui_action_wait_over_uds(server: str):
 def test_gui_action_scroll_when_trusted():
     if not _ax_trusted():
         pytest.skip("AX 未授权 — 跳过真实滚轮合成测试 (CI 路径)")
-    ex = FusionSandboxExecutor()
+    # RUN-12: 关闭默认白名单走真实 CGEvent scrollWheel 路径。
+    ex = FusionSandboxExecutor(disable_bundle_allowlist=True)
     r = ex.gui_action({"kind": "scroll", "dx": 0, "dy": -3})
     assert isinstance(r, GuiResult)
     assert r.ok is True, f"Scroll 应成功: {r.error}"
@@ -257,7 +263,8 @@ def test_gui_action_scroll_when_trusted():
 def test_gui_action_drag_when_trusted():
     if not _ax_trusted():
         pytest.skip("AX 未授权 — 跳过真实拖拽合成测试 (CI 路径)")
-    ex = FusionSandboxExecutor()
+    # RUN-12: 关闭默认白名单走真实 CGEvent mouseMove/down/up 拖拽路径。
+    ex = FusionSandboxExecutor(disable_bundle_allowlist=True)
     r = ex.gui_action({"kind": "drag", "from": [10.0, 10.0], "to": [50.0, 50.0]})
     assert isinstance(r, GuiResult)
     assert r.ok is True, f"Drag 应成功: {r.error}"
@@ -301,7 +308,8 @@ def test_gui_action_pointer_variants_when_trusted():
     # window_* 变体需真实 GUI 会话 (AX 窗口树), 沙箱内 fail — 不在此断言
     if not _ax_access_trusted():
         pytest.skip("AX Accessibility 未授权 — 跳过真实 pointer 合成测试 (CI 路径)")
-    ex = FusionSandboxExecutor()
+    # RUN-12: 关闭默认白名单 — 聚焦 app (pytest 终端) 不在默认安全集, 白名单会先拦 hover/pointer。
+    ex = FusionSandboxExecutor(disable_bundle_allowlist=True)
     for action in [
         {"kind": "hover", "ax_position": [10.0, 20.0]},
         {"kind": "double_click", "ax_position": [5.0, 5.0]},
@@ -318,7 +326,8 @@ def test_gui_action_holdkey_when_trusted():
     # hold_key 单键 CGEvent 合成 (keydown→sleep→keyup), 无需 AX 树 → ok=True
     if not _ax_access_trusted():
         pytest.skip("AX Accessibility 未授权 — 跳过真实 key 合成测试 (CI 路径)")
-    ex = FusionSandboxExecutor()
+    # RUN-12: 关闭默认白名单走真实 CGEvent hold_key 路径 (同 keypress/pointer)。
+    ex = FusionSandboxExecutor(disable_bundle_allowlist=True)
     r = ex.gui_action({"kind": "hold_key", "key": "return", "duration_ms": 20})
     assert isinstance(r, GuiResult)
     assert r.ok is True, f"HoldKey 应成功: {r.error}"

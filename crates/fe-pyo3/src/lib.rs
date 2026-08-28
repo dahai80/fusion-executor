@@ -101,6 +101,9 @@ struct PyExecutionResult {
     /// M-OPS-06: 跨层关联 id (回填请求侧或入口自动生成)
     #[pyo3(get)]
     trace_id: Option<String>,
+    /// RUN-11: 沙箱子进程 PID (调用方据此传 telemetry_stream 采样真实任务)
+    #[pyo3(get)]
+    pid: Option<u32>,
 }
 
 impl From<RsResult> for PyExecutionResult {
@@ -121,6 +124,7 @@ impl From<RsResult> for PyExecutionResult {
             rollback_unavailable: r.rollback_unavailable,
             rollback_skipped_reason: r.rollback_skipped_reason.clone(),
             trace_id: r.trace_id,
+            pid: r.pid,
         }
     }
 }
@@ -599,8 +603,8 @@ struct PyExecutor {
 #[pymethods]
 impl PyExecutor {
     #[new]
-    #[pyo3(signature = (extra_whitelist=None))]
-    fn new(extra_whitelist: Option<Vec<String>>) -> Self {
+    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false))]
+    fn new(extra_whitelist: Option<Vec<String>>, disable_bundle_allowlist: bool) -> Self {
         // extra_whitelist 经 with_extra_whitelist 烘焙进 inner 的 ArcSwap; A-4 后 serve() 共享
         // inner, 无需单独存。SIGHUP reload 从 FUSION_EXECUTOR_EXTRA_WHITELIST env 读 (m-OPS-02)。
         let extras: Vec<&str> = extra_whitelist
@@ -609,12 +613,22 @@ impl PyExecutor {
             .iter()
             .map(String::as_str)
             .collect();
-        let inner = if extras.is_empty() {
+        let mut inner = if extras.is_empty() {
             Executor::new()
         } else {
             tracing::info!(count = extras.len(), "PyExecutor 构造带项目级白名单扩展");
             Executor::new().with_extra_whitelist(&extras)
         };
+        // RUN-12: disable_bundle_allowlist=True → GuiConfig{allowed_bundle_ids: None} = 无限制
+        //   (显式 opt-in, 仅审计日志); 默认 False 走 GuiConfig::default 的安全默认集 (Terminal/
+        //   TextEdit/finder)。测试机需 drive 任意 app 时显式传 True 解除限制。
+        if disable_bundle_allowlist {
+            tracing::info!("PyExecutor 构造关闭 GUI 焦点 app 白名单 (RUN-12 显式无限制 opt-in)");
+            inner = inner.with_gui_config(fe_core::gui::GuiConfig {
+                allowed_bundle_ids: None,
+                allow_type_into_secure: false,
+            });
+        }
         // ARCH-4: 进程内路径 (execute_sync/run) 不经 fe-ipc BroadcastHub, recorder 未装
         // 则 record_exec_outcome 的 metrics::counter! 为 no-op。此处置装 (幂等 OnceLock),
         // 让进程内 execute 也能计数 Prometheus。失败仅 warn 不阻断 (降级 = 无 metrics, 非致命)。

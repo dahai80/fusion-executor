@@ -240,6 +240,10 @@ pub struct ExecutionResult {
     /// M-OPS-06: 跨层关联 id — 回填请求侧 trace_id (None 时入口自动生成)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// RUN-11: 沙箱子进程 PID — 从 SandboxResult.pid 回填, 调用方据此传给 telemetry_stream
+    /// 采样真实任务进程 (非 executor 自身)。stdio 路径有 pid; 拦截/超时路径无 → None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 impl ExecutionResult {
@@ -822,6 +826,7 @@ impl Executor {
             snapshot_id: sid_filtered.clone(),
             diagnostics: diag,
             trace_id: Some(trace_id),
+            pid: sb.pid, // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
             ..Default::default()
         };
 
@@ -1022,6 +1027,7 @@ impl Executor {
                                 snapshot_id: sid_filtered.clone(),
                                 diagnostics: diag,
                                 trace_id: Some(trace_id_for_done.clone()),
+                                pid: sb.pid, // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
                                 ..Default::default()
                             };
                             // 自动回滚 (FR-04, 同 execute_async; pre_status diff C-CORE-01)

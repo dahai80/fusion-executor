@@ -94,6 +94,11 @@ class ExecutionResult(BaseModel):
     trace_id: str | None = Field(
         default=None, description="跨层关联 id — 回填请求侧 trace_id 或入口自动生成 (M-OPS-06)"
     )
+    pid: int | None = Field(
+        default=None,
+        description="沙箱子进程 PID — 调用方据此传 telemetry_stream(pid=...) 采样真实任务进程 "
+        "(非 executor 自身, RUN-11); stdio 路径有, 拦截/超时路径无",
+    )
 
 
 class GuiResult(BaseModel):

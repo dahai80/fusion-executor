@@ -93,8 +93,17 @@ pub fn start_stream(
         // P-7: new_all 建全进程表基线 (单 PID refresh 在全新 System 上 mem 可能 0);
         // 循环内再窄到单 PID refresh 省 CPU。macOS libproc 怪癖: 全表建内存基线稳。
         let mut sys = sysinfo::System::new_all();
-        // L-15: pid=None (默认) 采样 executor 自身 (当前行为, 文档化); 传入则采样沙箱子进程
-        let raw_pid = cfg.pid.unwrap_or_else(std::process::id);
+        // L-15 + RUN-11: pid=None 采样 executor 自身 — 仅 ops 自监控场景合法, 非 sandbox 任务遥测。
+        // 审计 RUN-11: 默认采 executor 会让任务遥测读成空载 broker, 容量决策误导。
+        // 保留 None=采自身 (back-compat, ops 自监控合法), 但 warn fail-loud 让 "采的是 executor 非任务" 可见;
+        // sandbox 任务遥测调用方须从 ExecutionResult.pid 传入真实子进程 PID (4 层已暴露)。
+        let raw_pid = cfg.pid.unwrap_or_else(|| {
+            warn!(
+                "telemetry pid=None — 采样 executor 自身 (非 sandbox 任务). \
+                 sandbox 任务遥测须从 ExecutionResult.pid 传入子进程 PID, 否则读空载 broker (RUN-11)"
+            );
+            std::process::id()
+        });
         let pid = sysinfo::Pid::from_u32(raw_pid);
         info!(interval_ms = cfg.interval_ms, pid = raw_pid, "遥测采样启动");
         // L-TEL-03: 0 = 未指定用默认 100ms; <10 提至 10ms 防 CPU 霸占 (warn 显式, 非静默夹紧)
