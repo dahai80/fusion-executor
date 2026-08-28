@@ -22,6 +22,7 @@ from .models import (
     ShellInfo,
     ShellOutput,
     ShellStartResult,
+    SnapshotInfo,
     TelemetrySample,
 )
 
@@ -320,6 +321,15 @@ class FusionSandboxExecutor:
     def snapshot_create(self, cwd: str) -> str:
         logger.info("snapshot_create cwd=%s", cwd)
         return self._native.snapshot_create(cwd)
+
+    def list_snapshots(self, cwd: str) -> list[SnapshotInfo]:
+        # D6-03 (审计 0827 product): 快照清单 — on-disk 索引读回, 供运维审计/存活快照发现。
+        # 无状态 (M-ARCH-1): 仅读 cwd 对应索引, executor 不持有快照状态。
+        logger.info("list_snapshots cwd=%s", cwd)
+        native_list = self._native.list_snapshots(cwd)
+        out = [SnapshotInfo.model_validate(s.to_dict()) for s in native_list]
+        logger.info("list_snapshots done count=%d cwd=%s", len(out), cwd)
+        return out
 
     def validate(self, command: str) -> dict:
         # Issue #11 / #12.4: 非执行预校验 — 调用方先问用户授权再 run (Option A: caller owns gating)。

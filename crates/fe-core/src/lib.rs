@@ -683,6 +683,12 @@ impl Executor {
         self.rollback.snapshot_create(cwd).await
     }
 
+    /// D6-03 (审计 0827 product): 快照清单 — 公开供 fe-pyo3/fe-ipc 直接调用。
+    /// 无状态 (M-ARCH-1): 仅读 cwd 对应 on-disk 索引, Executor 不持有快照状态。
+    pub async fn list_snapshots_async(&self, cwd: &str) -> Result<Vec<fe_rollback::SnapshotInfo>> {
+        fe_rollback::RollbackManager::list_snapshots(cwd)
+    }
+
     /// 回滚 — 公开供 fe-pyo3 直接调用。
     /// L-1 (审计 0827): rollback() 内部返 RollbackOutcome; 此包装映射 .applied → bool
     /// 保持 IPC/PyO3/Python 侧 bool 契约不变 (skipped_reason 细节经 ExecutionResult 4 层流通)。

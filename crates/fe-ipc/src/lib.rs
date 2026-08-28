@@ -7,7 +7,7 @@
 //   扩展: -32010 安全拦截, -32011 超时, -32012 回滚失败, -32013 AX 未授权
 // 匹配 fusion-studio IPCClient.swift: 按字节读到 0x0A, 8s 超时
 //
-// 方法: executor.health/execute/execute_stream/telemetry_stream/snapshot_create/rollback/gui_action/diagnostics
+// 方法: executor.health/execute/execute_stream/telemetry_stream/snapshot_create/list_snapshots/rollback/gui_action/diagnostics
 //       executor.file_edit/glob/grep/apply_patch/replace_function/shutdown
 //       executor.subscribe/unsubscribe  (v1.5 #14 — 双向 server-push)
 //
@@ -1718,6 +1718,25 @@ async fn handle_method(
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("snapshot_create 失败: {}", e)))?;
             Ok(json!({"snapshot_id": id}))
+        }
+        // D6-03 (审计 0827 product): 快照清单 — on-disk NDJSON 索引读回, 供 on-call/审计查询。
+        "executor.list_snapshots" => {
+            let cwd = param_str(&params, "cwd").ok_or((ERR_INVALID_REQ, "缺少 cwd".to_string()))?;
+            let snaps = executor
+                .list_snapshots_async(&cwd)
+                .await
+                .map_err(|e| (ERR_INTERNAL, format!("list_snapshots 失败: {}", e)))?;
+            let arr: Vec<serde_json::Value> = snaps
+                .into_iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id,
+                        "created_ms": s.created_ms,
+                        "kind": s.kind,
+                    })
+                })
+                .collect();
+            Ok(json!({"snapshots": arr}))
         }
         // Issue #11 / #12.4: 非执行预校验 — 调用方 (fusion-code) 先问用户授权再 execute。
         // Executor 只强制硬黑名单 (never-blocked); interactive confirmation 归 caller (Option A, stateless)。

@@ -17,6 +17,7 @@ from .models import (
     ShellInfo,
     ShellOutput,
     ShellStartResult,
+    SnapshotInfo,
     TelemetrySample,
 )
 
@@ -37,6 +38,7 @@ __all__ = [
     "ShellInfo",
     "ShellOutput",
     "ShellStartResult",
+    "SnapshotInfo",
     "Subscription",
     "TelemetrySample",
 ]

@@ -250,6 +250,40 @@ def test_snapshot_rollback_over_uds(server: str, tmp_path: Path):
     assert (d / "app.py").read_text() == "BROKEN\n"
 
 
+def test_list_snapshots_over_uds(server: str, tmp_path: Path):
+    # D6-03 (审计 0827 product): 快照清单 — snapshot_create 写 on-disk 索引, list_snapshots 读回。
+    d = tmp_path / "repo"
+    d.mkdir()
+
+    def g(*a):
+        subprocess.run(["git", "-C", str(d), *a], check=True, capture_output=True)
+
+    g("init", "-q")
+    g("config", "user.email", "t@t")
+    g("config", "user.name", "t")
+    (d / "app.py").write_text("print(1)\n")
+    g("add", ".")
+    g("commit", "-q", "-m", "base")
+
+    snap = _rpc(
+        server,
+        {"jsonrpc": "2.0", "id": 5, "method": "executor.snapshot_create", "params": {"cwd": str(d)}},
+    )
+    sid = snap["result"]["snapshot_id"]
+    assert sid, "快照 id 非空"
+
+    lst = _rpc(
+        server,
+        {"jsonrpc": "2.0", "id": 6, "method": "executor.list_snapshots", "params": {"cwd": str(d)}},
+    )
+    snaps = lst["result"]["snapshots"]
+    assert len(snaps) >= 1, "清单应含至少一条快照"
+    first = snaps[0]
+    assert first["id"] == sid, "清单首条 id 应匹配 snapshot_create 返回"
+    assert first["kind"] == "head", "无改动快照 kind 应为 head"
+    assert isinstance(first["created_ms"], int), "created_ms 应为整数"
+
+
 def test_execute_stream_chunks_then_done_over_uds(server: str):
     req = {
         "jsonrpc": "2.0",

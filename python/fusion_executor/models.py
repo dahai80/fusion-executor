@@ -208,3 +208,11 @@ class ShellInfo(BaseModel):
     started_at_ms: int = Field(description="启动时间戳 (毫秒纪元)")
     finished: bool = Field(description="是否已退出")
     exit_code: int | None = Field(default=None, description="退出码 (运行中为 None)")
+
+
+# D6-03 (审计 0827 product): 快照清单条目 — 镜像 fe_rollback::SnapshotInfo (on-disk 索引读回)。
+class SnapshotInfo(BaseModel):
+    model_config = _STRICT
+    id: str = Field(description="快照 id (head:<SHA> / stash:<SHA>,base:<HEAD> / repo:<hash> 后缀)")
+    created_ms: int = Field(description="快照创建时间戳 (毫秒纪元)")
+    kind: str = Field(description="快照类型 (head 基线 / stash 含改动)")

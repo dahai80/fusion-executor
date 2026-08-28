@@ -232,6 +232,40 @@ impl From<RsGrepMatch> for PyGrepMatch {
     }
 }
 
+/// D6-03 (审计 0827 product): Python 可见快照条目 — 镜像 fe_rollback::SnapshotInfo。
+#[pyclass(name = "NativeSnapshotInfo", skip_from_py_object)]
+#[derive(Clone)]
+struct PySnapshotInfo {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    created_ms: u64,
+    #[pyo3(get)]
+    kind: String,
+}
+
+impl From<fe_rollback::SnapshotInfo> for PySnapshotInfo {
+    fn from(s: fe_rollback::SnapshotInfo) -> Self {
+        Self {
+            id: s.id,
+            created_ms: s.created_ms,
+            kind: s.kind,
+        }
+    }
+}
+
+#[pymethods]
+impl PySnapshotInfo {
+    /// dict 视图 — 供 Python 侧 Pydantic model_validate(fields) 构造。
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("id", self.id.clone())?;
+        d.set_item("created_ms", self.created_ms)?;
+        d.set_item("kind", self.kind.clone())?;
+        Ok(d)
+    }
+}
+
 /// Python 可见 grep 计数行 — 镜像 fe_tools::GrepFileCount (#7 count 模式)
 #[pyclass(name = "NativeGrepFileCount", skip_from_py_object)]
 #[derive(Clone)]
@@ -731,6 +765,19 @@ impl PyExecutor {
                 tracing::error!(error = %e, "snapshot_create 失败");
                 pyo3::exceptions::PyRuntimeError::new_err(format!("snapshot_create 失败: {e}"))
             })
+    }
+
+    /// D6-03: list_snapshots(cwd) -> Vec<NativeSnapshotInfo> — on-disk 索引读回。
+    /// RUN-1: block_on 跨 git IO 阻塞, py.detach 释放 GIL。
+    fn list_snapshots(&self, py: Python<'_>, cwd: String) -> PyResult<Vec<PySnapshotInfo>> {
+        let inner = self.inner.clone();
+        let snaps = py
+            .detach(move || fe_core::BLOCKING_RT.block_on(inner.list_snapshots_async(&cwd)))
+            .map_err(|e| {
+                tracing::error!(error = %e, "list_snapshots 失败");
+                pyo3::exceptions::PyRuntimeError::new_err(format!("list_snapshots 失败: {e}"))
+            })?;
+        Ok(snaps.into_iter().map(PySnapshotInfo::from).collect())
     }
 
     /// rollback(snapshot_id, cwd) -> bool (Ok(false) = 跳过/非 repo, 合法)
@@ -1310,6 +1357,7 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEditResult>()?;
     m.add_class::<PyGlobEntry>()?;
     m.add_class::<PyGrepMatch>()?;
+    m.add_class::<PySnapshotInfo>()?;
     m.add_class::<PyStreamIterator>()?;
     m.add_class::<PyTelemetryIterator>()?;
     m.add_class::<PyShellStartResult>()?;
