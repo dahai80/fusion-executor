@@ -28,6 +28,9 @@ from .models import (
 logger = logging.getLogger("fusion_executor")
 
 DEFAULT_SOCK = os.path.expanduser("~/.fusion-executor/fe.sock")  # IMPL-1: 对齐 Rust M-SEC-01 (HOME 私有 0o700)
+# D6-01: pidfile — serve 启动写 pid, 停机删。ops 可 `kill $(cat fe.pid)` / 监控存活。
+# 与 socket 同目录 (~/.fusion-executor/, HOME 私有 0o700), 不暴露 pid 给其他用户。
+DEFAULT_PIDFILE = os.path.expanduser("~/.fusion-executor/fe.pid")
 SUB_CHANNELS = ("telemetry", "stdio", "screenshot")
 # P-2: subscription 行缓冲上限 — 损坏流 (无 newline) / 超巨帧防护, 超则丢缓冲当流结束
 _SUB_BUF_MAX_BYTES = 8 * 1024 * 1024
@@ -44,6 +47,30 @@ def ensure_socket_dir(path: str = DEFAULT_SOCK) -> None:
             os.chmod(sock_dir, 0o700)
     except OSError as e:
         logger.warning("ensure_socket_dir 创建 %s 失败: %s", sock_dir, e)
+
+
+def write_pidfile(path: str = DEFAULT_PIDFILE) -> None:
+    # D6-01: serve 启动写 pidfile。目录由 ensure_socket_dir (socket 同目录) 先建。
+    # 失败不阻断 serve (pidfile 是 ops 辅助, 非安全关键) — fail-visible 警告, 继续服务。
+    try:
+        pid_dir = os.path.dirname(path)
+        if pid_dir:
+            os.makedirs(pid_dir, mode=0o700, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        logger.info("pidfile 写入 %s (pid=%d)", path, os.getpid())
+    except OSError as e:
+        logger.warning("pidfile 写入 %s 失败: %s — ops 监控将不可用, serve 继续", path, e)
+
+
+def remove_pidfile(path: str = DEFAULT_PIDFILE) -> None:
+    # D6-01: serve 停机删 pidfile。不存在 (写失败或已被删) 静默 no-op; 删失败警告不抛。
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+            logger.info("pidfile 清理 %s", path)
+    except OSError as e:
+        logger.warning("pidfile 清理 %s 失败: %s", path, e)
 
 
 class FusionSandboxExecutor:
@@ -704,8 +731,11 @@ class FusionSandboxExecutor:
         # 与 finally 清理用的 path (env 解析) 不同源, 虽 Rust 亦解析 env 凑巧一致, 但显式
         # 传 path 消除隐式 env 依赖, 清理与监听严格同一路径。
         path = sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        pid_path = os.environ.get("FUSION_EXECUTOR_PIDFILE", DEFAULT_PIDFILE)
         # IMPL-1: serve 前确保 socket 父目录存在 (默认 ~/.fusion-executor/ 0o700, 对齐 Rust M-SEC-01)。
         ensure_socket_dir(path)
+        # D6-01: 写 pidfile (ops 监控/kill 用)。socket 同目录, 目录已由 ensure_socket_dir 建。
+        write_pidfile(pid_path)
         # ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
         # 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
         logger.info(
@@ -731,6 +761,8 @@ class FusionSandboxExecutor:
                     logger.info("serve 清理残留 socket %s", path)
                 except OSError as e:
                     logger.warning("serve 清理 socket 失败 %s: %s", path, e)
+            # D6-01: 停机删 pidfile (正常 + 信号 + 异常路径都走 finally)
+            remove_pidfile(pid_path)
             if raised:
                 raise KeyboardInterrupt("serve 已停机")
 

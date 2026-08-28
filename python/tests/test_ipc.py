@@ -80,6 +80,63 @@ def test_health_over_uds(server: str):
     assert "version" in resp["result"]
 
 
+def test_pidfile_write_remove_roundtrip(tmp_path: Path):
+    # D6-01: pidfile helpers 直接测 (不跑 serve — serve 阻塞)。写 → 读校验 pid → 删 → 删后 no-op。
+    from fusion_executor.executor import remove_pidfile, write_pidfile
+
+    pid_path = str(tmp_path / "fe-test.pid")
+    assert not os.path.exists(pid_path)
+    write_pidfile(pid_path)
+    assert os.path.exists(pid_path)
+    with open(pid_path, encoding="utf-8") as f:
+        pid_str = f.read()
+    assert pid_str == str(os.getpid()), "pidfile 应写入当前进程 pid"
+    remove_pidfile(pid_path)
+    assert not os.path.exists(pid_path), "删除后 pidfile 应不存在"
+    # 删不存在文件应 no-op 不抛
+    remove_pidfile(pid_path)
+
+
+def test_pidfile_serve_lifecycle(tmp_path: Path):
+    # D6-01: serve 启动写 pidfile, 停机删 — 跨进程验证。注入 FUSION_EXECUTOR_PIDFILE 指向 tmp,
+    # 不污染 HOME。启动子进程 serve → 等 pidfile 出现 → 读校验 pid 匹配 → 停机 → 验证已删。
+    pid_path = str(tmp_path / "fe-lifecycle.pid")
+    sock = _sock_path()
+    env = dict(os.environ, FUSION_EXECUTOR_SOCK=sock, FUSION_EXECUTOR_PIDFILE=pid_path)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_sock(sock)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if os.path.exists(pid_path):
+                break
+            time.sleep(0.05)
+        assert os.path.exists(pid_path), "serve 启动应写 pidfile"
+        with open(pid_path, encoding="utf-8") as f:
+            written_pid = int(f.read().strip())
+        assert written_pid == proc.pid, f"pidfile pid {written_pid} 应匹配 serve 子进程 {proc.pid}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if os.path.exists(sock):
+            os.unlink(sock)
+    # 停机后 pidfile 应被 finally remove_pidfile 清理
+    assert not os.path.exists(pid_path), "serve 停机应删 pidfile"
+
+
 def test_execute_echo_over_uds(server: str):
     resp = _rpc(
         server,
