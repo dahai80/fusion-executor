@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -129,6 +129,52 @@ fn parse_shutdown_timeout(raw: Option<String>) -> Duration {
     }
 }
 
+/// D6-02: execute 墙钟直方图固定桶上界 (秒)。+Inf 末桶不计入数组 (独立 total = exec_total)。
+/// 桶选型覆盖 CLI 沙箱典型档: <5ms init / <50ms 快命令 / <500ms 编译 / <5s 测试套 / <30s 长跑 / +Inf 尾部。
+const DURATION_BUCKETS_LE: [f64; 5] = [0.005, 0.05, 0.5, 5.0, 30.0];
+
+/// D6-02: 墙钟 (秒) → 桶下标; 越过所有有限桶 → None (落入 +Inf 末桶, 不递增数组)。
+fn duration_bucket_index(sec: f64) -> Option<usize> {
+    for (i, le) in DURATION_BUCKETS_LE.iter().enumerate() {
+        if sec <= *le {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// D6-02: histogram_quantile 插值 — 累计计数数组 (每桶含自身及更小) → 分位值 (秒)。
+/// q ∈ [0,1]。线性插值跨相邻桶 (Prometheus _quantile_ 约定)。空/不足 → 0.0。
+fn histogram_quantile(cumulative: &[u64], q: f64) -> f64 {
+    let total = cumulative.last().copied().unwrap_or(0);
+    if total == 0 {
+        return 0.0;
+    }
+    let target = (total as f64) * q.clamp(0.0, 1.0);
+    for i in 0..cumulative.len() {
+        if (cumulative[i] as f64) >= target {
+            if i == 0 {
+                return DURATION_BUCKETS_LE.first().copied().unwrap_or(0.0);
+            }
+            let prev = cumulative[i - 1] as f64;
+            let cur = cumulative[i] as f64;
+            if cur <= prev {
+                return DURATION_BUCKETS_LE[i];
+            }
+            let lo = if i == 1 {
+                0.0
+            } else {
+                DURATION_BUCKETS_LE[i - 2]
+            };
+            let hi = DURATION_BUCKETS_LE[i - 1];
+            let frac = (target - prev) / (cur - prev);
+            return lo + (hi - lo) * frac;
+        }
+    }
+    // q 落在 +Inf 末桶 (超过所有有限桶累计) → 返回最大有限上界 (保守, 不假装无限)。
+    DURATION_BUCKETS_LE.last().copied().unwrap_or(0.0)
+}
+
 /// M-OPS-02: Prometheus recorder handle — global, idempotent 安装。
 /// metrics-exporter-prometheus 的 PrometheusBuilder::install() 安装全局 recorder,
 /// 返 PrometheusHandle (render() 出 Prometheus text format 供 scrape)。
@@ -143,7 +189,20 @@ static PROM_HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 pub fn install_prometheus_recorder() -> Option<PrometheusHandle> {
     PROM_HANDLE
         .get_or_init(|| {
-            let handle = PrometheusBuilder::new()
+            // D6-02: 配置直方图桶与 DURATION_BUCKETS_LE 对齐 — render() 出 _bucket{le=...} 行。
+            // set_buckets_for_metric 消费 self 返 Result<PrometheusBuilder, BuildError>;
+            // .ok()? 转 Option<PrometheusBuilder> (空桶→BuildError→None, 降级仅 JSON)。
+            let builder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Prefix("fe_exec_duration".to_string()),
+                    &DURATION_BUCKETS_LE,
+                )
+                .map_err(|e| {
+                    warn!(error = %e, "D6-02: set_buckets_for_metric 失败");
+                    e
+                })
+                .ok()?;
+            let handle = builder
                 .install_recorder()
                 .map_err(|e| {
                     warn!(error = %e, "M-OPS-02: Prometheus recorder install 失败");
@@ -157,6 +216,10 @@ pub fn install_prometheus_recorder() -> Option<PrometheusHandle> {
             metrics::describe_counter!("fe_exec_failed", "Executes failed (non-0/timeout/blocked)");
             metrics::describe_counter!("fe_rollback_total", "Total rollback() calls");
             metrics::describe_counter!("fe_rollback_failed", "Rollback failures");
+            metrics::describe_histogram!(
+                "fe_exec_duration_seconds",
+                "Execute() wall-clock duration (seconds)"
+            );
             metrics::describe_gauge!("fe_shell_active", "Active background shells");
             metrics::describe_gauge!("fe_connections", "Active UDS connections");
             Some(handle)
@@ -226,6 +289,12 @@ struct BroadcastHub {
     /// execute 累计墙钟 (ns) + stdio 累计字节 — 配合 exec_total 算均值
     exec_duration_nanos_sum: AtomicU64,
     stdio_bytes_sum: AtomicU64,
+    /// D6-02: execute 墙钟固定桶直方图 (ns) — p50/p95/p99 经 histogram_quantile 插值。
+    /// 6 桶上界 (秒): 0.005 / 0.05 / 0.5 / 5 / 30 / +Inf。AtomicU64 无锁, snapshot 累加走桶。
+    exec_duration_buckets: [AtomicU64; DURATION_BUCKETS_LE.len()],
+    /// D6-02: 墙钟 min/max (ns) — 单次最快/最慢, 配合直方图看尾部分布。
+    exec_duration_nanos_min: AtomicU64,
+    exec_duration_nanos_max: AtomicU64,
     /// M-OPS-02: Prometheus handle — render() 出 text format 供 executor.metrics_prometheus。
     /// None = recorder install 失败 (降级: 仅 JSON snapshot, 无 prometheus 端点)。
     prom_handle: Option<PrometheusHandle>,
@@ -253,6 +322,15 @@ impl BroadcastHub {
             rollback_failed: AtomicU64::new(0),
             exec_duration_nanos_sum: AtomicU64::new(0),
             stdio_bytes_sum: AtomicU64::new(0),
+            exec_duration_buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            exec_duration_nanos_min: AtomicU64::new(u64::MAX),
+            exec_duration_nanos_max: AtomicU64::new(0),
             prom_handle: install_prometheus_recorder(),
         })
     }
@@ -282,6 +360,40 @@ impl BroadcastHub {
         // stdio 字节 (stdout+stderr 截断后长度 — 真实传输量)
         let bytes = (r.stdout.len() + r.stderr.len()) as u64;
         self.stdio_bytes_sum.fetch_add(bytes, Ordering::Relaxed);
+        // D6-02: 墙钟直方图 (blocked/timeout duration=0 落首桶; 真实墙钟按桶上界分档)。
+        let dur_sec = r.duration_sec.max(0.0);
+        if let Some(i) = duration_bucket_index(dur_sec) {
+            self.exec_duration_buckets[i].fetch_add(1, Ordering::Relaxed);
+        }
+        // min/max (CAS 循环: 无锁更新, 无混叠)
+        if dur_ns < self.exec_duration_nanos_min.load(Ordering::Relaxed) {
+            let mut cur = self.exec_duration_nanos_min.load(Ordering::Relaxed);
+            while dur_ns < cur {
+                match self.exec_duration_nanos_min.compare_exchange_weak(
+                    cur,
+                    dur_ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(v) => cur = v,
+                }
+            }
+        }
+        let mut cur_max = self.exec_duration_nanos_max.load(Ordering::Relaxed);
+        while dur_ns > cur_max {
+            match self.exec_duration_nanos_max.compare_exchange_weak(
+                cur_max,
+                dur_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur_max = v,
+            }
+        }
+        // D6-02: 镜像进 Prometheus 直方图 (render() 出 _bucket{le=...})。
+        metrics::histogram!("fe_exec_duration_seconds").record(dur_sec);
     }
 
     /// C-OPS-05: 记一次 rollback — ok=true 算 total, false 算 total+failed
@@ -296,6 +408,7 @@ impl BroadcastHub {
 
     /// C-OPS-05: 指标快照 — 转为 JSON 给 executor.metrics handler。
     /// 均值用 exec_total 算 (blocked/timeout 不计 duration — 它们 duration_sec=0)。
+    /// D6-02: 墙钟直方图 — 累计计数 (每桶含自身及更小) → histogram_quantile 插值 p50/p95/p99。
     fn metrics_snapshot(&self) -> Value {
         let total = self.exec_total.load(Ordering::Relaxed);
         let dur_ns_sum = self.exec_duration_nanos_sum.load(Ordering::Relaxed);
@@ -306,6 +419,31 @@ impl BroadcastHub {
             0.0
         };
         let avg_stdio_bytes = stdio_sum.checked_div(total).unwrap_or(0);
+        // D6-02: 累计计数 — cumulative[i] = 桶 0..=i 原子求和, 末位 = total (含 +Inf)。
+        let per_bucket: Vec<u64> = self
+            .exec_duration_buckets
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let mut cumulative: Vec<u64> = Vec::with_capacity(per_bucket.len() + 1);
+        let mut acc = 0u64;
+        for c in &per_bucket {
+            acc += c;
+            cumulative.push(acc);
+        }
+        cumulative.push(total); // +Inf 末桶 = 全部 execute
+        let p50 = histogram_quantile(&cumulative, 0.5);
+        let p95 = histogram_quantile(&cumulative, 0.95);
+        let p99 = histogram_quantile(&cumulative, 0.99);
+        let min_sec = {
+            let m = self.exec_duration_nanos_min.load(Ordering::Relaxed);
+            if m == u64::MAX {
+                0.0
+            } else {
+                (m as f64) / 1e9
+            }
+        };
+        let max_sec = (self.exec_duration_nanos_max.load(Ordering::Relaxed) as f64) / 1e9;
         json!({
             "exec_total": total,
             "exec_success": self.exec_success.load(Ordering::Relaxed),
@@ -313,6 +451,13 @@ impl BroadcastHub {
             "exec_timeout": self.exec_timeout.load(Ordering::Relaxed),
             "exec_failed": self.exec_failed.load(Ordering::Relaxed),
             "execute_duration_sec_avg": avg_dur_sec,
+            "execute_duration_sec_min": min_sec,
+            "execute_duration_sec_max": max_sec,
+            "execute_duration_sec_p50": p50,
+            "execute_duration_sec_p95": p95,
+            "execute_duration_sec_p99": p99,
+            "execute_duration_buckets": per_bucket,
+            "execute_duration_bucket_le": DURATION_BUCKETS_LE,
             "stdio_bytes_total": stdio_sum,
             "stdio_bytes_avg": avg_stdio_bytes,
             "rollback_total": self.rollback_total.load(Ordering::Relaxed),
@@ -3659,5 +3804,90 @@ mod tests {
         let done = tokio::time::timeout(SHUTDOWN_DEADLINE, join).await;
         assert!(done.is_ok(), "显式 shutdown 后 serve join 应完成");
         let _ = std::fs::remove_file(&sock);
+    }
+
+    // D6-02: 墙钟直方图 — 记 N 次不同 duration, p50/p95/p99 插值正确 + 桶计数对齐。
+    // 构造 10 次: 5 次 0.001s (首桶 ≤0.005), 3 次 0.1s (次桶 ≤0.05 外, 落 0.5 桶), 2 次 1.0s (落 5.0 桶)。
+    #[test]
+    fn d602_histogram_quantiles_interpolated() {
+        install_prometheus_recorder();
+        let executor = Arc::new(Executor::new());
+        let hub = BroadcastHub::new(executor);
+        for dur in [0.001; 5] {
+            hub.record_exec(&ExecutionResult {
+                exit_code: 0,
+                duration_sec: dur,
+                ..Default::default()
+            });
+        }
+        for dur in [0.1; 3] {
+            hub.record_exec(&ExecutionResult {
+                exit_code: 0,
+                duration_sec: dur,
+                ..Default::default()
+            });
+        }
+        for dur in [1.0; 2] {
+            hub.record_exec(&ExecutionResult {
+                exit_code: 0,
+                duration_sec: dur,
+                ..Default::default()
+            });
+        }
+        let snap = hub.metrics_snapshot();
+        let total = snap["exec_total"].as_u64().unwrap();
+        assert_eq!(total, 10, "D6-02: 10 次 execute 应全计");
+        // 桶上界 [0.005, 0.05, 0.5, 5.0, 30.0] → 0.001 落首(5), 0.1 落 0.5 桶(3), 1.0 落 5.0 桶(2)。
+        let buckets = snap["execute_duration_buckets"].as_array().unwrap();
+        assert_eq!(buckets[0].as_u64(), Some(5), "≤0.005 桶应 5");
+        assert_eq!(buckets[1].as_u64(), Some(0), "0.05 桶应空");
+        assert_eq!(buckets[2].as_u64(), Some(3), "0.5 桶应 3");
+        assert_eq!(buckets[3].as_u64(), Some(2), "5.0 桶应 2");
+        assert_eq!(buckets[4].as_u64(), Some(0), "30.0 桶应空");
+        // p50: 累计 [5,5,8,10,10,10], 0.5 分位 target=5, 首桶累计 5 ≥ 5 → 返首桶上界 0.005。
+        let p50 = snap["execute_duration_sec_p50"].as_f64().unwrap();
+        assert_eq!(p50, 0.005, "D6-02: p50 应插值到首桶上界 0.005");
+        // min/max: 0.001 → 1.0s。
+        assert!(
+            (snap["execute_duration_sec_min"].as_f64().unwrap() - 0.001).abs() < 1e-9,
+            "min 应 0.001"
+        );
+        assert!(
+            (snap["execute_duration_sec_max"].as_f64().unwrap() - 1.0).abs() < 1e-9,
+            "max 应 1.0"
+        );
+        // avg: (5*0.001 + 3*0.1 + 2*1.0)/10 = 2.305/10 = 0.2305
+        let avg = snap["execute_duration_sec_avg"].as_f64().unwrap();
+        assert!((avg - 0.2305).abs() < 1e-9, "avg 应 0.2305, 实际 {avg}");
+    }
+
+    // D6-02: Prometheus text format — 直方图 render 出 _bucket{le=...} 行 + HELP/TYPE 头。
+    #[test]
+    fn d602_prometheus_histogram_buckets_rendered() {
+        install_prometheus_recorder();
+        let executor = Arc::new(Executor::new());
+        let hub = BroadcastHub::new(executor);
+        hub.record_exec(&ExecutionResult {
+            exit_code: 0,
+            duration_sec: 0.02,
+            ..Default::default()
+        });
+        let text = hub.metrics_prometheus().unwrap_or_default();
+        assert!(
+            text.contains("# HELP fe_exec_duration_seconds"),
+            "D6-02: prometheus 应含直方图 HELP 头"
+        );
+        assert!(
+            text.contains("# TYPE fe_exec_duration_seconds histogram"),
+            "D6-02: prometheus 应含直方图 TYPE 头"
+        );
+        assert!(
+            text.contains("fe_exec_duration_seconds_bucket{le=\"0.005\"}"),
+            "D6-02: 应有 le=0.005 桶行"
+        );
+        assert!(
+            text.contains("fe_exec_duration_seconds_bucket{le=\"+Inf\"}"),
+            "D6-02: 应有 +Inf 末桶行"
+        );
     }
 }
