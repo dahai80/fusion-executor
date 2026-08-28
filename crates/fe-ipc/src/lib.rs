@@ -718,10 +718,10 @@ impl IpcServer {
             .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", path.display(), e))?;
         chmod_secure(&path);
         info!(sock = %path.display(), "IPC 服务器监听中");
-        // ARCH-1: seatbelt 治理 — execute 默认 true (商用安全默认, 对齐 fe-core serde default_true)。
-        // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。shell_start 路径仍默认 false。
+        // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
+        // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
         info!(
-            "seatbelt 默认开启 (execute 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
+            "seatbelt 默认开启 (execute + shell_start 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
         );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -761,10 +761,10 @@ impl IpcServer {
                 .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", p.display(), e))?;
             chmod_secure(&p);
             info!(sock = %p.display(), "IPC 服务器监听中 (blocking, 信号可停)");
-            // ARCH-1: seatbelt 治理 — execute 默认 true (商用安全默认, 对齐 fe-core serde default_true)。
-            // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。shell_start 路径仍默认 false。
+            // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
+            // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
             info!(
-                "seatbelt 默认开启 (execute 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
+                "seatbelt 默认开启 (execute + shell_start 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
             );
             let (_tx, rx) = oneshot::channel::<()>();
             // 信号任务: 收 SIGINT/SIGTERM → notify_waiters, accept_loop 自行退出并 drain
@@ -1529,8 +1529,8 @@ async fn handle_method(
                 "git_sha": env!("FE_GIT_SHA"),
                 "build_time": env!("FE_BUILD_TIME"),
                 "ax_trusted": fe_core::gui::GuiController::ax_trusted(),
-                // ARCH-1: seatbelt 治理信号 — execute 默认 true (商用安全默认)。
-                // 负载均衡器/运维查此字段知实例 execute 路径默认开运行时隔离; shell_start 路径仍默认 false。
+                // ARCH-1: seatbelt 治理信号 — execute + shell_start 均默认 true (商用安全默认)。
+                // 负载均衡器/运维查此字段知实例默认开运行时隔离。
                 "seatbelt_default_on": true,
                 // D2-2: runtime 三态 — alive (空闲响应)/busy (饱和分流)/dead (停摆摘除)。
                 // ok=alive||busy; dead → ok=false。busy 供 LB 分流 (非摘除)。
@@ -1814,7 +1814,7 @@ async fn handle_method(
             let seatbelt = params
                 .get("seatbelt")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(true);
             let inherit_env = params
                 .get("inherit_env")
                 .and_then(|v| v.as_bool())
@@ -2181,7 +2181,10 @@ mod tests {
             resp["result"]["runtime"]
         );
         assert!(
-            matches!(resp["result"]["runtime"]["state"].as_str(), Some("alive") | Some("busy")),
+            matches!(
+                resp["result"]["runtime"]["state"].as_str(),
+                Some("alive") | Some("busy")
+            ),
             "D2-2: runtime.state 应为 alive 或 busy (非 dead): {}",
             resp["result"]["runtime"]
         );
@@ -3089,6 +3092,48 @@ mod tests {
         assert_eq!(blocked["result"]["blocked_by_security"], true);
         assert!(blocked["result"]["shell_id"].is_null());
 
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // D3-2: shell_start 默认 seatbelt=true (商用安全默认)。不传 seatbelt →
+    // fe-ipc unwrap_or(true) → 经 sandbox-exec 隔离; 白名单 python3 正常 echo。
+    // 显式 seatbelt:false → opt-out 关隔离。两路径白名单命令均 ok=true。
+    #[tokio::test]
+    async fn shell_start_defaults_seatbelt_on() {
+        let sock = tmp_sock("shell_seatbelt");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+
+        // 不传 seatbelt → 默认 true, 白名单 echo 经 sandbox-exec 正常
+        let on = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.shell_start","params":{"command":"echo d3-2-on"}}"#,
+        )
+        .await;
+        assert_eq!(on["result"]["ok"], true);
+        let sid_on = on["result"]["shell_id"].as_str().unwrap().to_string();
+
+        // 显式 seatbelt:false → opt-out
+        let off = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":2,"method":"executor.shell_start","params":{"command":"echo d3-2-off","seatbelt":false}}"#,
+        )
+        .await;
+        assert_eq!(off["result"]["ok"], true);
+        let sid_off = off["result"]["shell_id"].as_str().unwrap().to_string();
+
+        // 收尾: 两 shell 均 kill (防泄漏)
+        for sid in [sid_on.as_str(), sid_off.as_str()] {
+            let _ = rpc(
+                &sock,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":9,"method":"executor.kill_shell","params":{{"shell_id":"{}"}}}}"#,
+                    sid
+                ),
+            )
+            .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let _ = std::fs::remove_file(&sock);
     }
 

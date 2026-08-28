@@ -350,7 +350,7 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         task_id: str | None = None,
         max_output_chars: int = 100000,
-        seatbelt: bool = False,
+        seatbelt: bool = True,
         inherit_env: bool = False,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
@@ -706,10 +706,10 @@ class FusionSandboxExecutor:
         path = sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
         # IMPL-1: serve 前确保 socket 父目录存在 (默认 ~/.fusion-executor/ 0o700, 对齐 Rust M-SEC-01)。
         ensure_socket_dir(path)
-        # ARCH-1: seatbelt 治理 — execute 默认 true (商用安全默认, 对齐 fe-core serde default_true)。
-        # 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。shell_start 路径仍默认 false。
+        # ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
+        # 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
         logger.info(
-            "seatbelt 默认开启 (execute 路径) — macOS sandbox-exec 隔离。受信本地可透传 seatbelt:false opt-out。"
+            "seatbelt 默认开启 (execute + shell_start 路径) — macOS sandbox-exec 隔离。受信本地可透传 seatbelt:false opt-out。"
         )
         logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (信号可停)", path)
         old_int = signal.getsignal(signal.SIGINT)

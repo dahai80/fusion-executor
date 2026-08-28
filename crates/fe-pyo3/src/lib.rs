@@ -961,7 +961,7 @@ impl PyExecutor {
     }
 
     /// shell_start(command, cwd=None, env_vars=None, task_id=None, max_output_chars=100000,
-    ///             seatbelt=False, inherit_env=False, max_nproc=1024, max_cpu_sec=0,
+    ///             seatbelt=True, inherit_env=False, max_nproc=1024, max_cpu_sec=0,
     ///             max_idle_sec=3600)
     /// -> NativeShellStartResult — 后台持久 shell 启动 (#1, run_in_background parity)
     /// 安全校验在 fe-core (fail-closed); blocked → ok=false, shell_id=None
@@ -973,7 +973,7 @@ impl PyExecutor {
         env_vars=None,
         task_id=None,
         max_output_chars=100_000,
-        seatbelt=false,
+        seatbelt=true,
         inherit_env=false,
         max_nproc=1024,
         max_cpu_sec=0,
