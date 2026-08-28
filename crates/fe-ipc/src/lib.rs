@@ -36,7 +36,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use fe_core::gui::GuiAction;
 use fe_core::TelemetryStreamConfig;
@@ -1513,12 +1513,16 @@ async fn handle_method(
     match method {
         "executor.health" => {
             // C-OPS-05: ok 由真实探针决定 (非硬编码) — 探 BLOCKING_RT 响应 + 外部依赖 (git)。
-            // BLOCKING_RT 停摆 / worker 全阻塞 / 死锁 → spawn 超时 → ok:false, 负载均衡器摘除卡死实例。
-            let rt_ok = probe_runtime(Duration::from_secs(1)).await;
+            // D2-2 修 (2026-08-28): 旧版 probe_runtime 在 BLOCKING_RT 上 spawn 空任务 + 1s 超时;
+            // 16 并发执行饱和 + worker 数有限时, 探针任务排队 → 超时 → rt_ok=false → 误报摘除正常忙碌实例。
+            // 新版区分 alive/busy/dead: 短超时 (200ms) 探 BLOCKING_RT 响应 (空闲 worker 立即拾取);
+            // 超时再查 exec_sem 可用许可 — 0=饱和 (忙碌但健康, LB 应分流非摘除), >0 仍超时=停摆 (真不健康)。
+            let rt = probe_runtime(Duration::from_millis(200), exec_sem.available_permits()).await;
             let deps = probe_dependencies().await;
             // 任一核心依赖缺失 → ok:false (依赖不健康 = 服务降级)
             let deps_ok = deps.iter().all(|d| d["ok"].as_bool() == Some(true));
-            let ok = rt_ok && deps_ok;
+            // ok 仅在 dead (停摆) 或依赖缺失时 false; busy 仍 ok=true (忙碌是正常负载, 非故障)。
+            let ok = rt.healthy() && deps_ok;
             Ok(json!({
                 "ok": ok,
                 "version": env!("CARGO_PKG_VERSION"),
@@ -1528,7 +1532,9 @@ async fn handle_method(
                 // ARCH-1: seatbelt 治理信号 — execute 默认 true (商用安全默认)。
                 // 负载均衡器/运维查此字段知实例 execute 路径默认开运行时隔离; shell_start 路径仍默认 false。
                 "seatbelt_default_on": true,
-                "runtime": { "ok": rt_ok },
+                // D2-2: runtime 三态 — alive (空闲响应)/busy (饱和分流)/dead (停摆摘除)。
+                // ok=alive||busy; dead → ok=false。busy 供 LB 分流 (非摘除)。
+                "runtime": { "ok": rt.healthy(), "state": rt.state(), "available_permits": rt.available_permits },
                 "dependencies": deps,
                 // M-OPS-04/M-OPS-05: 运维深度指标 — 连接数/worker 线程/活跃 shell/内存。
                 // 运维面板 + 负载均衡器据此判断实例负载与 shell 注册表水位。
@@ -1893,12 +1899,64 @@ async fn handle_method(
     }
 }
 
-/// C-OPS-05: 探 BLOCKING_RT 响应 — spawn 空任务 + 超时, 超时即 rt_ok=false (worker 停摆/死锁)。
-/// BLOCKING_RT 是 executor 异步 runtime; 停摆则一切 execute 阻塞, 健康检查必须探测到。
-async fn probe_runtime(timeout: Duration) -> bool {
+/// D2-2 (2026-08-28): 运行时健康三态 — 区分 "忙碌但健康" 与 "停摆故障"。
+/// 旧版 bool 探针在饱和负载下误报不健康 (探针任务排队超时), 导致 LB 摘除正常忙碌实例。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeState {
+    Alive,
+    Busy,
+    Dead,
+}
+
+struct RuntimeHealth {
+    state: RuntimeState,
+    available_permits: usize,
+}
+
+impl RuntimeHealth {
+    /// ok=alive||busy; dead 才算不健康 (停摆需摘除)。
+    fn healthy(&self) -> bool {
+        !matches!(self.state, RuntimeState::Dead)
+    }
+
+    /// JSON 序列化用状态字符串。
+    fn state(&self) -> &'static str {
+        match self.state {
+            RuntimeState::Alive => "alive",
+            RuntimeState::Busy => "busy",
+            RuntimeState::Dead => "dead",
+        }
+    }
+}
+
+/// C-OPS-05 + D2-2: 探 BLOCKING_RT 响应, 区分三态。
+/// 短超时 (调用方传 200ms) spawn 空任务 — 空闲 worker 立即拾取 = alive;
+/// 超时再查 exec_sem 可用许可: 0=饱和 (busy, 忙碌但健康), >0 仍超时=停摆 (dead, 真故障)。
+/// BLOCKING_RT 停摆 / worker 全死锁 → spawn 永不完成 + 有空闲许可 → dead → ok:false 摘除。
+async fn probe_runtime(timeout: Duration, available_permits: usize) -> RuntimeHealth {
     let h = fe_core::BLOCKING_RT.handle();
     let task = h.spawn(async {});
-    tokio::time::timeout(timeout, task).await.is_ok()
+    let state = if tokio::time::timeout(timeout, task).await.is_ok() {
+        RuntimeState::Alive
+    } else if available_permits == 0 {
+        // 无可用执行许可 = 16 槽全占 = 饱和负载, 探针排队是预期非故障。
+        warn!(
+            available_permits,
+            "D2-2: 健康探针超时但 exec_sem 饱和, 判 busy (忙碌但健康, 非停摆)"
+        );
+        RuntimeState::Busy
+    } else {
+        // 有空闲执行许可但 runtime 不响应 = worker 停摆/死锁, 真故障。
+        error!(
+            available_permits,
+            "D2-2: 健康探针超时且有空闲许可, 判 dead (BLOCKING_RT 停摆/死锁)"
+        );
+        RuntimeState::Dead
+    };
+    RuntimeHealth {
+        state,
+        available_permits,
+    }
 }
 
 /// C-OPS-05 + 0827 P-1: 探外部依赖 — `git --version` (rollback/快照依赖 git CLI)。
@@ -2116,9 +2174,20 @@ mod tests {
             resp["result"]["ax_trusted"]
         );
         // C-OPS-05: runtime 探针 — BLOCKING_RT spawn 空任务超时探活
+        // D2-2: runtime 三态 (alive/busy/dead); 空闲测试环境应 alive, ok=true。
         assert_eq!(
             resp["result"]["runtime"]["ok"], true,
             "runtime 应健康 (BLOCKING_RT 可响应): {}",
+            resp["result"]["runtime"]
+        );
+        assert!(
+            matches!(resp["result"]["runtime"]["state"].as_str(), Some("alive") | Some("busy")),
+            "D2-2: runtime.state 应为 alive 或 busy (非 dead): {}",
+            resp["result"]["runtime"]
+        );
+        assert!(
+            resp["result"]["runtime"]["available_permits"].is_number(),
+            "D2-2: runtime.available_permits 应为数字: {}",
             resp["result"]["runtime"]
         );
         // C-OPS-05: dependencies 数组 — git CLI (rollback 依赖)
