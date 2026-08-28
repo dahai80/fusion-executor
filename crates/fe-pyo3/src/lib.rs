@@ -1245,7 +1245,14 @@ impl PyExecutor {
     fn serve(&self, py: pyo3::Python<'_>, sock_path: Option<String>) -> PyResult<()> {
         // M-OPS-01: fe_ipc::logging init_tracing — JSON+滚动文件 (FE_LOG_DIR) + stderr,
         // EnvFilter 运行时可 reload (SIGHUP, m-OPS-02)。幂等, handle 存 fe-ipc 静态。
-        let _ = fe_ipc::logging::init_tracing();
+        // IMPL-11: fail-loud — init 失败 (subscriber 被占用) 不启动无日志服务器。
+        // 幂等二次调用返 Ok; 仅首调失败 (全局 subscriber 冲突) 触发此 Err。
+        if let Err(e) = fe_ipc::logging::init_tracing() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "FATAL: logging init 失败 — 不启动无审计日志服务器: {}",
+                e
+            )));
+        }
         let sock = IpcServer::resolve_sock(sock_path.as_deref());
         // A-4: 共享 Executor Arc — in-process path 与 serve-path 同一白名单 (SIGHUP 重载两者皆生效)。
         let server =
