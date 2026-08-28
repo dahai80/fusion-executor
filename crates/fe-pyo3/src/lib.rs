@@ -637,8 +637,12 @@ struct PyExecutor {
 #[pymethods]
 impl PyExecutor {
     #[new]
-    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false))]
-    fn new(extra_whitelist: Option<Vec<String>>, disable_bundle_allowlist: bool) -> Self {
+    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false, allow_inline_interpreter=false))]
+    fn new(
+        extra_whitelist: Option<Vec<String>>,
+        disable_bundle_allowlist: bool,
+        allow_inline_interpreter: bool,
+    ) -> Self {
         // extra_whitelist 经 with_extra_whitelist 烘焙进 inner 的 ArcSwap; A-4 后 serve() 共享
         // inner, 无需单独存。SIGHUP reload 从 FUSION_EXECUTOR_EXTRA_WHITELIST env 读 (m-OPS-02)。
         let extras: Vec<&str> = extra_whitelist
@@ -653,6 +657,12 @@ impl PyExecutor {
             tracing::info!(count = extras.len(), "PyExecutor 构造带项目级白名单扩展");
             Executor::new().with_extra_whitelist(&extras)
         };
+        // D3-1 (审计 0827 product): 内联解释器网关 opt-in。默认 false (企业硬化拒 python -c /
+        // node -e / ruby -e / perl -e); true 保留 trusted-caller 内联执行能力 (测试机/本地交互)。
+        if allow_inline_interpreter {
+            tracing::info!("PyExecutor 构造开启内联解释器 (D3-1 trusted-caller opt-in)");
+            inner = inner.with_allow_inline_interpreter(true);
+        }
         // RUN-12: disable_bundle_allowlist=True → GuiConfig{allowed_bundle_ids: None} = 无限制
         //   (显式 opt-in, 仅审计日志); 默认 False 走 GuiConfig::default 的安全默认集 (Terminal/
         //   TextEdit/finder)。测试机需 drive 任意 app 时显式传 True 解除限制。

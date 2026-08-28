@@ -534,6 +534,14 @@ impl Executor {
         self
     }
 
+    /// D3-1 (审计 0827 product): 内联解释器网关透传。true=允许 python -c / node -e /
+    /// ruby -e / perl -e (保留 trusted-caller 内联执行能力); 默认 false (企业硬化拒内联代码,
+    /// 防 agent-driven 任意 payload 绕白名单语义)。透传 SecurityGuard.with_allow_inline_interpreter。
+    pub fn with_allow_inline_interpreter(mut self, allow: bool) -> Self {
+        self.security = self.security.with_allow_inline_interpreter(allow);
+        self
+    }
+
     /// m-OPS-02: SIGHUP 运行时白名单热重载 — 从基线 + extras 重建 (非累加)。
     /// &self (Executor 无状态约定, 仅透传 SecurityGuard.reload_extras 的 ArcSwap store)。
     /// fe-ipc SIGHUP 处理器读 FUSION_EXECUTOR_EXTRA_WHITELIST env → 逗号分割 → 调此。
@@ -1338,7 +1346,7 @@ mod tests {
     #[test]
     fn execute_streaming_timeout_done_frame() {
         rt().block_on(async {
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let req = ExecutionRequest {
                 command: "python3 -c \"while True: pass\"".to_string(),
                 task_id: None,
@@ -1372,7 +1380,7 @@ mod tests {
     #[test]
     fn execute_streaming_diagnostics_on_nonzero_exit() {
         rt().block_on(async {
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let req = ExecutionRequest {
                 command: "python3 -c \"raise ValueError('boom')\"".to_string(),
                 task_id: None,
@@ -1445,7 +1453,7 @@ mod tests {
                 max_nofile: 1024,
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败");
             assert!(res.auto_rolled_back, "应自动回滚");
@@ -1509,7 +1517,7 @@ mod tests {
                 max_nofile: 1024,
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0);
             assert!(!res.auto_rolled_back, "无 policy 不应回滚");
@@ -1547,7 +1555,7 @@ mod tests {
                 max_nofile: 1024,
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败");
             // 即使 max_consecutive_failures=99 (远超单次), 文件毁损仍立即回滚 — 字段不限制单次执行
@@ -1589,7 +1597,7 @@ mod tests {
                 max_nofile: 1024,
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败");
             assert!(
@@ -1695,7 +1703,7 @@ mod tests {
                 max_nofile: 1024,
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败 (python 抛错)");
             assert!(
@@ -1736,7 +1744,7 @@ mod tests {
                 max_nofile: 1024,
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败");
             assert!(

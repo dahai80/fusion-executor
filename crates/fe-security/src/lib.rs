@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
 pub enum SecurityError {
@@ -188,6 +188,10 @@ pub struct SecurityGuard {
     sensitive_paths: Vec<String>,
     sensitive_paths_exp: Vec<String>,
     redirect_re: Regex,
+    // D3-1 (审计 0827 product): 内联解释器网关。false(企业硬化默认)=拒 python -c / node -e /
+    // ruby -e / perl -e 等内联代码 (绕白名单语义, agent-driven 下模型可生成任意 payload);
+    // true(trusted-caller opt-in)=保留内联执行能力。validate_argv gate 读此字段。
+    allow_inline_interpreter: bool,
 }
 
 impl Clone for SecurityGuard {
@@ -200,6 +204,7 @@ impl Clone for SecurityGuard {
             sensitive_paths: self.sensitive_paths.clone(),
             sensitive_paths_exp: self.sensitive_paths_exp.clone(),
             redirect_re: self.redirect_re.clone(),
+            allow_inline_interpreter: self.allow_inline_interpreter,
         }
     }
 }
@@ -228,6 +233,9 @@ impl SecurityGuard {
             sensitive_paths,
             sensitive_paths_exp,
             redirect_re,
+            // D3-1: 企业硬化默认 false — 拒内联解释器 -c/-e。trusted-caller opt-in 经
+            // with_allow_inline_interpreter(true) 开启 (测试机/本地交互场景)。
+            allow_inline_interpreter: false,
         }
     }
 
@@ -265,6 +273,17 @@ impl SecurityGuard {
             if !self.trusted_bin_dirs.contains(&pb) {
                 self.trusted_bin_dirs.push(pb);
             }
+        }
+        self
+    }
+
+    /// D3-1 (审计 0827 product): 内联解释器网关 opt-in。true=允许 python -c / node -e /
+    /// ruby -e / perl -e (保留 trusted-caller 内联执行能力, 测试机/本地交互场景); 默认 false
+    /// (企业硬化拒内联代码, 防 agent-driven 任意 payload 绕白名单语义)。validate_argv 读此字段。
+    pub fn with_allow_inline_interpreter(mut self, allow: bool) -> Self {
+        self.allow_inline_interpreter = allow;
+        if allow {
+            info!("SecurityGuard 开启内联解释器 (D3-1 trusted-caller opt-in: 允许 -c/-e)");
         }
         self
     }
@@ -455,12 +474,30 @@ impl SecurityGuard {
 
     /// argv 级约束
     fn validate_argv(&self, binary: &str, args: &[String]) -> Result<(), String> {
-        // C-SEC-03 威胁模型边界 (设计取舍, 审计 §4 显式声明):
-        // `python -c` / `node -e` / `ruby -e` 等内联代码执行绕过文件审计白名单语义 —
-        // 解释器本身在白名单 (跑脚本文件), -c/-e 使参数变任意代码, regex 无法枚举所有危险 one-liner。
-        // 但本工具为单用户 local-first trusted-caller 模型 (人作者写命令), 此为已知接受取舍;
-        // 企业多用户/Agent 驱动场景应叠加 seatbelt (C-SEC-02) + UDS 鉴权 (M-SEC-01) 纵深, 非此处封堵。
-        // (拒绝 -c 会破坏沙箱测试机制 — 56 处测试依赖 python3 -c。)
+        // D3-1 (审计 0827 product) 内联解释器网关 — 见下方 gate。企业硬化默认 false 拒
+        // python -c / node -e / ruby -e / perl -e (绕白名单语义: 解释器在白名单跑脚本文件,
+        // -c/-e 使参数变任意代码, regex 无法枚举危险 one-liner; agent-driven 下模型可生成任意 payload)。
+        // trusted-caller opt-in (测试机/本地交互) 经 with_allow_inline_interpreter(true) 开启保留能力。
+        if !self.allow_inline_interpreter {
+            let is_inline_interp = matches!(
+                binary,
+                "python" | "python2" | "python3" | "node" | "ruby" | "perl" | "perl5"
+            );
+            if is_inline_interp
+                && args
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "-c" | "-e" | "-E" | "--eval" | "-p" | "--print"))
+            {
+                warn!(
+                    "D3-1 内联解释器拦截: {} -c/-e 被拒 (企业硬化默认; allow_inline_interpreter opt-in)",
+                    binary
+                );
+                return Err(format!(
+                    "禁止 {} -c/-e 内联代码执行 (D3-1 企业硬化; 用 allow_inline_interpreter=True opt-in)",
+                    binary
+                ));
+            }
+        }
         match binary {
             // C-5: mv/cp 全非选项参数校验 — 旧版仅校验最后一个 (目地), 源参数可读 ~/.ssh/id_rsa
             // 镜像 cat/grep 读源守卫: 敏感路径 + 敏感文件名 + .. 逃逸, 全非选项参数 (含源与目地)
@@ -1154,7 +1191,10 @@ mod tests {
 
     #[test]
     fn allows_python() {
-        let v = guard().validate("python -c \"print('hello')\"");
+        // D3-1: 内联解释器需 opt-in (此用例测白名单非 D3-1, 显式开启)
+        let v = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("python -c \"print('hello')\"");
         assert!(v.allowed, "应允许 python, reason={:?}", v.reason);
     }
 
@@ -1275,7 +1315,9 @@ mod tests {
             eprintln!("skip: /usr/bin/python3 not present on this machine");
             return;
         }
-        let v = guard().validate("/usr/bin/python3 -c \"print('hi')\"");
+        let v = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("/usr/bin/python3 -c \"print('hi')\"");
         assert!(v.allowed, "系统 python3 应放行, reason={:?}", v.reason);
     }
 
@@ -1306,7 +1348,9 @@ mod tests {
     #[test]
     fn arch2_unresolvable_binary_passes() {
         // basename 命中白名单但二进制不存在 (如 `python` 此机器无) → 无投毒面 → 放行。
-        let v = guard().validate("python -c \"print('hi')\"");
+        let v = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("python -c \"print('hi')\"");
         // python 在白名单; 若此机器无 python 二进制, resolve=None → 放行 (非投毒)。
         // 若机器恰好有 python (在可信目录), 也放行。两侧都应 allowed。
         assert!(
@@ -1664,13 +1708,17 @@ mod tests {
 
     #[test]
     fn allows_python_c_inline() {
-        let v = guard().validate("python3 -c \"print('hello')\"");
+        let v = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("python3 -c \"print('hello')\"");
         assert!(v.allowed, "python -c 应保留允许, reason={:?}", v.reason);
     }
 
     #[test]
     fn allows_node_e_inline() {
-        let v = guard().validate("node -e \"console.log(1)\"");
+        let v = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("node -e \"console.log(1)\"");
         assert!(v.allowed, "node -e 应保留允许, reason={:?}", v.reason);
     }
 
@@ -1784,6 +1832,52 @@ mod tests {
         // 基线工具不受扩展拒绝影响
         let v = g.validate("python3 --version");
         assert!(v.allowed, "基线工具不受影响: {:?}", v.reason);
+    }
+
+    #[test]
+    fn d3_1_inline_interpreter_blocked_by_default() {
+        // D3-1 (审计 0827 product): 企业硬化默认拒内联解释器 (python -c / node -e / ruby -e / perl -e),
+        // 防 agent-driven 任意 payload 绕白名单语义。Default SecurityGuard::new() 即拦。
+        let g = guard();
+        for cmd in [
+            "python3 -c 'print(1)'",
+            "python -c 'import os; os.system(\"x\")'",
+            "node -e 'console.log(1)'",
+            "ruby -e 'puts 1'",
+            "perl -e 'print 1'",
+            "perl5 -e 'print 1'",
+        ] {
+            let v = g.validate(cmd);
+            assert!(!v.allowed, "D3-1 默认应拒内联解释器: {}", cmd);
+        }
+    }
+
+    #[test]
+    fn d3_1_inline_interpreter_opt_in_allows() {
+        // D3-1: with_allow_inline_interpreter(true) opt-in 保留内联执行能力 (测试机/本地交互)。
+        let g = guard().with_allow_inline_interpreter(true);
+        for cmd in ["python3 -c 'print(1)'", "node -e 'console.log(1)'"] {
+            let v = g.validate(cmd);
+            assert!(
+                v.allowed,
+                "D3-1 opt-in 应放行内联解释器: {} — {:?}",
+                cmd, v.reason
+            );
+        }
+    }
+
+    #[test]
+    fn d3_1_inline_interpreter_preserves_normal_binary_use() {
+        // D3-1: 网关只拦 -c/-e/--eval/-p/--print; 普通解释器调用 (python3 script.py) 不受影响。
+        let g = guard();
+        for cmd in ["python3 --version", "python3 -m pytest", "node --version"] {
+            let v = g.validate(cmd);
+            assert!(
+                v.allowed,
+                "D3-1 不应影响普通解释器调用: {} — {:?}",
+                cmd, v.reason
+            );
+        }
     }
 
     #[test]

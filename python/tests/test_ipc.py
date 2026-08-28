@@ -50,7 +50,7 @@ def server():
         [
             sys.executable,
             "-c",
-            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()",
+            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor(allow_inline_interpreter=True).serve()",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -107,7 +107,7 @@ def test_pidfile_serve_lifecycle(tmp_path: Path):
         [
             sys.executable,
             "-c",
-            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()",
+            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor(allow_inline_interpreter=True).serve()",
         ],
         env=env,
         stdout=subprocess.PIPE,

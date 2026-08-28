@@ -3187,7 +3187,8 @@ mod tests {
     #[tokio::test]
     async fn shell_start_output_kill_list_over_uds() {
         let sock = tmp_sock("shell");
-        let server = IpcServer::new();
+        // D3-1: python3 -c 内联解释器需 opt-in (此用例测 shell_start 非 D3-1)
+        let server = IpcServer::with_executor(Executor::new().with_allow_inline_interpreter(true));
         let (_tx, _join) = server.serve(&sock).await.unwrap();
 
         // 启动长任务

@@ -25,7 +25,9 @@ from fusion_executor import (
 
 @pytest.fixture(scope="module")
 def executor():
-    return FusionSandboxExecutor()
+    # D3-1: 本测试机依赖 python3 -c 内联解释器 (诊断切片/真实执行), 故 opt-in。
+    # 企业硬化默认 False 拒内联解释器; 测试机属 trusted-caller 本地交互场景。
+    return FusionSandboxExecutor(allow_inline_interpreter=True)
 
 
 def test_run_echo(executor: FusionSandboxExecutor):
@@ -138,7 +140,7 @@ def uds_server():
         [
             sys.executable,
             "-c",
-            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()",
+            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor(allow_inline_interpreter=True).serve()",
         ],
         env=env,
         stdout=subprocess.PIPE,
