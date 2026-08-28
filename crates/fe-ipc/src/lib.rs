@@ -132,7 +132,10 @@ static PROM_HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 
 /// 安装 Prometheus recorder (幂等) 并返 handle 克隆; 已装则从 static 取。
 /// describe_counter 让 render() 带 HELP/TYPE 头 (无观测值时也有 schema)。
-fn install_prometheus_recorder() -> Option<PrometheusHandle> {
+/// ARCH-4: pub 化 — 进程内路径 (fe-pyo3 execute_sync, 不经 fe-ipc/BroadcastHub)
+/// 也须装 recorder, 否则 record_exec_outcome 的 metrics::counter! 无 recorder = no-op。
+/// 幂等 (OnceLock), 多调安全。
+pub fn install_prometheus_recorder() -> Option<PrometheusHandle> {
     PROM_HANDLE
         .get_or_init(|| {
             let handle = PrometheusBuilder::new()

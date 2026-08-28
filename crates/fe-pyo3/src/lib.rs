@@ -615,6 +615,10 @@ impl PyExecutor {
             tracing::info!(count = extras.len(), "PyExecutor 构造带项目级白名单扩展");
             Executor::new().with_extra_whitelist(&extras)
         };
+        // ARCH-4: 进程内路径 (execute_sync/run) 不经 fe-ipc BroadcastHub, recorder 未装
+        // 则 record_exec_outcome 的 metrics::counter! 为 no-op。此处置装 (幂等 OnceLock),
+        // 让进程内 execute 也能计数 Prometheus。失败仅 warn 不阻断 (降级 = 无 metrics, 非致命)。
+        let _ = fe_ipc::install_prometheus_recorder();
         Self {
             inner: Arc::new(inner),
             shells: Arc::new(ShellRegistry::new()),
@@ -685,19 +689,27 @@ impl PyExecutor {
         };
         // M-PYO3-02: 内部错误 fail-loud (旧版伪造 exit_code=-1 ExecutionResult, 调用方无法区分
         // 安全拦截与 executor bug; execute 仅在 sandbox 内部异常返 Err, 应上抛)
-        self.inner
-            .execute(req)
-            .map(PyExecutionResult::from)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("executor 内部错误: {e}"))
-            })
+        //
+        // RUN-1: execute() 同步, 阻塞子进程整个 wall-clock。py.detach 释放 GIL 让 Python
+        // 其他线程可跑 (子进程跑期间不必持 GIL)。inner Arc clone 进闭包 (Sync, UnwindSafe 经 AssertUnwindSafe)。
+        // ARCH-4: 成功路径调 record_exec_outcome 补 Prometheus 计数 (进程内路径不经 fe-ipc hub);
+        // blocked_with 返的 ExecutionResult exit_code=-1 blocked_by_security=true 也计数 (镜像 fe-ipc)。
+        let inner = self.inner.clone();
+        let result = py.detach(move || inner.execute(req)).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("executor 内部错误: {e}"))
+        })?;
+        // ARCH-4: 进程内 execute 计数 (recorder 在 PyExecutor::new 已装)。内部 Err 不计数
+        // (镜像 fe-ipc: execute Err 不调 record_exec, 仅成功/ blocked/timeout/failed 分支计数)。
+        fe_core::record_exec_outcome(&result);
+        Ok(PyExecutionResult::from(result))
     }
 
     /// snapshot_create(cwd) -> str (快照 id; 非 repo 为空串, 合法契约)
     /// M-PYO3-01: git 失败 (非 "非 repo 空串") fail-loud 抛 PyRuntimeError
-    fn snapshot_create(&self, cwd: String) -> PyResult<String> {
-        fe_core::BLOCKING_RT
-            .block_on(self.inner.snapshot_create_async(&cwd))
+    /// RUN-1: block_on 跨 git IO 阻塞, py.detach 释放 GIL (git 跑期间 Python 线程可跑)
+    fn snapshot_create(&self, py: Python<'_>, cwd: String) -> PyResult<String> {
+        let inner = self.inner.clone();
+        py.detach(move || fe_core::BLOCKING_RT.block_on(inner.snapshot_create_async(&cwd)))
             .map_err(|e| {
                 tracing::error!(error = %e, "snapshot_create 失败");
                 pyo3::exceptions::PyRuntimeError::new_err(format!("snapshot_create 失败: {e}"))
@@ -706,9 +718,10 @@ impl PyExecutor {
 
     /// rollback(snapshot_id, cwd) -> bool (Ok(false) = 跳过/非 repo, 合法)
     /// M-PYO3-01: git 失败 (Err) fail-loud 抛 PyRuntimeError
-    fn rollback(&self, snapshot_id: String, cwd: String) -> PyResult<bool> {
-        fe_core::BLOCKING_RT
-            .block_on(self.inner.rollback_async(&snapshot_id, &cwd))
+    /// RUN-1: block_on 跨 git IO 阻塞, py.detach 释放 GIL
+    fn rollback(&self, py: Python<'_>, snapshot_id: String, cwd: String) -> PyResult<bool> {
+        let inner = self.inner.clone();
+        py.detach(move || fe_core::BLOCKING_RT.block_on(inner.rollback_async(&snapshot_id, &cwd)))
             .map_err(|e| {
                 tracing::error!(error = %e, "rollback 失败");
                 pyo3::exceptions::PyRuntimeError::new_err(format!("rollback 失败: {e}"))
