@@ -76,7 +76,7 @@ def test_health_over_uds(server: str):
     assert resp["id"] == 1
     assert resp["result"]["ok"] is True
     assert resp["result"]["ax_trusted"] is True
-    assert resp["result"]["seatbelt_default_off"] is True  # C-SEC-02
+    assert resp["result"]["seatbelt_default_on"] is True  # ARCH-1
     assert "version" in resp["result"]
 
 

@@ -73,7 +73,9 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
         auto_rollback: RollbackPolicy | None = None,
-        seatbelt: bool = False,
+        # ARCH-1: 默认 True — 对齐 fe-core serde default_true (商用安全默认)。
+        # 受信本地 opt-out 显式传 seatbelt=False。原默认 False 与 UDS execute 路径 (serde 默认 true) 不一致。
+        seatbelt: bool = True,
         inherit_env: bool = False,
         use_pty: bool = True,
         max_nproc: int = 1024,
@@ -186,7 +188,8 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = True,
         auto_rollback: RollbackPolicy | None = None,
-        seatbelt: bool = False,
+        # ARCH-1: 默认 True — 对齐 fe-core serde default_true + run() (见上注释)。
+        seatbelt: bool = True,
         inherit_env: bool = False,
         use_pty: bool = True,
         max_nproc: int = 1024,
@@ -703,8 +706,11 @@ class FusionSandboxExecutor:
         path = sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
         # IMPL-1: serve 前确保 socket 父目录存在 (默认 ~/.fusion-executor/ 0o700, 对齐 Rust M-SEC-01)。
         ensure_socket_dir(path)
-        # C-SEC-02: seatbelt 治理 — 默认关闭, 生产环境须在 ExecutionRequest 透传 seatbelt:true
-        logger.warning("⚠️ seatbelt 默认关闭 — 子进程无 macOS sandbox-exec 隔离。生产部署须透传 seatbelt:true。")
+        # ARCH-1: seatbelt 治理 — execute 默认 true (商用安全默认, 对齐 fe-core serde default_true)。
+        # 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。shell_start 路径仍默认 false。
+        logger.info(
+            "seatbelt 默认开启 (execute 路径) — macOS sandbox-exec 隔离。受信本地可透传 seatbelt:false opt-out。"
+        )
         logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (信号可停)", path)
         old_int = signal.getsignal(signal.SIGINT)
         old_term = signal.getsignal(signal.SIGTERM)

@@ -248,6 +248,8 @@ assert r.exit_code != 0 and r.auto_rolled_back
 
 `RollbackPolicy{max_consecutive_failures=3 (reserved field), file_damage_check=True}`. No snapshot (`enable_rollback_snapshot=False`) → guard skips. Non-git repo → damage detection failure treated as 0 changes, no rollback.
 
+**ARCH-7 — caller owns the circuit breaker (audit 0827):** `max_consecutive_failures` is a reserved field the stateless Executor never reads — it is the threshold the **caller** (e.g. fusion-code's self-healing loop) reads to trip a consecutive-failure circuit breaker; auto-rollback itself is per-execute, not per-loop. A reference skeleton lives at `examples/08_integrate_fusion_code.py` (consumes the executor API only; a one-way issue tracks the `ExecutorDriver` refactor on fusion-code).
+
 ## Live Telemetry (v1.4 — GPU/CPU UDS broadcast)
 
 The `telemetry_stream()` generator yields `TelemetrySample` frame by frame — 10Hz (adjustable `interval_ms`) process CPU/mem sampling. GPU fields default to None (the executor runs no model, has no GPU handle) and are caller-injected. `max_samples>0` ends the stream when reached; dropping the iterator stops the sampling task automatically (channel closes). The Executor is stateless: each call is an independent stream.
@@ -335,7 +337,7 @@ Operability surface landed in the 0826 enterprise audit fix pass (C-OPS-01..06, 
 
 fusion-executor is a **single-user, local-first, trusted-caller** execution tool — a human author writes the commands, the executor enforces a defense-in-depth guard. It is **not** a multi-user / untrusted-agent sandbox; for that, layer macOS seatbelt (C-SEC-02) + UDS auth on top.
 
-- **seatbelt governance (C-SEC-02)** — macOS `sandbox-exec` isolation is **opt-in**, default off. `serve()` emits a `WARN` log on startup when seatbelt is off, and `executor.health` exposes `seatbelt_default_off: true` for ops audit. Production / cross-user deployments **must** pass `seatbelt: true` per `ExecutionRequest`. Changing the default to on was evaluated and rejected (breaks the existing E2E suite); the governance path is documented + health-visible instead.
+- **seatbelt governance (ARCH-1)** — macOS `sandbox-exec` isolation is **default-on** for the `execute` path (`run()` / `executor.execute`): the `ExecutionRequest.seatbelt` serde default is `true`, and `fe-pyo3` `run()` resolves `seatbelt.unwrap_or(true)` to match. A trusted local caller may pass `seatbelt: false` to opt out (must document the escape risk). `executor.health` exposes `seatbelt_default_on: true` for ops audit. Note: the long-running background-shell path (`shell_start`) keeps `seatbelt: false` as its default — background tasks rely on caller-driven `kill_shell`, not the sandbox heartbeat.
 - **env injection (C-SEC-01)** — `env_vars` is denylist-filtered (blocks `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` / `LD_LIBRARY_PATH` and similar escape vectors) and capped at 64KB. `inherit_env` is opt-in (default off → clean baseline PATH only), so a caller cannot smuggle injection libs via the host environment.
 - **read-path sensitive blocklist (C-SEC-03)** — reading credential files is blocked at two layers:
   - shell read commands (`cat` / `grep` / `head` / `tail` / `less` / `more` / `bat` / `rg`) — path-prefix check rejects `~/.ssh/*`, `/etc/*`, `/System/*`, etc., **plus** a filename-pattern check rejects `id_rsa*` (private keys, `.pub` allowed), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`, `*.htpasswd` anywhere (cwd-relative or absolute).
