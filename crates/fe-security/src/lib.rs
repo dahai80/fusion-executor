@@ -938,7 +938,29 @@ mod tests {
     use super::*;
 
     fn guard() -> SecurityGuard {
-        SecurityGuard::new()
+        // ARCH-2: 测试 guard 须对齐 Executor::new 的可信目录登记 — 否则 venv 内
+        // python/pytest (PATH 上是 .venv/bin/python) resolved-path 校验 fail-closed 拒,
+        // allows_python / allows_pytest 等基线用例误红。登记 VIRTUAL_ENV/bin + 当前 exe 父目录。
+        let mut trusted: Vec<String> = Vec::new();
+        if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+            let venv_bin = std::path::Path::new(&venv).join("bin");
+            if let Some(s) = venv_bin.to_str() {
+                trusted.push(s.to_string());
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                if let Some(s) = parent.to_str() {
+                    trusted.push(s.to_string());
+                }
+            }
+        }
+        let refs: Vec<&str> = trusted.iter().map(String::as_str).collect();
+        if refs.is_empty() {
+            SecurityGuard::new()
+        } else {
+            SecurityGuard::new().with_trusted_bin_dirs(&refs)
+        }
     }
 
     // ── Blocker 2: 读源敏感路径防护 (finding 1.4) ──
@@ -1752,14 +1774,16 @@ mod tests {
     #[test]
     fn with_extra_whitelist_rejects_shell_interpreter() {
         // 解释器/内建不可经项目扩展自我后门
-        let g = SecurityGuard::new().with_extra_whitelist(&["bash", "sh", "exec", "eval"]);
+        // 用 guard() 登记 venv 可信目录 — 否则 ARCH-2 resolved-path 拦 venv python3,
+        // 干扰 "基线工具不受影响" 断言 (基线放行的前提是可信目录已登记)。
+        let g = guard().with_extra_whitelist(&["bash", "sh", "exec", "eval"]);
         for cmd in ["bash -c 'x'", "sh -c 'x'", "eval 'x'", "exec foo"] {
             let v = g.validate(cmd);
             assert!(!v.allowed, "危险扩展项应仍被拦: {}", cmd);
         }
         // 基线工具不受扩展拒绝影响
         let v = g.validate("python3 --version");
-        assert!(v.allowed, "基线工具不受影响");
+        assert!(v.allowed, "基线工具不受影响: {:?}", v.reason);
     }
 
     #[test]
