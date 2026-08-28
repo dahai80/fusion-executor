@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import suppress
 
 import pytest
 
@@ -478,9 +479,10 @@ def test_subscription_subscribe_error_raises():
             os.unlink(sock_path)
 
 
-def test_subscription_next_raises_stopiteration_on_closed_stream():
-    # 覆盖 _read_json 行 344 (recv 空返回 None) + __next__ 行 363 (None → StopIteration)
-    # 伪 server: 发合法 subscribe 响应后立即关连接 → __next__ 内 recv 返 b"" → None → StopIteration
+def test_subscription_next_raises_connectionerror_on_unexpected_disconnect():
+    # IMPL-3: 伪 server 发合法 subscribe 响应后立即关连接 (无 unsubscribe) = server 崩溃场景。
+    # __next__ 内 recv 返 b"" → _eof_seen=True + 非 _closed_by_server → ConnectionError (非 StopIteration)。
+    # 调用方可 catch ConnectionError 重连/告警, 不当干净流尾吞掉。
     sock_path = _sock_path()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(sock_path)
@@ -505,12 +507,52 @@ def test_subscription_next_raises_stopiteration_on_closed_stream():
         sub = Subscription(sock_path, ["telemetry"], None, None)
         sub._open()
         assert sub.subscription_id == "sub-eof"
-        with pytest.raises(StopIteration):
+        with pytest.raises(ConnectionError, match="server disconnected"):
             next(sub)
-        # sock 仍开 (服务端关了对端, 本地未关) → close() 覆盖 396-397
+        # sock 仍开 (服务端关了对端, 本地未关) → close() 覆盖
         assert sub._sock is not None
         sub.close()
         assert sub._sock is None
+    finally:
+        listener.close()
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+
+def test_subscription_graceful_close_raises_stopiteration():
+    # IMPL-3: 主动 unsubscribe/close (_closed_by_server=True) → __next__ 得 None 抛 StopIteration (干净流尾)。
+    # 用真实 server: subscribe 后本端调 close (标记主动关), 再 next → StopIteration (非 ConnectionError)。
+    sock_path = _sock_path()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(sock_path)
+    listener.listen(1)
+    listener.settimeout(5.0)
+
+    def fake_server():
+        conn, _ = listener.accept()
+        conn.recv(4096)
+        conn.sendall(
+            (
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"ok": True, "subscription_id": "sub-grace"}}) + "\n"
+            ).encode()
+        )
+        # 保持连接开, 等本端 close
+        with suppress(OSError):
+            conn.recv(4096)
+        conn.close()
+
+    import threading
+
+    t = threading.Thread(target=fake_server, daemon=True)
+    t.start()
+    try:
+        sub = Subscription(sock_path, ["telemetry"], None, None)
+        sub._open()
+        assert sub.subscription_id == "sub-grace"
+        sub.close()  # 主动关 → _closed_by_server=True
+        assert sub._closed_by_server is True
+        with pytest.raises(StopIteration):
+            next(sub)
     finally:
         listener.close()
         if os.path.exists(sock_path):

@@ -7,6 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field
 # serde bug 时 Pydantic 侧空字段假成功)。严格校验破 silent-schema-drift。
 _STRICT = ConfigDict(extra="forbid")
 
+# ARCH-4 可观测性边界: 进程内路径 (run()/run_async()/run_streaming 直调 fe-core) 绕过 fe-ipc
+# 层, 故不经 UDS 的 metrics/telemetry/审计计数。execute_sync 已 mirror 关键计数器
+# (fe_exec_total 等) 进全局 metrics recorder, 但完整可观测性 (BroadcastHub 推送/连接计数/
+# Prometheus export) 仅 serve() UDS 路径具备。需完整指标时用 serve() + executor.execute over UDS,
+# 不要依赖进程内 run() 的指标覆盖。
+
 
 class Diagnostics(BaseModel):
     model_config = _STRICT

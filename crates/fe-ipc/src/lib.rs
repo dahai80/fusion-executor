@@ -718,9 +718,10 @@ impl IpcServer {
             .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", path.display(), e))?;
         chmod_secure(&path);
         info!(sock = %path.display(), "IPC 服务器监听中");
-        // C-SEC-02: seatbelt 治理 — 默认 false, 生产环境须调用方透传 seatbelt:true 启运行时隔离。
-        warn!(
-            "⚠️ seatbelt 默认关闭 — 子进程无 macOS sandbox-exec 隔离 (禁网/execve deny 均未启)。生产部署须在 ExecutionRequest 透传 seatbelt:true。查 health.seatbelt_default_off"
+        // ARCH-1: seatbelt 治理 — execute 默认 true (商用安全默认, 对齐 fe-core serde default_true)。
+        // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。shell_start 路径仍默认 false。
+        info!(
+            "seatbelt 默认开启 (execute 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
         );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -760,9 +761,10 @@ impl IpcServer {
                 .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", p.display(), e))?;
             chmod_secure(&p);
             info!(sock = %p.display(), "IPC 服务器监听中 (blocking, 信号可停)");
-            // C-SEC-02: seatbelt 治理 — 默认 false, 生产环境须调用方透传 seatbelt:true 启运行时隔离。
-            warn!(
-                "⚠️ seatbelt 默认关闭 — 子进程无 macOS sandbox-exec 隔离 (禁网/execve deny 均未启)。生产部署须在 ExecutionRequest 透传 seatbelt:true。查 health.seatbelt_default_off"
+            // ARCH-1: seatbelt 治理 — execute 默认 true (商用安全默认, 对齐 fe-core serde default_true)。
+            // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。shell_start 路径仍默认 false。
+            info!(
+                "seatbelt 默认开启 (execute 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
             );
             let (_tx, rx) = oneshot::channel::<()>();
             // 信号任务: 收 SIGINT/SIGTERM → notify_waiters, accept_loop 自行退出并 drain
@@ -1523,9 +1525,9 @@ async fn handle_method(
                 "git_sha": env!("FE_GIT_SHA"),
                 "build_time": env!("FE_BUILD_TIME"),
                 "ax_trusted": fe_core::gui::GuiController::ax_trusted(),
-                // C-SEC-02: seatbelt 治理信号 — 默认 false (调用方须显式 opt-in seatbelt:true)。
-                // 负载均衡器/运维查此字段知实例未开运行时隔离, 提示生产环境须透传 seatbelt:true。
-                "seatbelt_default_off": true,
+                // ARCH-1: seatbelt 治理信号 — execute 默认 true (商用安全默认)。
+                // 负载均衡器/运维查此字段知实例 execute 路径默认开运行时隔离; shell_start 路径仍默认 false。
+                "seatbelt_default_on": true,
                 "runtime": { "ok": rt_ok },
                 "dependencies": deps,
                 // M-OPS-04/M-OPS-05: 运维深度指标 — 连接数/worker 线程/活跃 shell/内存。
@@ -2104,8 +2106,8 @@ mod tests {
         .await;
         // C-OPS-05: ok 由真实探针决定 (BLOCKING_RT + git 依赖), CI 环境 git 存在 → ok=true。
         assert_eq!(resp["result"]["ok"], true);
-        // C-SEC-02: seatbelt 治理信号 — 默认关闭, 调用方须显式 opt-in seatbelt:true
-        assert_eq!(resp["result"]["seatbelt_default_off"], true);
+        // ARCH-1: seatbelt 治理信号 — execute 默认开启 (商用安全默认)。
+        assert_eq!(resp["result"]["seatbelt_default_on"], true);
         // ax_trusted = 真实 AXIsProcessTrusted() 查询 (C-GUI-01), CI 无 TCC 时为 false。
         // 仅断言字段存在且为布尔, 不硬编码 true。
         assert!(

@@ -248,6 +248,8 @@ assert r.exit_code != 0 and r.auto_rolled_back
 
 `RollbackPolicy{max_consecutive_failures=3 (reserved field), file_damage_check=True}`. No snapshot (`enable_rollback_snapshot=False`) → guard skips. Non-git repo → damage detection failure treated as 0 changes, no rollback.
 
+**ARCH-7 — caller owns the circuit breaker (audit 0827):** `max_consecutive_failures` is a reserved field the stateless Executor never reads — it is the threshold the **caller** (e.g. fusion-code's self-healing loop) reads to trip a consecutive-failure circuit breaker; auto-rollback itself is per-execute, not per-loop. A reference skeleton lives at `examples/08_integrate_fusion_code.py` (consumes the executor API only; a one-way issue tracks the `ExecutorDriver` refactor on fusion-code).
+
 ## Live Telemetry (v1.4 — GPU/CPU UDS broadcast)
 
 The `telemetry_stream()` generator yields `TelemetrySample` frame by frame — 10Hz (adjustable `interval_ms`) process CPU/mem sampling. GPU fields default to None (the executor runs no model, has no GPU handle) and are caller-injected. `max_samples>0` ends the stream when reached; dropping the iterator stops the sampling task automatically (channel closes). The Executor is stateless: each call is an independent stream.
@@ -297,7 +299,7 @@ Start a UDS JSON-RPC 2.0 server — for fusion-code (TypeScript) / fusion-studio
 
 ```bash
 python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"
-# Socket: /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK)
+# Socket: ~/.fusion-executor/fe.sock (HOME-private, 0o700 dir; override FUSION_EXECUTOR_SOCK)
 ```
 
 Protocol: newline-delimited JSON-RPC 2.0, error codes -32700/-32600/-32601/-32603 + extensions -32010(security)/-32011(timeout)/-32012(rollback)/-32013(AX). Methods: `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`grep_with_opts`/`apply_patch`/`replace_function`/`telemetry_stream`/`subscribe`/`unsubscribe`/`shell_start`/`shell_output`/`kill_shell`/`list_shells`/`shutdown`.
@@ -335,7 +337,7 @@ Operability surface landed in the 0826 enterprise audit fix pass (C-OPS-01..06, 
 
 fusion-executor is a **single-user, local-first, trusted-caller** execution tool — a human author writes the commands, the executor enforces a defense-in-depth guard. It is **not** a multi-user / untrusted-agent sandbox; for that, layer macOS seatbelt (C-SEC-02) + UDS auth on top.
 
-- **seatbelt governance (C-SEC-02)** — macOS `sandbox-exec` isolation is **opt-in**, default off. `serve()` emits a `WARN` log on startup when seatbelt is off, and `executor.health` exposes `seatbelt_default_off: true` for ops audit. Production / cross-user deployments **must** pass `seatbelt: true` per `ExecutionRequest`. Changing the default to on was evaluated and rejected (breaks the existing E2E suite); the governance path is documented + health-visible instead.
+- **seatbelt governance (ARCH-1)** — macOS `sandbox-exec` isolation is **default-on** for the `execute` path (`run()` / `executor.execute`): the `ExecutionRequest.seatbelt` serde default is `true`, and `fe-pyo3` `run()` resolves `seatbelt.unwrap_or(true)` to match. A trusted local caller may pass `seatbelt: false` to opt out (must document the escape risk). `executor.health` exposes `seatbelt_default_on: true` for ops audit. Note: the long-running background-shell path (`shell_start`) keeps `seatbelt: false` as its default — background tasks rely on caller-driven `kill_shell`, not the sandbox heartbeat.
 - **env injection (C-SEC-01)** — `env_vars` is denylist-filtered (blocks `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` / `LD_LIBRARY_PATH` and similar escape vectors) and capped at 64KB. `inherit_env` is opt-in (default off → clean baseline PATH only), so a caller cannot smuggle injection libs via the host environment.
 - **read-path sensitive blocklist (C-SEC-03)** — reading credential files is blocked at two layers:
   - shell read commands (`cat` / `grep` / `head` / `tail` / `less` / `more` / `bat` / `rg`) — path-prefix check rejects `~/.ssh/*`, `/etc/*`, `/System/*`, etc., **plus** a filename-pattern check rejects `id_rsa*` (private keys, `.pub` allowed), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`, `*.htpasswd` anywhere (cwd-relative or absolute).
@@ -358,11 +360,11 @@ fusion-executor is a **single-user, local-first, trusted-caller** execution tool
   - fe-pyo3: `NativeDiagnostics` + `diagnostics` field + `snapshot_create`/`rollback` methods; env_vars/enable_rollback_snapshot passed through
   - Exit gate: `run("python3 -c 'raise ValueError'")` → `diagnostics.error_type == "ValueError"`; rollback round-trip restores a corrupted file
 - **P3 — IPC Service** ✅ complete
-  - fe-ipc: UDS JSON-RPC 2.0 server — `tokio::net::UnixListener` + newline-delimited + per-connection spawn; socket `/tmp/fusion-executor.sock` (override `FUSION_EXECUTOR_SOCK`), unlink stale sock + chmod 0o666
+  - fe-ipc: UDS JSON-RPC 2.0 server — `tokio::net::UnixListener` + newline-delimited + per-connection spawn; socket `~/.fusion-executor/fe.sock` (HOME-private 0o700 dir, override `FUSION_EXECUTOR_SOCK`), unlink stale sock + chmod 0o666
   - Methods: `executor.health`/`execute`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`(P4 stub)/`shutdown`; error codes -32700/-32600/-32601/-32603 + extensions -32010..-32013
   - fe-pyo3: `NativeExecutor.serve(sock_path=None)` binding; `FusionSandboxExecutor.serve()` wrapper runs forever
   - 4 Rust unit tests (health/unknown -32601/malformed -32700/UDS execute) + 5 Python IPC tests (health/execute/diagnostics/unknown/snapshot+rollback round-trip)
-  - Exit gate: external raw-socket client calls `executor.execute` echo over UDS → `exit_code=0 stdout="hi\n"`; fusion-code-style TS client sketch in `docs/ipc-client-typescript.md`; fusion-studio uses existing `IPCClient.swift udsCall` pointed at `/tmp/fusion-executor.sock`
+  - Exit gate: external raw-socket client calls `executor.execute` echo over UDS → `exit_code=0 stdout="hi\n"`; fusion-code-style TS client sketch in `docs/ipc-client-typescript.md`; fusion-studio uses existing `IPCClient.swift udsCall` pointed at `~/.fusion-executor/fe.sock`
 - **P4 — macOS GUI** ✅ complete
   - fe-gui: `accessibility` 0.2 safe wrapper (AXUIElement tree/focus/click/type/inspect) + 3 audited unsafe FFI blocks (AXIsProcessTrusted + AXValueGetValue ×2); CoreGraphics `CGDisplay::screenshot` → PNG base64 (Layer B vision fallback)
   - GuiAction (tag=kind, snake_case): `focus_app`/`click`/`type_text`/`key_press`/`screenshot`/`inspect_tree`; GuiResult{ok, node_tree, screenshot_png_b64, error}

@@ -693,7 +693,10 @@ impl PyExecutor {
             env_vars,
             enable_rollback_snapshot: enable_rollback_snapshot.unwrap_or(true),
             auto_rollback_policy: policy,
-            seatbelt: seatbelt.unwrap_or(false),
+            // ARCH-1: 默认 true — 对齐 fe-core serde default_true (商用安全默认)。
+            // 原 unwrap_or(false) 与 fe-core/fe-ipc 路径不一致 (UDS execute 经 serde 默认 true,
+            // 仅 Python run() 经此站走 false) — 修复层间不一致 (Rule 7)。
+            seatbelt: seatbelt.unwrap_or(true),
             inherit_env: inherit_env.unwrap_or(false),
             use_pty: use_pty.unwrap_or(true),
             max_nproc: max_nproc.unwrap_or(1024),
@@ -869,7 +872,10 @@ impl PyExecutor {
             env_vars,
             enable_rollback_snapshot: enable_rollback_snapshot.unwrap_or(true),
             auto_rollback_policy: policy,
-            seatbelt: seatbelt.unwrap_or(false),
+            // ARCH-1: 默认 true — 对齐 fe-core serde default_true (商用安全默认)。
+            // 原 unwrap_or(false) 与 fe-core/fe-ipc 路径不一致 (UDS execute 经 serde 默认 true,
+            // 仅 Python run() 经此站走 false) — 修复层间不一致 (Rule 7)。
+            seatbelt: seatbelt.unwrap_or(true),
             inherit_env: inherit_env.unwrap_or(false),
             use_pty: use_pty.unwrap_or(true),
             max_nproc: max_nproc.unwrap_or(1024),

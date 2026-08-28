@@ -100,14 +100,14 @@ python -c "from fusion_executor import FusionSandboxExecutor; print(FusionSandbo
 
 # Start UDS JSON-RPC server (P3)
 python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"
-# Socket: /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK)
+# Socket: ~/.fusion-executor/fe.sock (HOME-private 0o700; override FUSION_EXECUTOR_SOCK)
 ```
 
 Python ≥3.11 (venv is 3.14). Runtime dep `pydantic>=2.0`. Test deps `pytest`/`pytest-asyncio`/`pytest-cov`. No httpx, no hard fusion-core — executor is an L4 OS tool, delegates inference to caller. Package root is `fusion_executor` (import as `from fusion_executor import FusionSandboxExecutor, ExecutionResult`). Native extension is `fusion_executor._native` (built from `crates/fe-pyo3`).
 
 ## Integration With Ecosystem
 
-- **fusion-code → fusion-executor**: fusion-code drops generated patch to disk, calls `executor.run("pytest tests/")`, receives structured diagnostics, enters next self-healing loop iteration. Refactor plan (PRD §"重构"): fusion-code strips its own subprocess/file-IO into an `ExecutorDriver` interface — all command validation, timeout, stdio capture delegated here.
+- **fusion-code → fusion-executor**: fusion-code drops generated patch to disk, calls `executor.run("pytest tests/")`, receives structured diagnostics, enters next self-healing loop iteration. Refactor plan (PRD §"重构"): fusion-code strips its own subprocess/file-IO into an `ExecutorDriver` interface — all command validation, timeout, stdio capture delegated here. **ARCH-7 caller-circuit contract (audit 0827)**: `RollbackPolicy.max_consecutive_failures` is a reserved field the stateless `Executor` never reads — the **caller** (fusion-code self-healing loop) owns the consecutive-failure count and reads that field as its circuit-breaker threshold; auto-rollback is per-execute, not per-loop. Reference skeleton: `examples/08_integrate_fusion_code.py` (consumes the executor API only, does not import fusion-code; one-way issue opened on fusion-code for the `ExecutorDriver` refactor).
 - **fusion-executor → fusion-studio**: live stdio stream, screenshot sampling, GPU/CPU telemetry broadcast over Unix Domain Socket to the studio dashboard (zero-copy, high-frame-rate render).
 - **fusion-executor ↔ fusion-mlx / fusion-gateway**: UDS comms (not HTTP/gRPC) — terminal Traceback-to-model-prompt transfer latency target <2ms.
 - **Replaces**: Claude SDK's BashTool/FileEdit/Glob/Grep + Docker sandbox, and DeepSeek Harness's SWE-bench container — but native (no Docker): macOS process isolation + Git snapshots, sandbox init overhead target <5ms.

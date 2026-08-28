@@ -28,6 +28,7 @@ TypeScript 示例另需 `bun` (`brew install oven-sh/bun/bun`)。
 | 05 | `05_file_tools.py` | 原生文件工具: `file_edit` (唯一匹配)、`glob`、`grep`、`apply_patch` (Unified Diff, 禁全文件重写)、`replace_function` (tree-sitter AST)。 |
 | 06 | `06_telemetry.py` | `telemetry_stream()` 以 10Hz 产出 `TelemetrySample` (CPU%、内存 MB、墙钟 `ts_ms`)。 |
 | 07 | `07_subscribe.py` | 启动 UDS 服务, `subscribe(["telemetry"])`, 打印服务端推送帧, `unsubscribe()`, 停服务。 |
+| 08 | `08_integrate_fusion_code.py` | **集成骨架 (ARCH-3)** —— 上游 agent (fusion-code) 应跑的自愈循环: 解析 `result.diagnostics`、自持连续失败计数作熔断 (`RollbackPolicy.max_consecutive_failures`)、可选 `auto_rollback`。单向参考, 不 import fusion-code。 |
 
 运行单个:
 
@@ -57,6 +58,6 @@ bun examples/uds_client_typescript.ts subscribe  # + 遥测推送帧
 ## 注意
 
 - 示例自行清理临时数据, 运行后无残留文件。
-- `07_subscribe.py` 与 `uds_client_typescript.ts` 在 `/tmp/fusion-executor.sock` 上启停/连接服务 (可用 `FUSION_EXECUTOR_SOCK` 覆盖)。
+- `07_subscribe.py` 与 `uds_client_typescript.ts` 在 `~/.fusion-executor/fe.sock` 上启停/连接服务 (可用 `FUSION_EXECUTOR_SOCK` 覆盖)。
 - GUI 动作 (点击/输入/截图) **不**在示例中 —— 需 TCC 辅助功能 + 屏幕录制权限及真实 GUI 会话。手动清单见根 `README.md`。
 - 所有示例含日志 (`logging.basicConfig`), 符合项目约定。

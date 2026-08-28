@@ -30,6 +30,7 @@ The TypeScript example additionally needs `bun` (`brew install oven-sh/bun/bun`)
 | 05 | `05_file_tools.py` | Native file tools: `file_edit` (unique-match), `glob`, `grep`, `apply_patch` (Unified Diff, no full-rewrite), `replace_function` (tree-sitter AST). |
 | 06 | `06_telemetry.py` | `telemetry_stream()` yields `TelemetrySample` at 10Hz (CPU%, mem MB, wall-clock `ts_ms`). |
 | 07 | `07_subscribe.py` | Starts the UDS server, `subscribe(["telemetry"])`, prints server-push frames, `unsubscribe()`, stops server. |
+| 08 | `08_integrate_fusion_code.py` | **Integration skeleton (ARCH-3)** — the self-healing loop an upstream agent (fusion-code) should run: parse `result.diagnostics`, own the consecutive-failure count as a circuit breaker (`RollbackPolicy.max_consecutive_failures`), optional `auto_rollback`. One-way reference; does not import fusion-code. |
 
 Run any one:
 
@@ -59,6 +60,6 @@ bun examples/uds_client_typescript.ts subscribe  # + telemetry push frames
 ## Notes
 
 - Examples clean up their own temp data; no leftover files after a run.
-- `07_subscribe.py` and `uds_client_typescript.ts` start/connect to a server on `/tmp/fusion-executor.sock` (override via `FUSION_EXECUTOR_SOCK`).
+- `07_subscribe.py` and `uds_client_typescript.ts` start/connect to a server on `~/.fusion-executor/fe.sock` (override via `FUSION_EXECUTOR_SOCK`).
 - GUI actions (click/type/screenshot) are **not** in these examples — they need TCC Accessibility + Screen Recording permission and a real GUI session. See the manual checklist in the root `README.md`.
 - All examples include logging (`logging.basicConfig`) per project convention.
