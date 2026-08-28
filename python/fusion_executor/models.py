@@ -58,6 +58,10 @@ class ExecutionRequest(BaseModel):
         default=0,
         description="CPU 秒上限 (RLIMIT_CPU, 经 ulimit -t 注入); >0 到顶 SIGXCPU (CPU 死循环防御); 0=不限 (依赖 timeout_sec watchdog); Darwin 实测生效",
     )
+    max_nofile: int = Field(
+        default=1024,
+        description="文件描述符上限 (RLIMIT_NOFILE, 经 ulimit -n 注入); 拦 FD 耗尽攻击; 0=不限 (受信 opt-out); Darwin 实测生效 (errno 24 EMFILE)",
+    )
     trace_id: str | None = Field(
         default=None,
         description="跨层关联 id; None 时执行入口自动生成 uuid v4, 贯穿日志/IPC/结果 (M-OPS-06)",
@@ -89,6 +93,11 @@ class ExecutionResult(BaseModel):
     )
     trace_id: str | None = Field(
         default=None, description="跨层关联 id — 回填请求侧 trace_id 或入口自动生成 (M-OPS-06)"
+    )
+    pid: int | None = Field(
+        default=None,
+        description="沙箱子进程 PID — 调用方据此传 telemetry_stream(pid=...) 采样真实任务进程 "
+        "(非 executor 自身, RUN-11); stdio 路径有, 拦截/超时路径无",
     )
 
 

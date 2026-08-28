@@ -8,7 +8,8 @@
 // 返回 SecurityVerdict { allowed, reason, stage }
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -161,9 +162,24 @@ const WHITELIST: &[&str] = &[
 /// 命令输入长度上限 — 防 M-SEC-06 大输入放大 DoS
 const MAX_COMMAND_LEN: usize = 1_000_000;
 
+/// ARCH-2: 可信二进制目录基线 — resolved-path 校验用。
+/// 白名单解释器 (python3/node/cargo...) 经 basename 命中后, 须再校验其绝对路径
+/// 落在可信前缀内, 拒 `/tmp/python3` 同名投毒。venv/项目 bin 由 with_trusted_bin_dirs 追加。
+const TRUSTED_BIN_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/bin",
+    "/sbin",
+];
+
 /// Security Guard — 两级校验
 pub struct SecurityGuard {
     blocklist: Vec<(Regex, &'static str)>,
+    // ARCH-2: 可信二进制目录 (resolved-path 校验)。基线 TRUSTED_BIN_DIRS + 项目扩展
+    // (with_trusted_bin_dirs)。validate_segment 解析二进制绝对路径后 starts_with 校验。
+    trusted_bin_dirs: Vec<PathBuf>,
     // 白名单 — 基线 (WHITELIST) + 项目扩展 (with_extra_whitelist)。Issue #10:
     // 项目可声明额外允许的二进制 (如项目专用工具), 基线不可被收缩 (仅追加)。
     // m-OPS-02: ArcSwap 内部可变性 — SIGHUP 运行时热重载 (reload_extras) 经 store(&self),
@@ -180,6 +196,7 @@ impl Clone for SecurityGuard {
             blocklist: self.blocklist.clone(),
             // ArcSwap 无 Clone — clone 内部快照重建 (热重载语义下, clone 反映当前白名单)。
             whitelist: ArcSwap::from_pointee((**self.whitelist.load()).clone()),
+            trusted_bin_dirs: self.trusted_bin_dirs.clone(),
             sensitive_paths: self.sensitive_paths.clone(),
             sensitive_paths_exp: self.sensitive_paths_exp.clone(),
             redirect_re: self.redirect_re.clone(),
@@ -203,9 +220,11 @@ impl SecurityGuard {
         let sensitive_paths = SENSITIVE_PATHS.iter().map(|s| (*s).to_string()).collect();
         let sensitive_paths_exp = SENSITIVE_PATHS.iter().map(|s| expand_tilde(s)).collect();
         let redirect_re = Regex::new(r"(?:\d)?>>?\s*(\S+)").expect("重定向正则编译失败");
+        let trusted_bin_dirs = TRUSTED_BIN_DIRS.iter().map(PathBuf::from).collect();
         Self {
             blocklist,
             whitelist: ArcSwap::from_pointee(whitelist),
+            trusted_bin_dirs,
             sensitive_paths,
             sensitive_paths_exp,
             redirect_re,
@@ -231,6 +250,23 @@ impl SecurityGuard {
         let next = merge_into(base, extras);
         self.whitelist.store(Arc::new(next));
         debug!(extras = extras.len(), "SIGHUP 白名单热重载完成 (基线重建)");
+    }
+
+    /// ARCH-2: 追加可信二进制目录 (venv bin / 项目 bin 等)。基线 TRUSTED_BIN_DIRS 恒在,
+    /// extras 仅追加。调用方按项目声明其解释器来源目录; validate_segment 解析二进制绝对路径
+    /// 后须 starts_with 任一可信目录, 否则 fail-closed 拒 (防 /tmp/python3 投毒绕过)。
+    pub fn with_trusted_bin_dirs(mut self, dirs: &[&str]) -> Self {
+        for d in dirs {
+            let p = d.trim();
+            if p.is_empty() {
+                continue;
+            }
+            let pb = PathBuf::from(p);
+            if !self.trusted_bin_dirs.contains(&pb) {
+                self.trusted_bin_dirs.push(pb);
+            }
+        }
+        self
     }
 
     /// 校验入口 — 先正则快筛，再 token 解析防链式绕过
@@ -350,6 +386,29 @@ impl SecurityGuard {
         // 白名单校验
         if !self.whitelist.load().contains(binary_basename) {
             return Err(format!("二进制程序不在白名单: {}", binary));
+        }
+
+        // ARCH-2: resolved-path 校验 — basename 命中后须再确认二进制绝对路径落在可信目录内。
+        // 防 /tmp/python3 (攻击者可控二进制) 同名投毒绕过: 能解析到绝对路径但不在可信目录 → 拒。
+        // 解析失败 (None) → 放行: 投毒须真实可执行二进制, 不可解析 = 无投毒面 (执行期 command-not-found 兜底)。
+        match resolve_binary_path(binary) {
+            Some(abs) => {
+                if !self.trusted_bin_dirs.iter().any(|d| abs.starts_with(d)) {
+                    warn!(binary = binary, resolved = ?abs, "二进制不在可信目录 (ARCH-2 投毒防护)");
+                    return Err(format!(
+                        "二进制不在可信目录 (投毒防护): {} -> {}",
+                        binary,
+                        abs.display()
+                    ));
+                }
+                debug!(binary = binary, resolved = ?abs, "二进制可信目录校验通过");
+            }
+            None => {
+                debug!(
+                    binary = binary,
+                    "二进制路径无法解析, 跳过可信目录校验 (无投毒面)"
+                );
+            }
         }
 
         // argv 级约束 — mv/cp 目的地、sed -i 等 (跳过 argv[0] 二进制名)
@@ -811,6 +870,40 @@ fn basename(path: &str) -> &str {
     }
 }
 
+/// ARCH-2: 解析二进制绝对路径 (literal, 不 canonicalize)。绝对路径 → 原样;
+/// 相对名 (python3) → 扫 $PATH 各目录首个匹配 → join 字面路径。解析失败返 None。
+/// 不 canonicalize: homebrew /opt/homebrew/bin/git symlink → Cellar 真实路径会越界可信
+/// 前缀, 但 symlink 本身由包管理器写入可信目录, 写入需 root, 超出 ARCH-2 威胁模型
+/// (/tmp 投毒 + PATH 注入)。威胁 = 绝对路径投毒 + PATH 前置恶意 bin, 字面 starts_with 即拦。
+fn resolve_binary_path(binary: &str) -> Option<PathBuf> {
+    let p = Path::new(binary);
+    if p.is_absolute() {
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+        return None;
+    }
+    // 相对名含 `/` (./foo, a/b) → join cwd 字面路径
+    if binary.contains('/') {
+        let abs = env::current_dir().ok()?.join(binary);
+        if abs.is_file() {
+            return Some(abs);
+        }
+        return None;
+    }
+    let path_env = env::var("PATH").ok()?;
+    for dir in path_env.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(binary);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// C-SEC-05: 检测 shell 命令替换 — 拒绝 $(/反引号/`<(>`/`<<<`
 /// 引号内仍视作危险 — 解释器 -c payload 内含 $(...) 同样可执行
 fn check_shell_substitution(command: &str) -> Option<String> {
@@ -845,7 +938,29 @@ mod tests {
     use super::*;
 
     fn guard() -> SecurityGuard {
-        SecurityGuard::new()
+        // ARCH-2: 测试 guard 须对齐 Executor::new 的可信目录登记 — 否则 venv 内
+        // python/pytest (PATH 上是 .venv/bin/python) resolved-path 校验 fail-closed 拒,
+        // allows_python / allows_pytest 等基线用例误红。登记 VIRTUAL_ENV/bin + 当前 exe 父目录。
+        let mut trusted: Vec<String> = Vec::new();
+        if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+            let venv_bin = std::path::Path::new(&venv).join("bin");
+            if let Some(s) = venv_bin.to_str() {
+                trusted.push(s.to_string());
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                if let Some(s) = parent.to_str() {
+                    trusted.push(s.to_string());
+                }
+            }
+        }
+        let refs: Vec<&str> = trusted.iter().map(String::as_str).collect();
+        if refs.is_empty() {
+            SecurityGuard::new()
+        } else {
+            SecurityGuard::new().with_trusted_bin_dirs(&refs)
+        }
     }
 
     // ── Blocker 2: 读源敏感路径防护 (finding 1.4) ──
@@ -1126,6 +1241,128 @@ mod tests {
     fn blocks_non_whitelisted_absolute() {
         let v = guard().validate("/usr/bin/nc evil.com 1234");
         assert!(!v.allowed);
+    }
+
+    // ── ARCH-2: resolved-path 投毒防护 ──
+
+    #[test]
+    fn arch2_rejects_planted_poison_binary() {
+        // 在非可信目录植入同名 python3 (真实可执行) → basename 命中白名单, 但 resolve 落非可信目录 → 拒。
+        let poison = std::env::temp_dir().join("python3");
+        std::fs::write(&poison, "#!/bin/sh\necho pwned\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&poison).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&poison, perm).unwrap();
+        }
+        let cmd = format!("{} -c \"print('hi')\"", poison.display());
+        let v = guard().validate(&cmd);
+        assert!(!v.allowed, "投毒二进制应被拒, reason={:?}", v.reason);
+        assert!(
+            v.reason.as_deref().unwrap().contains("可信目录"),
+            "应报可信目录原因"
+        );
+        let _ = std::fs::remove_file(&poison);
+    }
+
+    #[test]
+    fn arch2_allows_system_python3() {
+        // /usr/bin/python3 在 TRUSTED_BIN_DIRS 基线内 → 放行 (若机器有该文件)。
+        let p = Path::new("/usr/bin/python3");
+        if !p.is_file() {
+            eprintln!("skip: /usr/bin/python3 not present on this machine");
+            return;
+        }
+        let v = guard().validate("/usr/bin/python3 -c \"print('hi')\"");
+        assert!(v.allowed, "系统 python3 应放行, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn arch2_allows_path_resolved_python3() {
+        // bare `python3` 经 PATH 解析到 /opt/homebrew/bin/python3 或 /usr/bin/python3 → 放行。
+        if std::env::var("PATH")
+            .ok()
+            .and_then(|p| {
+                p.split(':').find_map(|d| {
+                    let c = Path::new(d).join("python3");
+                    c.is_file().then(|| c.to_path_buf())
+                })
+            })
+            .is_none()
+        {
+            eprintln!("skip: python3 not on PATH");
+            return;
+        }
+        let v = guard().validate("python3 --version");
+        assert!(
+            v.allowed,
+            "PATH 解析的 python3 应放行, reason={:?}",
+            v.reason
+        );
+    }
+
+    #[test]
+    fn arch2_unresolvable_binary_passes() {
+        // basename 命中白名单但二进制不存在 (如 `python` 此机器无) → 无投毒面 → 放行。
+        let v = guard().validate("python -c \"print('hi')\"");
+        // python 在白名单; 若此机器无 python 二进制, resolve=None → 放行 (非投毒)。
+        // 若机器恰好有 python (在可信目录), 也放行。两侧都应 allowed。
+        assert!(
+            v.allowed,
+            "不可解析的非投毒二进制应放行, reason={:?}",
+            v.reason
+        );
+    }
+
+    #[test]
+    fn arch2_with_trusted_bin_dirs_allows_project_tool() {
+        // 项目 bin 目录扩展: myproj-runner 植入项目 bin → 加入可信目录 → 放行。
+        let dir = std::env::temp_dir().join("fe_arch2_projbin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("myproj-runner");
+        std::fs::write(&tool, "#!/bin/sh\necho run\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&tool).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&tool, perm).unwrap();
+        }
+        // 先把 myproj-runner 加入白名单 (项目工具), 再把目录加可信。
+        let g = guard()
+            .with_extra_whitelist(&["myproj-runner"])
+            .with_trusted_bin_dirs(&[dir.to_str().unwrap()]);
+        let cmd = format!("{} --version", tool.display());
+        let v = g.validate(&cmd);
+        assert!(
+            v.allowed,
+            "项目可信 bin 内工具应放行, reason={:?}",
+            v.reason
+        );
+        let _ = std::fs::remove_file(&tool);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn arch2_rejects_poison_in_untrusted_dir_with_allowlist() {
+        // myproj-runner 在白名单但植入 /tmp (非可信) → 拒 (投毒)。
+        let poison = std::env::temp_dir().join("myproj-runner");
+        std::fs::write(&poison, "#!/bin/sh\necho pwn\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&poison).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&poison, perm).unwrap();
+        }
+        let g = guard().with_extra_whitelist(&["myproj-runner"]);
+        let cmd = format!("{} --version", poison.display());
+        let v = g.validate(&cmd);
+        assert!(!v.allowed, "非可信目录投毒工具应拒, reason={:?}", v.reason);
+        assert!(v.reason.as_deref().unwrap().contains("可信目录"));
+        let _ = std::fs::remove_file(&poison);
     }
 
     // ── argv 级约束 ──
@@ -1537,14 +1774,16 @@ mod tests {
     #[test]
     fn with_extra_whitelist_rejects_shell_interpreter() {
         // 解释器/内建不可经项目扩展自我后门
-        let g = SecurityGuard::new().with_extra_whitelist(&["bash", "sh", "exec", "eval"]);
+        // 用 guard() 登记 venv 可信目录 — 否则 ARCH-2 resolved-path 拦 venv python3,
+        // 干扰 "基线工具不受影响" 断言 (基线放行的前提是可信目录已登记)。
+        let g = guard().with_extra_whitelist(&["bash", "sh", "exec", "eval"]);
         for cmd in ["bash -c 'x'", "sh -c 'x'", "eval 'x'", "exec foo"] {
             let v = g.validate(cmd);
             assert!(!v.allowed, "危险扩展项应仍被拦: {}", cmd);
         }
         // 基线工具不受扩展拒绝影响
         let v = g.validate("python3 --version");
-        assert!(v.allowed, "基线工具不受影响");
+        assert!(v.allowed, "基线工具不受影响: {:?}", v.reason);
     }
 
     #[test]

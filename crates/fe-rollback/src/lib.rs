@@ -26,8 +26,40 @@ use anyhow::{Context, Result};
 use fe_security::SecurityGuard;
 use fs2::FileExt;
 use std::fs::OpenOptions;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{info, warn};
+
+/// RUN-6 (审计 0827 arch): git 操作超时上限。git CLI 无内置超时 — NFS hang / 网络挂起
+/// 会让 `.output().await` 永不返回, 持有 RepoLock 跨 hang → 其他回滚阻塞死锁。
+/// 包 `tokio::time::timeout`, 超时 fail-loud (bail) 释放锁。单机本地 git 远低于此值。
+const GIT_TIMEOUT_SEC: u64 = 30;
+/// RepoLock acquire 轮询超时 (与 git 超时同量)。BSD flock 在 NFS 上可能无限阻塞,
+/// fs2 无带超时 lock → try_lock_exclusive 轮询至上限, 超时 fail-loud (不无限挂)。
+const LOCK_ACQUIRE_TIMEOUT_MS: u64 = GIT_TIMEOUT_SEC * 1000;
+const LOCK_POLL_INTERVAL_MS: u64 = 50;
+
+/// RUN-6a (审计 0827 arch): git 调用统一有界包装。git CLI 无内置超时, NFS hang / 死锁
+/// 会让 `.output().await` 永不返回 (持有 RepoLock 跨 hang → 其他回滚阻塞)。包
+/// `tokio::time::timeout(GIT_TIMEOUT_SEC)`, 超时 fail-loud; `kill_on_drop(true)` 让
+/// 超时丢弃 future 时杀掉挂起的 git 进程 (防泄漏)。单机本地 git 远低于此值。
+async fn git_output(cwd: &str, args: &[&str]) -> Result<std::process::Output> {
+    let fut = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(Duration::from_secs(GIT_TIMEOUT_SEC), fut)
+        .await
+        .with_context(|| {
+            format!(
+                "git 超时 ({}s) — NFS hang/死锁可能, fail-loud 释放锁",
+                GIT_TIMEOUT_SEC
+            )
+        })?
+        .context("git 命令启动失败")
+}
 
 /// FNV-1a 64-bit (无外部 hash 依赖, 稳定跨节点)。repo 路径 → 16-hex 标识。
 fn fnv1a_64(s: &str) -> String {
@@ -45,30 +77,53 @@ fn fnv1a_64(s: &str) -> String {
 async fn repo_id(cwd: &str) -> String {
     // git rev-parse --git-common-dir: 对 worktree 返公共 .git, 对 bare repo 返自身。
     // canonicalize 该路径 → NFS 各节点同物理路径得同哈希。
-    let out = Command::new("git")
+    // RUN-6a: 经 git_output 有界 (NFS hang 不会无限挂)。
+    let out = match git_output(cwd, &["rev-parse", "--git-common-dir"]).await {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return String::new(),
+    };
+    if out.is_empty() {
+        return String::new();
+    }
+    let resolved = resolve_git_dir_path(cwd, &out);
+    fnv1a_64(&resolved.to_string_lossy())
+}
+
+/// RUN-7 (审计 0827 arch): 解析 cwd 的真实 git 目录路径。
+/// worktree 内 `.git` 是 **文件** (内容 `gitdir: <path>`), 非 directory —
+/// 旧版 `cwd.join(".git")` 当目录用 → `join("fe-rollback.lock")` 在文件下 open = ENOTDIR,
+/// 锁静默失效。改: `git rev-parse --git-common-dir` 得真实 git dir (公共 .git),
+/// 相对路径以 cwd 为基解析, canonicalize 失败用字面路径兜底。
+/// 同步 (std::process::Command): rev-parse --git-common-dir 是纯本地 config 读, 不触网络,
+/// 无 NFS hang 风险 (区别 fetch/push); acquire 是同步锁路径, 不引入 .await。
+fn resolve_git_dir(cwd: &str) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--git-common-dir"])
         .output()
-        .await;
-    let git_dir = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => return String::new(),
-    };
-    if git_dir.is_empty() {
-        return String::new();
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    // 相对路径 (worktree 内常见 "gitdir: ..." 或 ".git") → 以 cwd 为基解析
-    let base = std::path::Path::new(cwd);
-    let p = std::path::Path::new(&git_dir);
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if dir.is_empty() {
+        return None;
+    }
+    Some(resolve_git_dir_path(cwd, &dir))
+}
+
+/// 共用: 相对 git-dir 字符串 → 绝对 PathBuf (canonicalize 失败用字面兜底)。
+fn resolve_git_dir_path(cwd: &str, dir: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(dir);
     let resolved = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        base.join(p)
+        std::path::Path::new(cwd).join(p)
     };
     match std::fs::canonicalize(&resolved) {
-        Ok(canonical) => fnv1a_64(&canonical.to_string_lossy()),
-        Err(_) => fnv1a_64(&resolved.to_string_lossy()),
+        Ok(c) => c,
+        Err(_) => resolved,
     }
 }
 
@@ -82,18 +137,31 @@ struct RepoLock {
 }
 
 impl RepoLock {
-    fn acquire(cwd: &str) -> Result<Self> {
-        let git_dir = std::path::Path::new(cwd).join(".git");
-        if !git_dir.exists() {
-            // 非 worktree repo (bare) 或 .git 缺 — 锁无意义, 返空锁占位 (no-op)。
-            // 调用方仅靠 is_repo 守卫; 此处不拦 (validate_cwd + is_repo 已前置于)。
-            return Ok(RepoLock {
-                file: OpenOptions::new()
-                    .read(true)
-                    .open("/dev/null")
-                    .context("打开 /dev/null 占位锁失败")?,
-            });
-        }
+    /// RUN-7 + RUN-6b: async acquire。
+    /// RUN-7: 真实 git dir 经 `git rev-parse --git-common-dir` 解析 (非 cwd/.git),
+    ///         worktree 内 `.git` 是文件 → 旧 `cwd.join(".git")` 当目录 open = ENOTDIR 锁失效。
+    /// RUN-6b: flock acquire 轮询有界 (fs2 无带超时 lock; NFS flock 可能无限阻塞)。
+    ///         `try_lock_exclusive` 失败 → sleep(50ms) 重试至上限 (30s) → fail-loud。
+    ///         kill_on_drop 不适用 (fd-held flock, drop File 即释放, 无进程需 kill)。
+    /// 取消安全: 轮询循环内每步不持跨 .await 资源; 超时返 Err 释放半开 fd。
+    async fn acquire(cwd: &str) -> Result<Self> {
+        // RUN-7: 解析真实 git dir。resolve_git_dir 是同步本地 config 读 (无 NFS 风险)。
+        let git_dir = match resolve_git_dir(cwd) {
+            Some(d) => d,
+            None => {
+                // 退回 cwd/.git 探测 (非 worktree 的普通 repo 仍走此)。
+                let fallback = std::path::Path::new(cwd).join(".git");
+                if !fallback.exists() {
+                    return Ok(RepoLock {
+                        file: OpenOptions::new()
+                            .read(true)
+                            .open("/dev/null")
+                            .context("打开 /dev/null 占位锁失败")?,
+                    });
+                }
+                fallback
+            }
+        };
         let lock_path = git_dir.join("fe-rollback.lock");
         let file = OpenOptions::new()
             .create(true)
@@ -101,10 +169,36 @@ impl RepoLock {
             .truncate(true)
             .open(&lock_path)
             .with_context(|| format!("打开回滚锁失败: {}", lock_path.display()))?;
-        file.lock_exclusive()
-            .with_context(|| format!("获取回滚锁失败 (另一回滚进行中): {}", lock_path.display()))?;
-        info!(cwd, lock = %lock_path.display(), "回滚进程锁已获取");
-        Ok(RepoLock { file })
+        // RUN-6b: 有界轮询 acquire。fs2 `lock_exclusive` 无超时, NFS 上可能无限阻塞。
+        let deadline = Instant::now() + Duration::from_millis(LOCK_ACQUIRE_TIMEOUT_MS);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    info!(cwd, lock = %lock_path.display(), "回滚进程锁已获取");
+                    return Ok(RepoLock { file });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        warn!(
+                            cwd, lock = %lock_path.display(),
+                            "回滚锁 acquire 超时 ({}ms) — 另一回滚长期持锁/NFS flock 阻塞, fail-loud",
+                            LOCK_ACQUIRE_TIMEOUT_MS
+                        );
+                        anyhow::bail!(
+                            "获取回滚锁超时 ({}ms): {}",
+                            LOCK_ACQUIRE_TIMEOUT_MS,
+                            lock_path.display()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(LOCK_POLL_INTERVAL_MS));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("获取回滚锁失败 (IO 错误): {}", lock_path.display())
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -187,13 +281,8 @@ impl RollbackManager {
     }
 
     async fn git(cwd: &str, args: &[&str]) -> Result<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(args)
-            .output()
-            .await
-            .context("git 命令启动失败")?;
+        // RUN-6a: 经 git_output 有界 (NFS hang 不会无限挂; kill_on_drop 超时杀 git)。
+        let output = git_output(cwd, args).await?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -205,11 +294,8 @@ impl RollbackManager {
 
     /// 判断 cwd 是否 git repo
     async fn is_repo(cwd: &str) -> bool {
-        Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .output()
+        // RUN-6a: 有界。超时/启动失败 → false (保守, 当非 repo 跳过)。
+        git_output(cwd, &["rev-parse", "--is-inside-work-tree"])
             .await
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -238,7 +324,7 @@ impl RollbackManager {
             return Ok(String::new());
         }
         // Blocker 9 (审计 2.7a): 进程级锁防并发双应用冲突。
-        let _lock = RepoLock::acquire(cwd)?;
+        let _lock = RepoLock::acquire(cwd).await?;
         let head = Self::git(cwd, &["rev-parse", "HEAD"]).await?;
         let stash = Self::git(cwd, &["stash", "create"]).await?;
         // Blocker 9 (审计 2.7c): repo:<hash> 标识 — 跨节点回滚前比对。
@@ -313,7 +399,7 @@ impl RollbackManager {
             return Ok(RollbackOutcome::skipped("空 snapshot_id"));
         }
         // Blocker 9 (审计 2.7a): 进程级锁防并发回滚双应用冲突。
-        let _lock = RepoLock::acquire(cwd)?;
+        let _lock = RepoLock::acquire(cwd).await?;
         let (kind, stash, base, repo_tag) = match Self::parse_snapshot(snapshot_id) {
             Some(v) => v,
             None => {
@@ -449,7 +535,7 @@ impl RollbackManager {
             warn!(cwd, "非 git repo, 无法回滚单文件");
             return Ok(false);
         }
-        let _lock = RepoLock::acquire(cwd)?;
+        let _lock = RepoLock::acquire(cwd).await?;
         match Self::git(cwd, &["checkout", "--", path]).await {
             Ok(_) => {
                 info!(cwd, %path, "单文件回滚成功");
@@ -909,5 +995,65 @@ mod tests {
             "锁释放后 rollback 应成功"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── RUN-7 (审计 0827 arch): worktree .git 是文件, RepoLock 须解析真实 git dir ──
+
+    // resolve_git_dir 对普通 repo 返 cwd/.git (canonicalize 后)
+    #[tokio::test]
+    async fn resolve_git_dir_normal_repo() {
+        let dir = tmp_repo("resolve");
+        let cwd = dir.to_str().unwrap();
+        fs::write(dir.join("app.py"), "v1\n").unwrap();
+        git_commit(&dir, &["add", "app.py"], "base");
+        let resolved = resolve_git_dir(cwd).expect("普通 repo 应解析出 git dir");
+        assert!(
+            resolved.ends_with(".git"),
+            "普通 repo git dir 应以 .git 结尾: {:?}",
+            resolved
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // worktree 内 .git 是文件非目录; RepoLock::acquire 须解析真实 git dir 不 ENOTDIR
+    #[tokio::test]
+    async fn repo_lock_worktree_git_file_not_dir() {
+        let main = tmp_repo("wt-main");
+        fs::write(main.join("app.py"), "v1\n").unwrap();
+        git_commit(&main, &["add", "app.py"], "base");
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["branch", "wt-branch"])
+            .status();
+        let wt =
+            std::env::temp_dir().join(format!("fe-rollback-wt-{}-{}", std::process::id(), "wt"));
+        let _ = fs::remove_dir_all(&wt);
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", wt.to_str().unwrap(), "wt-branch"])
+            .status();
+        // worktree .git 应为文件 (非目录) — 这是 RUN-7 的触发条件
+        let dot_git = wt.join(".git");
+        assert!(dot_git.is_file(), "worktree .git 应为文件: {:?}", dot_git);
+        // RUN-7: acquire 须成功 (解析真实 git dir, 旧版 cwd.join(".git") 当目录会 ENOTDIR)
+        let lock = RepoLock::acquire(wt.to_str().unwrap()).await;
+        assert!(
+            lock.is_ok(),
+            "worktree 内 RepoLock::acquire 应成功 (RUN-7): {:?}",
+            lock.err()
+        );
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "remove", "--force", wt.to_str().unwrap()])
+            .status();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["branch", "-D", "wt-branch"])
+            .status();
+        let _ = fs::remove_dir_all(&main);
     }
 }

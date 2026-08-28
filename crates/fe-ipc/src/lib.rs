@@ -86,6 +86,11 @@ const MAX_CONNECTIONS: usize = 64;
 /// 审计 2.11: 并发 **执行** 上限 — 连接信号量限连接非限执行 (64 连接各跑 cargo build = 64 并发子进程超额)。
 /// 独立执行信号量限真实子进程并发, 与连接数解耦。8 核机 16 并发重命令留 2x 余量。
 const MAX_CONCURRENT_EXECS: usize = 16;
+/// RUN-3: 并发 **流式执行** 上限 — 与非流式 exec_sem (16) 分离。
+/// 流式 (execute_stream) 持 permit 跨整 chunk→done 生命周期; 若共用 exec_sem (16),
+/// 16 长流占满 permit → 短 execute 命令饿死。独立 stream_sem 容量 = MAX_CONNECTIONS (64),
+/// 流式按连接数上限 (连接信号量已限总连接), 不与非流式短执行争抢。
+const MAX_CONCURRENT_STREAMS: usize = MAX_CONNECTIONS;
 /// 单连接 idle 读超时 — 防 slowloris 占连接不读 (C-IPC-05)
 const IDLE_READ_TIMEOUT_SECS: u64 = 30;
 /// 截图 b64 帧上限 (4MB) — 超此降级去 png_b64 防 N 订阅内存堆积 (P-IPC-03)
@@ -132,7 +137,10 @@ static PROM_HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 
 /// 安装 Prometheus recorder (幂等) 并返 handle 克隆; 已装则从 static 取。
 /// describe_counter 让 render() 带 HELP/TYPE 头 (无观测值时也有 schema)。
-fn install_prometheus_recorder() -> Option<PrometheusHandle> {
+/// ARCH-4: pub 化 — 进程内路径 (fe-pyo3 execute_sync, 不经 fe-ipc/BroadcastHub)
+/// 也须装 recorder, 否则 record_exec_outcome 的 metrics::counter! 无 recorder = no-op。
+/// 幂等 (OnceLock), 多调安全。
+pub fn install_prometheus_recorder() -> Option<PrometheusHandle> {
     PROM_HANDLE
         .get_or_init(|| {
             let handle = PrometheusBuilder::new()
@@ -805,6 +813,11 @@ async fn wait_signal_and_notify(hub: Arc<BroadcastHub>) {
 /// 与 wait_signal_and_notify 并列 (后者管 SIGINT/SIGTERM 退出; SIGHUP 不退出, 仅重载)。
 /// 无配置 → no-op (不报错); tracing 未 init → 跳过日志重载; env 缺失 → 跳过白名单重载。
 /// 遵守 Executor 无状态约定: executor: Arc<Executor> 经 reload_whitelist(&self) 透传 ArcSwap store。
+///
+/// IMPL-12 信号竞态断言: 本 handler **永不触发 shutdown** — 不调 hub.shutdown.notify_waiters(),
+/// 不清理连接, 不 abort accept_loop。shutdown 单源 = wait_signal_and_notify (SIGINT/SIGTERM)。
+/// SIGHUP 仅重载配置, server 继续服务。竞态面 = 单源 shutdown, SIGHUP 与退出正交。测试覆盖见
+/// tests::sighup_does_not_trigger_shutdown。
 async fn handle_sighup_reload(executor: Arc<Executor>) {
     #[cfg(unix)]
     {
@@ -882,8 +895,11 @@ async fn accept_loop(
     drain_deadline: Duration,
 ) {
     let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    // 审计 2.11: 执行信号量 — 限并发 **执行** (子进程) 非并发连接。全 server 共享, 与连接信号量解耦。
+    // 审计 2.11: 执行信号量 — 限并发 **非流式执行** (子进程) 非并发连接。全 server 共享, 与连接信号量解耦。
     let exec_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_EXECS));
+    // RUN-3: 流式执行信号量 — 与 exec_sem 分离。流式 permit 跨整 chunk→done (长生命周期),
+    // 非流式短 execute 用 exec_sem (16)。分离防 16 长流饿死短命令。
+    let stream_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS));
     // C-OPS-03: in-flight 连接 JoinHandle 收集 — drain 时 join_all + deadline
     let conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>> = Arc::new(AsyncMutex::new(Vec::new()));
     let shutdown_notify = hub.shutdown.clone();
@@ -917,8 +933,9 @@ async fn accept_loop(
                         let h = hub.clone();
                         let sh = shells.clone();
                         let es = exec_sem.clone();
+                        let ss = stream_sem.clone();
                         let handle = tokio::spawn(async move {
-                            handle_conn(stream, ex, h, sh, es).await;
+                            handle_conn(stream, ex, h, sh, es, ss).await;
                             drop(permit);
                         });
                         conns.lock().await.push(handle);
@@ -1007,6 +1024,7 @@ async fn handle_conn(
     hub: Arc<BroadcastHub>,
     shells: Arc<fe_core::shell::ShellRegistry>,
     exec_sem: Arc<Semaphore>,
+    stream_sem: Arc<Semaphore>,
 ) {
     let conn_id = hub.next_conn_id();
     hub.active_conns.fetch_add(1, Ordering::Relaxed);
@@ -1118,8 +1136,12 @@ async fn handle_conn(
         let sh = read_shells.clone();
         let ptx = read_push_tx.clone();
         let es = exec_sem.clone();
+        let ss = stream_sem.clone();
         let handle = tokio::spawn(async move {
-            dispatch_request(&w, req_id, method, params, &ex, &h, &sh, conn_id, &ptx, &es).await;
+            dispatch_request(
+                &w, req_id, method, params, &ex, &h, &sh, conn_id, &ptx, &es, &ss,
+            )
+            .await;
         });
         req_tasks.push(handle);
     }
@@ -1133,7 +1155,7 @@ async fn handle_conn(
 }
 
 /// 单请求分发 — 从 read_task spawn 调用 (审计 2.12 单连接请求多路复用)。
-/// execute 类方法 (execute/execute_stream) 取 exec_sem permit 限并发子进程 (审计 2.11)。
+/// execute (非流式) 取 exec_sem permit; execute_stream 取 stream_sem permit (RUN-3 分离, 防长流饿死短命令)。
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
@@ -1146,10 +1168,11 @@ async fn dispatch_request(
     conn_id: u64,
     push_tx: &mpsc::Sender<Value>,
     exec_sem: &Arc<Semaphore>,
+    stream_sem: &Arc<Semaphore>,
 ) {
     if method == "executor.execute_stream" {
         if let Err(e) =
-            handle_execute_stream(writer, id, params, executor, hub, conn_id, exec_sem).await
+            handle_execute_stream(writer, id, params, executor, hub, conn_id, stream_sem).await
         {
             warn!(error = %e, "execute_stream 写帧失败");
         }
@@ -1365,7 +1388,7 @@ async fn handle_execute_stream(
     executor: &Arc<Executor>,
     hub: &Arc<BroadcastHub>,
     conn_id: u64,
-    exec_sem: &Arc<Semaphore>,
+    stream_sem: &Arc<Semaphore>,
 ) -> Result<()> {
     let req: ExecutionRequest = match serde_json::from_value(params) {
         Ok(r) => r,
@@ -1381,12 +1404,13 @@ async fn handle_execute_stream(
         }
     };
     let task_id = req.task_id.clone();
-    // 审计 2.11: 取执行 permit — 限并发子进程 (非连接)。持 permit 跨整流式生命周期
-    // (execute_streaming 启子进程 → chunk/done 全程), drop 时释放供下一执行。
-    let _exec_permit = exec_sem
+    // RUN-3: 取流式 permit — stream_sem 与非流式 exec_sem 分离 (容量 64 vs 16)。
+    // 流式持 permit 跨整 chunk→done 生命周期 (长); 若共用 exec_sem, 16 长流占满 → 短 execute 饿死。
+    // stream_sem 容量 = MAX_CONNECTIONS, 受连接信号量上限保护, 不与非流式短执行争抢。
+    let _stream_permit = stream_sem
         .acquire()
         .await
-        .map_err(|e| anyhow::anyhow!("exec_sem 已关闭: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("stream_sem 已关闭: {e}"))?;
     let (mut rx, handle) = match executor.execute_streaming(req).await {
         Ok(p) => p,
         Err(e) => {
@@ -1797,6 +1821,11 @@ async fn handle_method(
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32)
                 .unwrap_or(0);
+            let max_nofile = params
+                .get("max_nofile")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(1024);
             let max_idle_sec = params
                 .get("max_idle_sec")
                 .and_then(|v| v.as_u64())
@@ -1815,6 +1844,7 @@ async fn handle_method(
                 inherit_env,
                 max_nproc,
                 max_cpu_sec,
+                max_nofile,
                 max_idle_sec,
                 kill_grace_ms,
             };
@@ -3451,5 +3481,67 @@ mod tests {
             mode
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // IMPL-12 信号竞态: SIGHUP 仅重载配置, 永不触发 shutdown。
+    // 不发真 SIGHUP (进程级信号在测试二进制内不可靠, 影响整个 test runner),
+    // 改直调 handle_sighup_reload 循环体所调的 reload_log_level + reload_extra_whitelist
+    // (与 SIGHUP 等价路径), 验证:
+    //   1. serve join 未完成 (shutdown Notify + oneshot 均未被触发 → accept_loop 未退);
+    //   2. server 仍可接受 health RPC (连接未被清理, 服务继续)。
+    // env 测试须串行 (set_var/remove_var 跨测试竞态)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_does_not_trigger_shutdown() {
+        static SIGHUP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        let sock = tmp_sock("sighup-noshutdown");
+        let server = IpcServer::new();
+        let (shutdown_tx, mut join) = server.serve(&sock).await.unwrap();
+        // 先确认 server 活
+        let h = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
+        )
+        .await;
+        assert_eq!(h["result"]["ok"], true);
+
+        // 模拟 SIGHUP 效果: 直调 reload 路径 (handle_sighup_reload 循环体的两个调用)。
+        // env lock 仅守同步 set_var/remove_var + reload (非 async), 守卫在块末 drop — 不跨 await。
+        {
+            let _g = SIGHUP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // 设可解析的 RUST_LOG + 非空白名单扩展, 走 reload 真实分支。
+            std::env::set_var("RUST_LOG", "warn");
+            std::env::set_var("FUSION_EXECUTOR_EXTRA_WHITELIST", "jq,gh");
+            reload_log_level();
+            reload_extra_whitelist(&server.executor);
+            std::env::remove_var("RUST_LOG");
+            std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
+        }
+
+        // 断言 1: serve join 未完成 — shutdown Notify + oneshot 均未触发 (reload 不碰 shutdown)。
+        // 短超时探测, join 仍 Pending = server 未退。
+        let pending = tokio::time::timeout(Duration::from_millis(200), &mut join).await;
+        assert!(
+            pending.is_err(),
+            "IMPL-12: reload 后 serve 不应退出 (SIGHUP 不触发 shutdown), 实际 join 已完成"
+        );
+
+        // 断言 2: server 仍可接受新 RPC — 连接未被清理, 服务继续。
+        let h2 = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":2,"method":"executor.health","params":{}}"#,
+        )
+        .await;
+        assert_eq!(
+            h2["result"]["ok"], true,
+            "IMPL-12: reload 后 server 仍应服务, 实际 health 失败"
+        );
+
+        // 清理: 显式触发 shutdown 让 serve join 完成 (避免 leak)。
+        let _ = shutdown_tx.send(());
+        let done = tokio::time::timeout(SHUTDOWN_DEADLINE, join).await;
+        assert!(done.is_ok(), "显式 shutdown 后 serve join 应完成");
+        let _ = std::fs::remove_file(&sock);
     }
 }

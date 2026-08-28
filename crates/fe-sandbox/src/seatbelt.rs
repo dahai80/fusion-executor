@@ -29,12 +29,17 @@
 //   - RLIMIT_AS (ulimit -v) / RLIMIT_DATA (ulimit -d) / RLIMIT_FSIZE (ulimit -f) 均 NO-OP
 //     (setrlimit EINVAL 或接受但不限分配; 无限 malloc 仍逃逸不 cap) — Darwin 平台限制,
 //     非代码缺陷。堆内存上限无可用 rlimit; 输出端 OOM 由 fe-sandbox 环形缓冲兜底 (2*max_output)。
+//     RUN-4 (审计 0827): 内存上限无 OS 机制可用 — 此为 Darwin 平台固有限制, 非代码可修。
+//     文档化 + 环形缓冲 (输出端) + seatbelt 禁网/定向 FS deny (攻击面端) 为现有缓解。
 //   - RLIMIT_NPROC (ulimit -u) 生效: fork bomb 被限并发数 (spread-limit, 非 terminator —
 //     已生成子进程 retry-storm, 真正终止靠 timeout watchdog kill 进程树)。
 //   - RLIMIT_CPU (ulimit -t) 生效: CPU 秒上限, 到顶 SIGXCPU。
+//   - RLIMIT_NOFILE (ulimit -n) 生效: 限每进程打开 FD 数 (Darwin 实测 errno 24 EMFILE
+//     命中 cap, RUN-10 审计 0827 — fork 炸弹配 FD 耗尽攻击拦截)。
 //   - seatbelt profile `resource-limit`/`limit` 关键字 — 不解析 (parse error), 不可用。
-// 策略: 仅注入实测生效的 ulimit -u (NPROC) + ulimit -t (CPU); 不注入 -v/-d/-f (no-op,
-// 假安全违反 Rule 12 fail-visible)。Darwin 堆内存无 rlimit 上限, 文档化为平台限制。
+// 策略: 注入实测生效的 ulimit -u (NPROC) + ulimit -t (CPU) + ulimit -n (NOFILE);
+// 不注入 -v/-d/-f (no-op, 假安全违反 Rule 12 fail-visible)。Darwin 堆内存无 rlimit 上限,
+// 文档化为平台限制 (RUN-4)。
 
 use portable_pty::CommandBuilder;
 use std::process::Command;
@@ -69,12 +74,12 @@ fn build_profile() -> String {
     p
 }
 
-/// Issue #3: 资源上限包装 — 在命令串前注入实测生效的 ulimit 内建。
-/// 仅 -u (NPROC, 防进程炸弹) + -t (CPU, 防死循环烧 CPU) 生效; -v/-d/-f Darwin no-op 不注入。
-/// nproc=0 → 不限 NPROC; cpu_sec=0 → 不限 CPU (timeout watchdog 仍兜底)。
+/// Issue #3 + RUN-10: 资源上限包装 — 在命令串前注入实测生效的 ulimit 内建。
+/// -u (NPROC, 防进程炸弹) + -t (CPU, 防死循环烧 CPU) + -n (NOFILE, 防 FD 耗尽) 生效;
+/// -v/-d/-f Darwin no-op 不注入。nproc=0/cpu_sec=0/nofile=0 → 对应项不限。
 /// 注入到 sh -c 脚本内, 跨 PTY/stdio 后端一致, 无 unsafe。
-fn wrap_rlimits(command: &str, nproc: u32, cpu_sec: u32) -> String {
-    if nproc == 0 && cpu_sec == 0 {
+fn wrap_rlimits(command: &str, nproc: u32, cpu_sec: u32, nofile: u32) -> String {
+    if nproc == 0 && cpu_sec == 0 && nofile == 0 {
         return command.to_string();
     }
     let mut prefix = String::new();
@@ -84,6 +89,9 @@ fn wrap_rlimits(command: &str, nproc: u32, cpu_sec: u32) -> String {
     if cpu_sec > 0 {
         prefix.push_str(&format!("ulimit -t {} 2>/dev/null; ", cpu_sec));
     }
+    if nofile > 0 {
+        prefix.push_str(&format!("ulimit -n {} 2>/dev/null; ", nofile));
+    }
     // 2>/dev/null 吞 Darwin 对某些 limit 的 EINVAL 噪声 (已知 -v no-op 会报; 我们只注入生效项,
     // 但保守吞错防 stderr 污染诊断)。前缀失败不短路 (; 继续跑命令) — rlimit 是 best-effort 纵深防御,
     // 真正的硬上限由 timeout watchdog + 输出环形缓冲保底。
@@ -91,6 +99,7 @@ fn wrap_rlimits(command: &str, nproc: u32, cpu_sec: u32) -> String {
     debug!(
         nproc,
         cpu_sec,
+        nofile,
         wrapped_len = wrapped.len(),
         "注入 ulimit 资源上限"
     );
@@ -100,10 +109,16 @@ fn wrap_rlimits(command: &str, nproc: u32, cpu_sec: u32) -> String {
 /// 构建子进程 CommandBuilder。
 /// seatbelt=true → sandbox-exec -p '<profile>' sh -c '<cmd>' (运行时隔离)
 /// seatbelt=false → sh -c '<cmd>' (裸跑, 兼容旧调用方)
-/// Issue #3: nproc/cpu_sec 经 wrap_rlimits 注入到 sh -c 脚本 (实测生效的 ulimit)。
+/// Issue #3 + RUN-10: nproc/cpu_sec/nofile 经 wrap_rlimits 注入到 sh -c 脚本 (实测生效的 ulimit)。
 /// cwd/env 在返回的 cmd 上由调用方继续设置。
-pub fn build_command(command: &str, seatbelt: bool, nproc: u32, cpu_sec: u32) -> CommandBuilder {
-    let wrapped = wrap_rlimits(command, nproc, cpu_sec);
+pub fn build_command(
+    command: &str,
+    seatbelt: bool,
+    nproc: u32,
+    cpu_sec: u32,
+    nofile: u32,
+) -> CommandBuilder {
+    let wrapped = wrap_rlimits(command, nproc, cpu_sec, nofile);
     if seatbelt {
         let profile = build_profile();
         info!(
@@ -131,9 +146,15 @@ pub fn build_command(command: &str, seatbelt: bool, nproc: u32, cpu_sec: u32) ->
 /// Issue #4: stdio 后端命令构建 — 与 build_command 同语义 (seatbelt 包装 / 裸 sh -c),
 /// 但返回 std::process::Command (stdout/stderr 独立 Stdio::piped, 非 PTY)。
 /// use_pty=false 路径专用, 保留与 PTY 路径一致的 seatbelt 行为。
-/// Issue #3: nproc/cpu_sec 同样经 wrap_rlimits 注入。
-pub fn build_std_command(command: &str, seatbelt: bool, nproc: u32, cpu_sec: u32) -> Command {
-    let wrapped = wrap_rlimits(command, nproc, cpu_sec);
+/// Issue #3 + RUN-10: nproc/cpu_sec/nofile 同样经 wrap_rlimits 注入。
+pub fn build_std_command(
+    command: &str,
+    seatbelt: bool,
+    nproc: u32,
+    cpu_sec: u32,
+    nofile: u32,
+) -> Command {
+    let wrapped = wrap_rlimits(command, nproc, cpu_sec, nofile);
     if seatbelt {
         let profile = build_profile();
         info!(
@@ -202,7 +223,7 @@ mod tests {
 
     #[test]
     fn build_command_seatbelt_wraps_sandbox_exec() {
-        let cmd = build_command("echo hi", true, 0, 0);
+        let cmd = build_command("echo hi", true, 0, 0, 0);
         // CommandBuilder 无直接 introspect API — 验证不 panic 且 profile 含禁网即可
         let p = build_profile();
         assert!(p.contains("network-outbound"));
@@ -211,35 +232,45 @@ mod tests {
 
     #[test]
     fn build_command_bare_when_disabled() {
-        let cmd = build_command("echo hi", false, 0, 0);
+        let cmd = build_command("echo hi", false, 0, 0, 0);
         let _ = cmd; // 不 panic
     }
 
     #[test]
     fn wrap_rlimits_injects_nproc_and_cpu() {
-        let w = wrap_rlimits("echo hi", 1024, 30);
+        let w = wrap_rlimits("echo hi", 1024, 30, 0);
         assert!(w.contains("ulimit -u 1024"), "应注入 NPROC: {}", w);
         assert!(w.contains("ulimit -t 30"), "应注入 CPU: {}", w);
         assert!(w.ends_with("echo hi"), "原命令应在末尾: {}", w);
     }
 
+    // RUN-10: NOFILE 注入实测生效 (Darwin errno 24 EMFILE)
+    #[test]
+    fn wrap_rlimits_injects_nofile() {
+        let w = wrap_rlimits("echo hi", 0, 0, 1024);
+        assert!(w.contains("ulimit -n 1024"), "应注入 NOFILE: {}", w);
+        assert!(!w.contains("ulimit -u"), "nproc=0 不应注入 NPROC");
+        assert!(w.ends_with("echo hi"), "原命令应在末尾: {}", w);
+    }
+
     #[test]
     fn wrap_rlimits_skips_when_zero() {
-        let w = wrap_rlimits("echo hi", 0, 0);
-        assert_eq!(w, "echo hi", "nproc=cpu=0 不应注入任何前缀");
+        let w = wrap_rlimits("echo hi", 0, 0, 0);
+        assert_eq!(w, "echo hi", "全零不应注入任何前缀");
     }
 
     #[test]
     fn wrap_rlimits_only_nproc() {
-        let w = wrap_rlimits("echo hi", 512, 0);
+        let w = wrap_rlimits("echo hi", 512, 0, 0);
         assert!(w.contains("ulimit -u 512"));
         assert!(!w.contains("ulimit -t"), "cpu=0 不应注入 CPU");
+        assert!(!w.contains("ulimit -n"), "nofile=0 不应注入 NOFILE");
     }
 
     #[test]
     fn build_std_command_accepts_rlimits() {
         // 验证 stdio 后端 build 不 panic + 接受 rlimit 参数 (不 introspect Command args)
-        let _ = build_std_command("echo hi", false, 1024, 30);
-        let _ = build_std_command("echo hi", true, 1024, 30);
+        let _ = build_std_command("echo hi", false, 1024, 30, 1024);
+        let _ = build_std_command("echo hi", true, 1024, 30, 1024);
     }
 }

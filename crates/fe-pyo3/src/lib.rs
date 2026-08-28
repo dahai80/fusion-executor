@@ -101,6 +101,9 @@ struct PyExecutionResult {
     /// M-OPS-06: 跨层关联 id (回填请求侧或入口自动生成)
     #[pyo3(get)]
     trace_id: Option<String>,
+    /// RUN-11: 沙箱子进程 PID (调用方据此传 telemetry_stream 采样真实任务)
+    #[pyo3(get)]
+    pid: Option<u32>,
 }
 
 impl From<RsResult> for PyExecutionResult {
@@ -121,6 +124,7 @@ impl From<RsResult> for PyExecutionResult {
             rollback_unavailable: r.rollback_unavailable,
             rollback_skipped_reason: r.rollback_skipped_reason.clone(),
             trace_id: r.trace_id,
+            pid: r.pid,
         }
     }
 }
@@ -599,8 +603,8 @@ struct PyExecutor {
 #[pymethods]
 impl PyExecutor {
     #[new]
-    #[pyo3(signature = (extra_whitelist=None))]
-    fn new(extra_whitelist: Option<Vec<String>>) -> Self {
+    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false))]
+    fn new(extra_whitelist: Option<Vec<String>>, disable_bundle_allowlist: bool) -> Self {
         // extra_whitelist 经 with_extra_whitelist 烘焙进 inner 的 ArcSwap; A-4 后 serve() 共享
         // inner, 无需单独存。SIGHUP reload 从 FUSION_EXECUTOR_EXTRA_WHITELIST env 读 (m-OPS-02)。
         let extras: Vec<&str> = extra_whitelist
@@ -609,12 +613,26 @@ impl PyExecutor {
             .iter()
             .map(String::as_str)
             .collect();
-        let inner = if extras.is_empty() {
+        let mut inner = if extras.is_empty() {
             Executor::new()
         } else {
             tracing::info!(count = extras.len(), "PyExecutor 构造带项目级白名单扩展");
             Executor::new().with_extra_whitelist(&extras)
         };
+        // RUN-12: disable_bundle_allowlist=True → GuiConfig{allowed_bundle_ids: None} = 无限制
+        //   (显式 opt-in, 仅审计日志); 默认 False 走 GuiConfig::default 的安全默认集 (Terminal/
+        //   TextEdit/finder)。测试机需 drive 任意 app 时显式传 True 解除限制。
+        if disable_bundle_allowlist {
+            tracing::info!("PyExecutor 构造关闭 GUI 焦点 app 白名单 (RUN-12 显式无限制 opt-in)");
+            inner = inner.with_gui_config(fe_core::gui::GuiConfig {
+                allowed_bundle_ids: None,
+                allow_type_into_secure: false,
+            });
+        }
+        // ARCH-4: 进程内路径 (execute_sync/run) 不经 fe-ipc BroadcastHub, recorder 未装
+        // 则 record_exec_outcome 的 metrics::counter! 为 no-op。此处置装 (幂等 OnceLock),
+        // 让进程内 execute 也能计数 Prometheus。失败仅 warn 不阻断 (降级 = 无 metrics, 非致命)。
+        let _ = fe_ipc::install_prometheus_recorder();
         Self {
             inner: Arc::new(inner),
             shells: Arc::new(ShellRegistry::new()),
@@ -628,7 +646,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None, trace_id=None))]
+                        max_nproc=None, max_cpu_sec=None, max_nofile=None, trace_id=None))]
     fn execute_sync(
         &self,
         py: Python<'_>,
@@ -644,6 +662,7 @@ impl PyExecutor {
         use_pty: Option<bool>,
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
+        max_nofile: Option<u32>,
         trace_id: Option<String>,
     ) -> PyResult<PyExecutionResult> {
         // L-PYO3-02: policy 入参无效应 fail-loud (旧版 warn+None 静默吞错, 调用方以为开了回滚实则没开)
@@ -679,23 +698,32 @@ impl PyExecutor {
             use_pty: use_pty.unwrap_or(true),
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
+            max_nofile: max_nofile.unwrap_or(1024),
             trace_id,
         };
         // M-PYO3-02: 内部错误 fail-loud (旧版伪造 exit_code=-1 ExecutionResult, 调用方无法区分
         // 安全拦截与 executor bug; execute 仅在 sandbox 内部异常返 Err, 应上抛)
-        self.inner
-            .execute(req)
-            .map(PyExecutionResult::from)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("executor 内部错误: {e}"))
-            })
+        //
+        // RUN-1: execute() 同步, 阻塞子进程整个 wall-clock。py.detach 释放 GIL 让 Python
+        // 其他线程可跑 (子进程跑期间不必持 GIL)。inner Arc clone 进闭包 (Sync, UnwindSafe 经 AssertUnwindSafe)。
+        // ARCH-4: 成功路径调 record_exec_outcome 补 Prometheus 计数 (进程内路径不经 fe-ipc hub);
+        // blocked_with 返的 ExecutionResult exit_code=-1 blocked_by_security=true 也计数 (镜像 fe-ipc)。
+        let inner = self.inner.clone();
+        let result = py.detach(move || inner.execute(req)).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("executor 内部错误: {e}"))
+        })?;
+        // ARCH-4: 进程内 execute 计数 (recorder 在 PyExecutor::new 已装)。内部 Err 不计数
+        // (镜像 fe-ipc: execute Err 不调 record_exec, 仅成功/ blocked/timeout/failed 分支计数)。
+        fe_core::record_exec_outcome(&result);
+        Ok(PyExecutionResult::from(result))
     }
 
     /// snapshot_create(cwd) -> str (快照 id; 非 repo 为空串, 合法契约)
     /// M-PYO3-01: git 失败 (非 "非 repo 空串") fail-loud 抛 PyRuntimeError
-    fn snapshot_create(&self, cwd: String) -> PyResult<String> {
-        fe_core::BLOCKING_RT
-            .block_on(self.inner.snapshot_create_async(&cwd))
+    /// RUN-1: block_on 跨 git IO 阻塞, py.detach 释放 GIL (git 跑期间 Python 线程可跑)
+    fn snapshot_create(&self, py: Python<'_>, cwd: String) -> PyResult<String> {
+        let inner = self.inner.clone();
+        py.detach(move || fe_core::BLOCKING_RT.block_on(inner.snapshot_create_async(&cwd)))
             .map_err(|e| {
                 tracing::error!(error = %e, "snapshot_create 失败");
                 pyo3::exceptions::PyRuntimeError::new_err(format!("snapshot_create 失败: {e}"))
@@ -704,9 +732,10 @@ impl PyExecutor {
 
     /// rollback(snapshot_id, cwd) -> bool (Ok(false) = 跳过/非 repo, 合法)
     /// M-PYO3-01: git 失败 (Err) fail-loud 抛 PyRuntimeError
-    fn rollback(&self, snapshot_id: String, cwd: String) -> PyResult<bool> {
-        fe_core::BLOCKING_RT
-            .block_on(self.inner.rollback_async(&snapshot_id, &cwd))
+    /// RUN-1: block_on 跨 git IO 阻塞, py.detach 释放 GIL
+    fn rollback(&self, py: Python<'_>, snapshot_id: String, cwd: String) -> PyResult<bool> {
+        let inner = self.inner.clone();
+        py.detach(move || fe_core::BLOCKING_RT.block_on(inner.rollback_async(&snapshot_id, &cwd)))
             .map_err(|e| {
                 tracing::error!(error = %e, "rollback 失败");
                 pyo3::exceptions::PyRuntimeError::new_err(format!("rollback 失败: {e}"))
@@ -794,7 +823,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None, trace_id=None))]
+                        max_nproc=None, max_cpu_sec=None, max_nofile=None, trace_id=None))]
     fn execute_streaming(
         &self,
         py: Python<'_>,
@@ -810,6 +839,7 @@ impl PyExecutor {
         use_pty: Option<bool>,
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
+        max_nofile: Option<u32>,
         trace_id: Option<String>,
     ) -> PyResult<PyStreamIterator> {
         let policy = match auto_rollback_policy {
@@ -844,6 +874,7 @@ impl PyExecutor {
             use_pty: use_pty.unwrap_or(true),
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
+            max_nofile: max_nofile.unwrap_or(1024),
             trace_id,
         }; // L-PYO3-01: execute_streaming async → 释 GIL 后在 BLOCKING_RT block_on (旧版持 GIL
            // 整个 spawn + 校验期间, 阻塞 Python 线程; detach 后 Python 可并发跑其他协程)
@@ -940,6 +971,7 @@ impl PyExecutor {
         inherit_env=false,
         max_nproc=1024,
         max_cpu_sec=0,
+        max_nofile=1024,
         max_idle_sec=fe_core::shell::DEFAULT_MAX_IDLE_SEC,
         kill_grace_ms=500,
     ))]
@@ -956,6 +988,7 @@ impl PyExecutor {
         inherit_env: bool,
         max_nproc: u32,
         max_cpu_sec: u32,
+        max_nofile: u32,
         max_idle_sec: u64,
         kill_grace_ms: u64,
     ) -> PyResult<Py<PyShellStartResult>> {
@@ -986,6 +1019,7 @@ impl PyExecutor {
             inherit_env,
             max_nproc,
             max_cpu_sec,
+            max_nofile,
             max_idle_sec,
             kill_grace_ms,
         };
@@ -1225,7 +1259,14 @@ impl PyExecutor {
     fn serve(&self, py: pyo3::Python<'_>, sock_path: Option<String>) -> PyResult<()> {
         // M-OPS-01: fe_ipc::logging init_tracing — JSON+滚动文件 (FE_LOG_DIR) + stderr,
         // EnvFilter 运行时可 reload (SIGHUP, m-OPS-02)。幂等, handle 存 fe-ipc 静态。
-        let _ = fe_ipc::logging::init_tracing();
+        // IMPL-11: fail-loud — init 失败 (subscriber 被占用) 不启动无日志服务器。
+        // 幂等二次调用返 Ok; 仅首调失败 (全局 subscriber 冲突) 触发此 Err。
+        if let Err(e) = fe_ipc::logging::init_tracing() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "FATAL: logging init 失败 — 不启动无审计日志服务器: {}",
+                e
+            )));
+        }
         let sock = IpcServer::resolve_sock(sock_path.as_deref());
         // A-4: 共享 Executor Arc — in-process path 与 serve-path 同一白名单 (SIGHUP 重载两者皆生效)。
         let server =

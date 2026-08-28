@@ -426,6 +426,23 @@ impl Tools {
                 buffer.replacen(&item.old_string, &item.new_string, 1)
             };
             total_matches += count as u32;
+            // IMPL-10: 每项应用后检 buffer 膨胀 — 超 MULTI_EDIT_BUFFER_MAX fail-loud,
+            // 文件不动 (未到 atomic_write, buffer 丢弃), 防大文件多 edit 累积膨胀 OOM。
+            if buffer.len() > MULTI_EDIT_BUFFER_MAX {
+                warn!(path = %abs.display(), idx = i, len = buffer.len(), max = MULTI_EDIT_BUFFER_MAX,
+                    "multi_edit buffer 超上限, 拒绝写入 (防膨胀)");
+                return Ok(EditResult {
+                    ok: false,
+                    path: Some(path.to_string()),
+                    error: Some(format!(
+                        "multi_edit 第 {} 项后 buffer 膨胀超上限 ({} > {} bytes), 拒绝写入",
+                        i,
+                        buffer.len(),
+                        MULTI_EDIT_BUFFER_MAX
+                    )),
+                    matches: total_matches,
+                });
+            }
         }
         // 全部项成功 → 一次原子写盘
         atomic_write(&abs, &buffer)?;
@@ -1216,6 +1233,12 @@ fn expand_tilde(path: &str) -> String {
 /// 写工具文件大小上限 (Blocker 8 / 3.5) — 64MB, 防 1GB 生成文件 read_to_string OOM
 const WRITE_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+// IMPL-10: multi_edit in-memory buffer 独立上限 — 文件 64MB check_size 只检原始大小,
+// 多项 replace_all 叠加膨胀后 buffer 可远超。每项应用后检 buffer.len() 超 MULTI_EDIT_BUFFER_MAX
+// → fail-loud Err, 文件不动 (buffer 丢弃, atomic_write 不触发, 原子回滚保留)。
+// 256MB > 64MB 文件 cap 留叠加余量, 拦非合理膨胀 (调用方传过大 new_string)。
+const MULTI_EDIT_BUFFER_MAX: usize = 256 * 1024 * 1024;
+
 /// glob/grep 结果上限 — 防 .venv/node_modules 扫出 10 万条目 OOM (审计 3.6/3.7)
 /// 5000 条够定位代码, 超限截断 + warn (调用方拉全量应走专用索引工具)
 const GLOB_RESULT_CAP: usize = 5000;
@@ -1379,6 +1402,14 @@ struct FileLock {
 impl FileLock {
     /// 锁 `<data_path>.fe-flock` sidecar (data_path 为数据文件绝对路径)
     fn exclusive(data_path: &Path) -> std::result::Result<Self, ToolsError> {
+        // RUN-5: BSD flock 跨主机不互斥 (NFS 本地只锁, 远端不知)。当前单机 UDS 部署无 NFS 场景,
+        // 不引入分布式锁 (Rule 2 — 无需求过度工程)。仅检测 NFS mount → warn 提示限制, 不改锁机制。
+        // stat -f -t <path> macOS 取 fstype (含 nfs → NFS); 失败静默 (非 macOS 或 stat 缺失, 不阻塞锁)。
+        if is_nfs(data_path) {
+            warn!(path = %data_path.display(),
+                "NFS mount 检测到 — BSD flock 跨主机不互斥, 当前单机部署场景; \
+                 多节点共享目录请改本地工作区 (flock 限制已知)");
+        }
         let lock_path = sidecar_lock_path(data_path);
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -1406,6 +1437,33 @@ fn sidecar_lock_path(data_path: &Path) -> PathBuf {
     let mut s = data_path.to_string_lossy().into_owned();
     s.push_str(".fe-flock");
     PathBuf::from(s)
+}
+
+/// RUN-5: 检测路径所在文件系统是否 NFS — macOS `stat -f -t <path>` 取 fstype。
+/// 输出形如 `/dev/disk1s1 apfs` 或 `host:/export nfs`; 含 `nfs` → true。
+/// 失败 (非 macOS / stat 缺失 / 路径不存在) → false (静默, 不阻塞锁路径)。
+/// 仅用于 warn 提示 BSD flock 跨主机限制, 不改变锁行为 (单机部署无 NFS 需求)。
+fn is_nfs(path: &Path) -> bool {
+    // 取父目录探测 (path 可能是不存在的待建文件, 父目录通常存在)
+    let target = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => path,
+    };
+    let output = match std::process::Command::new("stat")
+        .args(["-f", "-t", &target.to_string_lossy()])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    debug!(path = %target.display(), fstype = %stdout.trim(), "is_nfs stat 探测");
+    stdout
+        .split_whitespace()
+        .any(|tok| tok.eq_ignore_ascii_case("nfs"))
 }
 
 /// 原子写 — NamedTempFile 随机名 + persist 原子 rename
@@ -1468,12 +1526,23 @@ fn parser_for_ext(ext: &str) -> Option<tree_sitter::Parser> {
     Some(p)
 }
 
-/// 函数定义节点类型 — 按扩展映射 (py: function_definition, js/ts: function_declaration, rs: function_item)
-fn function_node_kind(ext: &str) -> Option<&'static str> {
+/// 函数定义节点类型候选 — 按扩展映射
+/// IMPL-6: JS/TS 漏 arrow function — `const f = () => {}` 是 lexical_declaration >
+/// variable_declarator(name: identifier, value: arrow_function)。arrow_function 节点本身
+/// 无 name 字段, 须走 variable_declarator 路径。method_definition (类方法) 也补入。
+/// py: function_definition; rs: function_item; js/ts: function_declaration + method_definition
+/// + variable_declarator (arrow function 入口)。
+fn function_node_kinds(ext: &str) -> Option<&'static [&'static str]> {
     match ext {
-        "py" => Some("function_definition"),
-        "js" | "ts" | "tsx" => Some("function_declaration"),
-        "rs" => Some("function_item"),
+        "py" => Some(&["function_definition"]),
+        "js" | "ts" | "tsx" => Some(&[
+            "function_declaration",
+            "method_definition",
+            "generator_function_declaration",
+            // arrow function: 名在 variable_declarator, 值为 arrow_function
+            "variable_declarator",
+        ]),
+        "rs" => Some(&["function_item"]),
         _ => None,
     }
 }
@@ -1483,7 +1552,7 @@ const NAME_FIELD: &str = "name";
 
 /// 在源码中定位函数定义, 返回字节范围 (start, end)
 fn locate_function(content: &str, ext: &str, fn_name: &str) -> Result<Option<ByteSpan>> {
-    let kind = match function_node_kind(ext) {
+    let kinds = match function_node_kinds(ext) {
         Some(k) => k,
         None => {
             // 审计 3.12 / M-12.1: 无 grammar 时无正则回退 — 正则结束边界靠找下一行
@@ -1516,8 +1585,40 @@ fn locate_function(content: &str, ext: &str, fn_name: &str) -> Result<Option<Byt
     let mut found: Option<ByteSpan> = None;
     let mut stack: Vec<tree_sitter::Node> = vec![root];
     while let Some(node) = stack.pop() {
-        if node.kind() == kind {
-            if let Some(name_node) = node.child_by_field_name(NAME_FIELD) {
+        if kinds.contains(&node.kind()) {
+            // IMPL-6: variable_declarator 是 arrow function 入口 — 名在 name 字段,
+            // 值须是 arrow_function 才算箭头函数 (普通 `const x = 1` 不该被替换函数体)。
+            // 命中后替换整个声明语句 (parent lexical_declaration / variable_declaration),
+            // 即 `const add = (...) => ...;` 整句 — 否则只换 declarator span 会残 `const ` 前缀
+            // 与 `;` 后缀 → 损坏文件 (const + const + ;)。new_body 须自带完整声明。
+            if node.kind() == "variable_declarator" {
+                let is_arrow = node
+                    .child_by_field_name("value")
+                    .map(|v| v.kind() == "arrow_function")
+                    .unwrap_or(false);
+                if !is_arrow {
+                    // 非 arrow function 的 declarator, 跳过 (继续遍历其子节点)
+                } else if let Some(name_node) = node.child_by_field_name(NAME_FIELD) {
+                    let name_text = name_node.utf8_text(content.as_bytes()).unwrap_or("");
+                    if name_text == fn_name {
+                        // 取 parent 整句声明 span (const/let → lexical_declaration, var → variable_declaration)
+                        let span_node = match node.parent() {
+                            Some(p)
+                                if p.kind() == "lexical_declaration"
+                                    || p.kind() == "variable_declaration" =>
+                            {
+                                p
+                            }
+                            _ => node,
+                        };
+                        found = Some(ByteSpan {
+                            start: span_node.start_byte(),
+                            end: span_node.end_byte(),
+                        });
+                        break;
+                    }
+                }
+            } else if let Some(name_node) = node.child_by_field_name(NAME_FIELD) {
                 let name_text = name_node.utf8_text(content.as_bytes()).unwrap_or("");
                 if name_text == fn_name {
                     found = Some(ByteSpan {
@@ -2854,6 +2955,108 @@ mod tests {
         assert!(r.ok);
         assert_eq!(r.matches, 3);
         assert_eq!(std::fs::read_to_string(&fp).unwrap(), "z\nz\nw\n");
+    }
+
+    // IMPL-10: buffer 膨胀超 MULTI_EDIT_BUFFER_MAX → fail-loud, 文件不动
+    #[test]
+    fn test_multi_edit_buffer_overflow_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("big.txt");
+        // 用极小 old_string + 极大 new_string 触发膨胀 (单次 replace 即超 256MB)
+        let seed = "MARKER\n".to_string();
+        std::fs::write(&fp, &seed).unwrap();
+        let original = std::fs::read_to_string(&fp).unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let huge = "x".repeat(MULTI_EDIT_BUFFER_MAX + 1);
+        let edits = vec![MultiEditItem {
+            old_string: "MARKER".to_string(),
+            new_string: huge,
+            replace_all: false,
+        }];
+        let r = tools.multi_edit("big.txt", &edits, Some(&cwd)).unwrap();
+        assert!(!r.ok, "buffer 超限应 fail-loud: {r:?}");
+        assert!(
+            r.error.as_deref().unwrap().contains("膨胀超上限"),
+            "缺膨胀错误: {:?}",
+            r.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fp).unwrap(),
+            original,
+            "文件应保持原状 (未写盘)"
+        );
+    }
+
+    // IMPL-6: arrow function 替换 — `const add = (a, b) => a + b;`
+    #[test]
+    fn test_replace_function_arrow_js() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("arr.js");
+        std::fs::write(
+            &fp,
+            "const add = (a, b) => a + b;\nconst sub = (a, b) => a - b;\n",
+        )
+        .unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        // 替换整个声明语句 (parent lexical_declaration, 含 const → ; 整句)
+        let new_body = "const add = (a, b) => a + b + 100;";
+        let r = tools
+            .replace_function("arr.js", "add", new_body, Some(&cwd))
+            .unwrap();
+        assert!(r.ok, "arrow function 替换应成功: {r:?}");
+        let after = std::fs::read_to_string(&fp).unwrap();
+        // 整句等值断言 (防只换 declarator span 残 const 前缀 / ; 后缀 → 损坏)
+        assert_eq!(
+            after, "const add = (a, b) => a + b + 100;\nconst sub = (a, b) => a - b;\n",
+            "arrow 替换应整句替换, 邻近函数不变: {after}"
+        );
+    }
+
+    // IMPL-6: 非 arrow 的 declarator 不被误替换 — `const x = 1;` 不当函数
+    #[test]
+    fn test_replace_function_non_arrow_declarator_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("na.js");
+        std::fs::write(&fp, "const x = 1;\nfunction real() { return 2; }\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        // x 非 arrow, real 是 function_declaration — 替换 real 应成功, 不碰 x
+        let r = tools
+            .replace_function("na.js", "real", "function real() { return 3; }", Some(&cwd))
+            .unwrap();
+        assert!(r.ok, "function_declaration 替换应成功: {r:?}");
+        let after = std::fs::read_to_string(&fp).unwrap();
+        assert!(after.contains("return 3"), "新体未写入: {after}");
+        assert!(
+            after.contains("const x = 1;"),
+            "非 arrow declarator 受损: {after}"
+        );
+    }
+
+    // IMPL-6: 类方法 method_definition 替换
+    #[test]
+    fn test_replace_function_method_definition_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("cls.ts");
+        std::fs::write(&fp, "class Foo {\n  bar(): number { return 1; }\n}\n").unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let tools = Tools::new();
+        let r = tools
+            .replace_function("cls.ts", "bar", "bar(): number { return 2; }", Some(&cwd))
+            .unwrap();
+        assert!(r.ok, "method_definition 替换应成功: {r:?}");
+        let after = std::fs::read_to_string(&fp).unwrap();
+        assert!(after.contains("return 2"), "新体未写入: {after}");
+    }
+
+    // RUN-5: is_nfs helper — 本地 tempdir 非 NFS (macOS apfs) → false
+    #[test]
+    fn test_is_nfs_local_false() {
+        let dir = tempfile::tempdir().unwrap();
+        // 本地 tempdir (apfs) 非 nfs
+        assert!(!is_nfs(dir.path()), "本地 tempdir 不应判为 NFS");
     }
 
     // ── #6: notebook_edit ──

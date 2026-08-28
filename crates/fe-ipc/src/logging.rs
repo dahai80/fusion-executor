@@ -11,12 +11,22 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use thiserror::Error;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::reload::{self, Handle};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
+
+/// IMPL-11: init_tracing 失败原因 — fail-loud (serve 不启动无日志服务器)。
+/// 已初始化 (幂等二次调用) 不算错误 → Ok(())。
+#[derive(Debug, Error)]
+pub enum InitError {
+    /// tracing global subscriber 已被占用 (测试并发 init 或 set_global_default 冲突)。
+    #[error("tracing subscriber init 失败 (可能已被占用): {0} — 日志输出不生效")]
+    SubscriberOccupied(String),
+}
 
 /// 运行时可重载的 EnvFilter handle — SIGHUP handler 持有, 调 reload_log_filter 换级别。
 #[derive(Clone)]
@@ -49,21 +59,24 @@ pub const DEFAULT_FILTER_DIRECTIVE: &str = "info";
 
 /// init_tracing — 幂等初始化 tracing subscriber。
 ///
-/// 首次调用 init subscriber 并返 Some(FilterHandle) 供 SIGHUP handler 持有;
-/// 已初始化 (幂等二次调用) 返 None (handle 已被首调用方持有, 不重复给, 避多 handler 竞争)。
-/// FE_LOG_DIR 未设 / 目录不可写 → 仅 stderr 输出 (降级, 不崩), 仍返 handle (filter 可 reload)。
-pub fn init_tracing() -> Option<FilterHandle> {
+/// 首次调用 init subscriber 并存 FilterHandle 到全局槽 (SIGHUP handler 经 current_handle 取);
+/// 已初始化 (幂等二次调用) 返 Ok(()) (不重复 init, 避多 handler 竞争)。
+/// FE_LOG_DIR 未设 / 目录不可写 → 仅 stderr 输出 (降级, 不崩), 仍返 Ok (filter 可 reload)。
+///
+/// IMPL-11: try_init 失败 (subscriber 已被占用) → 返 Err(InitError), 调用方 (serve) 须
+/// fail-loud — 不启动无日志服务器 (生产无审计日志 = 不可接受)。旧版 eprintln warn 后继续 = 静默丢失。
+pub fn init_tracing() -> Result<(), InitError> {
     let mut first = false;
     TRACING_INIT.get_or_init(|| {
         first = true;
         true
     });
     if !first {
-        return None;
+        return Ok(());
     }
-    let handle = build_subscriber();
-    FIRST_HANDLE.set(handle.clone()).ok();
-    handle
+    let handle = build_subscriber()?;
+    FIRST_HANDLE.set(Some(handle)).ok();
+    Ok(())
 }
 
 /// 已初始化则返 handle 克隆 (SIGHUP handler 后续可重取), 未初始化返 None。
@@ -72,7 +85,8 @@ pub fn current_handle() -> Option<FilterHandle> {
 }
 
 /// 构建并 init subscriber — Tee(file, stderr) 双输出 + reload::Layer<EnvFilter>。
-fn build_subscriber() -> Option<FilterHandle> {
+/// IMPL-11: try_init 失败 → Err (fail-loud), 不再 eprintln warn 后返 Some。
+fn build_subscriber() -> Result<FilterHandle, InitError> {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER_DIRECTIVE));
     let (reload_filter, reload_handle) = reload::Layer::new(env_filter);
@@ -85,16 +99,13 @@ fn build_subscriber() -> Option<FilterHandle> {
         .with_filter(reload_filter);
 
     let registry = Registry::default().with(fmt_layer);
-    // M-7(2): 旧版 `let _ = registry.try_init();` 静默吞 Err — 若已被其他 subscriber 占用
-    // (测试并发 init) 或 set_global_default 失败, 无任何信号 → 日志静默丢失。fail-loud。
-    if let Err(e) = registry.try_init() {
-        eprintln!(
-            "fe-ipc logging: tracing subscriber init 失败 (可能已被占用): {e} \
-             — 日志输出可能不生效"
-        );
-    }
+    // IMPL-11: 旧版 `let _ = registry.try_init();` 静默吞 Err — 若已被其他 subscriber 占用
+    // (测试并发 init) 或 set_global_default 失败, 无任何信号 → 日志静默丢失。fail-loud 返 Err。
+    registry
+        .try_init()
+        .map_err(|e| InitError::SubscriberOccupied(e.to_string()))?;
 
-    Some(FilterHandle {
+    Ok(FilterHandle {
         inner: reload_handle,
     })
 }

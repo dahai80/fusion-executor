@@ -140,14 +140,39 @@ struct UiNode {
 /// 点击候选 — (节点, label, 位置)
 type ClickCandidate = (AXUIElement, Option<String>, Option<(f64, f64)>);
 
+/// RUN-12: 默认 bundle 安全集 — 商用安全默认非空 allowlist, 防越权驱动任意 app。
+/// 本地可信调用方若需无限制, 显式传 GuiConfig { allowed_bundle_ids: None, .. } (向后兼容)。
+const DEFAULT_ALLOWED_BUNDLE_IDS: &[&str] = &[
+    "com.apple.Terminal",
+    "com.apple.TextEdit",
+    "com.apple.finder",
+];
+
 /// M-SEC-04: GUI 安全配置。
-/// - allowed_bundle_ids: None=不限 (本地可信调用方默认, 仅审计日志); Some=set=仅放行集合内 bundle。
+/// - allowed_bundle_ids: None=不限 (显式 opt-in, 仅审计日志); Some=set=仅放行集合内 bundle。
+///   RUN-12: 默认非空安全集 (DEFAULT_ALLOWED_BUNDLE_IDS), 商用默认受限。
 /// - allow_type_into_secure: false (默认) 时拒绝向 AXSecureTextField (密码框) type_text;
 ///   true 显式 opt-in (受控场景)。无论取值都记审计 WARN (bundle + 文本长度, 不记文本)。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GuiConfig {
     pub allowed_bundle_ids: Option<Vec<String>>,
     pub allow_type_into_secure: bool,
+}
+
+/// RUN-12: 默认非空 allowlist (商用安全默认), 非 None。
+/// 与 check_bundle_allowed None→Ok 契约不冲突: 显式传 None 仍 = 无限制 opt-in。
+impl Default for GuiConfig {
+    fn default() -> Self {
+        GuiConfig {
+            allowed_bundle_ids: Some(
+                DEFAULT_ALLOWED_BUNDLE_IDS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            ),
+            allow_type_into_secure: false,
+        }
+    }
 }
 
 pub struct GuiController {
@@ -255,6 +280,12 @@ impl GuiController {
         if let GuiAction::Wait { seconds } = &action {
             return self.wait(*seconds);
         }
+        // IMPL-9: Screenshot 走 CoreGraphics (CGWindowListCreateImage) 需 Screen Recording TCC,
+        // 非 Accessibility TCC — 两权限独立。AX 未授权但 Screen Recording 授权时仍应可截图。
+        // 提到 ax_trusted 闸门前, 让 screenshot() 自探 Screen Recording (CGImage None → 降级)。
+        if let GuiAction::Screenshot {} = &action {
+            return self.screenshot();
+        }
         if !Self::ax_trusted() {
             warn!("AX 未授权 (TCC Accessibility) — GUI 操作降级");
             return Ok(GuiResult {
@@ -272,7 +303,13 @@ impl GuiController {
             GuiAction::TypeText { text } => self.type_text(&text),
             GuiAction::KeyPress { key, modifiers } => self.key_press(&key, &modifiers),
             GuiAction::HoldKey { key, duration_ms } => self.hold_key(&key, duration_ms),
-            GuiAction::Screenshot {} => self.screenshot(),
+            // IMPL-9: Screenshot 已在 ax_trusted 闸门前 early-return (Screen Recording TCC 独立)。
+            // 走到此说明 early-return 被重构破 — fail-loud (非 crash), 同 Wait 兜底模式。
+            GuiAction::Screenshot {} => Ok(GuiResult {
+                ok: false,
+                error: Some("internal: Screenshot 未在 early-return 处理 (invariant 破坏)".into()),
+                ..Default::default()
+            }),
             GuiAction::InspectTree {} => self.inspect_tree(),
             GuiAction::Scroll { dx, dy, at } => self.scroll(dx, dy, at),
             GuiAction::Drag { from, to } => self.drag(from, to),
@@ -508,9 +545,8 @@ impl GuiController {
     /// 内部均为 unsafe FFI, 但已封进 safe API; 本函数无需手写 unsafe block。
     fn key_press(&self, key: &str, modifiers: &[String]) -> Result<GuiResult> {
         info!(key, mods = ?modifiers, "KeyPress");
-        if let Some(r) = self.focused_not_allowed() {
-            return Ok(r);
-        }
+        // RUN-12: trusted-independent 输入校验先行 — 未知键名/修饰键降级与焦点 app 无关,
+        // 放在 focused_not_allowed 闸门之前 (keycode/modifier 解析不触 AX 焦点读)。
         let code = match Self::resolve_keycode(key) {
             Some(c) => c,
             None => {
@@ -564,6 +600,10 @@ impl GuiController {
                     });
                 }
             }
+        }
+        // RUN-12: 输入校验已过 (trusted-independent), 再查焦点 app 白名单 — 非白名单 app 拒绝合成事件
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
         }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (CGEventSourceCreate 返回 null)"))?;
@@ -628,9 +668,7 @@ impl GuiController {
                 ..Default::default()
             });
         }
-        if let Some(r) = self.focused_not_allowed() {
-            return Ok(r);
-        }
+        // RUN-12: trusted-independent keycode 校验先行 (与 key_press 同理)
         let code = match Self::resolve_keycode(key) {
             Some(c) => c,
             None => {
@@ -648,6 +686,10 @@ impl GuiController {
                 });
             }
         };
+        // RUN-12: 焦点 app 白名单 — keycode 已过, 非白名单 app 拒绝合成事件
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| anyhow!("CGEventSource 创建失败 (hold_key)"))?;
         // keydown
@@ -1471,17 +1513,25 @@ mod tests {
         assert!(r.error.is_none());
     }
 
-    /// 未授权时所有操作降级 — CI 无 TCC, 走此路径
+    /// 未授权时操作降级 — CI 无 TCC, 走此路径。
+    /// IMPL-9: Screenshot 提到 ax_trusted 闸门前, 自探 Screen Recording —
+    /// CI 无 Screen Recording → screen-recording-permission-required (非 accessibility)。
     #[test]
     fn execute_degrades_without_ax_trust() {
         let ctrl = GuiController::new();
         let r = ctrl.execute(GuiAction::Screenshot {}).unwrap();
+        // IMPL-9: screenshot 走 Screen Recording TCC (CoreGraphics), 非 Accessibility 闸门。
+        // 两路径均合法, 不强断言 ok 字面:
+        //   CI 无 Screen Recording → ok:false + screen-recording-permission-required;
+        //   trusted 机有 Screen Recording → ok:true (PNG)。
         if !GuiController::ax_trusted() {
-            assert!(!r.ok, "未授权应降级");
-            assert_eq!(
-                r.error.as_deref(),
-                Some("accessibility-permission-required"),
-                "未授权错误标记"
+            assert!(
+                !r.ok,
+                "IMPL-9: 未授权 (无 Screen Recording) 应降级 ok:false"
+            );
+            assert!(
+                r.error.is_some(),
+                "IMPL-9: 未授权应降级 (Screen Recording 或 encode 错误)"
             );
         }
     }
@@ -1526,9 +1576,13 @@ mod tests {
     }
 
     /// 未授权时 KeyPress 降级 (CI 无 TCC); 授权时合成应成功 (手动)
+    /// RUN-12: 用显式无限制 config (None), 测 keycode 逻辑不被默认 allowlist 干扰 (focused 拦截)。
     #[test]
     fn keypress_unknown_key_degrades_even_if_trusted() {
-        let ctrl = GuiController::new();
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: None,
+            allow_type_into_secure: false,
+        });
         let r = ctrl
             .execute(GuiAction::KeyPress {
                 key: "totally-fake-key".into(),
@@ -1553,9 +1607,13 @@ mod tests {
 
     /// HoldKey 未知键名降级 — trusted 时经 resolve_keycode 返 None → ok:false unknown-key;
     /// CI 未授权路径在 AX 闸门降级 accessibility-permission-required (闸门先于 dispatch)。
+    /// RUN-12: 用显式无限制 config (None), 测 keycode 逻辑不被默认 allowlist 干扰。
     #[test]
     fn holdkey_unknown_key_degrades_even_if_trusted() {
-        let ctrl = GuiController::new();
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: None,
+            allow_type_into_secure: false,
+        });
         let r = ctrl
             .execute(GuiAction::HoldKey {
                 key: "totally-fake-key".into(),
@@ -1649,9 +1707,13 @@ mod tests {
     }
 
     /// 未知修饰键 → ok:false unknown-modifier (trusted-independent, CI 路径)
+    /// RUN-12: 用显式无限制 config (None), 测 modifier 逻辑不被默认 allowlist 干扰。
     #[test]
     fn keypress_unknown_modifier_degrades_even_if_trusted() {
-        let ctrl = GuiController::new();
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: None,
+            allow_type_into_secure: false,
+        });
         let r = ctrl
             .execute(GuiAction::KeyPress {
                 key: "Tab".into(),
@@ -1833,9 +1895,13 @@ mod tests {
     /// Hover 无坐标降级 — 不可能触发 (ax_position 必填非 Option), 仅编译期保证。
     /// double_click/right_click 无 label 无 position → resolve_click_position 返 Err (经 ? 上抛)。
     /// CI 无 TCC → 降级 ok:false; trusted 机 → execute 返 Err (无定位坐标), 不 panic。
+    /// RUN-12: 用显式无限制 config (None), 测 resolve_click_position 逻辑不被默认 allowlist 干扰。
     #[test]
     fn double_click_no_target_error_when_trusted() {
-        let ctrl = GuiController::new();
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: None,
+            allow_type_into_secure: false,
+        });
         let res = ctrl.execute(GuiAction::DoubleClick {
             ax_label: None,
             ax_position: None,
@@ -1876,12 +1942,28 @@ mod tests {
         assert!(r.ok, "负值 Wait 应裁 0 后 ok=true");
     }
 
-    /// M-SEC-04: 默认无 allowlist → 任意 bundle 放行 (仅审计日志), 不拒。
+    /// RUN-12: 默认 (非空安全集) → 集合外 bundle 拒, 集合内放行。
+    /// 显式传 None = 无限制 opt-in → 任意 bundle 放行 (向后兼容)。
     #[test]
     fn msec04_no_allowlist_allows_any_bundle() {
+        // 默认非空 allowlist: evil bundle 拒, 安全 bundle 放行
         let ctrl = GuiController::new();
-        assert!(ctrl.check_bundle_allowed("com.evil.keylogger").is_ok());
+        assert!(
+            ctrl.check_bundle_allowed("com.evil.keylogger").is_err(),
+            "RUN-12: 默认 allowlist 应拒未列入的 evil bundle"
+        );
         assert!(ctrl.check_bundle_allowed("com.apple.TextEdit").is_ok());
+        // 显式 None = 无限制 opt-in: 任意 bundle 放行 (向后兼容)
+        let ctrl_unrestricted = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: None,
+            allow_type_into_secure: false,
+        });
+        assert!(ctrl_unrestricted
+            .check_bundle_allowed("com.evil.keylogger")
+            .is_ok());
+        assert!(ctrl_unrestricted
+            .check_bundle_allowed("com.apple.TextEdit")
+            .is_ok());
     }
 
     /// M-SEC-04: 设 allowlist → 仅集合内 bundle 放行, 集合外拒绝。
@@ -1906,11 +1988,28 @@ mod tests {
         );
     }
 
-    /// M-SEC-04: GuiConfig default = 无限制 (向后兼容本地可信调用方)。
+    /// RUN-12: GuiConfig default = 非空安全集 (商用安全默认受限, 非无限制)。
+    /// 显式传 None 仍 = 无限制 opt-in (向后兼容本地可信调用方)。
     #[test]
     fn msec04_gui_config_default_unrestricted() {
         let cfg = GuiConfig::default();
-        assert!(cfg.allowed_bundle_ids.is_none(), "默认无 allowlist");
+        assert!(
+            cfg.allowed_bundle_ids.is_some(),
+            "RUN-12: 默认应有非空 allowlist"
+        );
+        let set = cfg.allowed_bundle_ids.unwrap();
+        assert!(
+            set.contains(&"com.apple.Terminal".to_string()),
+            "默认集含 Terminal"
+        );
+        assert!(
+            set.contains(&"com.apple.TextEdit".to_string()),
+            "默认集含 TextEdit"
+        );
+        assert!(
+            set.contains(&"com.apple.finder".to_string()),
+            "默认集含 finder"
+        );
         assert!(!cfg.allow_type_into_secure, "默认拒绝向密码框 type_text");
     }
 
@@ -1965,12 +2064,16 @@ mod tests {
 
     /// C-13: 无 allowlist (None) → focused_not_allowed 始终 None (放行, 审计)。
     /// 验证 short-circuit: allowlist=None 时不调 focused_app_bundle (无 AX 调用)。
+    /// RUN-12: 默认非空 allowlist, 须显式传 None 才测无限制 short-circuit。
     #[test]
     fn c13_focused_not_allowed_passes_without_allowlist() {
-        let ctrl = GuiController::new();
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: None,
+            allow_type_into_secure: false,
+        });
         assert!(
             ctrl.focused_not_allowed().is_none(),
-            "C-13: 无 allowlist 应放行返 None"
+            "C-13: 无 allowlist (显式 None) 应放行返 None"
         );
     }
 
@@ -2002,9 +2105,13 @@ mod tests {
     /// M-12.4: hold_key duration_ms=0 → ok:false hold-key-duration-zero (fail-loud, 非静默 no-op)。
     /// trusted-independent? 否 — hold_key 经 execute 的 ax_trusted 闸门。CI 无 AX 走闸门降级;
     /// trusted 机闸门过后 duration_ms==0 早拒绝 (在 keycode resolve 前)。两路径均 ok:false。
+    /// RUN-12: 用显式无限制 config (None), 测 duration 逻辑不被默认 allowlist 干扰 (focused 拦截)。
     #[test]
     fn m12_4_hold_key_zero_duration_rejected() {
-        let ctrl = GuiController::new();
+        let ctrl = GuiController::new_with_config(GuiConfig {
+            allowed_bundle_ids: None,
+            allow_type_into_secure: false,
+        });
         let r = ctrl
             .execute(GuiAction::HoldKey {
                 key: "Return".into(),
@@ -2037,5 +2144,52 @@ mod tests {
         // 截图全屏 alpha=255 (不透明) — 预乘无差异; M-12.3 注释覆盖半透明窗边缘色偏取舍。
         // 此处仅断言方法签名稳定 (不破坏调用方), 实际色偏取舍见 cgimage_to_png_b64 注释。
         let _: fn(&CGImage) -> Result<String> = GuiController::cgimage_to_png_b64;
+    }
+
+    /// RUN-12: 默认 GuiController::new() 受限 — 非默认集 bundle 被 check_bundle_allowed 拒。
+    /// 商用安全默认: 防越权驱动任意 app (keylogger 等), 须显式扩 allowlist。
+    #[test]
+    fn run12_default_rejects_non_allowlisted_bundle() {
+        let ctrl = GuiController::new();
+        // 默认集内: 放行
+        assert!(ctrl.check_bundle_allowed("com.apple.Terminal").is_ok());
+        assert!(ctrl.check_bundle_allowed("com.apple.finder").is_ok());
+        // 默认集外: 拒 (商用安全默认)
+        assert!(
+            ctrl.check_bundle_allowed("com.evil.keylogger").is_err(),
+            "RUN-12: 默认受限应拒 evil bundle"
+        );
+        assert!(
+            ctrl.check_bundle_allowed("com.apple.Safari").is_err(),
+            "RUN-12: 默认集不含 Safari 应拒 (须显式扩)"
+        );
+    }
+
+    /// IMPL-9: Screenshot 提到 ax_trusted 闸门前 — Accessibility 未授权不应误拦截图。
+    /// 截图走 Screen Recording TCC (CoreGraphics), 与 Accessibility 独立。
+    /// CI 无 Screen Recording → screen-recording-permission-required (非 accessibility-permission-required)。
+    /// trusted 机有 Screen Recording → ok:true。两路径均不返 accessibility 错误。
+    #[test]
+    fn impl9_screenshot_bypasses_accessibility_gate() {
+        let ctrl = GuiController::new();
+        let r = ctrl.execute(GuiAction::Screenshot {}).unwrap();
+        // 关键: screenshot 不经 Accessibility 闸门, 故 error 不应是 accessibility-permission-required
+        assert_ne!(
+            r.error.as_deref(),
+            Some("accessibility-permission-required"),
+            "IMPL-9: screenshot 不应被 Accessibility 闸门拦 (TCC 权限独立)"
+        );
+        if !GuiController::ax_trusted() {
+            // CI 无 Screen Recording → screen-recording 降级 (非 accessibility)
+            assert!(!r.ok, "IMPL-9: CI 无 Screen Recording 应降级 ok:false");
+            assert!(
+                r.error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("screen-recording-permission-required"),
+                "IMPL-9: CI 应返 screen-recording 错误: {:?}",
+                r.error
+            );
+        }
     }
 }
