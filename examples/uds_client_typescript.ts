@@ -16,7 +16,7 @@
 
 import net from "node:net";
 
-const DEFAULT_SOCK = "/tmp/fusion-executor.sock";
+const DEFAULT_SOCK = require("os").homedir() + "/.fusion-executor/fe.sock";
 
 // ── Wire types (mirror Python Pydantic models / Rust serde structs) ──
 

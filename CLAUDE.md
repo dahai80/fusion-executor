@@ -100,7 +100,7 @@ python -c "from fusion_executor import FusionSandboxExecutor; print(FusionSandbo
 
 # Start UDS JSON-RPC server (P3)
 python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"
-# Socket: /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK)
+# Socket: ~/.fusion-executor/fe.sock (HOME-private 0o700; override FUSION_EXECUTOR_SOCK)
 ```
 
 Python ≥3.11 (venv is 3.14). Runtime dep `pydantic>=2.0`. Test deps `pytest`/`pytest-asyncio`/`pytest-cov`. No httpx, no hard fusion-core — executor is an L4 OS tool, delegates inference to caller. Package root is `fusion_executor` (import as `from fusion_executor import FusionSandboxExecutor, ExecutionResult`). Native extension is `fusion_executor._native` (built from `crates/fe-pyo3`).
