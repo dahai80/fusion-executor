@@ -1797,6 +1797,11 @@ async fn handle_method(
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32)
                 .unwrap_or(0);
+            let max_nofile = params
+                .get("max_nofile")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(1024);
             let max_idle_sec = params
                 .get("max_idle_sec")
                 .and_then(|v| v.as_u64())
@@ -1815,6 +1820,7 @@ async fn handle_method(
                 inherit_env,
                 max_nproc,
                 max_cpu_sec,
+                max_nofile,
                 max_idle_sec,
                 kill_grace_ms,
             };

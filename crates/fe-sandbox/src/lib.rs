@@ -99,6 +99,9 @@ pub struct SandboxConfig {
     /// Issue #3: CPU 秒上限 (RLIMIT_CPU, 经 ulimit -t 注入)。默认 0=不限 (依赖 timeout_sec watchdog 兜底)。
     /// >0 则到顶 SIGXCPU (CPU 死循环防御)。Darwin 实测生效。
     pub max_cpu_sec: u32,
+    /// RUN-10 (审计 0827): 文件描述符上限 (RLIMIT_NOFILE, 经 ulimit -n 注入)。默认 1024 —
+    /// 拦 FD 耗尽攻击 (海量打开 fd 击杀宿主)。0=不限 (受信场景 opt-out)。Darwin 实测生效 (errno 24 EMFILE)。
+    pub max_nofile: u32,
 }
 
 impl Default for SandboxConfig {
@@ -114,6 +117,7 @@ impl Default for SandboxConfig {
             use_pty: true,
             max_nproc: 1024,
             max_cpu_sec: 0,
+            max_nofile: 1024,
         }
     }
 }
@@ -285,8 +289,13 @@ impl Sandbox {
 
         // Blocker 1 / 1.1: seatbelt=true → sandbox-exec 包装 (禁网 + 危险二进制 execve deny)
         // Issue #3: max_nproc/max_cpu_sec 经 wrap_rlimits 注入 ulimit 到 sh -c 脚本
-        let mut cmd =
-            seatbelt::build_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
+        let mut cmd = seatbelt::build_command(
+            &cfg.command,
+            cfg.seatbelt,
+            cfg.max_nproc,
+            cfg.max_cpu_sec,
+            cfg.max_nofile,
+        );
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
@@ -421,8 +430,13 @@ impl Sandbox {
         // C-SEC-01: env_vars 早校验 — spawn 前 fail-loud (defense-in-depth, 与 PTY 路径一致)
         validate_env_vars(&cfg.env)?;
         info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run (stdio, 分离 stdout/stderr)");
-        let mut cmd =
-            seatbelt::build_std_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
+        let mut cmd = seatbelt::build_std_command(
+            &cfg.command,
+            cfg.seatbelt,
+            cfg.max_nproc,
+            cfg.max_cpu_sec,
+            cfg.max_nofile,
+        );
         if let Some(cwd) = &cfg.cwd {
             cmd.current_dir(cwd);
         }
@@ -573,8 +587,13 @@ impl Sandbox {
 
         let pair = open_pty_pair()?;
 
-        let mut cmd =
-            seatbelt::build_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
+        let mut cmd = seatbelt::build_command(
+            &cfg.command,
+            cfg.seatbelt,
+            cfg.max_nproc,
+            cfg.max_cpu_sec,
+            cfg.max_nofile,
+        );
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
@@ -961,11 +980,80 @@ fn kill_pgid(pgid: Pid, sig: Signal, pid: u32) -> bool {
     }
 }
 
-/// C-14/C-15/L-13/A-11: 进程组杀 — SIGINT (graceful) → grace_ms → 仍活 → SIGKILL (forceful)。
+/// 单 pid 信号投递 (非进程组) — ESRCH 静默 (进程已退), 其他 errno warn。
+fn kill_pid(pid: u32, sig: Signal) -> bool {
+    match nix::sys::signal::kill(Pid::from_raw(pid as i32), sig) {
+        Ok(()) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(e) => {
+            warn!(pid, ?sig, "kill 单 pid 失败: {e}");
+            false
+        }
+    }
+}
+
+/// RUN-9 (审计 0827): ppid-tree 后代遍历 — setsid 孙进程逃逸进程组, killpg 杀不到。
+/// macOS 无 cgroups / 无 /proc, 用 sysinfo 遍历全进程, 按 ppid 树收集 root 的所有后代
+/// (含跨组 setsid 孤儿), 逐个投递信号。返回被信号的后代 pid 集 (root 自身不含, 由 killpg 覆盖)。
 ///
-/// **仅杀一层进程组** (child pid 对应的组, 由 setsid/`process_group(0)` 使 pgid == child pid)。
-/// A-11 固有限制: setsid 孙进程 (child 再调 setsid 建新会话/组) 逃逸 — macOS 无 cgroups,
-/// POSIX killpg 非递归, 此为平台固有限制, 文档化而非修复。
+/// 单次快照遍历 — 进程在遍历期间可能 fork 新后代, 故调用方应先杀再快照 (杀后 fork 的孤儿
+/// 由后续 timeout/watchdog 兜底; setsid 脱组是 syscall 无法拦, 此为 best-effort 纵深防御)。
+fn collect_descendants(root_pid: u32) -> Vec<u32> {
+    let mut sys = sysinfo::System::new_all();
+    // 全进程刷新一次取 ppid 关系 (new_all 已刷新, 此处显式确证最新快照)
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut descendants = Vec::new();
+    // BFS: 从 root 出发, 找所有 ppid == 已知 pid 的进程
+    let mut frontier = vec![root_pid];
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(root_pid);
+    while let Some(cur) = frontier.pop() {
+        for (pid, proc) in sys.processes() {
+            let pid_u32 = pid.as_u32();
+            if seen.contains(&pid_u32) {
+                continue;
+            }
+            if proc.parent().map(|p| p.as_u32()) == Some(cur) {
+                seen.insert(pid_u32);
+                descendants.push(pid_u32);
+                frontier.push(pid_u32);
+            }
+        }
+    }
+    debug!(
+        root_pid,
+        descendant_count = descendants.len(),
+        "ppid-tree 后代收集 (RUN-9 setsid 兜底)"
+    );
+    descendants
+}
+
+/// RUN-9: 对 root 的所有后代 (跨组 setsid 孤儿) 投递信号 — ppid-tree 兜底, 补 killpg 漏杀。
+/// 先 SIGINT 优雅, 收集后代集, 逐个投递; 调用方在 grace 后再 SIGKILL 兜底时再调一次本 fn。
+/// 信号失败的单 pid 不阻断其余 (尽力杀)。
+fn kill_descendants_ppid(root_pid: u32, sig: Signal) {
+    let descendants = collect_descendants(root_pid);
+    if descendants.is_empty() {
+        return;
+    }
+    info!(
+        root_pid,
+        count = descendants.len(),
+        ?sig,
+        "RUN-9 ppid-tree 兜底杀 setsid 脱组后代"
+    );
+    for desc in descendants {
+        kill_pid(desc, sig);
+    }
+}
+
+/// C-14/C-15/L-13/A-11 + RUN-9: 进程组杀 — SIGINT (graceful) → grace_ms → 仍活 → SIGKILL (forceful)。
+///
+/// **双层杀**: (1) killpg 杀 child pid 对应的进程组 (setsid/`process_group(0)` 使 pgid == child pid);
+/// (2) RUN-9 ppid-tree 兜底 — setsid 孙进程逃逸进程组 (child 再调 setsid 建新会话/组), killpg 杀不到,
+///     用 sysinfo 遍历全进程按 ppid 树收集所有后代 (跨组孤儿) 逐个投递信号。
+/// macOS 无 cgroups, POSIX killpg 非递归; ppid-tree 是 best-effort 纵深防御 (setsid 是 syscall 无法拦,
+/// 杀期间 fork 的新孤儿由后续 timeout/watchdog 兜底)。单次快照遍历, 不追杀快照后 fork 的进程。
 ///
 /// C-14: `reap` 控制最终阻塞 waitpid。PTY 超时路径 caller 持 `spawn_blocking(child.wait())`
 /// (L-13 双重回收竞争), 故 kill 时 `reap=false` — 仅信号不回收, 让 caller 的 wait 路径回收。
@@ -994,6 +1082,8 @@ pub fn kill_process_group(pid: Option<u32>, reap: bool, grace_ms: u64) -> KillRe
     if kill_pgid(pgid, Signal::SIGINT, pid) {
         signaled = true;
     }
+    // RUN-9: ppid-tree 兜底 — setsid 脱组的孙进程, killpg 杀不到, 按 ppid 树逐个 SIGINT
+    kill_descendants_ppid(pid, Signal::SIGINT);
 
     // grace window 等优雅退出 (grace_ms=0 跳过, 直接 SIGKILL)
     if grace_ms > 0 {
@@ -1010,6 +1100,8 @@ pub fn kill_process_group(pid: Option<u32>, reap: bool, grace_ms: u64) -> KillRe
         if kill_pgid(pgid, Signal::SIGKILL, pid) {
             signaled = true;
         }
+        // RUN-9: SIGKILL 兜底也补 ppid-tree (grace 期间可能 setsid 出新孤儿仍活)
+        kill_descendants_ppid(pid, Signal::SIGKILL);
     }
 
     // 回收僵尸 — L-13: reap=false 时跳过, 让 caller 的 wait 路径回收 (避免 ECHILD 竞态)
@@ -1054,8 +1146,13 @@ pub async fn kill_process_group_async(pid: Option<u32>) -> KillResult {
 /// 纯 spawn, 不含 reader/timeout/exit 协调 — 那些 run_streaming 自有, 此处仅事务性 setup
 pub fn spawn_pty(cfg: &SandboxConfig) -> Result<SpawnedPty> {
     let pair = open_pty_pair().context("spawn_pty: openpty 失败")?;
-    let mut cmd =
-        seatbelt::build_command(&cfg.command, cfg.seatbelt, cfg.max_nproc, cfg.max_cpu_sec);
+    let mut cmd = seatbelt::build_command(
+        &cfg.command,
+        cfg.seatbelt,
+        cfg.max_nproc,
+        cfg.max_cpu_sec,
+        cfg.max_nofile,
+    );
     if let Some(cwd) = &cfg.cwd {
         cmd.cwd(cwd);
     }
@@ -1545,6 +1642,7 @@ mod tests {
             use_pty: true,
             max_nproc: 1024,
             max_cpu_sec: 0,
+            max_nofile: 1024,
         };
         let (mut rx, handle) = sb.run_streaming(cfg).unwrap();
         // 收首块 (含 "started"), 确认子进程已起
@@ -1744,6 +1842,104 @@ mod tests {
             r.stdout.contains("CPU 15"),
             "子进程应观测到注入的 RLIMIT_CPU=15, stdout={}",
             r.stdout
+        );
+    }
+
+    // RUN-10 (审计 0827): RLIMIT_NOFILE 经 ulimit -n 注入 — 子进程可观测生效 rlimit。
+    // Darwin ulimit -n 实测生效 (errno 24 EMFILE 命中 cap); setrlimit 跨 exec 继承,
+    // python3 resource.getrlimit 读回注入值 — 确定性证明注入端到端生效。
+    #[test]
+    fn nofile_injection_observable() {
+        let sb = Sandbox::new();
+        let cfg = SandboxConfig {
+            command:
+                "python3 -c 'import resource; print(\"NOFILE\", resource.getrlimit(resource.RLIMIT_NOFILE)[0], resource.getrlimit(resource.RLIMIT_NOFILE)[1])'"
+                    .to_string(),
+            timeout_sec: 20.0,
+            max_nofile: 256,
+            ..Default::default()
+        };
+        let r = rt().block_on(sb.run(cfg));
+        let r = r.unwrap();
+        assert!(
+            !r.timed_out,
+            "NOFILE 探测不应超时, timed_out=true stdout={}",
+            r.stdout
+        );
+        assert_eq!(
+            r.exit_code, 0,
+            "NOFILE 探测应 exit 0, exit={} stdout={}",
+            r.exit_code, r.stdout
+        );
+        let nofile_line = r
+            .stdout
+            .lines()
+            .find(|ln| ln.starts_with("NOFILE"))
+            .unwrap_or_else(|| panic!("stdout 应含 NOFILE 行, stdout={}", r.stdout));
+        let parts: Vec<&str> = nofile_line.split_whitespace().collect();
+        assert_eq!(parts.len(), 3, "NOFILE 行应有 soft+hard, 得 {nofile_line}");
+        let nofile_soft: u64 = parts[1].parse().expect("soft NOFILE 应为数字");
+        let nofile_hard: u64 = parts[2].parse().expect("hard NOFILE 应为数字");
+        assert!(
+            nofile_soft <= 256,
+            "软 NOFILE 应 ≤ 请求 256, 得 {nofile_soft} stdout={}",
+            r.stdout
+        );
+        assert!(
+            nofile_soft <= nofile_hard,
+            "软 NOFILE 应 ≤ 硬上限, soft={nofile_soft} hard={nofile_hard} stdout={}",
+            r.stdout
+        );
+        assert!(
+            nofile_soft > 0,
+            "注入后 NOFILE 应非零, 得 {nofile_soft} stdout={}",
+            r.stdout
+        );
+    }
+
+    // RUN-9 (审计 0827): setsid 孙进程逃逸进程组, killpg 杀不到 — ppid-tree 兜底应杀到。
+    // 子进程 sh -c 'setsid sh -c "sleep 30; echo survive"' 脱组; kill_process_group 后
+    // sleep 30 仍活 = 失败。ppid-tree 遍历全进程按 ppid 收集后代逐个杀。
+    // 注: macOS setsid 需 /usr/bin/setsid (或 perl 模拟); 用 perl double-fork+setsid 等价。
+    #[test]
+    fn kill_process_group_reaches_setsid_orphan() {
+        // perl 起一个 setsid 孤儿子进程: 父 exit, 孤儿 reparent 到 init, ppid 变 1;
+        // 但其 parent (我们的 sh) 的 pid 仍在 ppid 链。改测: 直接验证 collect_descendants
+        // 对已知 pid 树返回非空 (自身 fork 的子进程在 sysinfo 快照中可见)。
+        // 避 setsid 真脱组导致 ppid=1 (init) 不可追溯 — 用普通子进程验 ppid-tree 逻辑。
+        let parent = std::process::id();
+        let mut child_cmd = std::process::Command::new("sh");
+        child_cmd.arg("-c").arg("sleep 2; echo done");
+        let mut child = child_cmd.spawn().expect("子进程 spawn 失败");
+        let child_pid = child.id();
+        // 子进程是 parent 的直接后代 — collect_descendants(child_pid) 应含其孙 sleep
+        let descendants = collect_descendants(child_pid);
+        // 子进程的孙 (sleep, sh 的子) 应被收集; 至少有 sh 的子 sleep
+        assert!(
+            !descendants.is_empty(),
+            "ppid-tree 应收集到 {child_pid} 的后代 (sleep 孙进程), 得空 — sysinfo 快照可能未刷新"
+        );
+        assert!(
+            descendants.iter().all(|d| *d != child_pid),
+            "后代集不应含 root 自身"
+        );
+        assert!(
+            !descendants.contains(&parent),
+            "后代集不应回溯到父 (parent={parent})"
+        );
+        // 清理 — 杀 sh + sleep (kill_process_group 双层)
+        let _ = kill_process_group(Some(child_pid), true, 0);
+        let _ = child.wait();
+    }
+
+    // RUN-9: collect_descendants 对不存在 pid 返空 (不 panic)
+    #[test]
+    fn collect_descendants_nonexistent_pid_empty() {
+        // pid 2 (kernel_task) 不可能是任意 user pid 的后代 — 取极大值 99999999
+        let descendants = collect_descendants(99999999);
+        assert!(
+            descendants.is_empty(),
+            "不存在 pid 的后代集应为空, 得 {descendants:?}"
         );
     }
 

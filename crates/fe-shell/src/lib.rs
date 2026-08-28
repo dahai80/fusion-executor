@@ -85,6 +85,8 @@ pub struct ShellStartParams {
     pub inherit_env: bool,
     pub max_nproc: u32,
     pub max_cpu_sec: u32,
+    /// RUN-10 (审计 0827): 文件描述符上限 (RLIMIT_NOFILE)。默认 1024, 0=不限。透传 SandboxConfig。
+    pub max_nofile: u32,
     /// m-SEC-01: 空闲超时 (秒) — 无输出超此值的 shell 自动 kill。0 = 不限 (向后兼容)。
     pub max_idle_sec: u64,
     /// M-9: kill 宽限期 (毫秒) — kill_shell/expire_idle/Drop 用此值作 SIGINT→grace→SIGKILL 间隔。
@@ -147,6 +149,7 @@ impl ShellRegistry {
             use_pty: true,
             max_nproc: p.max_nproc,
             max_cpu_sec: p.max_cpu_sec,
+            max_nofile: p.max_nofile,
         };
         let spawned: SpawnedPty = match spawn_pty(&sb_cfg) {
             Ok(s) => s,
@@ -564,6 +567,7 @@ mod tests {
             inherit_env: true,
             max_nproc: 0,
             max_cpu_sec: 0,
+            max_nofile: 0,
             max_idle_sec: 0,
             kill_grace_ms: DEFAULT_KILL_GRACE_MS,
         }

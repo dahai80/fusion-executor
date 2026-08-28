@@ -122,6 +122,10 @@ pub struct ExecutionRequest {
     /// >0 到顶 SIGXCPU (CPU 死循环防御)。Darwin 实测生效。
     #[serde(default)]
     pub max_cpu_sec: u32,
+    /// RUN-10 (审计 0827): 文件描述符上限 (RLIMIT_NOFILE, 经 ulimit -n 注入)。默认 1024 —
+    /// 拦 FD 耗尽攻击 (海量打开 fd 击杀宿主)。0=不限 (受信场景 opt-out)。Darwin 实测生效 (errno 24 EMFILE)。
+    #[serde(default = "default_nofile")]
+    pub max_nofile: u32,
     /// M-OPS-06: 跨层关联 id。None 时 execute 入口自动生成 uuid v4, 贯穿日志/IPC/结果。
     #[serde(default)]
     pub trace_id: Option<String>,
@@ -132,6 +136,10 @@ fn default_use_pty() -> bool {
 }
 
 fn default_nproc() -> u32 {
+    1024
+}
+
+fn default_nofile() -> u32 {
     1024
 }
 
@@ -478,8 +486,33 @@ impl Default for Executor {
 impl Executor {
     pub fn new() -> Self {
         info!("Executor::new() — 初始化 SecurityGuard + Sandbox + Slicer + Rollback + Gui + Tools");
+        // ARCH-2: SecurityGuard 基线 TRUSTED_BIN_DIRS 仅系统目录 (/usr/bin 等)。本地 venv
+        // 解释器 (/Users/.../.venv/bin/python3) 不在内 → basename 命中后 resolved-path 校验
+        // fail-closed 拒, 正常 python3 命令被拦。此处自动登记 venv bin (VIRTUAL_ENV env) +
+        // 当前可执行父目录 (PyO3 扩展所在), 使本地解释器路径落可信集。
+        let mut trusted: Vec<String> = Vec::new();
+        if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+            let venv_bin = std::path::Path::new(&venv).join("bin");
+            if let Some(s) = venv_bin.to_str() {
+                trusted.push(s.to_string());
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                if let Some(s) = parent.to_str() {
+                    trusted.push(s.to_string());
+                }
+            }
+        }
+        let trusted_refs: Vec<&str> = trusted.iter().map(String::as_str).collect();
+        let security = if trusted_refs.is_empty() {
+            SecurityGuard::new()
+        } else {
+            info!(dirs = ?trusted_refs, "Executor 登记 venv/exe 可信二进制目录 (ARCH-2)");
+            SecurityGuard::new().with_trusted_bin_dirs(&trusted_refs)
+        };
         Self {
-            security: SecurityGuard::new(),
+            security,
             sandbox: Sandbox::new(),
             #[cfg(feature = "diagnostics")]
             slicer: Slicer::new(),
@@ -750,6 +783,7 @@ impl Executor {
             use_pty: req.use_pty,
             max_nproc: req.max_nproc,
             max_cpu_sec: req.max_cpu_sec,
+            max_nofile: req.max_nofile,
         };
         info!(
             seatbelt = req.seatbelt,
@@ -922,6 +956,7 @@ impl Executor {
             use_pty: req.use_pty,
             max_nproc: req.max_nproc,
             max_cpu_sec: req.max_cpu_sec,
+            max_nofile: req.max_nofile,
         };
         info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg)?;
@@ -1113,6 +1148,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1151,6 +1187,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1180,6 +1217,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: Some("caller-tid-123".to_string()),
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1205,6 +1243,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: Some("blk-tid".to_string()),
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1231,6 +1270,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: Some("stream-tid".to_string()),
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1263,6 +1303,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1299,6 +1340,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1332,6 +1374,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1387,6 +1430,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let ex = Executor::new();
@@ -1419,6 +1463,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let ex = Executor::new();
@@ -1449,6 +1494,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let ex = Executor::new();
@@ -1486,6 +1532,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let ex = Executor::new();
@@ -1527,6 +1574,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let ex = Executor::new();
@@ -1632,6 +1680,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let ex = Executor::new();
@@ -1672,6 +1721,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                max_nofile: 1024,
                 trace_id: None,
             };
             let ex = Executor::new();

@@ -62,6 +62,7 @@ class FusionSandboxExecutor:
         use_pty: bool = True,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
+        max_nofile: int = 1024,
         trace_id: str | None = None,
     ) -> ExecutionResult:
         # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
@@ -81,8 +82,10 @@ class FusionSandboxExecutor:
             raise ValueError(f"max_nproc 必须为非负 int, 得 {max_nproc!r}")
         if not isinstance(max_cpu_sec, int) or max_cpu_sec < 0:
             raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
+        if not isinstance(max_nofile, int) or max_nofile < 0:
+            raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
         logger.debug(
-            "run command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s",
+            "run command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s",
             command,
             timeout_sec,
             cwd,
@@ -91,6 +94,7 @@ class FusionSandboxExecutor:
             use_pty,
             max_nproc,
             max_cpu_sec,
+            max_nofile,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         native = self._native.execute_sync(
@@ -106,6 +110,7 @@ class FusionSandboxExecutor:
             use_pty,
             max_nproc,
             max_cpu_sec,
+            max_nofile,
             trace_id,
         )
         diag = None
@@ -169,6 +174,7 @@ class FusionSandboxExecutor:
         use_pty: bool = True,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
+        max_nofile: int = 1024,
         trace_id: str | None = None,
     ) -> Iterator[str | ExecutionResult]:
         # M-PY-01: 同 run() 前置校验
@@ -180,12 +186,14 @@ class FusionSandboxExecutor:
             raise ValueError(f"max_nproc 必须为非负 int, 得 {max_nproc!r}")
         if not isinstance(max_cpu_sec, int) or max_cpu_sec < 0:
             raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
+        if not isinstance(max_nofile, int) or max_nofile < 0:
+            raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
         # 流式后端仅 PTY: use_pty=False 暂无 stdio 流式实现 (run_streaming 走 portable-pty,
         # 保 ANSI/Traceback 保真 — 流式主要目的)。需独立 stderr 分流用 run(use_pty=False)。
         if not use_pty:
             raise ValueError("run_streaming 暂不支持 use_pty=False (无 stdio 流式后端; 用 run() 分流)")
         logger.debug(
-            "run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s",
+            "run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s",
             command,
             timeout_sec,
             cwd,
@@ -194,6 +202,7 @@ class FusionSandboxExecutor:
             use_pty,
             max_nproc,
             max_cpu_sec,
+            max_nofile,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         it = self._native.execute_streaming(
@@ -209,6 +218,7 @@ class FusionSandboxExecutor:
             use_pty,
             max_nproc,
             max_cpu_sec,
+            max_nofile,
             trace_id,
         )
         for frame in it:
@@ -324,6 +334,7 @@ class FusionSandboxExecutor:
         inherit_env: bool = False,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
+        max_nofile: int = 1024,
         max_idle_sec: int = 3600,
         kill_grace_ms: int = 500,
     ) -> ShellStartResult:
@@ -331,8 +342,10 @@ class FusionSandboxExecutor:
             raise ValueError(f"max_idle_sec 必须为非负 int, 得 {max_idle_sec!r}")
         if not isinstance(kill_grace_ms, int) or kill_grace_ms < 0:
             raise ValueError(f"kill_grace_ms 必须为非负 int, 得 {kill_grace_ms!r}")
+        if not isinstance(max_nofile, int) or max_nofile < 0:
+            raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
         logger.debug(
-            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s kill_grace_ms=%s",
+            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s kill_grace_ms=%s max_nofile=%s",
             command,
             cwd,
             task_id,
@@ -340,6 +353,7 @@ class FusionSandboxExecutor:
             inherit_env,
             max_idle_sec,
             kill_grace_ms,
+            max_nofile,
         )
         native = self._native.shell_start(
             command,
@@ -351,6 +365,7 @@ class FusionSandboxExecutor:
             inherit_env,
             max_nproc,
             max_cpu_sec,
+            max_nofile,
             max_idle_sec,
             kill_grace_ms,
         )
