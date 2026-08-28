@@ -508,6 +508,7 @@ dependencies = [
  "fe-tools",
  "futures",
  "metrics",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

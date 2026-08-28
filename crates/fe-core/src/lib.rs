@@ -84,6 +84,55 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_TIMEOUT: i32 = -124;
 pub const EXIT_BLOCKED: i32 = -1;
 
+/// D3-5/D3-10 (审计 0827 product): 命令日志脱敏 — command 字段直入 tracing JSON 日志
+/// (~/.fusion-executor/logs/fe.log), agent-driven 场景模型可生成含 secret 的内联命令
+/// (curl -H "Authorization: Bearer sk-ant-xxx" / export API_KEY=... / -u user:pass)。
+/// 无脱敏 → token 明文落盘, 同 UID 进程可读, 企业合规违规 (PCI-DSS/HIPAA)。
+///
+/// 纯日志侧过滤 (不改 ExecutionResult.command — 调用方需原始命令做回放/审计);
+/// 非 token 提取 (非金库) — 仅掩码疑似 secret 片段, 保守多掩少漏。
+/// 红线: 脱敏仅作用于日志 span/info, 不破坏 validate 校验 (validate 吃原始 req.command)。
+fn redact_command(cmd: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    // (?:...) 非捕获组避免影响 replace 回引用编号。case-insensitive (?i)。
+    static RE_BEARER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+\S+").unwrap());
+    static RE_SK: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bsk-[A-Za-z0-9_-]+").unwrap());
+    // KEY=VAL 形: key 命中敏感集 → 掩 VAL (VAL 不含空白, 含引号则到引号内整体)
+    // 形如 export PASSWORD=hunter2 / API_KEY="abc def" / --password=secret
+    static RE_KV: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)((?:password|passwd|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credential|authorization)\s*=\s*)("[^"]*"|\S+)"#,
+        )
+        .unwrap()
+    });
+    // curl basic auth: -u user:pass / --user user:pass (pass 为冒号后整段)
+    static RE_BASIC: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)(\B-u\b|--user)\s+(\S+):(\S+)").unwrap());
+    // -H/--header "Name: val" 中 Name 命中敏感集 → 掩整段引号内容
+    static RE_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)(-H|--header)\s+"((?:authorization|x-api-key|api-key|cookie|set-cookie)[^"]*)""#,
+        )
+        .unwrap()
+    });
+    let mut out = cmd.to_string();
+    out = RE_BEARER
+        .replace_all(&out, "Bearer [REDACTED]")
+        .into_owned();
+    out = RE_SK.replace_all(&out, "sk-[REDACTED]").into_owned();
+    out = RE_KV.replace_all(&out, "${1}[REDACTED]").into_owned();
+    out = RE_BASIC
+        .replace_all(&out, "${1} ${2}:[REDACTED]")
+        .into_owned();
+    out = RE_HEADER
+        .replace_all(&out, r#"${1} "[REDACTED]""#)
+        .into_owned();
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionRequest {
@@ -736,10 +785,10 @@ impl Executor {
             tracing::Level::INFO,
             "execute",
             trace_id = %trace_id,
-            command = %req.command
+            command = %redact_command(&req.command)
         );
         let _enter = span.enter();
-        info!(command = %req.command, "execute_async — 校验中");
+        info!(command = %redact_command(&req.command), "execute_async — 校验中");
         let start = Instant::now();
         let verdict = self.security.validate(&req.command);
         if !verdict.allowed {
@@ -901,10 +950,10 @@ impl Executor {
             tracing::Level::INFO,
             "execute_stream",
             trace_id = %trace_id,
-            command = %req.command
+            command = %redact_command(&req.command)
         );
         let _enter = span.enter();
-        info!(command = %req.command, "execute_streaming — 校验中");
+        info!(command = %redact_command(&req.command), "execute_streaming — 校验中");
         let start = Instant::now();
         let verdict = self.security.validate(&req.command);
         if !verdict.allowed {
@@ -1166,6 +1215,69 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    // D3-5/D3-10: 命令日志脱敏 — secret 模式掩码, 非 secret 保留
+    #[test]
+    fn redact_command_bearer_token() {
+        let r = redact_command("curl -H 'Authorization: Bearer sk-ant-abc123' https://api");
+        assert!(!r.contains("sk-ant-abc123"), "Bearer token 应脱敏: {r}");
+        assert!(r.contains("[REDACTED]"), "应含 [REDACTED] 占位: {r}");
+    }
+
+    #[test]
+    fn redact_command_sk_prefix() {
+        let r = redact_command("echo sk-proj-xyz789");
+        assert!(!r.contains("sk-proj-xyz789"), "sk- key 应脱敏: {r}");
+        assert!(r.contains("sk-[REDACTED]"), "应含 sk-[REDACTED]: {r}");
+    }
+
+    #[test]
+    fn redact_command_key_equals_value() {
+        let r = redact_command("export PASSWORD=hunter2 && curl https://api");
+        assert!(!r.contains("hunter2"), "PASSWORD 值应脱敏: {r}");
+        assert!(
+            r.contains("PASSWORD=[REDACTED]"),
+            "应含 PASSWORD=[REDACTED]: {r}"
+        );
+    }
+
+    #[test]
+    fn redact_command_api_key_quoted() {
+        let r = redact_command(r#"cli --api-key="abc def ghi""#);
+        assert!(!r.contains("abc def ghi"), "引号内 api_key 值应脱敏: {r}");
+        assert!(r.contains("[REDACTED]"), "应含 [REDACTED]: {r}");
+    }
+
+    #[test]
+    fn redact_command_curl_basic_auth() {
+        let r = redact_command("curl -u admin:s3cret https://api");
+        assert!(!r.contains("s3cret"), "basic auth 密码应脱敏: {r}");
+        assert!(r.contains("admin:[REDACTED]"), "应保留 user 掩 pass: {r}");
+    }
+
+    #[test]
+    fn redact_command_header_authorization() {
+        let r = redact_command(r#"curl -H "Authorization: Bearer xyz" https://api"#);
+        assert!(
+            !r.contains("Bearer xyz"),
+            "Authorization header 值应脱敏: {r}"
+        );
+    }
+
+    #[test]
+    fn redact_command_preserves_non_secret() {
+        let r = redact_command("pytest tests/ -v --tb=short");
+        assert_eq!(
+            r, "pytest tests/ -v --tb=short",
+            "无 secret 命令应原样保留: {r}"
+        );
+    }
+
+    #[test]
+    fn redact_command_case_insensitive() {
+        let r = redact_command("curl -H 'authorization: bearer tok' url");
+        assert!(!r.contains("tok"), "小写 authorization/bearer 应脱敏: {r}");
     }
 
     #[test]
