@@ -27,10 +27,23 @@ from .models import (
 
 logger = logging.getLogger("fusion_executor")
 
-DEFAULT_SOCK = "/tmp/fusion-executor.sock"
+DEFAULT_SOCK = os.path.expanduser("~/.fusion-executor/fe.sock")  # IMPL-1: 对齐 Rust M-SEC-01 (HOME 私有 0o700)
 SUB_CHANNELS = ("telemetry", "stdio", "screenshot")
 # P-2: subscription 行缓冲上限 — 损坏流 (无 newline) / 超巨帧防护, 超则丢缓冲当流结束
 _SUB_BUF_MAX_BYTES = 8 * 1024 * 1024
+
+
+def ensure_socket_dir(path: str = DEFAULT_SOCK) -> None:
+    # IMPL-1: 对齐 Rust M-SEC-01 — 默认 socket 置 ~/.fusion-executor/ (HOME 私有, 0o700)。
+    # serve 前确保目录存在 (Rust 侧亦 mkdir, 此处前置防 bind 前路径缺失; 自定义路径父目录已存在则 no-op)。
+    # makedirs mode 仅创建时生效; 既存目录 (如旧 0o755 残留) 须显式 chmod 收紧, 否则破坏鉴权前提。
+    sock_dir = os.path.dirname(path) or os.path.expanduser("~/.fusion-executor")
+    try:
+        os.makedirs(sock_dir, mode=0o700, exist_ok=True)
+        if os.path.isdir(sock_dir):
+            os.chmod(sock_dir, 0o700)
+    except OSError as e:
+        logger.warning("ensure_socket_dir 创建 %s 失败: %s", sock_dir, e)
 
 
 class FusionSandboxExecutor:
@@ -688,6 +701,8 @@ class FusionSandboxExecutor:
         # 与 finally 清理用的 path (env 解析) 不同源, 虽 Rust 亦解析 env 凑巧一致, 但显式
         # 传 path 消除隐式 env 依赖, 清理与监听严格同一路径。
         path = sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        # IMPL-1: serve 前确保 socket 父目录存在 (默认 ~/.fusion-executor/ 0o700, 对齐 Rust M-SEC-01)。
+        ensure_socket_dir(path)
         # C-SEC-02: seatbelt 治理 — 默认关闭, 生产环境须在 ExecutionRequest 透传 seatbelt:true
         logger.warning("⚠️ seatbelt 默认关闭 — 子进程无 macOS sandbox-exec 隔离。生产部署须透传 seatbelt:true。")
         logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (信号可停)", path)
@@ -734,6 +749,12 @@ class Subscription:
         self._sock: socket.socket | None = None
         self._sub_id: str | None = None
         self._buf = b""
+        # IMPL-3: crash 标记 — 区分 "正常流结束" (本端 unsubscribe/close 主动, _closed_by_server=True)
+        # vs "server 崩溃/断连" (socket EOF 无预期, _closed_by_server=False)。__next__ 据此区分:
+        # 主动关闭 → StopIteration (干净流尾); 非预期 EOF → ConnectionError (调用方可 catch 重连/告警)。
+        self._closed_by_server: bool = False
+        # IMPL-3: _read_json 在 socket EOF 时置 True (区分超时-None), __next__ 据此判 crash。
+        self._eof_seen: bool = False
 
     def _open(self) -> None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -777,6 +798,10 @@ class Subscription:
                 logger.warning("subscription recv 超时, 当流结束")
                 return None
             if not chunk:
+                # IMPL-3: socket EOF — 区分超时 (上分支, 合法 idle) vs 真断连 (本分支)。
+                # 标记 _eof_seen=True 让 __next__ 据此决定: 主动关闭 → StopIteration;
+                # 非预期 EOF → ConnectionError。
+                self._eof_seen = True
                 return None
             self._buf += chunk
             # P-2: 行缓冲无界增长防护 — 损坏流 (无 newline) 或超巨帧会撑爆 _buf。
@@ -799,9 +824,23 @@ class Subscription:
         return self
 
     def __next__(self) -> dict:
+        # IMPL-3: 本端已主动 close/unsubscribe (_closed_by_server=True, _sock=None) → 干净流尾 StopIteration。
+        # 提前返回, 不再调 _read_json (sock 已关, 其 assert self._sock is not None 会抛)。
+        if self._sock is None:
+            if self._eof_seen and not self._closed_by_server:
+                logger.warning("subscription 非预期断连 (server EOF 无 unsubscribe), 抛 ConnectionError")
+                raise ConnectionError("server disconnected unexpectedly")
+            raise StopIteration
         while True:
             frame = self._read_json()
             if frame is None:
+                # IMPL-3: 区分流尾原因。_closed_by_server=True = 本端主动 unsubscribe/close
+                # (干净流尾 → StopIteration); _eof_seen=True 且非主动关 = server 崩溃/断连
+                # (→ ConnectionError, 调用方可 catch 重连/告警); 纯超时 (两标志皆 False) =
+                # 合法 idle, 当流尾 StopIteration。
+                if self._eof_seen and not self._closed_by_server:
+                    logger.warning("subscription 非预期断连 (server EOF 无 unsubscribe), 抛 ConnectionError")
+                    raise ConnectionError("server disconnected unexpectedly")
                 raise StopIteration
             if "method" in frame and frame.get("method") == "executor.event":
                 params = frame.get("params", {})
@@ -830,11 +869,15 @@ class Subscription:
             return False
         finally:
             if self._sock is not None:
+                # IMPL-3: 主动关标记 — 本端 unsubscribe/close 是预期关闭, __next__ 得 None 应 StopIteration 非 ConnectionError。
+                self._closed_by_server = True
                 self._sock.close()
                 self._sock = None
 
     def close(self) -> None:
         if self._sock is not None:
+            # IMPL-3: 同 unsubscribe — 显式 close 属主动关闭, 标记避免误判 crash。
+            self._closed_by_server = True
             self._sock.close()
             self._sock = None
 

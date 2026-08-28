@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from .executor import DEFAULT_SOCK, FusionSandboxExecutor
+from .executor import DEFAULT_SOCK, FusionSandboxExecutor, ensure_socket_dir
 from .models import RollbackPolicy
 
 
@@ -18,6 +18,9 @@ def _validate_paths(cwd: str | None, sock: str | None, *, check_sock: bool = Tru
         sys.exit(2)
     if check_sock:
         sock_path = sock or DEFAULT_SOCK
+        # IMPL-1: 默认 socket 在 ~/.fusion-executor/ (HOME 私有 0o700), 该目录可能不存在。
+        # serve() 会 ensure_socket_dir 创建, 此处先建以让父目录可写校验通过 (避免误拦首次启动)。
+        ensure_socket_dir(sock_path)
         parent = Path(sock_path).parent
         if not parent.is_dir() or not os.access(parent, os.W_OK):
             print(f"错误: socket 父目录不可写: {parent}", file=sys.stderr)
@@ -33,7 +36,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # 兼容旧用法 `fusion-executor echo hi`)。subcommand + bare positional argparse
     # 歧义 (echo v 被当 subcommand choice), flag 无歧义。
     parser.add_argument("--serve", action="store_true", help="启动 UDS JSON-RPC server (替代执行命令)")
-    parser.add_argument("--sock", default=None, help="serve 模式 socket 路径 (默认 /tmp/fusion-executor.sock)")
+    parser.add_argument(
+        "--sock", default=None, help="serve 模式 socket 路径 (默认 ~/.fusion-executor/fe.sock, HOME 私有 0o700)"
+    )
     parser.add_argument("command", nargs="?", help="要执行的命令 (serve 模式忽略)")
     parser.add_argument("--cwd", default=None, help="工作目录")
     parser.add_argument("--timeout-sec", type=float, default=30.0, help="超时秒 (超时退出码 -124)")

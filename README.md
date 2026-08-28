@@ -297,7 +297,7 @@ Start a UDS JSON-RPC 2.0 server — for fusion-code (TypeScript) / fusion-studio
 
 ```bash
 python -c "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()"
-# Socket: /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK)
+# Socket: ~/.fusion-executor/fe.sock (HOME-private, 0o700 dir; override FUSION_EXECUTOR_SOCK)
 ```
 
 Protocol: newline-delimited JSON-RPC 2.0, error codes -32700/-32600/-32601/-32603 + extensions -32010(security)/-32011(timeout)/-32012(rollback)/-32013(AX). Methods: `executor.health`/`execute`/`execute_stream`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`/`file_edit`/`glob`/`grep`/`grep_with_opts`/`apply_patch`/`replace_function`/`telemetry_stream`/`subscribe`/`unsubscribe`/`shell_start`/`shell_output`/`kill_shell`/`list_shells`/`shutdown`.
@@ -358,11 +358,11 @@ fusion-executor is a **single-user, local-first, trusted-caller** execution tool
   - fe-pyo3: `NativeDiagnostics` + `diagnostics` field + `snapshot_create`/`rollback` methods; env_vars/enable_rollback_snapshot passed through
   - Exit gate: `run("python3 -c 'raise ValueError'")` → `diagnostics.error_type == "ValueError"`; rollback round-trip restores a corrupted file
 - **P3 — IPC Service** ✅ complete
-  - fe-ipc: UDS JSON-RPC 2.0 server — `tokio::net::UnixListener` + newline-delimited + per-connection spawn; socket `/tmp/fusion-executor.sock` (override `FUSION_EXECUTOR_SOCK`), unlink stale sock + chmod 0o666
+  - fe-ipc: UDS JSON-RPC 2.0 server — `tokio::net::UnixListener` + newline-delimited + per-connection spawn; socket `~/.fusion-executor/fe.sock` (HOME-private 0o700 dir, override `FUSION_EXECUTOR_SOCK`), unlink stale sock + chmod 0o666
   - Methods: `executor.health`/`execute`/`snapshot_create`/`rollback`/`diagnostics`/`gui_action`(P4 stub)/`shutdown`; error codes -32700/-32600/-32601/-32603 + extensions -32010..-32013
   - fe-pyo3: `NativeExecutor.serve(sock_path=None)` binding; `FusionSandboxExecutor.serve()` wrapper runs forever
   - 4 Rust unit tests (health/unknown -32601/malformed -32700/UDS execute) + 5 Python IPC tests (health/execute/diagnostics/unknown/snapshot+rollback round-trip)
-  - Exit gate: external raw-socket client calls `executor.execute` echo over UDS → `exit_code=0 stdout="hi\n"`; fusion-code-style TS client sketch in `docs/ipc-client-typescript.md`; fusion-studio uses existing `IPCClient.swift udsCall` pointed at `/tmp/fusion-executor.sock`
+  - Exit gate: external raw-socket client calls `executor.execute` echo over UDS → `exit_code=0 stdout="hi\n"`; fusion-code-style TS client sketch in `docs/ipc-client-typescript.md`; fusion-studio uses existing `IPCClient.swift udsCall` pointed at `~/.fusion-executor/fe.sock`
 - **P4 — macOS GUI** ✅ complete
   - fe-gui: `accessibility` 0.2 safe wrapper (AXUIElement tree/focus/click/type/inspect) + 3 audited unsafe FFI blocks (AXIsProcessTrusted + AXValueGetValue ×2); CoreGraphics `CGDisplay::screenshot` → PNG base64 (Layer B vision fallback)
   - GuiAction (tag=kind, snake_case): `focus_app`/`click`/`type_text`/`key_press`/`screenshot`/`inspect_tree`; GuiResult{ok, node_tree, screenshot_png_b64, error}
