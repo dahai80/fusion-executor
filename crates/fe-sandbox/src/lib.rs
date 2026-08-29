@@ -2055,21 +2055,31 @@ mod tests {
     // 注: macOS setsid 需 /usr/bin/setsid (或 perl 模拟); 用 perl double-fork+setsid 等价。
     #[test]
     fn kill_process_group_reaches_setsid_orphan() {
-        // perl 起一个 setsid 孤儿子进程: 父 exit, 孤儿 reparent 到 init, ppid 变 1;
-        // 但其 parent (我们的 sh) 的 pid 仍在 ppid 链。改测: 直接验证 collect_descendants
-        // 对已知 pid 树返回非空 (自身 fork 的子进程在 sysinfo 快照中可见)。
-        // 避 setsid 真脱组导致 ppid=1 (init) 不可追溯 — 用普通子进程验 ppid-tree 逻辑。
+        // 验 collect_descendants 对已知 pid 树返回非空 (sh 的孙 sleep 可见)。
+        // 竞态修正: spawn 后 sh 需时间 fork sleep 孙进程 — 单次立即快照在快机器上常早于 fork,
+        // 得空 → 误红 (本机 --nocapture 慢化时序即过, 裸跑即挂)。轮询至多 1s 等 fork 物化,
+        // 对齐真实使用 (kill 发生在命令运行后而非 spawn 后微秒级)。普通子进程验 ppid-tree 逻辑,
+        // 避 setsid 真脱组 ppid=1 不可追溯。
         let parent = std::process::id();
         let mut child_cmd = std::process::Command::new("sh");
         child_cmd.arg("-c").arg("sleep 2; echo done");
         let mut child = child_cmd.spawn().expect("子进程 spawn 失败");
         let child_pid = child.id();
-        // 子进程是 parent 的直接后代 — collect_descendants(child_pid) 应含其孙 sleep
-        let descendants = collect_descendants(child_pid);
-        // 子进程的孙 (sleep, sh 的子) 应被收集; 至少有 sh 的子 sleep
+        // 轮询 collect_descendants: 等 sh fork 出 sleep 孙进程, 至多 1s (10×100ms)
+        let descendants = {
+            let mut got = Vec::new();
+            for _ in 0..10 {
+                got = collect_descendants(child_pid);
+                if !got.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            got
+        };
         assert!(
             !descendants.is_empty(),
-            "ppid-tree 应收集到 {child_pid} 的后代 (sleep 孙进程), 得空 — sysinfo 快照可能未刷新"
+            "ppid-tree 应收集到 {child_pid} 的后代 (sleep 孙进程), 轮询 1s 仍得空 — fork 未物化或 sysinfo 未刷新"
         );
         assert!(
             descendants.iter().all(|d| *d != child_pid),
