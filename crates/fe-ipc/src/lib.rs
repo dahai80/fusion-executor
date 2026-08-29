@@ -858,10 +858,11 @@ impl IpcServer {
         }
         // C-10: 先建 + 收紧父目录 0o700, 再 bind — 消除 bind→chmod 间窗口。
         // ensure_sock_dir 内对已存在目录也收紧权限 (旧版早 return 跳过 = 残留宽松目录)。
-        ensure_sock_dir(&path);
+        // D3-8: 权限收紧失败 → fail-loud, serve 拒绝启动 (世界可读写 socket = M-SEC-01 绕过)。
+        ensure_sock_dir(&path)?;
         let listener = UnixListener::bind(&path)
             .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", path.display(), e))?;
-        chmod_secure(&path);
+        chmod_secure(&path)?;
         info!(sock = %path.display(), "IPC 服务器监听中");
         // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
         // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
@@ -901,10 +902,10 @@ impl IpcServer {
             if p.exists() {
                 let _ = std::fs::remove_file(&p);
             }
-            ensure_sock_dir(&p);
+            ensure_sock_dir(&p)?;
             let listener = UnixListener::bind(&p)
                 .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", p.display(), e))?;
-            chmod_secure(&p);
+            chmod_secure(&p)?;
             info!(sock = %p.display(), "IPC 服务器监听中 (blocking, 信号可停)");
             // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
             // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
@@ -2215,47 +2216,80 @@ fn err_str(id: Value, code: i64, message: &str) -> String {
 
 /// chmod 0o600 — 仅 owner 可读写 (本地提权防护, C-IPC-01)。
 /// 监听前已 unlink 旧 socket, bind 后立即收紧权限。
+/// D3-8 企业硬化: 权限收紧失败 = world 可读写 socket = M-SEC-01 绕过 → fail-loud 返 Err, serve 拒绝启动。
 #[cfg(unix)]
-fn chmod_secure(path: &Path) {
+fn chmod_secure(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        warn!(path = %path.display(), error = %e, "chmod 0o600 失败");
-    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        error!(path = %path.display(), error = %e, "FATAL: chmod 0o600 socket 失败 — 拒绝 world-readable socket 启动 (D3-8)");
+        anyhow::anyhow!("chmod 0o600 socket 失败 (D3-8 企业硬化): {}: {}", path.display(), e)
+    })?;
+    info!(path = %path.display(), "socket 收紧 0o600 (owner-only rw, C-IPC-01)");
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn chmod_secure(_path: &Path) {}
+fn chmod_secure(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// M-SEC-01 + 0827 C-10: 建 socket 父目录 0o700 — 私有目录阻他 UID connect (目录无搜索权限)。
 /// 仅对 HOME 下默认路径生效; 显式 /tmp 覆盖路径走 chmod_secure 0o600 单文件。
 /// C-10 修: 已存在目录**也收紧 0o700** (旧版早 return = 残留宽松目录, 他 UID 可 traverse+connect)。
 /// 仅对本次新建/本服务 socket 父目录收紧; 上级 (HOME 本身) 不动 — 收紧的是 ~/.fusion-executor。
+/// D3-8 企业硬化:
+///   - create_dir_all 失败 → fail-loud Err (无法建私有目录 = 无法保证隔离)。
+///   - 我们新建的目录 chmod 0o700 失败 → fail-loud Err (自己建的目录理应可收紧, 失败 = FS 异常)。
+///   - 已存在非自有目录 (如共享 /tmp 根) chmod EPERM/EACCES → 降级 warn + Ok (非 HOME 默认路径, 靠文件 0o600 兜底)。
+///   - chmod 其他错误 (只读 FS/IO) → fail-loud Err。
 #[cfg(unix)]
-fn ensure_sock_dir(path: &Path) {
+fn ensure_sock_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let Some(parent) = path.parent() else {
-        return;
+        return Ok(());
     };
     if parent.as_os_str().is_empty() {
-        return;
+        return Ok(());
     }
-    if !parent.exists() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!(dir = %parent.display(), error = %e, "M-SEC-01: 建 socket 私有目录失败");
-            return;
-        }
+    let pre_existing = parent.exists();
+    if !pre_existing {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            error!(dir = %parent.display(), error = %e, "FATAL: 建 socket 私有目录失败 — 拒绝启动 (D3-8 M-SEC-01)");
+            anyhow::anyhow!("建 socket 私有目录失败 (D3-8 M-SEC-01): {}: {}", parent.display(), e)
+        })?;
         info!(dir = %parent.display(), "M-SEC-01: socket 父目录已建");
     }
-    // C-10: 无论新建或已存在, 收紧 0o700。已存在宽松目录 (如旧版残留 0o755) → 修。
-    if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
-        warn!(dir = %parent.display(), error = %e, "M-SEC-01: chmod 0o700 私有目录失败");
-    } else {
-        info!(dir = %parent.display(), "M-SEC-01: socket 父目录收紧 0o700 (阻他 UID traverse/connect)");
+    // C-10: 无论新建或已存在, 尝试收紧 0o700。
+    match std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
+        Ok(()) => {
+            info!(dir = %parent.display(), "M-SEC-01: socket 父目录收紧 0o700 (阻他 UID traverse/connect)");
+        }
+        Err(e) => {
+            let perm_denied = matches!(e.raw_os_error(), Some(1) | Some(13)); // EPERM/EACCES
+            if !pre_existing || !perm_denied {
+                // 新建目录收紧失败 (我们拥有, 应可收紧) 或非权限类 IO 错误 → fail-loud。
+                error!(dir = %parent.display(), error = %e, "FATAL: chmod 0o700 私有目录失败 — 拒绝其他 UID traverse/connect (D3-8 M-SEC-01)");
+                return Err(anyhow::anyhow!(
+                    "chmod 0o700 私有目录失败 (D3-8 M-SEC-01): {}: {}",
+                    parent.display(),
+                    e
+                ));
+            }
+            // 已存在非自有目录 (如共享 /tmp 根) 无权 chmod → 降级: 靠 socket 文件 0o600 兜底。
+            warn!(
+                dir = %parent.display(),
+                error = %e,
+                "M-SEC-01: 非自有 socket 父目录无权收紧 0o700 (共享 /tmp 等) — 降级靠文件 0o600 兜底"
+            );
+        }
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn ensure_sock_dir(_path: &Path) {}
+fn ensure_sock_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// M-SEC-01: LOCAL_PEERCRED UID 校验 — accept 后查对端 UID, 须等于本进程 UID。
 /// 防同主机他 UID 经符号链接或 /tmp 覆盖路径越权 connect。零 unsafe (nix safe wrapper)。
@@ -3421,7 +3455,7 @@ mod tests {
             .join(format!("fe-msec01-probe-{}", std::process::id()))
             .join("subdir")
             .join("fe.sock");
-        ensure_sock_dir(&probe);
+        ensure_sock_dir(&probe).expect("ensure_sock_dir 应成功建 0o700 父目录");
         let parent = probe.parent().unwrap();
         assert!(parent.exists(), "ensure_sock_dir 应建父目录");
         #[cfg(unix)]
@@ -3479,6 +3513,51 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    // D3-8 企业硬化: socket 父目录权限收紧失败 → serve fail-loud 拒绝启动 (不残留 world-accessible socket)。
+    // 构造只读父目录: create_dir_all 成功但 chmod 0o700 因父目录无写权限失败 → ensure_sock_dir Err → serve Err。
+    // 注: macOS root 可绕 chmod, 故本测试仅非 root 跑断言; root 跳过 (CI 非 root)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn d38_serve_fails_when_sock_dir_not_tightenable() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::getuid().as_raw() == 0 {
+            eprintln!("skip d38 chmod test under root (root bypasses mode bits)");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("fe-d38-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // 建外层目录, 然后剥写权限 — 内层子目录 create_dir_all 会失败
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let sock = tmp.join("nope").join("fe.sock");
+        let server = IpcServer::new();
+        let res = server.serve(sock.to_str().unwrap()).await;
+        assert!(
+            res.is_err(),
+            "D3-8: 不可建/不可收紧 socket 私有目录应 fail-loud 返 Err, 实际 Ok"
+        );
+        // 恢复权限清理 (否则 remove_dir_all 也无写权限)
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // D3-8: 正常路径 ensure_sock_dir + chmod_secure 返 Ok (幂等 — 已 0o700 目录仍 Ok)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn d38_sock_hardening_ok_on_normal_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fe-d38-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("fe.sock");
+        ensure_sock_dir(&sock_path).expect("D3-8: 正常路径 ensure_sock_dir 应 Ok");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "D3-8: 正常路径目录应收紧 0o700");
+        // 幂等: 二次调用已收紧目录仍 Ok
+        ensure_sock_dir(&sock_path).expect("D3-8: ensure_sock_dir 幂等应 Ok");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // m-OPS-02: env-var 测试串行化 (set_var/remove_var 跨并行测试竞态)。
@@ -3791,7 +3870,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let sock_path = dir.join("fe.sock");
         // 调 ensure_sock_dir — 应收紧 0o700
-        ensure_sock_dir(&sock_path);
+        ensure_sock_dir(&sock_path).expect("ensure_sock_dir 应成功收紧已存在目录 0o700");
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o700,
