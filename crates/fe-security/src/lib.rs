@@ -1212,10 +1212,11 @@ mod tests {
     #[test]
     fn allows_python() {
         // D3-1: 内联解释器需 opt-in (此用例测白名单非 D3-1, 显式开启)
+        // D3-6: validate fail-closed — 用 python3 (常在 PATH), 裸 python 本机常缺席
         let v = guard()
             .with_allow_inline_interpreter(true)
-            .validate("python -c \"print('hello')\"");
-        assert!(v.allowed, "应允许 python, reason={:?}", v.reason);
+            .validate("python3 -c \"print('hello')\"");
+        assert!(v.allowed, "应允许 python3, reason={:?}", v.reason);
     }
 
     #[test]
@@ -1296,7 +1297,9 @@ mod tests {
 
     #[test]
     fn allows_env_prefix() {
-        let v = guard().validate("FOO=bar BAR=baz python script.py");
+        // D3-6: validate fail-closed — 二进制须可解析才断言 allowed,
+        // 本机裸 python 常缺席 (仅 python3), 缺席时跳过 validate 断言。
+        let v = guard().validate("FOO=bar BAR=baz python3 script.py");
         assert!(v.allowed, "应允许环境变量前缀, reason={:?}", v.reason);
     }
 
