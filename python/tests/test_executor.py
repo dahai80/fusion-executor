@@ -25,7 +25,9 @@ from fusion_executor import (
 
 @pytest.fixture(scope="module")
 def executor():
-    return FusionSandboxExecutor()
+    # D3-1: 本测试机依赖 python3 -c 内联解释器 (诊断切片/真实执行), 故 opt-in。
+    # 企业硬化默认 False 拒内联解释器; 测试机属 trusted-caller 本地交互场景。
+    return FusionSandboxExecutor(allow_inline_interpreter=True)
 
 
 def test_run_echo(executor: FusionSandboxExecutor):
@@ -138,7 +140,7 @@ def uds_server():
         [
             sys.executable,
             "-c",
-            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()",
+            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor(allow_inline_interpreter=True).serve()",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -237,6 +239,33 @@ def test_seatbelt_allows_whitelisted_echo(executor: FusionSandboxExecutor):
     assert result.exit_code == 0
     assert not result.blocked_by_security
     assert "seatbelt_ok" in result.stdout
+
+
+def test_seatbelt_default_true_all_layers_no_drift():
+    # D1-2/D2-3 (审计 0827 arch ARCH-1 + product): seatbelt 默认值 4 层须一致 True。
+    # 历史 drift — models.py Pydantic 默认 False, 而 executor.run/run_async/shell_start 默认 True +
+    # Rust serde default_true。任一层默认 False = 商用静默关隔离 (绕 ARCH-1)。此测试锁住统一。
+    import inspect
+
+    from fusion_executor.models import ExecutionRequest
+
+    # 层 1: Pydantic ExecutionRequest 默认 True
+    assert ExecutionRequest(command="x").seatbelt is True, "ExecutionRequest.seatbelt 默认须 True"
+
+    # 层 2-3: FusionSandboxExecutor.run / run_streaming / shell_start 签名默认 True
+    # (run_async 吸收 **kw 转发 run, 无独立 seatbelt 形参, 不入此检查)
+    for name in ("run", "run_streaming", "shell_start"):
+        fn = getattr(FusionSandboxExecutor, name)
+        sig = inspect.signature(fn)
+        param = sig.parameters.get("seatbelt")
+        assert param is not None, f"{name} 须有 seatbelt 参数"
+        assert param.default is True, f"{name} seatbelt 默认须 True, 实际 {param.default!r}"
+
+    # 层 4: Rust serde default_true — Python ExecutionRequest 默认 True → 序列化含 seatbelt=true
+    # (native 反序列化对齐; ARCH-1 health 已断言 seatbelt_default_on)。
+    req = ExecutionRequest(command="echo drift_check")
+    dumped = req.model_dump()
+    assert dumped.get("seatbelt") is True, f"默认 request 序列化 seatbelt 须 True, 实际 {dumped.get('seatbelt')}"
 
 
 def test_run_populates_schema_fields(executor: FusionSandboxExecutor):
@@ -1322,9 +1351,14 @@ def test_validate_empty_command_raises_valueerror(executor: FusionSandboxExecuto
 
 
 # Issue #10: 白名单覆盖 + 项目级扩展 + 动态执行拦截
-def test_extra_whitelist_allows_project_tool():
-    ex = FusionSandboxExecutor(extra_whitelist=["myproj-runner"])
-    v = ex.validate("myproj-runner --version")
+# D3-6 (审计 0827 product): extra_whitelist 的工具须 resolve 到可信目录才放行 (fail-closed 防
+#   /tmp 投毒)。测试建真实可执行工具到临时 bin 目录, 登记 trusted_bin_dirs, 校验放行。
+def test_extra_whitelist_allows_project_tool(tmp_path):
+    tool = tmp_path / "myproj-runner"
+    tool.write_text("#!/bin/sh\necho run\n")
+    tool.chmod(0o755)
+    ex = FusionSandboxExecutor(extra_whitelist=["myproj-runner"], trusted_bin_dirs=[str(tmp_path)])
+    v = ex.validate(f"{tool} --version")
     assert v["allowed"] is True, v
 
 
@@ -1750,3 +1784,39 @@ def test_p2_subscription_buf_normal_line_still_works():
     assert out is not None
     assert out["id"] == 1
     assert out["result"]["ok"] is True
+
+
+# D3-4 (审计 0827 product): per-task RSS watchdog — 子进程树 RSS 超 rss_limit_mb
+# 被 sysinfo 轮询 kill (exit_code -124, oom_killed=true)。Darwin RLIMIT_AS/RLIMIT_DATA
+# 平台无效, 改轮询缓解。inline 解释器经 D3-1 opt-in 网关放行 (fixture allow_inline_interpreter)。
+def test_run_rss_watchdog_kills_memory_bomb(executor: FusionSandboxExecutor):
+    bomb = "python3 -c \"x=[bytearray(b'a'*10**7) for _ in range(100)]; import time; time.sleep(5)\""
+    r = executor.run(bomb, rss_limit_mb=256, timeout_sec=10.0, enable_rollback_snapshot=False)
+    assert r.oom_killed, f"内存炸弹应触发 oom_killed, exit={r.exit_code}"
+    assert r.exit_code == -124, f"OOM kill exit 应 -124, got {r.exit_code}"
+
+
+def test_run_rss_watchdog_zero_disables(executor: FusionSandboxExecutor):
+    # rss_limit_mb=0 禁用 watchdog — 较小分配正常完成 (受信 opt-out)
+    r = executor.run(
+        "python3 -c \"x=[bytearray(b'a'*10**6) for _ in range(10)]; print(len(x))\"",
+        rss_limit_mb=0,
+        timeout_sec=15.0,
+        enable_rollback_snapshot=False,
+    )
+    assert not r.oom_killed, "rss_limit_mb=0 不应触发 oom_killed"
+    assert r.exit_code == 0, f"正常完成 exit 0, got {r.exit_code}"
+
+
+def test_run_rss_watchdog_normal_unaffected(executor: FusionSandboxExecutor):
+    r = executor.run("echo hi", rss_limit_mb=256, enable_rollback_snapshot=False)
+    assert r.exit_code == 0, f"echo 应 exit 0, got {r.exit_code}"
+    assert not r.oom_killed, "echo 不应触发 oom_killed"
+
+
+def test_run_streaming_rss_watchdog(executor: FusionSandboxExecutor):
+    bomb = "python3 -c \"x=[bytearray(b'a'*10**7) for _ in range(100)]; import time; time.sleep(5)\""
+    _chunks, result = _consume_stream(executor, bomb, rss_limit_mb=256, timeout_sec=10.0)
+    assert result is not None
+    assert result.oom_killed, f"流式 Done 帧 oom_killed 应 true, exit={result.exit_code}"
+    assert result.exit_code == -124, f"流式 OOM exit 应 -124, got {result.exit_code}"

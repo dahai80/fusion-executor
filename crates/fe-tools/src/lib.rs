@@ -710,6 +710,10 @@ impl Tools {
                 continue;
             }
             // L-TOOLS-01: 命中父目录经 validate_cwd 校验敏感前缀
+            // D4-6 perf 评估 (2026-08-29): 此 per-entry validate_cwd 不能"只校验一次 cwd"省掉 —
+            // cwd 根已校验 (line 655), 但敏感子目录 (cwd=/home/user 命中 /home/user/.ssh) 须逐项拦。
+            // strip_prefix(cwd_abs) 只证命中在 cwd 下, 不证非敏感。validate_cwd 是 O(sensitive_paths)
+            // 纯内存前缀比对 (无 fs syscall), 热路径成本微。保留逐项校验 = 正确性优先, 不降级。
             let check_target = if p.is_dir() {
                 p.to_string_lossy().into_owned()
             } else {
@@ -770,6 +774,11 @@ impl Tools {
         cwd: Option<&str>,
         opts: &GrepOptions,
     ) -> Result<GrepOutput> {
+        // D4-7 (审计 0827 product): regex 每次 grep 调用重建 (RegexBuilder + opts.multiline 变体)。
+        // regex crate 编译是 µs 级 (无 backtracking NFA, 单遍 DFA 构建), 远小于文件遍历/IO 主导耗时;
+        // 缓存需 keyed by (pattern, multiline) 二元组, 增内存 + 并发锁, 收益 <1% (Rule 2 不投机)。
+        // 调用方高频重复同 pattern 可自行缓存 Regex 传 pattern→但 API 收 &str, 不接受预编译 Regex;
+        // 若未来 profiling 证编译占主耗时, 再加 LazyLock<HashMap<(String,bool), Regex>> (YAGNI now)。
         let re = regex::RegexBuilder::new(pattern)
             .multi_line(opts.multiline)
             // 多行模式: . 匹配换行 (ripgrep -U 语义, 跨行块匹配)

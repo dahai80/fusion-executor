@@ -101,6 +101,9 @@ struct PyExecutionResult {
     /// M-OPS-06: 跨层关联 id (回填请求侧或入口自动生成)
     #[pyo3(get)]
     trace_id: Option<String>,
+    /// D3-4 (审计 0827 product): RSS watchdog 触发标记 (子进程树超 rss_limit_mb 被 kill)
+    #[pyo3(get)]
+    oom_killed: bool,
     /// RUN-11: 沙箱子进程 PID (调用方据此传 telemetry_stream 采样真实任务)
     #[pyo3(get)]
     pid: Option<u32>,
@@ -124,6 +127,7 @@ impl From<RsResult> for PyExecutionResult {
             rollback_unavailable: r.rollback_unavailable,
             rollback_skipped_reason: r.rollback_skipped_reason.clone(),
             trace_id: r.trace_id,
+            oom_killed: r.oom_killed,
             pid: r.pid,
         }
     }
@@ -229,6 +233,40 @@ impl From<RsGrepMatch> for PyGrepMatch {
             context_before: m.context_before,
             context_after: m.context_after,
         }
+    }
+}
+
+/// D6-03 (审计 0827 product): Python 可见快照条目 — 镜像 fe_rollback::SnapshotInfo。
+#[pyclass(name = "NativeSnapshotInfo", skip_from_py_object)]
+#[derive(Clone)]
+struct PySnapshotInfo {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    created_ms: u64,
+    #[pyo3(get)]
+    kind: String,
+}
+
+impl From<fe_rollback::SnapshotInfo> for PySnapshotInfo {
+    fn from(s: fe_rollback::SnapshotInfo) -> Self {
+        Self {
+            id: s.id,
+            created_ms: s.created_ms,
+            kind: s.kind,
+        }
+    }
+}
+
+#[pymethods]
+impl PySnapshotInfo {
+    /// dict 视图 — 供 Python 侧 Pydantic model_validate(fields) 构造。
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("id", self.id.clone())?;
+        d.set_item("created_ms", self.created_ms)?;
+        d.set_item("kind", self.kind.clone())?;
+        Ok(d)
     }
 }
 
@@ -603,8 +641,13 @@ struct PyExecutor {
 #[pymethods]
 impl PyExecutor {
     #[new]
-    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false))]
-    fn new(extra_whitelist: Option<Vec<String>>, disable_bundle_allowlist: bool) -> Self {
+    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false, allow_inline_interpreter=false, trusted_bin_dirs=None))]
+    fn new(
+        extra_whitelist: Option<Vec<String>>,
+        disable_bundle_allowlist: bool,
+        allow_inline_interpreter: bool,
+        trusted_bin_dirs: Option<Vec<String>>,
+    ) -> Self {
         // extra_whitelist 经 with_extra_whitelist 烘焙进 inner 的 ArcSwap; A-4 后 serve() 共享
         // inner, 无需单独存。SIGHUP reload 从 FUSION_EXECUTOR_EXTRA_WHITELIST env 读 (m-OPS-02)。
         let extras: Vec<&str> = extra_whitelist
@@ -619,6 +662,23 @@ impl PyExecutor {
             tracing::info!(count = extras.len(), "PyExecutor 构造带项目级白名单扩展");
             Executor::new().with_extra_whitelist(&extras)
         };
+        // D3-6 (审计 0827 product 4-layer): trusted_bin_dirs 注册项目工具所在目录 —
+        // extra_whitelist 的工具须 resolve 到可信目录才放行 (fail-closed 防 /tmp 投毒)。
+        // Python 测试/调用方登记项目 bin 目录后, 扩展工具 resolve 通过才 allowed。
+        if let Some(dirs) = trusted_bin_dirs.as_ref() {
+            let dir_refs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+            tracing::info!(
+                count = dir_refs.len(),
+                "PyExecutor 构造登记可信 bin 目录 (D3-6)"
+            );
+            inner = inner.with_trusted_bin_dirs(&dir_refs);
+        }
+        // D3-1 (审计 0827 product): 内联解释器网关 opt-in。默认 false (企业硬化拒 python -c /
+        // node -e / ruby -e / perl -e); true 保留 trusted-caller 内联执行能力 (测试机/本地交互)。
+        if allow_inline_interpreter {
+            tracing::info!("PyExecutor 构造开启内联解释器 (D3-1 trusted-caller opt-in)");
+            inner = inner.with_allow_inline_interpreter(true);
+        }
         // RUN-12: disable_bundle_allowlist=True → GuiConfig{allowed_bundle_ids: None} = 无限制
         //   (显式 opt-in, 仅审计日志); 默认 False 走 GuiConfig::default 的安全默认集 (Terminal/
         //   TextEdit/finder)。测试机需 drive 任意 app 时显式传 True 解除限制。
@@ -646,7 +706,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None, max_nofile=None, trace_id=None))]
+                        max_nproc=None, max_cpu_sec=None, max_nofile=None, rss_limit_mb=None, trace_id=None))]
     fn execute_sync(
         &self,
         py: Python<'_>,
@@ -663,6 +723,7 @@ impl PyExecutor {
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
         max_nofile: Option<u32>,
+        rss_limit_mb: Option<u32>,
         trace_id: Option<String>,
     ) -> PyResult<PyExecutionResult> {
         // L-PYO3-02: policy 入参无效应 fail-loud (旧版 warn+None 静默吞错, 调用方以为开了回滚实则没开)
@@ -702,6 +763,7 @@ impl PyExecutor {
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
             max_nofile: max_nofile.unwrap_or(1024),
+            rss_limit_mb: rss_limit_mb.unwrap_or(2048),
             trace_id,
         };
         // M-PYO3-02: 内部错误 fail-loud (旧版伪造 exit_code=-1 ExecutionResult, 调用方无法区分
@@ -731,6 +793,19 @@ impl PyExecutor {
                 tracing::error!(error = %e, "snapshot_create 失败");
                 pyo3::exceptions::PyRuntimeError::new_err(format!("snapshot_create 失败: {e}"))
             })
+    }
+
+    /// D6-03: list_snapshots(cwd) -> Vec<NativeSnapshotInfo> — on-disk 索引读回。
+    /// RUN-1: block_on 跨 git IO 阻塞, py.detach 释放 GIL。
+    fn list_snapshots(&self, py: Python<'_>, cwd: String) -> PyResult<Vec<PySnapshotInfo>> {
+        let inner = self.inner.clone();
+        let snaps = py
+            .detach(move || fe_core::BLOCKING_RT.block_on(inner.list_snapshots_async(&cwd)))
+            .map_err(|e| {
+                tracing::error!(error = %e, "list_snapshots 失败");
+                pyo3::exceptions::PyRuntimeError::new_err(format!("list_snapshots 失败: {e}"))
+            })?;
+        Ok(snaps.into_iter().map(PySnapshotInfo::from).collect())
     }
 
     /// rollback(snapshot_id, cwd) -> bool (Ok(false) = 跳过/非 repo, 合法)
@@ -826,7 +901,7 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None, max_nofile=None, trace_id=None))]
+                        max_nproc=None, max_cpu_sec=None, max_nofile=None, rss_limit_mb=None, trace_id=None))]
     fn execute_streaming(
         &self,
         py: Python<'_>,
@@ -843,6 +918,7 @@ impl PyExecutor {
         max_nproc: Option<u32>,
         max_cpu_sec: Option<u32>,
         max_nofile: Option<u32>,
+        rss_limit_mb: Option<u32>,
         trace_id: Option<String>,
     ) -> PyResult<PyStreamIterator> {
         let policy = match auto_rollback_policy {
@@ -881,6 +957,7 @@ impl PyExecutor {
             max_nproc: max_nproc.unwrap_or(1024),
             max_cpu_sec: max_cpu_sec.unwrap_or(0),
             max_nofile: max_nofile.unwrap_or(1024),
+            rss_limit_mb: rss_limit_mb.unwrap_or(2048),
             trace_id,
         }; // L-PYO3-01: execute_streaming async → 释 GIL 后在 BLOCKING_RT block_on (旧版持 GIL
            // 整个 spawn + 校验期间, 阻塞 Python 线程; detach 后 Python 可并发跑其他协程)
@@ -961,7 +1038,7 @@ impl PyExecutor {
     }
 
     /// shell_start(command, cwd=None, env_vars=None, task_id=None, max_output_chars=100000,
-    ///             seatbelt=False, inherit_env=False, max_nproc=1024, max_cpu_sec=0,
+    ///             seatbelt=True, inherit_env=False, max_nproc=1024, max_cpu_sec=0,
     ///             max_idle_sec=3600)
     /// -> NativeShellStartResult — 后台持久 shell 启动 (#1, run_in_background parity)
     /// 安全校验在 fe-core (fail-closed); blocked → ok=false, shell_id=None
@@ -973,7 +1050,7 @@ impl PyExecutor {
         env_vars=None,
         task_id=None,
         max_output_chars=100_000,
-        seatbelt=false,
+        seatbelt=true,
         inherit_env=false,
         max_nproc=1024,
         max_cpu_sec=0,
@@ -1310,6 +1387,7 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEditResult>()?;
     m.add_class::<PyGlobEntry>()?;
     m.add_class::<PyGrepMatch>()?;
+    m.add_class::<PySnapshotInfo>()?;
     m.add_class::<PyStreamIterator>()?;
     m.add_class::<PyTelemetryIterator>()?;
     m.add_class::<PyShellStartResult>()?;
@@ -1318,4 +1396,111 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyExecutor>()?;
     m.add_function(wrap_pyfunction!(version_info, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // D1-1 (审计 0827 arch / product): fe-pyo3 零 Rust 单元测试 — pyclass From 转换是纯 Rust 逻辑
+    // (字段映射, 无 GIL), 直接 cargo test -p fe-pyo3 覆盖。防 4 层 wire 字段漂移 (Rule 9)。
+
+    use super::*;
+
+    #[test]
+    fn d11_execution_result_from_maps_all_fields() {
+        let rs = RsResult {
+            exit_code: 0,
+            stdout: "out".into(),
+            stderr: "err".into(),
+            task_id: Some("t-1".into()),
+            command: Some("echo".into()),
+            duration_sec: 1.25,
+            timed_out: false,
+            blocked_by_security: false,
+            security_reason: None,
+            snapshot_id: Some("snap-9".into()),
+            diagnostics: Some(RsDiag {
+                error_type: Some("ValueError".into()),
+                file_path: Some("a.py".into()),
+                line_number: Some(7),
+                code_snippet: Some("x = 1".into()),
+                raw_trace: Some("Traceback".into()),
+            }),
+            auto_rolled_back: false,
+            rollback_unavailable: true,
+            rollback_skipped_reason: Some("snapshot-stale".into()),
+            trace_id: Some("trace-42".into()),
+            oom_killed: true,
+            pid: Some(1234),
+        };
+        let py = PyExecutionResult::from(rs);
+        assert_eq!(py.exit_code, 0);
+        assert_eq!(py.stdout, "out");
+        assert_eq!(py.stderr, "err");
+        assert_eq!(py.task_id.as_deref(), Some("t-1"));
+        assert_eq!(py.command.as_deref(), Some("echo"));
+        assert!((py.duration_sec - 1.25).abs() < f64::EPSILON);
+        assert!(!py.timed_out);
+        assert!(!py.blocked_by_security);
+        assert!(py.security_reason.is_none());
+        assert_eq!(py.snapshot_id.as_deref(), Some("snap-9"));
+        let diag = py.diagnostics.expect("diagnostics 应 Some");
+        assert_eq!(diag.error_type.as_deref(), Some("ValueError"));
+        assert_eq!(diag.file_path.as_deref(), Some("a.py"));
+        assert_eq!(diag.line_number, Some(7));
+        assert_eq!(diag.code_snippet.as_deref(), Some("x = 1"));
+        assert_eq!(diag.raw_trace.as_deref(), Some("Traceback"));
+        assert!(!py.auto_rolled_back);
+        assert!(py.rollback_unavailable);
+        assert_eq!(
+            py.rollback_skipped_reason.as_deref(),
+            Some("snapshot-stale")
+        );
+        assert_eq!(py.trace_id.as_deref(), Some("trace-42"));
+        assert!(py.oom_killed);
+        assert_eq!(py.pid, Some(1234));
+    }
+
+    #[test]
+    fn d11_execution_result_from_none_diagnostics_is_none() {
+        let rs = RsResult::default();
+        let py = PyExecutionResult::from(rs);
+        assert!(py.diagnostics.is_none(), "无诊断时 PyDiagnostics 应 None");
+        assert_eq!(py.exit_code, 0);
+        assert!(py.trace_id.is_none());
+        assert!(!py.oom_killed);
+    }
+
+    #[test]
+    fn d11_tools_from_conversions_map_fields() {
+        let er = PyEditResult::from(RsEditResult {
+            ok: true,
+            path: Some("p.rs".into()),
+            error: None,
+            matches: 3,
+        });
+        assert!(er.ok);
+        assert_eq!(er.path.as_deref(), Some("p.rs"));
+        assert!(er.error.is_none());
+        assert_eq!(er.matches, 3);
+
+        let ge = PyGlobEntry::from(RsGlobEntry {
+            path: "src/a.py".into(),
+            is_dir: false,
+        });
+        assert_eq!(ge.path, "src/a.py");
+        assert!(!ge.is_dir);
+
+        let gm = PyGrepMatch::from(RsGrepMatch {
+            path: "b.go".into(),
+            line_number: 9,
+            content: "panic".into(),
+            context_before: vec!["ctx1".into()],
+            context_after: vec!["ctx2".into()],
+        });
+        assert_eq!(gm.path, "b.go");
+        assert_eq!(gm.line_number, 9);
+        assert_eq!(gm.content, "panic");
+        assert_eq!(gm.context_before, vec!["ctx1".to_string()]);
+        assert_eq!(gm.context_after, vec!["ctx2".to_string()]);
+    }
 }

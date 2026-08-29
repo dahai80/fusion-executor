@@ -70,6 +70,27 @@ v1.8 COMPLETE (#1 background task API — new `fe-shell` crate, run_in_backgroun
 - #105 workspace verify + docs
 419 Rust + 190 Python (1 skip TCC) 全绿, clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat), fmt/ruff 净, maturin 构建. 提交链 #94-#105 on `fix/audit0827-p0-p3` (不 push 待命).
 
+**v0.2.4 enterprise-publishable upgrade (产品就绪审计, branch `fix/enterprise-upgrade-0828`):** 产品就绪审计 (`audit/fusion-executor-audit-result-product-0827.md` 只读参考, 基线 `9b96aeb` v0.2.3/PR #25) 判定 ❌ 不可企业级商用 (6 真 CRITICAL + 33 MAJOR/MINOR) → 升级至企业级可发布, 16 批次全落地:
+- D3-1 内联解释器网关: `fe-security::validate_argv` 默认拦截 `python -c`/`python -m`/`node -e`/`ruby -e`/`perl -e` (binary+flag 级, payload 内容无关 — 防 agent-driven 模型生成 one-liner 绕 regex 危险词枚举); `with_allow_inline_interpreter(true)` opt-in 受信调用方。Stage1 顶层 regex → tokenizer → Stage2 白名单 → argv 网关 (4 层防御纵深: 危险词 payload 由 Stage1 拦, 非白名单解释器由 Stage2 拦, 白名单解释器 + -c/-e 由网关拦)。`d311_blocks_inline_exec_payload_variants` 回归测试隔离测网关本身 (白名单解释器 + 无害 payload)。
+- ARCH-1 seatbelt 默认 True 4 层: `fe-core` serde `default_true` + `executor.py` run/run_streaming/shell_start 默认 True + Pydantic `ExecutionRequest.seatbelt` default True (D1-2/D2-3 drift 修 — Pydantic 旧默认 False 漂移, 已对齐 True) + Rust serde。`test_seatbelt_default_true_all_layers_no_drift` drift 断言锁。
+- ARCH-2 resolved-path 白名单: `fe-security::resolve_binary_path` 双校验 — (1) basename 在白名单; (2) 绝对路径 `starts_with(trusted_bin_dirs)` (默认 `/usr/bin`/`/usr/local/bin`/`/opt/homebrew/bin` + venv bin 自动注册)。`/tmp/python3` 同名投毒 → 拒 (D3-6 fail-closed)。`Executor` auto-register `VIRTUAL_ENV/bin` trusted dirs。
+- D3-4 每任务 RSS watchdog: `fe-sandbox` sysinfo 轮询子进程树 RSS, 超阈值 kill (exit -124, `oom_killed=true`); Darwin RLIMIT_AS no-op 故改 watchdog 非 rlimit。
+- RUN-4/RUN-10 rlimit: seatbelt profile + 非 seatbelt 路径 `setrlimit` NOFILE(1024)/NPROC(512)。
+- RUN-9 ppid 树 kill: `kill_tree` killpg + sysinfo ppid 树遍历兜底 (防孙进程 setsid 脱组逃逸)。
+- RUN-3 stream/exec 信号量分离: `fe-ipc` `exec_sem=16` (非流 execute) + `stream_sem=64` (流式), 长流不饿死短命令。
+- RUN-6 git 超时 + RUN-7 worktree gitdir: `fe-rollback::git()` `tokio::time::timeout(30s)` + `kill_on_drop`; `RepoLock::acquire` 不跨 `.await` (仅保瞬时状态读); `resolve_git_dir` `rev-parse --git-common-dir` (worktree `.git` 是文件 ENOTDIR bug 修)。
+- RUN-5 NFS 检测: `fe-tools::is_nfs` stat fstype, NFS mount → warn (不引分布式锁, Rule 2 — 当前单机 UDS 无 NFS 部署)。
+- IMPL-7 prompt-injection sanitize: `fe-diagnostics::slice()` 单一 chokepoint — `sanitize_file_path` (换行切分) + `sanitize_raw_trace` (inject_re→[filtered] 中和) + `sanitize_error_type`, 大小上限 1KB/4KB/256B。
+- RUN-12 默认 bundle 白名单 + IMPL-9 截图 TCC 分离: `fe-gui` `GuiConfig::default()` 非空安全集 (Terminal/TextEdit/Finder), `disable_bundle_allowlist` opt-in 无限制; screenshot `gui_action(Screenshot)` 走 Screen-Recording TCC (与 Accessibility 独立, early-return before AX gate)。
+- RUN-11 子进程 pid 遥测: `fe-telemetry` 沙箱执行自动采 child pid (非 executor pid), 4 层 surface。
+- IMPL-1 默认 socket + IMPL-3 Subscription 崩溃标记: Python `DEFAULT_SOCK=~/.fusion-executor/fe.sock` (4 层对齐 M-SEC-01); `Subscription.__next__` 断连区分正常结束 vs server 崩溃 → `ConnectionError` 非 StopIteration。
+- D4 perf: `LazyLock` profile cache (D4-1) + 16KB 读取缓冲 (D4-5) + 广播 fast-path (D4-4) + exec_sem gauge (D4-9) + worker clamp(2,8) (D4-12)。
+- ARCH-3 集成骨架: `examples/08_integrate_fusion_code.py` (本工程内单向消费 executor, 不 import fusion-code) + fusion-code 单向 issue (ARCH-7 调用方熔断 `max_consecutive_failures` 文档化)。
+- D1-1 fe-pyo3 首批 Rust 单元测试: `PyExecutionResult::From` 16 字段映射 + `PyEditResult`/`PyGlobEntry`/`PyGrepMatch` From 转换覆盖。
+- IMPL-8 DISPROVEN: pyo3 0.29 trampoline 已 `catch_unwind`, 无需 wrapper。
+- annotate (D3-7/D4-7): seatbelt allowlist-by-default rationale + grep per-call regex rebuild µs-level rationale。
+**出口: 476 Rust + 195 Python (6 skip TCC) 测试全绿**, clippy `--all-targets -D warnings` 净 (仅上游 block v0.1.6 future-incompat), fmt/ruff 净, maturin 构建. 跨工程 Issue #23 (fusion-guard Phase 3) 延期 — 超范围。提交链 16 批次 on `fix/enterprise-upgrade-0828`, 合并至 main, tag `v0.2.4` + GitHub release。
+
 See `architecture/fusion-executor-prd.md` §4 for the full `ExecutionRequest` / `ExecutionResult` field list and the Diagnostics Slicer algorithm.
 
 ## Build / Test / Lint

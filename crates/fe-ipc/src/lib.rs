@@ -7,7 +7,7 @@
 //   扩展: -32010 安全拦截, -32011 超时, -32012 回滚失败, -32013 AX 未授权
 // 匹配 fusion-studio IPCClient.swift: 按字节读到 0x0A, 8s 超时
 //
-// 方法: executor.health/execute/execute_stream/telemetry_stream/snapshot_create/rollback/gui_action/diagnostics
+// 方法: executor.health/execute/execute_stream/telemetry_stream/snapshot_create/list_snapshots/rollback/gui_action/diagnostics
 //       executor.file_edit/glob/grep/apply_patch/replace_function/shutdown
 //       executor.subscribe/unsubscribe  (v1.5 #14 — 双向 server-push)
 //
@@ -30,13 +30,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use fe_core::gui::GuiAction;
 use fe_core::TelemetryStreamConfig;
@@ -129,6 +129,52 @@ fn parse_shutdown_timeout(raw: Option<String>) -> Duration {
     }
 }
 
+/// D6-02: execute 墙钟直方图固定桶上界 (秒)。+Inf 末桶不计入数组 (独立 total = exec_total)。
+/// 桶选型覆盖 CLI 沙箱典型档: <5ms init / <50ms 快命令 / <500ms 编译 / <5s 测试套 / <30s 长跑 / +Inf 尾部。
+const DURATION_BUCKETS_LE: [f64; 5] = [0.005, 0.05, 0.5, 5.0, 30.0];
+
+/// D6-02: 墙钟 (秒) → 桶下标; 越过所有有限桶 → None (落入 +Inf 末桶, 不递增数组)。
+fn duration_bucket_index(sec: f64) -> Option<usize> {
+    for (i, le) in DURATION_BUCKETS_LE.iter().enumerate() {
+        if sec <= *le {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// D6-02: histogram_quantile 插值 — 累计计数数组 (每桶含自身及更小) → 分位值 (秒)。
+/// q ∈ [0,1]。线性插值跨相邻桶 (Prometheus _quantile_ 约定)。空/不足 → 0.0。
+fn histogram_quantile(cumulative: &[u64], q: f64) -> f64 {
+    let total = cumulative.last().copied().unwrap_or(0);
+    if total == 0 {
+        return 0.0;
+    }
+    let target = (total as f64) * q.clamp(0.0, 1.0);
+    for i in 0..cumulative.len() {
+        if (cumulative[i] as f64) >= target {
+            if i == 0 {
+                return DURATION_BUCKETS_LE.first().copied().unwrap_or(0.0);
+            }
+            let prev = cumulative[i - 1] as f64;
+            let cur = cumulative[i] as f64;
+            if cur <= prev {
+                return DURATION_BUCKETS_LE[i];
+            }
+            let lo = if i == 1 {
+                0.0
+            } else {
+                DURATION_BUCKETS_LE[i - 2]
+            };
+            let hi = DURATION_BUCKETS_LE[i - 1];
+            let frac = (target - prev) / (cur - prev);
+            return lo + (hi - lo) * frac;
+        }
+    }
+    // q 落在 +Inf 末桶 (超过所有有限桶累计) → 返回最大有限上界 (保守, 不假装无限)。
+    DURATION_BUCKETS_LE.last().copied().unwrap_or(0.0)
+}
+
 /// M-OPS-02: Prometheus recorder handle — global, idempotent 安装。
 /// metrics-exporter-prometheus 的 PrometheusBuilder::install() 安装全局 recorder,
 /// 返 PrometheusHandle (render() 出 Prometheus text format 供 scrape)。
@@ -143,7 +189,20 @@ static PROM_HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 pub fn install_prometheus_recorder() -> Option<PrometheusHandle> {
     PROM_HANDLE
         .get_or_init(|| {
-            let handle = PrometheusBuilder::new()
+            // D6-02: 配置直方图桶与 DURATION_BUCKETS_LE 对齐 — render() 出 _bucket{le=...} 行。
+            // set_buckets_for_metric 消费 self 返 Result<PrometheusBuilder, BuildError>;
+            // .ok()? 转 Option<PrometheusBuilder> (空桶→BuildError→None, 降级仅 JSON)。
+            let builder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Prefix("fe_exec_duration".to_string()),
+                    &DURATION_BUCKETS_LE,
+                )
+                .map_err(|e| {
+                    warn!(error = %e, "D6-02: set_buckets_for_metric 失败");
+                    e
+                })
+                .ok()?;
+            let handle = builder
                 .install_recorder()
                 .map_err(|e| {
                     warn!(error = %e, "M-OPS-02: Prometheus recorder install 失败");
@@ -157,8 +216,15 @@ pub fn install_prometheus_recorder() -> Option<PrometheusHandle> {
             metrics::describe_counter!("fe_exec_failed", "Executes failed (non-0/timeout/blocked)");
             metrics::describe_counter!("fe_rollback_total", "Total rollback() calls");
             metrics::describe_counter!("fe_rollback_failed", "Rollback failures");
+            metrics::describe_histogram!(
+                "fe_exec_duration_seconds",
+                "Execute() wall-clock duration (seconds)"
+            );
             metrics::describe_gauge!("fe_shell_active", "Active background shells");
             metrics::describe_gauge!("fe_connections", "Active UDS connections");
+            // D4-9: 非流式 exec_sem 可用许可 — LB/运维面板据此判饱和 (0=满载分流)。与 health
+            // response available_permits 同源; Prometheus exporter 镜像成 gauge 供 scrape。
+            metrics::describe_gauge!("fe_exec_sem_available", "Available exec semaphore permits");
             Some(handle)
         })
         .clone()
@@ -226,6 +292,12 @@ struct BroadcastHub {
     /// execute 累计墙钟 (ns) + stdio 累计字节 — 配合 exec_total 算均值
     exec_duration_nanos_sum: AtomicU64,
     stdio_bytes_sum: AtomicU64,
+    /// D6-02: execute 墙钟固定桶直方图 (ns) — p50/p95/p99 经 histogram_quantile 插值。
+    /// 6 桶上界 (秒): 0.005 / 0.05 / 0.5 / 5 / 30 / +Inf。AtomicU64 无锁, snapshot 累加走桶。
+    exec_duration_buckets: [AtomicU64; DURATION_BUCKETS_LE.len()],
+    /// D6-02: 墙钟 min/max (ns) — 单次最快/最慢, 配合直方图看尾部分布。
+    exec_duration_nanos_min: AtomicU64,
+    exec_duration_nanos_max: AtomicU64,
     /// M-OPS-02: Prometheus handle — render() 出 text format 供 executor.metrics_prometheus。
     /// None = recorder install 失败 (降级: 仅 JSON snapshot, 无 prometheus 端点)。
     prom_handle: Option<PrometheusHandle>,
@@ -253,6 +325,15 @@ impl BroadcastHub {
             rollback_failed: AtomicU64::new(0),
             exec_duration_nanos_sum: AtomicU64::new(0),
             stdio_bytes_sum: AtomicU64::new(0),
+            exec_duration_buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            exec_duration_nanos_min: AtomicU64::new(u64::MAX),
+            exec_duration_nanos_max: AtomicU64::new(0),
             prom_handle: install_prometheus_recorder(),
         })
     }
@@ -282,6 +363,40 @@ impl BroadcastHub {
         // stdio 字节 (stdout+stderr 截断后长度 — 真实传输量)
         let bytes = (r.stdout.len() + r.stderr.len()) as u64;
         self.stdio_bytes_sum.fetch_add(bytes, Ordering::Relaxed);
+        // D6-02: 墙钟直方图 (blocked/timeout duration=0 落首桶; 真实墙钟按桶上界分档)。
+        let dur_sec = r.duration_sec.max(0.0);
+        if let Some(i) = duration_bucket_index(dur_sec) {
+            self.exec_duration_buckets[i].fetch_add(1, Ordering::Relaxed);
+        }
+        // min/max (CAS 循环: 无锁更新, 无混叠)
+        if dur_ns < self.exec_duration_nanos_min.load(Ordering::Relaxed) {
+            let mut cur = self.exec_duration_nanos_min.load(Ordering::Relaxed);
+            while dur_ns < cur {
+                match self.exec_duration_nanos_min.compare_exchange_weak(
+                    cur,
+                    dur_ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(v) => cur = v,
+                }
+            }
+        }
+        let mut cur_max = self.exec_duration_nanos_max.load(Ordering::Relaxed);
+        while dur_ns > cur_max {
+            match self.exec_duration_nanos_max.compare_exchange_weak(
+                cur_max,
+                dur_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur_max = v,
+            }
+        }
+        // D6-02: 镜像进 Prometheus 直方图 (render() 出 _bucket{le=...})。
+        metrics::histogram!("fe_exec_duration_seconds").record(dur_sec);
     }
 
     /// C-OPS-05: 记一次 rollback — ok=true 算 total, false 算 total+failed
@@ -296,6 +411,7 @@ impl BroadcastHub {
 
     /// C-OPS-05: 指标快照 — 转为 JSON 给 executor.metrics handler。
     /// 均值用 exec_total 算 (blocked/timeout 不计 duration — 它们 duration_sec=0)。
+    /// D6-02: 墙钟直方图 — 累计计数 (每桶含自身及更小) → histogram_quantile 插值 p50/p95/p99。
     fn metrics_snapshot(&self) -> Value {
         let total = self.exec_total.load(Ordering::Relaxed);
         let dur_ns_sum = self.exec_duration_nanos_sum.load(Ordering::Relaxed);
@@ -306,6 +422,31 @@ impl BroadcastHub {
             0.0
         };
         let avg_stdio_bytes = stdio_sum.checked_div(total).unwrap_or(0);
+        // D6-02: 累计计数 — cumulative[i] = 桶 0..=i 原子求和, 末位 = total (含 +Inf)。
+        let per_bucket: Vec<u64> = self
+            .exec_duration_buckets
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let mut cumulative: Vec<u64> = Vec::with_capacity(per_bucket.len() + 1);
+        let mut acc = 0u64;
+        for c in &per_bucket {
+            acc += c;
+            cumulative.push(acc);
+        }
+        cumulative.push(total); // +Inf 末桶 = 全部 execute
+        let p50 = histogram_quantile(&cumulative, 0.5);
+        let p95 = histogram_quantile(&cumulative, 0.95);
+        let p99 = histogram_quantile(&cumulative, 0.99);
+        let min_sec = {
+            let m = self.exec_duration_nanos_min.load(Ordering::Relaxed);
+            if m == u64::MAX {
+                0.0
+            } else {
+                (m as f64) / 1e9
+            }
+        };
+        let max_sec = (self.exec_duration_nanos_max.load(Ordering::Relaxed) as f64) / 1e9;
         json!({
             "exec_total": total,
             "exec_success": self.exec_success.load(Ordering::Relaxed),
@@ -313,6 +454,13 @@ impl BroadcastHub {
             "exec_timeout": self.exec_timeout.load(Ordering::Relaxed),
             "exec_failed": self.exec_failed.load(Ordering::Relaxed),
             "execute_duration_sec_avg": avg_dur_sec,
+            "execute_duration_sec_min": min_sec,
+            "execute_duration_sec_max": max_sec,
+            "execute_duration_sec_p50": p50,
+            "execute_duration_sec_p95": p95,
+            "execute_duration_sec_p99": p99,
+            "execute_duration_buckets": per_bucket,
+            "execute_duration_bucket_le": DURATION_BUCKETS_LE,
             "stdio_bytes_total": stdio_sum,
             "stdio_bytes_avg": avg_stdio_bytes,
             "rollback_total": self.rollback_total.load(Ordering::Relaxed),
@@ -586,11 +734,16 @@ impl BroadcastHub {
     /// source_conn = 发起该命令的连接 conn_id (OwnConn 过滤用); data 含 task_id (Tasks 过滤用)。
     /// Blocker 10 (审计 2.9): 旧版无过滤全广播 = 跨租户泄漏 (Agent A 见 Agent B stdout)。
     fn broadcast_stdio(&self, data: Value, source_conn: u64) {
+        // D4-4: 快路径 — 0 stdio 订阅时跳过 task_id 提取 + 逐订阅 frame 构建 (避免无订阅时
+        // 仍锁 registry 建 Vec + clone Value)。collect_targets 空即无订阅, 直接返回零工作。
+        let targets = self.collect_targets(CH_STDIO);
+        if targets.is_empty() {
+            return;
+        }
         let task_id = data
             .get("task_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let targets = self.collect_targets(CH_STDIO);
         for (sub_id, scope, tx) in targets {
             if !scope.allows(task_id.as_deref(), source_conn) {
                 continue;
@@ -598,6 +751,30 @@ impl BroadcastHub {
             let frame = notification(sub_id.clone(), CH_STDIO, data.clone());
             if tx.try_send(frame).is_err() {
                 warn!(%sub_id, "stdio 帧满通道被丢 (P-IPC-01)");
+            }
+        }
+    }
+
+    /// stdio 广播 (阻塞版) — done 帧专用。done 是流终止标记, 丢不得 (调用方见不到结束)。
+    /// 与 broadcast_stdio 区别: 用 `tx.send(frame).await` (等槽位) 而非 try_send (满即丢)。
+    /// D5-3: 旧版 done 也走 try_send, 慢消费者满通道时 done 被丢, 订阅方永不收尾 → 挂死。
+    async fn broadcast_stdio_blocking(&self, data: Value, source_conn: u64) {
+        let targets = self.collect_targets(CH_STDIO);
+        if targets.is_empty() {
+            return;
+        }
+        let task_id = data
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        for (sub_id, scope, tx) in targets {
+            if !scope.allows(task_id.as_deref(), source_conn) {
+                continue;
+            }
+            let frame = notification(sub_id.clone(), CH_STDIO, data.clone());
+            // 阻塞等槽位 — done 不可丢。tx 关闭 (订阅方断连) → send 返 Err, warn! 记 (非 panic)。
+            if tx.send(frame).await.is_err() {
+                warn!(%sub_id, "stdio done 帧发送失败 — 订阅方已断连 (D5-3)");
             }
         }
     }
@@ -700,28 +877,76 @@ impl IpcServer {
         std::env::var("FUSION_EXECUTOR_SOCK").unwrap_or_else(|_| default_sock_path())
     }
 
-    /// 异步 serve — bind + unlink 旧 sock + chmod 0o600 + accept 循环
+    /// D6-07: bind socket 带陈旧 socket 自愈。
+    /// 旧版无条件 unlink 旧 socket 再 bind — 会劫持正在运行的实例 (D6-05 多实例冲突)。
+    /// 新版: 直接 bind; EADDRINUSE 时探测 liveness —
+    ///   connect 成功 = 有活实例 → fail-loud (拒绝劫持);
+    ///   connect 失败 = 陈旧死 socket → unlink + 重 bind 一次 (自愈)。
+    /// 残留竞态: check→rebind 窗口内他实例可能 bind 同路径, 二次 bind 仍失败 → fail-loud。
+    /// 真正原子需 bindfd+flock, 对 UDS 本地受信场景过度, 文档标注残留窗口可接受。
+    /// D6-08: 错误消息用英文 FATAL/WARN 关键词便于 ops grep/alert。
+    fn bind_with_stale_recovery(path: &Path) -> Result<UnixListener> {
+        match UnixListener::bind(path) {
+            Ok(l) => Ok(l),
+            Err(e) => {
+                // 仅 EADDRINUSE 走陈旧自愈; 其他 bind 错误 (权限/路径) 直接 fail-loud。
+                let in_use = e
+                    .raw_os_error()
+                    .map(|c| c == libc::EADDRINUSE || c == libc::EEXIST)
+                    .unwrap_or(false);
+                if !in_use {
+                    error!(sock = %path.display(), error = %e, "FATAL: socket bind failed");
+                    return Err(anyhow::anyhow!(
+                        "FATAL: socket bind failed: {}: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+                // D6-07: 探测占位 socket 是否活实例。
+                let live = std::os::unix::net::UnixStream::connect(path).is_ok();
+                if live {
+                    error!(sock = %path.display(), "FATAL: socket already in use — live instance detected, refusing to hijack; set FUSION_EXECUTOR_SOCK to run a second instance");
+                    return Err(anyhow::anyhow!(
+                        "FATAL: socket already in use (live instance on {}); \
+                         set FUSION_EXECUTOR_SOCK to run a second instance",
+                        path.display()
+                    ));
+                }
+                // 陈旧死 socket — unlink + 重 bind 一次。
+                warn!(sock = %path.display(), "WARN: stale socket detected (no live listener), unlinking and rebinding");
+                let _ = std::fs::remove_file(path);
+                UnixListener::bind(path).map_err(|e2| {
+                    error!(sock = %path.display(), error = %e2, "FATAL: socket rebind failed after stale cleanup");
+                    anyhow::anyhow!(
+                        "FATAL: socket rebind failed after stale cleanup: {}: {}",
+                        path.display(),
+                        e2
+                    )
+                })
+            }
+        }
+    }
+
+    /// 异步 serve — bind + chmod 0o600 + accept 循环
     /// 返回 (shutdown_tx, join_handle): 调用方发 shutdown_tx 触发优雅退出, 可 await join 等待清理
+    /// D6-05/07: bind 经 bind_with_stale_recovery — 活实例 fail-loud, 陈旧 socket 自愈 (不无条件 unlink)。
+    /// D6-05: 多实例需显式设 FUSION_EXECUTOR_SOCK (不同 socket) + FE_LOG_DIR (不同日志) 各实例独立。
     pub async fn serve(
         &self,
         sock_path: &str,
     ) -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
         let path = Path::new(sock_path).to_path_buf();
-        if path.exists() {
-            info!(sock = %path.display(), "清理旧 socket");
-            let _ = std::fs::remove_file(&path);
-        }
         // C-10: 先建 + 收紧父目录 0o700, 再 bind — 消除 bind→chmod 间窗口。
         // ensure_sock_dir 内对已存在目录也收紧权限 (旧版早 return 跳过 = 残留宽松目录)。
-        ensure_sock_dir(&path);
-        let listener = UnixListener::bind(&path)
-            .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", path.display(), e))?;
-        chmod_secure(&path);
+        // D3-8: 权限收紧失败 → fail-loud, serve 拒绝启动 (世界可读写 socket = M-SEC-01 绕过)。
+        ensure_sock_dir(&path)?;
+        let listener = Self::bind_with_stale_recovery(&path)?;
+        chmod_secure(&path)?;
         info!(sock = %path.display(), "IPC 服务器监听中");
-        // ARCH-1: seatbelt 治理 — execute 默认 true (商用安全默认, 对齐 fe-core serde default_true)。
-        // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。shell_start 路径仍默认 false。
+        // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
+        // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
         info!(
-            "seatbelt 默认开启 (execute 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
+            "seatbelt 默认开启 (execute + shell_start 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
         );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -753,18 +978,14 @@ impl IpcServer {
         let shells = self.shells.clone();
         fe_core::BLOCKING_RT.block_on(async move {
             let p = Path::new(&path).to_path_buf();
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-            ensure_sock_dir(&p);
-            let listener = UnixListener::bind(&p)
-                .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", p.display(), e))?;
-            chmod_secure(&p);
+            ensure_sock_dir(&p)?;
+            let listener = Self::bind_with_stale_recovery(&p)?;
+            chmod_secure(&p)?;
             info!(sock = %p.display(), "IPC 服务器监听中 (blocking, 信号可停)");
-            // ARCH-1: seatbelt 治理 — execute 默认 true (商用安全默认, 对齐 fe-core serde default_true)。
-            // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。shell_start 路径仍默认 false。
+            // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
+            // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
             info!(
-                "seatbelt 默认开启 (execute 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
+                "seatbelt 默认开启 (execute + shell_start 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
             );
             let (_tx, rx) = oneshot::channel::<()>();
             // 信号任务: 收 SIGINT/SIGTERM → notify_waiters, accept_loop 自行退出并 drain
@@ -1440,14 +1661,16 @@ async fn handle_execute_stream(
                 // L-6: streaming exec 完成也记指标 — 旧版漏 record_exec, Prometheus
                 // fe_exec_total 漏计流式执行 (仅非流式 execute 计)。与非流式 handler 对齐。
                 hub.record_exec(&r);
-                hub.broadcast_stdio(
+                // D5-3: done 帧走阻塞广播 — 不可丢 (订阅方须见流终止标记)。
+                hub.broadcast_stdio_blocking(
                     json!({
                         "task_id": task_id,
                         "event": "done",
                         "result": result_val.clone(),
                     }),
                     conn_id,
-                );
+                )
+                .await;
                 json!({"type": "done", "result": result_val})
             }
         };
@@ -1513,22 +1736,30 @@ async fn handle_method(
     match method {
         "executor.health" => {
             // C-OPS-05: ok 由真实探针决定 (非硬编码) — 探 BLOCKING_RT 响应 + 外部依赖 (git)。
-            // BLOCKING_RT 停摆 / worker 全阻塞 / 死锁 → spawn 超时 → ok:false, 负载均衡器摘除卡死实例。
-            let rt_ok = probe_runtime(Duration::from_secs(1)).await;
+            // D2-2 修 (2026-08-28): 旧版 probe_runtime 在 BLOCKING_RT 上 spawn 空任务 + 1s 超时;
+            // 16 并发执行饱和 + worker 数有限时, 探针任务排队 → 超时 → rt_ok=false → 误报摘除正常忙碌实例。
+            // 新版区分 alive/busy/dead: 短超时 (200ms) 探 BLOCKING_RT 响应 (空闲 worker 立即拾取);
+            // 超时再查 exec_sem 可用许可 — 0=饱和 (忙碌但健康, LB 应分流非摘除), >0 仍超时=停摆 (真不健康)。
+            let rt = probe_runtime(Duration::from_millis(200), exec_sem.available_permits()).await;
+            // D4-9: health 探针同步镜像 exec_sem 可用数成 Prometheus gauge (scrape 路径互补)。
+            metrics::gauge!("fe_exec_sem_available").set(exec_sem.available_permits() as f64);
             let deps = probe_dependencies().await;
             // 任一核心依赖缺失 → ok:false (依赖不健康 = 服务降级)
             let deps_ok = deps.iter().all(|d| d["ok"].as_bool() == Some(true));
-            let ok = rt_ok && deps_ok;
+            // ok 仅在 dead (停摆) 或依赖缺失时 false; busy 仍 ok=true (忙碌是正常负载, 非故障)。
+            let ok = rt.healthy() && deps_ok;
             Ok(json!({
                 "ok": ok,
                 "version": env!("CARGO_PKG_VERSION"),
                 "git_sha": env!("FE_GIT_SHA"),
                 "build_time": env!("FE_BUILD_TIME"),
                 "ax_trusted": fe_core::gui::GuiController::ax_trusted(),
-                // ARCH-1: seatbelt 治理信号 — execute 默认 true (商用安全默认)。
-                // 负载均衡器/运维查此字段知实例 execute 路径默认开运行时隔离; shell_start 路径仍默认 false。
+                // ARCH-1: seatbelt 治理信号 — execute + shell_start 均默认 true (商用安全默认)。
+                // 负载均衡器/运维查此字段知实例默认开运行时隔离。
                 "seatbelt_default_on": true,
-                "runtime": { "ok": rt_ok },
+                // D2-2: runtime 三态 — alive (空闲响应)/busy (饱和分流)/dead (停摆摘除)。
+                // ok=alive||busy; dead → ok=false。busy 供 LB 分流 (非摘除)。
+                "runtime": { "ok": rt.healthy(), "state": rt.state(), "available_permits": rt.available_permits },
                 "dependencies": deps,
                 // M-OPS-04/M-OPS-05: 运维深度指标 — 连接数/worker 线程/活跃 shell/内存。
                 // 运维面板 + 负载均衡器据此判断实例负载与 shell 注册表水位。
@@ -1544,20 +1775,27 @@ async fn handle_method(
                 .acquire()
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("exec_sem 已关闭: {e}")))?;
+            // D4-9: 取 permit 后镜像可用数成 gauge (permit drop 在 handler 末尾, Rust 无 drop 钩子点位,
+            // 故 acquire 后即时 set 一次反映新水位; 下一请求 acquire 时再刷新)。
+            metrics::gauge!("fe_exec_sem_available").set(exec_sem.available_permits() as f64);
             let r: ExecutionResult = executor
                 .execute_async(req)
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("execute 失败: {}", e)))?;
             hub.record_exec(&r);
+            // D4-9: 释放前刷新水位 (permit 即将 drop 归还)。
+            metrics::gauge!("fe_exec_sem_available").set((exec_sem.available_permits() + 1) as f64);
             let val = serde_json::to_value(&r).unwrap_or(json!({}));
-            hub.broadcast_stdio(
+            // D5-3: done 帧走阻塞广播 — 不可丢 (订阅方须见流终止标记)。
+            hub.broadcast_stdio_blocking(
                 json!({
                     "task_id": task_id,
                     "event": "done",
                     "result": val.clone(),
                 }),
                 conn_id,
-            );
+            )
+            .await;
             Ok(val)
         }
         "executor.snapshot_create" => {
@@ -1567,6 +1805,25 @@ async fn handle_method(
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("snapshot_create 失败: {}", e)))?;
             Ok(json!({"snapshot_id": id}))
+        }
+        // D6-03 (审计 0827 product): 快照清单 — on-disk NDJSON 索引读回, 供 on-call/审计查询。
+        "executor.list_snapshots" => {
+            let cwd = param_str(&params, "cwd").ok_or((ERR_INVALID_REQ, "缺少 cwd".to_string()))?;
+            let snaps = executor
+                .list_snapshots_async(&cwd)
+                .await
+                .map_err(|e| (ERR_INTERNAL, format!("list_snapshots 失败: {}", e)))?;
+            let arr: Vec<serde_json::Value> = snaps
+                .into_iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id,
+                        "created_ms": s.created_ms,
+                        "kind": s.kind,
+                    })
+                })
+                .collect();
+            Ok(json!({"snapshots": arr}))
         }
         // Issue #11 / #12.4: 非执行预校验 — 调用方 (fusion-code) 先问用户授权再 execute。
         // Executor 只强制硬黑名单 (never-blocked); interactive confirmation 归 caller (Option A, stateless)。
@@ -1808,7 +2065,7 @@ async fn handle_method(
             let seatbelt = params
                 .get("seatbelt")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(true);
             let inherit_env = params
                 .get("inherit_env")
                 .and_then(|v| v.as_bool())
@@ -1893,12 +2150,64 @@ async fn handle_method(
     }
 }
 
-/// C-OPS-05: 探 BLOCKING_RT 响应 — spawn 空任务 + 超时, 超时即 rt_ok=false (worker 停摆/死锁)。
-/// BLOCKING_RT 是 executor 异步 runtime; 停摆则一切 execute 阻塞, 健康检查必须探测到。
-async fn probe_runtime(timeout: Duration) -> bool {
+/// D2-2 (2026-08-28): 运行时健康三态 — 区分 "忙碌但健康" 与 "停摆故障"。
+/// 旧版 bool 探针在饱和负载下误报不健康 (探针任务排队超时), 导致 LB 摘除正常忙碌实例。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeState {
+    Alive,
+    Busy,
+    Dead,
+}
+
+struct RuntimeHealth {
+    state: RuntimeState,
+    available_permits: usize,
+}
+
+impl RuntimeHealth {
+    /// ok=alive||busy; dead 才算不健康 (停摆需摘除)。
+    fn healthy(&self) -> bool {
+        !matches!(self.state, RuntimeState::Dead)
+    }
+
+    /// JSON 序列化用状态字符串。
+    fn state(&self) -> &'static str {
+        match self.state {
+            RuntimeState::Alive => "alive",
+            RuntimeState::Busy => "busy",
+            RuntimeState::Dead => "dead",
+        }
+    }
+}
+
+/// C-OPS-05 + D2-2: 探 BLOCKING_RT 响应, 区分三态。
+/// 短超时 (调用方传 200ms) spawn 空任务 — 空闲 worker 立即拾取 = alive;
+/// 超时再查 exec_sem 可用许可: 0=饱和 (busy, 忙碌但健康), >0 仍超时=停摆 (dead, 真故障)。
+/// BLOCKING_RT 停摆 / worker 全死锁 → spawn 永不完成 + 有空闲许可 → dead → ok:false 摘除。
+async fn probe_runtime(timeout: Duration, available_permits: usize) -> RuntimeHealth {
     let h = fe_core::BLOCKING_RT.handle();
     let task = h.spawn(async {});
-    tokio::time::timeout(timeout, task).await.is_ok()
+    let state = if tokio::time::timeout(timeout, task).await.is_ok() {
+        RuntimeState::Alive
+    } else if available_permits == 0 {
+        // 无可用执行许可 = 16 槽全占 = 饱和负载, 探针排队是预期非故障。
+        warn!(
+            available_permits,
+            "D2-2: 健康探针超时但 exec_sem 饱和, 判 busy (忙碌但健康, 非停摆)"
+        );
+        RuntimeState::Busy
+    } else {
+        // 有空闲执行许可但 runtime 不响应 = worker 停摆/死锁, 真故障。
+        error!(
+            available_permits,
+            "D2-2: 健康探针超时且有空闲许可, 判 dead (BLOCKING_RT 停摆/死锁)"
+        );
+        RuntimeState::Dead
+    };
+    RuntimeHealth {
+        state,
+        available_permits,
+    }
 }
 
 /// C-OPS-05 + 0827 P-1: 探外部依赖 — `git --version` (rollback/快照依赖 git CLI)。
@@ -1993,47 +2302,80 @@ fn err_str(id: Value, code: i64, message: &str) -> String {
 
 /// chmod 0o600 — 仅 owner 可读写 (本地提权防护, C-IPC-01)。
 /// 监听前已 unlink 旧 socket, bind 后立即收紧权限。
+/// D3-8 企业硬化: 权限收紧失败 = world 可读写 socket = M-SEC-01 绕过 → fail-loud 返 Err, serve 拒绝启动。
 #[cfg(unix)]
-fn chmod_secure(path: &Path) {
+fn chmod_secure(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        warn!(path = %path.display(), error = %e, "chmod 0o600 失败");
-    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        error!(path = %path.display(), error = %e, "FATAL: chmod 0o600 socket 失败 — 拒绝 world-readable socket 启动 (D3-8)");
+        anyhow::anyhow!("chmod 0o600 socket 失败 (D3-8 企业硬化): {}: {}", path.display(), e)
+    })?;
+    info!(path = %path.display(), "socket 收紧 0o600 (owner-only rw, C-IPC-01)");
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn chmod_secure(_path: &Path) {}
+fn chmod_secure(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// M-SEC-01 + 0827 C-10: 建 socket 父目录 0o700 — 私有目录阻他 UID connect (目录无搜索权限)。
 /// 仅对 HOME 下默认路径生效; 显式 /tmp 覆盖路径走 chmod_secure 0o600 单文件。
 /// C-10 修: 已存在目录**也收紧 0o700** (旧版早 return = 残留宽松目录, 他 UID 可 traverse+connect)。
 /// 仅对本次新建/本服务 socket 父目录收紧; 上级 (HOME 本身) 不动 — 收紧的是 ~/.fusion-executor。
+/// D3-8 企业硬化:
+///   - create_dir_all 失败 → fail-loud Err (无法建私有目录 = 无法保证隔离)。
+///   - 我们新建的目录 chmod 0o700 失败 → fail-loud Err (自己建的目录理应可收紧, 失败 = FS 异常)。
+///   - 已存在非自有目录 (如共享 /tmp 根) chmod EPERM/EACCES → 降级 warn + Ok (非 HOME 默认路径, 靠文件 0o600 兜底)。
+///   - chmod 其他错误 (只读 FS/IO) → fail-loud Err。
 #[cfg(unix)]
-fn ensure_sock_dir(path: &Path) {
+fn ensure_sock_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let Some(parent) = path.parent() else {
-        return;
+        return Ok(());
     };
     if parent.as_os_str().is_empty() {
-        return;
+        return Ok(());
     }
-    if !parent.exists() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!(dir = %parent.display(), error = %e, "M-SEC-01: 建 socket 私有目录失败");
-            return;
-        }
+    let pre_existing = parent.exists();
+    if !pre_existing {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            error!(dir = %parent.display(), error = %e, "FATAL: 建 socket 私有目录失败 — 拒绝启动 (D3-8 M-SEC-01)");
+            anyhow::anyhow!("建 socket 私有目录失败 (D3-8 M-SEC-01): {}: {}", parent.display(), e)
+        })?;
         info!(dir = %parent.display(), "M-SEC-01: socket 父目录已建");
     }
-    // C-10: 无论新建或已存在, 收紧 0o700。已存在宽松目录 (如旧版残留 0o755) → 修。
-    if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
-        warn!(dir = %parent.display(), error = %e, "M-SEC-01: chmod 0o700 私有目录失败");
-    } else {
-        info!(dir = %parent.display(), "M-SEC-01: socket 父目录收紧 0o700 (阻他 UID traverse/connect)");
+    // C-10: 无论新建或已存在, 尝试收紧 0o700。
+    match std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
+        Ok(()) => {
+            info!(dir = %parent.display(), "M-SEC-01: socket 父目录收紧 0o700 (阻他 UID traverse/connect)");
+        }
+        Err(e) => {
+            let perm_denied = matches!(e.raw_os_error(), Some(1) | Some(13)); // EPERM/EACCES
+            if !pre_existing || !perm_denied {
+                // 新建目录收紧失败 (我们拥有, 应可收紧) 或非权限类 IO 错误 → fail-loud。
+                error!(dir = %parent.display(), error = %e, "FATAL: chmod 0o700 私有目录失败 — 拒绝其他 UID traverse/connect (D3-8 M-SEC-01)");
+                return Err(anyhow::anyhow!(
+                    "chmod 0o700 私有目录失败 (D3-8 M-SEC-01): {}: {}",
+                    parent.display(),
+                    e
+                ));
+            }
+            // 已存在非自有目录 (如共享 /tmp 根) 无权 chmod → 降级: 靠 socket 文件 0o600 兜底。
+            warn!(
+                dir = %parent.display(),
+                error = %e,
+                "M-SEC-01: 非自有 socket 父目录无权收紧 0o700 (共享 /tmp 等) — 降级靠文件 0o600 兜底"
+            );
+        }
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn ensure_sock_dir(_path: &Path) {}
+fn ensure_sock_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// M-SEC-01: LOCAL_PEERCRED UID 校验 — accept 后查对端 UID, 须等于本进程 UID。
 /// 防同主机他 UID 经符号链接或 /tmp 覆盖路径越权 connect。零 unsafe (nix safe wrapper)。
@@ -2116,9 +2458,23 @@ mod tests {
             resp["result"]["ax_trusted"]
         );
         // C-OPS-05: runtime 探针 — BLOCKING_RT spawn 空任务超时探活
+        // D2-2: runtime 三态 (alive/busy/dead); 空闲测试环境应 alive, ok=true。
         assert_eq!(
             resp["result"]["runtime"]["ok"], true,
             "runtime 应健康 (BLOCKING_RT 可响应): {}",
+            resp["result"]["runtime"]
+        );
+        assert!(
+            matches!(
+                resp["result"]["runtime"]["state"].as_str(),
+                Some("alive") | Some("busy")
+            ),
+            "D2-2: runtime.state 应为 alive 或 busy (非 dead): {}",
+            resp["result"]["runtime"]
+        );
+        assert!(
+            resp["result"]["runtime"]["available_permits"].is_number(),
+            "D2-2: runtime.available_permits 应为数字: {}",
             resp["result"]["runtime"]
         );
         // C-OPS-05: dependencies 数组 — git CLI (rollback 依赖)
@@ -2366,6 +2722,19 @@ mod tests {
         assert!(
             text.contains("# TYPE fe_connections gauge"),
             "缺 fe_connections gauge: {text}"
+        );
+        // D4-9: exec_sem 可用许可 gauge — execute 后 health 路径镜像, 应含 HELP/TYPE/指标行。
+        assert!(
+            text.contains("# HELP fe_exec_sem_available"),
+            "缺 fe_exec_sem_available HELP: {text}"
+        );
+        assert!(
+            text.contains("# TYPE fe_exec_sem_available gauge"),
+            "缺 fe_exec_sem_available TYPE: {text}"
+        );
+        assert!(
+            text.contains("fe_exec_sem_available"),
+            "缺 fe_exec_sem_available 指标行: {text}"
         );
         let _ = std::fs::remove_file(&sock);
     }
@@ -2951,7 +3320,8 @@ mod tests {
     #[tokio::test]
     async fn shell_start_output_kill_list_over_uds() {
         let sock = tmp_sock("shell");
-        let server = IpcServer::new();
+        // D3-1: python3 -c 内联解释器需 opt-in (此用例测 shell_start 非 D3-1)
+        let server = IpcServer::with_executor(Executor::new().with_allow_inline_interpreter(true));
         let (_tx, _join) = server.serve(&sock).await.unwrap();
 
         // 启动长任务
@@ -3020,6 +3390,48 @@ mod tests {
         assert_eq!(blocked["result"]["blocked_by_security"], true);
         assert!(blocked["result"]["shell_id"].is_null());
 
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // D3-2: shell_start 默认 seatbelt=true (商用安全默认)。不传 seatbelt →
+    // fe-ipc unwrap_or(true) → 经 sandbox-exec 隔离; 白名单 python3 正常 echo。
+    // 显式 seatbelt:false → opt-out 关隔离。两路径白名单命令均 ok=true。
+    #[tokio::test]
+    async fn shell_start_defaults_seatbelt_on() {
+        let sock = tmp_sock("shell_seatbelt");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+
+        // 不传 seatbelt → 默认 true, 白名单 echo 经 sandbox-exec 正常
+        let on = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.shell_start","params":{"command":"echo d3-2-on"}}"#,
+        )
+        .await;
+        assert_eq!(on["result"]["ok"], true);
+        let sid_on = on["result"]["shell_id"].as_str().unwrap().to_string();
+
+        // 显式 seatbelt:false → opt-out
+        let off = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":2,"method":"executor.shell_start","params":{"command":"echo d3-2-off","seatbelt":false}}"#,
+        )
+        .await;
+        assert_eq!(off["result"]["ok"], true);
+        let sid_off = off["result"]["shell_id"].as_str().unwrap().to_string();
+
+        // 收尾: 两 shell 均 kill (防泄漏)
+        for sid in [sid_on.as_str(), sid_off.as_str()] {
+            let _ = rpc(
+                &sock,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":9,"method":"executor.kill_shell","params":{{"shell_id":"{}"}}}}"#,
+                    sid
+                ),
+            )
+            .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let _ = std::fs::remove_file(&sock);
     }
 
@@ -3142,7 +3554,7 @@ mod tests {
             .join(format!("fe-msec01-probe-{}", std::process::id()))
             .join("subdir")
             .join("fe.sock");
-        ensure_sock_dir(&probe);
+        ensure_sock_dir(&probe).expect("ensure_sock_dir 应成功建 0o700 父目录");
         let parent = probe.parent().unwrap();
         assert!(parent.exists(), "ensure_sock_dir 应建父目录");
         #[cfg(unix)]
@@ -3202,16 +3614,83 @@ mod tests {
         }
     }
 
+    // D3-8 企业硬化: socket 父目录权限收紧失败 → serve fail-loud 拒绝启动 (不残留 world-accessible socket)。
+    // 构造只读父目录: create_dir_all 成功但 chmod 0o700 因父目录无写权限失败 → ensure_sock_dir Err → serve Err。
+    // 注: macOS root 可绕 chmod, 故本测试仅非 root 跑断言; root 跳过 (CI 非 root)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn d38_serve_fails_when_sock_dir_not_tightenable() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::getuid().as_raw() == 0 {
+            eprintln!("skip d38 chmod test under root (root bypasses mode bits)");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("fe-d38-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // 建外层目录, 然后剥写权限 — 内层子目录 create_dir_all 会失败
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let sock = tmp.join("nope").join("fe.sock");
+        let server = IpcServer::new();
+        let res = server.serve(sock.to_str().unwrap()).await;
+        assert!(
+            res.is_err(),
+            "D3-8: 不可建/不可收紧 socket 私有目录应 fail-loud 返 Err, 实际 Ok"
+        );
+        // 恢复权限清理 (否则 remove_dir_all 也无写权限)
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // D3-8: 正常路径 ensure_sock_dir + chmod_secure 返 Ok (幂等 — 已 0o700 目录仍 Ok)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn d38_sock_hardening_ok_on_normal_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fe-d38-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("fe.sock");
+        ensure_sock_dir(&sock_path).expect("D3-8: 正常路径 ensure_sock_dir 应 Ok");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "D3-8: 正常路径目录应收紧 0o700");
+        // 幂等: 二次调用已收紧目录仍 Ok
+        ensure_sock_dir(&sock_path).expect("D3-8: ensure_sock_dir 幂等应 Ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // m-OPS-02: env-var 测试串行化 (set_var/remove_var 跨并行测试竞态)。
     static MOPS02_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // D3-6: validate 现 fail-closed (不可解析二进制不放行)。SIGHUP reload 测试需真实二进制
+    // 落可信目录才能 resolve 通过, 故建临时 bin 目录 + 真实可执行文件 + 登记 Executor 可信目录。
+    fn mops02_make_tool(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+    }
 
     // m-OPS-02: reload_extra_whitelist 解析 FUSION_EXECUTOR_EXTRA_WHITELIST (逗号分割/去空白/去空) → Executor 白名单更新。
     #[test]
     fn mops02_reload_extra_whitelist_parses_env() {
         let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let executor = Arc::new(Executor::new());
-        // 先用 validate 断言非基线工具默认被拦
-        let v = executor.validate("sighup-tool-xyz --version");
+        // D3-6: 真实二进制 + 可信目录 + 绝对路径调用, 否则 validate fail-closed 拦 (resolve 失败)。
+        let dir = std::env::temp_dir().join("fe_mops02_sighup_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        mops02_make_tool(&dir, "sighup-tool-xyz");
+        mops02_make_tool(&dir, "other-tool");
+        let executor = Arc::new(Executor::new().with_trusted_bin_dirs(&[dir.to_str().unwrap()]));
+        let sighup_abs = dir.join("sighup-tool-xyz");
+        let other_abs = dir.join("other-tool");
+        // 先用 validate 断言非基线工具默认被拦 (白名单未含 → whitelist-reject)
+        let v = executor.validate(&format!("{} --version", sighup_abs.display()));
         assert!(!v.allowed, "扩展前 sighup-tool-xyz 应被拦");
         // 设 env → reload → 应放行
         std::env::set_var(
@@ -3219,36 +3698,51 @@ mod tests {
             " sighup-tool-xyz ,,other-tool ",
         );
         reload_extra_whitelist(&executor);
-        let v = executor.validate("sighup-tool-xyz --version");
-        assert!(v.allowed, "SIGHUP 重载后 sighup-tool-xyz 应放行");
-        let v = executor.validate("other-tool run");
-        assert!(v.allowed, "逗号第二项 other-tool 应放行");
+        let v = executor.validate(&format!("{} --version", sighup_abs.display()));
+        assert!(
+            v.allowed,
+            "SIGHUP 重载后 sighup-tool-xyz 应放行: {:?}",
+            v.reason
+        );
+        let v = executor.validate(&format!("{} run", other_abs.display()));
+        assert!(v.allowed, "逗号第二项 other-tool 应放行: {:?}", v.reason);
         // 基线恒在
         let v = executor.validate("python3 --version");
         assert!(v.allowed, "基线 python3 恒放行");
         std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // m-OPS-02: 空 env → 回退纯基线 (项目扩展清空)。
     #[test]
     fn mops02_reload_extra_whitelist_empty_clears_extras() {
         let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let executor = Arc::new(Executor::new());
+        // D3-6: 真实二进制 + 可信目录 + 绝对路径调用, 否则 validate fail-closed 拦。
+        let dir = std::env::temp_dir().join("fe_mops02_cleartool_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        mops02_make_tool(&dir, "temp-tool");
+        let executor = Arc::new(Executor::new().with_trusted_bin_dirs(&[dir.to_str().unwrap()]));
+        let temp_abs = dir.join("temp-tool");
         // 先加扩展
         std::env::set_var("FUSION_EXECUTOR_EXTRA_WHITELIST", "temp-tool");
         reload_extra_whitelist(&executor);
         assert!(
-            executor.validate("temp-tool run").allowed,
-            "先加 temp-tool 放行"
+            executor
+                .validate(&format!("{} run", temp_abs.display()))
+                .allowed,
+            "先加 temp-tool 放行: 详见 reload 后 validate reason"
         );
         // 清 env → reload → 回退基线
         std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
         reload_extra_whitelist(&executor);
         assert!(
-            !executor.validate("temp-tool run").allowed,
+            !executor
+                .validate(&format!("{} run", temp_abs.display()))
+                .allowed,
             "空 reload 后 temp-tool 应已拦 (回退基线)"
         );
         assert!(executor.validate("python3 --version").allowed, "基线恒在");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // m-OPS-02: reload_log_level 无 handle (tracing 未 init) → 不 panic, 仅 warn。
@@ -3475,7 +3969,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let sock_path = dir.join("fe.sock");
         // 调 ensure_sock_dir — 应收紧 0o700
-        ensure_sock_dir(&sock_path);
+        ensure_sock_dir(&sock_path).expect("ensure_sock_dir 应成功收紧已存在目录 0o700");
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o700,
@@ -3544,6 +4038,132 @@ mod tests {
         let _ = shutdown_tx.send(());
         let done = tokio::time::timeout(SHUTDOWN_DEADLINE, join).await;
         assert!(done.is_ok(), "显式 shutdown 后 serve join 应完成");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // D6-02: 墙钟直方图 — 记 N 次不同 duration, p50/p95/p99 插值正确 + 桶计数对齐。
+    // 构造 10 次: 5 次 0.001s (首桶 ≤0.005), 3 次 0.1s (次桶 ≤0.05 外, 落 0.5 桶), 2 次 1.0s (落 5.0 桶)。
+    #[test]
+    fn d602_histogram_quantiles_interpolated() {
+        install_prometheus_recorder();
+        let executor = Arc::new(Executor::new());
+        let hub = BroadcastHub::new(executor);
+        for dur in [0.001; 5] {
+            hub.record_exec(&ExecutionResult {
+                exit_code: 0,
+                duration_sec: dur,
+                ..Default::default()
+            });
+        }
+        for dur in [0.1; 3] {
+            hub.record_exec(&ExecutionResult {
+                exit_code: 0,
+                duration_sec: dur,
+                ..Default::default()
+            });
+        }
+        for dur in [1.0; 2] {
+            hub.record_exec(&ExecutionResult {
+                exit_code: 0,
+                duration_sec: dur,
+                ..Default::default()
+            });
+        }
+        let snap = hub.metrics_snapshot();
+        let total = snap["exec_total"].as_u64().unwrap();
+        assert_eq!(total, 10, "D6-02: 10 次 execute 应全计");
+        // 桶上界 [0.005, 0.05, 0.5, 5.0, 30.0] → 0.001 落首(5), 0.1 落 0.5 桶(3), 1.0 落 5.0 桶(2)。
+        let buckets = snap["execute_duration_buckets"].as_array().unwrap();
+        assert_eq!(buckets[0].as_u64(), Some(5), "≤0.005 桶应 5");
+        assert_eq!(buckets[1].as_u64(), Some(0), "0.05 桶应空");
+        assert_eq!(buckets[2].as_u64(), Some(3), "0.5 桶应 3");
+        assert_eq!(buckets[3].as_u64(), Some(2), "5.0 桶应 2");
+        assert_eq!(buckets[4].as_u64(), Some(0), "30.0 桶应空");
+        // p50: 累计 [5,5,8,10,10,10], 0.5 分位 target=5, 首桶累计 5 ≥ 5 → 返首桶上界 0.005。
+        let p50 = snap["execute_duration_sec_p50"].as_f64().unwrap();
+        assert_eq!(p50, 0.005, "D6-02: p50 应插值到首桶上界 0.005");
+        // min/max: 0.001 → 1.0s。
+        assert!(
+            (snap["execute_duration_sec_min"].as_f64().unwrap() - 0.001).abs() < 1e-9,
+            "min 应 0.001"
+        );
+        assert!(
+            (snap["execute_duration_sec_max"].as_f64().unwrap() - 1.0).abs() < 1e-9,
+            "max 应 1.0"
+        );
+        // avg: (5*0.001 + 3*0.1 + 2*1.0)/10 = 2.305/10 = 0.2305
+        let avg = snap["execute_duration_sec_avg"].as_f64().unwrap();
+        assert!((avg - 0.2305).abs() < 1e-9, "avg 应 0.2305, 实际 {avg}");
+    }
+
+    // D6-02: Prometheus text format — 直方图 render 出 _bucket{le=...} 行 + HELP/TYPE 头。
+    #[test]
+    fn d602_prometheus_histogram_buckets_rendered() {
+        install_prometheus_recorder();
+        let executor = Arc::new(Executor::new());
+        let hub = BroadcastHub::new(executor);
+        hub.record_exec(&ExecutionResult {
+            exit_code: 0,
+            duration_sec: 0.02,
+            ..Default::default()
+        });
+        let text = hub.metrics_prometheus().unwrap_or_default();
+        assert!(
+            text.contains("# HELP fe_exec_duration_seconds"),
+            "D6-02: prometheus 应含直方图 HELP 头"
+        );
+        assert!(
+            text.contains("# TYPE fe_exec_duration_seconds histogram"),
+            "D6-02: prometheus 应含直方图 TYPE 头"
+        );
+        assert!(
+            text.contains("fe_exec_duration_seconds_bucket{le=\"0.005\"}"),
+            "D6-02: 应有 le=0.005 桶行"
+        );
+        assert!(
+            text.contains("fe_exec_duration_seconds_bucket{le=\"+Inf\"}"),
+            "D6-02: 应有 +Inf 末桶行"
+        );
+    }
+
+    // D6-07: bind_with_stale_recovery — 陈旧死 socket (无 listener) 应 unlink + rebind 成功。
+    #[tokio::test]
+    async fn d607_stale_socket_rebind_succeeds() {
+        let sock = tmp_sock("d607-stale");
+        // 留一个无 listener 的陈旧 socket 文件 (模拟崩溃残留)。
+        std::fs::File::create(&sock).unwrap();
+        assert!(Path::new(&sock).exists(), "前置: 陈旧 socket 存在");
+        let server = IpcServer::new();
+        let (_tx, join) = server
+            .serve(&sock)
+            .await
+            .expect("陈旧 socket 应自愈 rebind");
+        // 健康 roundtrip 证明 listener 真活。
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["ok"], true, "D6-07: 自愈后 listener 应响应");
+        let _ = std::fs::remove_file(&sock);
+        drop(join);
+    }
+
+    // D6-05: bind_with_stale_recovery — 活实例占位时应 fail-loud, 不劫持。
+    #[tokio::test]
+    async fn d605_live_socket_refuses_hijack() {
+        let sock = tmp_sock("d605-live");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        // 第二实例尝试同 socket → Err (活 listener 探测成功)。
+        let server2 = IpcServer::new();
+        let err = server2.serve(&sock).await;
+        assert!(err.is_err(), "D6-05: 活实例占位时应 fail-loud 拒绝劫持");
+        let msg = format!("{}", err.err().unwrap());
+        assert!(
+            msg.contains("already in use") || msg.contains("FATAL"),
+            "D6-05: 错误消息应含 already in use/FATAL 关键词, 实际: {msg}"
+        );
         let _ = std::fs::remove_file(&sock);
     }
 }

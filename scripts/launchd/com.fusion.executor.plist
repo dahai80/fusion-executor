@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fusion-executor launchd LaunchAgent template (D6-01)
+  Process supervision for macOS: RunAtLoad + KeepAlive (crash restart).
+
+  Install (opt-in, operator-driven — NOT auto-installed by the library):
+    1. Copy to ~/Library/LaunchAgents/com.fusion.executor.plist
+    2. Edit PATH/ProgramArguments to point at your `fusion-executor` entrypoint
+       (venv activate + which fusion-executor).
+    3. launchctl load ~/Library/LaunchAgents/com.fusion.executor.plist
+    4. launchctl list | grep fusion.executor   # see pid + last exit code
+    5. launchctl unload ~/Library/LaunchAgents/com.fusion.executor.plist  # stop
+
+  Logs: stdout/stderr -> ~/.fusion-executor/logs/launchd.log
+  Socket: ~/.fusion-executor/fe.sock (override via FUSION_EXECUTOR_SOCK env)
+  Pidfile: ~/.fusion-executor/fe.pid (written by serve, ops can `kill $(cat fe.pid)`)
+
+  KeepAlive=true restarts on crash. Throttling: RunAtLoad starts at login.
+  This is a TEMPLATE — edit paths/env to match your install before loading.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fusion.executor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- EDIT: absolute path to your fusion-executor entrypoint (venv-activated) -->
+        <string>/Users/YOUR_USER/fusion/.venv/bin/fusion-executor</string>
+        <string>--serve</string>
+    </array>
+
+    <!-- EDIT: ensure venv + runtime libs on PATH -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/YOUR_USER/fusion/.venv/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>FUSION_EXECUTOR_SOCK</key>
+        <string>/Users/YOUR_USER/.fusion-executor/fe.sock</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Crash throttle: don't spin-restart faster than 10s -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USER/.fusion-executor/logs/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USER/.fusion-executor/logs/launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

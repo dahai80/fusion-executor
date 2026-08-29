@@ -43,10 +43,11 @@ class ExecutionRequest(BaseModel):
     cwd: str | None = None
     timeout_sec: float = Field(default=30.0, description="秒; 超时退出码 -124")
     env_vars: dict[str, str] | None = None
-    enable_rollback_snapshot: bool = True
+    enable_rollback_snapshot: bool = False
     auto_rollback_policy: RollbackPolicy | None = None
     seatbelt: bool = Field(
-        default=False, description="macOS seatbelt 运行时隔离 (sandbox-exec 禁网 + 危险二进制 execve deny)"
+        default=True,
+        description="macOS seatbelt 运行时隔离 (sandbox-exec 禁网 + 危险二进制 execve deny); 商用安全默认 True, 对齐 fe-core serde default_true + executor.run/run_async/shell_start 默认",
     )
     inherit_env: bool = Field(
         default=False,
@@ -67,6 +68,10 @@ class ExecutionRequest(BaseModel):
     max_nofile: int = Field(
         default=1024,
         description="文件描述符上限 (RLIMIT_NOFILE, 经 ulimit -n 注入); 拦 FD 耗尽攻击; 0=不限 (受信 opt-out); Darwin 实测生效 (errno 24 EMFILE)",
+    )
+    rss_limit_mb: int = Field(
+        default=2048,
+        description="per-task RSS 上限 (MB); Darwin RLIMIT_AS/RLIMIT_DATA 平台无效, 改 sysinfo 轮询子进程树 RSS 超限 kill (exit_code -124, oom_killed=true); 拦内存炸弹; 0=禁用 watchdog (受信 opt-out) (D3-4)",
     )
     trace_id: str | None = Field(
         default=None,
@@ -99,6 +104,10 @@ class ExecutionResult(BaseModel):
     )
     trace_id: str | None = Field(
         default=None, description="跨层关联 id — 回填请求侧 trace_id 或入口自动生成 (M-OPS-06)"
+    )
+    oom_killed: bool = Field(
+        default=False,
+        description="RSS watchdog 触发标记 — 子进程树 RSS 超 rss_limit_mb 被 kill (D3-4); 伴随 exit_code -124",
     )
     pid: int | None = Field(
         default=None,
@@ -208,3 +217,11 @@ class ShellInfo(BaseModel):
     started_at_ms: int = Field(description="启动时间戳 (毫秒纪元)")
     finished: bool = Field(description="是否已退出")
     exit_code: int | None = Field(default=None, description="退出码 (运行中为 None)")
+
+
+# D6-03 (审计 0827 product): 快照清单条目 — 镜像 fe_rollback::SnapshotInfo (on-disk 索引读回)。
+class SnapshotInfo(BaseModel):
+    model_config = _STRICT
+    id: str = Field(description="快照 id (head:<SHA> / stash:<SHA>,base:<HEAD> / repo:<hash> 后缀)")
+    created_ms: int = Field(description="快照创建时间戳 (毫秒纪元)")
+    kind: str = Field(description="快照类型 (head 基线 / stash 含改动)")

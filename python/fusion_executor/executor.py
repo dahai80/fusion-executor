@@ -22,12 +22,16 @@ from .models import (
     ShellInfo,
     ShellOutput,
     ShellStartResult,
+    SnapshotInfo,
     TelemetrySample,
 )
 
 logger = logging.getLogger("fusion_executor")
 
 DEFAULT_SOCK = os.path.expanduser("~/.fusion-executor/fe.sock")  # IMPL-1: 对齐 Rust M-SEC-01 (HOME 私有 0o700)
+# D6-01: pidfile — serve 启动写 pid, 停机删。ops 可 `kill $(cat fe.pid)` / 监控存活。
+# 与 socket 同目录 (~/.fusion-executor/, HOME 私有 0o700), 不暴露 pid 给其他用户。
+DEFAULT_PIDFILE = os.path.expanduser("~/.fusion-executor/fe.pid")
 SUB_CHANNELS = ("telemetry", "stdio", "screenshot")
 # P-2: subscription 行缓冲上限 — 损坏流 (无 newline) / 超巨帧防护, 超则丢缓冲当流结束
 _SUB_BUF_MAX_BYTES = 8 * 1024 * 1024
@@ -46,6 +50,30 @@ def ensure_socket_dir(path: str = DEFAULT_SOCK) -> None:
         logger.warning("ensure_socket_dir 创建 %s 失败: %s", sock_dir, e)
 
 
+def write_pidfile(path: str = DEFAULT_PIDFILE) -> None:
+    # D6-01: serve 启动写 pidfile。目录由 ensure_socket_dir (socket 同目录) 先建。
+    # 失败不阻断 serve (pidfile 是 ops 辅助, 非安全关键) — fail-visible 警告, 继续服务。
+    try:
+        pid_dir = os.path.dirname(path)
+        if pid_dir:
+            os.makedirs(pid_dir, mode=0o700, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        logger.info("pidfile 写入 %s (pid=%d)", path, os.getpid())
+    except OSError as e:
+        logger.warning("pidfile 写入 %s 失败: %s — ops 监控将不可用, serve 继续", path, e)
+
+
+def remove_pidfile(path: str = DEFAULT_PIDFILE) -> None:
+    # D6-01: serve 停机删 pidfile。不存在 (写失败或已被删) 静默 no-op; 删失败警告不抛。
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+            logger.info("pidfile 清理 %s", path)
+    except OSError as e:
+        logger.warning("pidfile 清理 %s 失败: %s", path, e)
+
+
 class FusionSandboxExecutor:
     def __init__(
         self,
@@ -53,6 +81,8 @@ class FusionSandboxExecutor:
         *,
         extra_whitelist: list[str] | None = None,
         disable_bundle_allowlist: bool = False,
+        allow_inline_interpreter: bool = False,
+        trusted_bin_dirs: list[str] | None = None,
     ) -> None:
         try:
             from ._native import NativeExecutor
@@ -60,7 +90,14 @@ class FusionSandboxExecutor:
             raise ImportError("fusion_executor._native 未加载 — 运行 `maturin develop` 编译原生扩展") from e
         # RUN-12: disable_bundle_allowlist=True 关闭 GUI 焦点 app 白名单 (无限制 opt-in, 仅审计日志);
         #         默认 False 走安全默认集 (Terminal/TextEdit/finder)。测试机 drive 任意 app 时传 True。
-        self._native = NativeExecutor(extra_whitelist, disable_bundle_allowlist)
+        # D3-1 (审计 0827 product): allow_inline_interpreter=True 开启内联解释器 (python -c / node -e
+        #   / ruby -e / perl -e); 默认 False (企业硬化拒内联代码, 防 agent-driven 任意 payload 绕白名单语义)。
+        #   测试机/本地交互场景依赖 python3 -c, 显式传 True opt-in。
+        # D3-6 (审计 0827 product 4-layer): trusted_bin_dirs 登记项目工具所在目录 — extra_whitelist 的工具
+        #   须 resolve 到可信目录才放行 (fail-closed 防 /tmp/python3 投毒)。测试/调用方登记项目 bin 目录。
+        self._native = NativeExecutor(
+            extra_whitelist, disable_bundle_allowlist, allow_inline_interpreter, trusted_bin_dirs
+        )
         self._sock_path = sock_path
 
     def run(
@@ -71,7 +108,7 @@ class FusionSandboxExecutor:
         cwd: str | None = None,
         timeout_sec: float = 30.0,
         env_vars: dict[str, str] | None = None,
-        enable_rollback_snapshot: bool = True,
+        enable_rollback_snapshot: bool = False,
         auto_rollback: RollbackPolicy | None = None,
         # ARCH-1: 默认 True — 对齐 fe-core serde default_true (商用安全默认)。
         # 受信本地 opt-out 显式传 seatbelt=False。原默认 False 与 UDS execute 路径 (serde 默认 true) 不一致。
@@ -81,6 +118,7 @@ class FusionSandboxExecutor:
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
         max_nofile: int = 1024,
+        rss_limit_mb: int = 2048,
         trace_id: str | None = None,
     ) -> ExecutionResult:
         # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
@@ -102,8 +140,10 @@ class FusionSandboxExecutor:
             raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
         if not isinstance(max_nofile, int) or max_nofile < 0:
             raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
+        if not isinstance(rss_limit_mb, int) or rss_limit_mb < 0:
+            raise ValueError(f"rss_limit_mb 必须为非负 int, 得 {rss_limit_mb!r}")
         logger.debug(
-            "run command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s",
+            "run command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s rss_limit_mb=%s",
             command,
             timeout_sec,
             cwd,
@@ -113,6 +153,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_nofile,
+            rss_limit_mb,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         native = self._native.execute_sync(
@@ -129,6 +170,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_nofile,
+            rss_limit_mb,
             trace_id,
         )
         diag = None
@@ -157,13 +199,15 @@ class FusionSandboxExecutor:
             rollback_unavailable=native.rollback_unavailable,
             rollback_skipped_reason=native.rollback_skipped_reason,
             trace_id=native.trace_id,
+            oom_killed=native.oom_killed,
             pid=native.pid,
         )
         logger.info(
-            "run done exit=%s blocked=%s timed_out=%s diag=%s rolled_back=%s rb_unavail=%s rb_skipped=%s dur=%.3fs",
+            "run done exit=%s blocked=%s timed_out=%s oom=%s diag=%s rolled_back=%s rb_unavail=%s rb_skipped=%s dur=%.3fs",
             result.exit_code,
             result.blocked_by_security,
             result.timed_out,
+            result.oom_killed,
             result.diagnostics.error_type if result.diagnostics else None,
             result.auto_rolled_back,
             result.rollback_unavailable,
@@ -186,7 +230,7 @@ class FusionSandboxExecutor:
         cwd: str | None = None,
         timeout_sec: float = 30.0,
         env_vars: dict[str, str] | None = None,
-        enable_rollback_snapshot: bool = True,
+        enable_rollback_snapshot: bool = False,
         auto_rollback: RollbackPolicy | None = None,
         # ARCH-1: 默认 True — 对齐 fe-core serde default_true + run() (见上注释)。
         seatbelt: bool = True,
@@ -195,6 +239,7 @@ class FusionSandboxExecutor:
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
         max_nofile: int = 1024,
+        rss_limit_mb: int = 2048,
         trace_id: str | None = None,
     ) -> Iterator[str | ExecutionResult]:
         # M-PY-01: 同 run() 前置校验
@@ -208,12 +253,14 @@ class FusionSandboxExecutor:
             raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
         if not isinstance(max_nofile, int) or max_nofile < 0:
             raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
+        if not isinstance(rss_limit_mb, int) or rss_limit_mb < 0:
+            raise ValueError(f"rss_limit_mb 必须为非负 int, 得 {rss_limit_mb!r}")
         # 流式后端仅 PTY: use_pty=False 暂无 stdio 流式实现 (run_streaming 走 portable-pty,
         # 保 ANSI/Traceback 保真 — 流式主要目的)。需独立 stderr 分流用 run(use_pty=False)。
         if not use_pty:
             raise ValueError("run_streaming 暂不支持 use_pty=False (无 stdio 流式后端; 用 run() 分流)")
         logger.debug(
-            "run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s",
+            "run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s rss_limit_mb=%s",
             command,
             timeout_sec,
             cwd,
@@ -223,6 +270,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_nofile,
+            rss_limit_mb,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
         it = self._native.execute_streaming(
@@ -239,6 +287,7 @@ class FusionSandboxExecutor:
             max_nproc,
             max_cpu_sec,
             max_nofile,
+            rss_limit_mb,
             trace_id,
         )
         for frame in it:
@@ -293,6 +342,15 @@ class FusionSandboxExecutor:
     def snapshot_create(self, cwd: str) -> str:
         logger.info("snapshot_create cwd=%s", cwd)
         return self._native.snapshot_create(cwd)
+
+    def list_snapshots(self, cwd: str) -> list[SnapshotInfo]:
+        # D6-03 (审计 0827 product): 快照清单 — on-disk 索引读回, 供运维审计/存活快照发现。
+        # 无状态 (M-ARCH-1): 仅读 cwd 对应索引, executor 不持有快照状态。
+        logger.info("list_snapshots cwd=%s", cwd)
+        native_list = self._native.list_snapshots(cwd)
+        out = [SnapshotInfo.model_validate(s.to_dict()) for s in native_list]
+        logger.info("list_snapshots done count=%d cwd=%s", len(out), cwd)
+        return out
 
     def validate(self, command: str) -> dict:
         # Issue #11 / #12.4: 非执行预校验 — 调用方先问用户授权再 run (Option A: caller owns gating)。
@@ -350,7 +408,7 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         task_id: str | None = None,
         max_output_chars: int = 100000,
-        seatbelt: bool = False,
+        seatbelt: bool = True,
         inherit_env: bool = False,
         max_nproc: int = 1024,
         max_cpu_sec: int = 0,
@@ -704,12 +762,15 @@ class FusionSandboxExecutor:
         # 与 finally 清理用的 path (env 解析) 不同源, 虽 Rust 亦解析 env 凑巧一致, 但显式
         # 传 path 消除隐式 env 依赖, 清理与监听严格同一路径。
         path = sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        pid_path = os.environ.get("FUSION_EXECUTOR_PIDFILE", DEFAULT_PIDFILE)
         # IMPL-1: serve 前确保 socket 父目录存在 (默认 ~/.fusion-executor/ 0o700, 对齐 Rust M-SEC-01)。
         ensure_socket_dir(path)
-        # ARCH-1: seatbelt 治理 — execute 默认 true (商用安全默认, 对齐 fe-core serde default_true)。
-        # 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。shell_start 路径仍默认 false。
+        # D6-01: 写 pidfile (ops 监控/kill 用)。socket 同目录, 目录已由 ensure_socket_dir 建。
+        write_pidfile(pid_path)
+        # ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
+        # 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
         logger.info(
-            "seatbelt 默认开启 (execute 路径) — macOS sandbox-exec 隔离。受信本地可透传 seatbelt:false opt-out。"
+            "seatbelt 默认开启 (execute + shell_start 路径) — macOS sandbox-exec 隔离。受信本地可透传 seatbelt:false opt-out。"
         )
         logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (信号可停)", path)
         old_int = signal.getsignal(signal.SIGINT)
@@ -731,6 +792,8 @@ class FusionSandboxExecutor:
                     logger.info("serve 清理残留 socket %s", path)
                 except OSError as e:
                     logger.warning("serve 清理 socket 失败 %s: %s", path, e)
+            # D6-01: 停机删 pidfile (正常 + 信号 + 异常路径都走 finally)
+            remove_pidfile(pid_path)
             if raised:
                 raise KeyboardInterrupt("serve 已停机")
 

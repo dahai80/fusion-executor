@@ -50,7 +50,7 @@ def server():
         [
             sys.executable,
             "-c",
-            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor().serve()",
+            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor(allow_inline_interpreter=True).serve()",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -78,6 +78,63 @@ def test_health_over_uds(server: str):
     assert resp["result"]["ax_trusted"] is True
     assert resp["result"]["seatbelt_default_on"] is True  # ARCH-1
     assert "version" in resp["result"]
+
+
+def test_pidfile_write_remove_roundtrip(tmp_path: Path):
+    # D6-01: pidfile helpers 直接测 (不跑 serve — serve 阻塞)。写 → 读校验 pid → 删 → 删后 no-op。
+    from fusion_executor.executor import remove_pidfile, write_pidfile
+
+    pid_path = str(tmp_path / "fe-test.pid")
+    assert not os.path.exists(pid_path)
+    write_pidfile(pid_path)
+    assert os.path.exists(pid_path)
+    with open(pid_path, encoding="utf-8") as f:
+        pid_str = f.read()
+    assert pid_str == str(os.getpid()), "pidfile 应写入当前进程 pid"
+    remove_pidfile(pid_path)
+    assert not os.path.exists(pid_path), "删除后 pidfile 应不存在"
+    # 删不存在文件应 no-op 不抛
+    remove_pidfile(pid_path)
+
+
+def test_pidfile_serve_lifecycle(tmp_path: Path):
+    # D6-01: serve 启动写 pidfile, 停机删 — 跨进程验证。注入 FUSION_EXECUTOR_PIDFILE 指向 tmp,
+    # 不污染 HOME。启动子进程 serve → 等 pidfile 出现 → 读校验 pid 匹配 → 停机 → 验证已删。
+    pid_path = str(tmp_path / "fe-lifecycle.pid")
+    sock = _sock_path()
+    env = dict(os.environ, FUSION_EXECUTOR_SOCK=sock, FUSION_EXECUTOR_PIDFILE=pid_path)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from fusion_executor import FusionSandboxExecutor; FusionSandboxExecutor(allow_inline_interpreter=True).serve()",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_sock(sock)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if os.path.exists(pid_path):
+                break
+            time.sleep(0.05)
+        assert os.path.exists(pid_path), "serve 启动应写 pidfile"
+        with open(pid_path, encoding="utf-8") as f:
+            written_pid = int(f.read().strip())
+        assert written_pid == proc.pid, f"pidfile pid {written_pid} 应匹配 serve 子进程 {proc.pid}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if os.path.exists(sock):
+            os.unlink(sock)
+    # 停机后 pidfile 应被 finally remove_pidfile 清理
+    assert not os.path.exists(pid_path), "serve 停机应删 pidfile"
 
 
 def test_execute_echo_over_uds(server: str):
@@ -191,6 +248,40 @@ def test_snapshot_rollback_over_uds(server: str, tmp_path: Path):
     )
     assert rb["result"]["ok"] is True
     assert (d / "app.py").read_text() == "BROKEN\n"
+
+
+def test_list_snapshots_over_uds(server: str, tmp_path: Path):
+    # D6-03 (审计 0827 product): 快照清单 — snapshot_create 写 on-disk 索引, list_snapshots 读回。
+    d = tmp_path / "repo"
+    d.mkdir()
+
+    def g(*a):
+        subprocess.run(["git", "-C", str(d), *a], check=True, capture_output=True)
+
+    g("init", "-q")
+    g("config", "user.email", "t@t")
+    g("config", "user.name", "t")
+    (d / "app.py").write_text("print(1)\n")
+    g("add", ".")
+    g("commit", "-q", "-m", "base")
+
+    snap = _rpc(
+        server,
+        {"jsonrpc": "2.0", "id": 5, "method": "executor.snapshot_create", "params": {"cwd": str(d)}},
+    )
+    sid = snap["result"]["snapshot_id"]
+    assert sid, "快照 id 非空"
+
+    lst = _rpc(
+        server,
+        {"jsonrpc": "2.0", "id": 6, "method": "executor.list_snapshots", "params": {"cwd": str(d)}},
+    )
+    snaps = lst["result"]["snapshots"]
+    assert len(snaps) >= 1, "清单应含至少一条快照"
+    first = snaps[0]
+    assert first["id"] == sid, "清单首条 id 应匹配 snapshot_create 返回"
+    assert first["kind"] == "head", "无改动快照 kind 应为 head"
+    assert isinstance(first["created_ms"], int), "created_ms 应为整数"
 
 
 def test_execute_stream_chunks_then_done_over_uds(server: str):

@@ -31,6 +31,7 @@ futures.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 metrics.workspace = true
+regex.workspace = true
 
 [lints]
 workspace = true

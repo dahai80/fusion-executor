@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
 pub enum SecurityError {
@@ -188,6 +188,10 @@ pub struct SecurityGuard {
     sensitive_paths: Vec<String>,
     sensitive_paths_exp: Vec<String>,
     redirect_re: Regex,
+    // D3-1 (审计 0827 product): 内联解释器网关。false(企业硬化默认)=拒 python -c / node -e /
+    // ruby -e / perl -e 等内联代码 (绕白名单语义, agent-driven 下模型可生成任意 payload);
+    // true(trusted-caller opt-in)=保留内联执行能力。validate_argv gate 读此字段。
+    allow_inline_interpreter: bool,
 }
 
 impl Clone for SecurityGuard {
@@ -200,6 +204,7 @@ impl Clone for SecurityGuard {
             sensitive_paths: self.sensitive_paths.clone(),
             sensitive_paths_exp: self.sensitive_paths_exp.clone(),
             redirect_re: self.redirect_re.clone(),
+            allow_inline_interpreter: self.allow_inline_interpreter,
         }
     }
 }
@@ -228,6 +233,9 @@ impl SecurityGuard {
             sensitive_paths,
             sensitive_paths_exp,
             redirect_re,
+            // D3-1: 企业硬化默认 false — 拒内联解释器 -c/-e。trusted-caller opt-in 经
+            // with_allow_inline_interpreter(true) 开启 (测试机/本地交互场景)。
+            allow_inline_interpreter: false,
         }
     }
 
@@ -269,8 +277,23 @@ impl SecurityGuard {
         self
     }
 
+    /// D3-1 (审计 0827 product): 内联解释器网关 opt-in。true=允许 python -c / node -e /
+    /// ruby -e / perl -e (保留 trusted-caller 内联执行能力, 测试机/本地交互场景); 默认 false
+    /// (企业硬化拒内联代码, 防 agent-driven 任意 payload 绕白名单语义)。validate_argv 读此字段。
+    pub fn with_allow_inline_interpreter(mut self, allow: bool) -> Self {
+        self.allow_inline_interpreter = allow;
+        if allow {
+            info!("SecurityGuard 开启内联解释器 (D3-1 trusted-caller opt-in: 允许 -c/-e)");
+        }
+        self
+    }
+
     /// 校验入口 — 先正则快筛，再 token 解析防链式绕过
     pub fn validate(&self, command: &str) -> SecurityVerdict {
+        // D4-2/D4-3 perf 评估 (2026-08-29): 正则已 struct-field 缓存 (build_blocklist/redirect_re
+        // 在 new() 一次编译, 非每调编译) — 无 LazyLock 必要。resolve_binary_path 走 fs stat (非 CPU),
+        // 路径缓存仅对同进程内重复同名的二进制有益, validate 逐命令调用 binary 名罕密集重复;
+        // 加 Mutex<HashMap> 反在热路径引入锁竞争 (Rule 2 简单优先)。故两项均不改, 诚实标注。
         // M-SEC-05: 空字节清理 — 命令含 \0 拒绝 (echo hi\0id)
         if command.contains('\0') {
             return SecurityVerdict::block("命令含空字节 (null byte)", SecurityStage::Regex);
@@ -390,7 +413,11 @@ impl SecurityGuard {
 
         // ARCH-2: resolved-path 校验 — basename 命中后须再确认二进制绝对路径落在可信目录内。
         // 防 /tmp/python3 (攻击者可控二进制) 同名投毒绕过: 能解析到绝对路径但不在可信目录 → 拒。
-        // 解析失败 (None) → 放行: 投毒须真实可执行二进制, 不可解析 = 无投毒面 (执行期 command-not-found 兜底)。
+        // D3-6 (审计 0827 product): 解析失败 (None) → fail-closed 拒 (非放行)。企业硬化默认:
+        // 不可解析的二进制不应通过安全门 (即便执行期会 command-not-found, 安全门本身不得 fail-open)。
+        // canonicalize 跳过 (by-design): homebrew /opt/homebrew/bin/git symlink → Cellar 真实路径越界
+        // 可信前缀, 但 symlink 由包管理器写入 /opt/homebrew/bin (root-gated), 超出 ARCH-2 威胁模型
+        // (/tmp 投毒 + PATH 前置恶意 bin)。字面 starts_with 即拦该威胁面。
         match resolve_binary_path(binary) {
             Some(abs) => {
                 if !self.trusted_bin_dirs.iter().any(|d| abs.starts_with(d)) {
@@ -404,10 +431,11 @@ impl SecurityGuard {
                 debug!(binary = binary, resolved = ?abs, "二进制可信目录校验通过");
             }
             None => {
-                debug!(
+                warn!(
                     binary = binary,
-                    "二进制路径无法解析, 跳过可信目录校验 (无投毒面)"
+                    "二进制路径无法解析, fail-closed 拒绝 (D3-6 企业硬化: 不可解析不放行)"
                 );
+                return Err(format!("二进制无法解析 (投毒防护 fail-closed): {}", binary));
             }
         }
 
@@ -455,12 +483,30 @@ impl SecurityGuard {
 
     /// argv 级约束
     fn validate_argv(&self, binary: &str, args: &[String]) -> Result<(), String> {
-        // C-SEC-03 威胁模型边界 (设计取舍, 审计 §4 显式声明):
-        // `python -c` / `node -e` / `ruby -e` 等内联代码执行绕过文件审计白名单语义 —
-        // 解释器本身在白名单 (跑脚本文件), -c/-e 使参数变任意代码, regex 无法枚举所有危险 one-liner。
-        // 但本工具为单用户 local-first trusted-caller 模型 (人作者写命令), 此为已知接受取舍;
-        // 企业多用户/Agent 驱动场景应叠加 seatbelt (C-SEC-02) + UDS 鉴权 (M-SEC-01) 纵深, 非此处封堵。
-        // (拒绝 -c 会破坏沙箱测试机制 — 56 处测试依赖 python3 -c。)
+        // D3-1 (审计 0827 product) 内联解释器网关 — 见下方 gate。企业硬化默认 false 拒
+        // python -c / node -e / ruby -e / perl -e (绕白名单语义: 解释器在白名单跑脚本文件,
+        // -c/-e 使参数变任意代码, regex 无法枚举危险 one-liner; agent-driven 下模型可生成任意 payload)。
+        // trusted-caller opt-in (测试机/本地交互) 经 with_allow_inline_interpreter(true) 开启保留能力。
+        if !self.allow_inline_interpreter {
+            let is_inline_interp = matches!(
+                binary,
+                "python" | "python2" | "python3" | "node" | "ruby" | "perl" | "perl5"
+            );
+            if is_inline_interp
+                && args
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "-c" | "-e" | "-E" | "--eval" | "-p" | "--print"))
+            {
+                warn!(
+                    "D3-1 内联解释器拦截: {} -c/-e 被拒 (企业硬化默认; allow_inline_interpreter opt-in)",
+                    binary
+                );
+                return Err(format!(
+                    "禁止 {} -c/-e 内联代码执行 (D3-1 企业硬化; 用 allow_inline_interpreter=True opt-in)",
+                    binary
+                ));
+            }
+        }
         match binary {
             // C-5: mv/cp 全非选项参数校验 — 旧版仅校验最后一个 (目地), 源参数可读 ~/.ssh/id_rsa
             // 镜像 cat/grep 读源守卫: 敏感路径 + 敏感文件名 + .. 逃逸, 全非选项参数 (含源与目地)
@@ -872,6 +918,7 @@ fn basename(path: &str) -> &str {
 
 /// ARCH-2: 解析二进制绝对路径 (literal, 不 canonicalize)。绝对路径 → 原样;
 /// 相对名 (python3) → 扫 $PATH 各目录首个匹配 → join 字面路径。解析失败返 None。
+/// D3-6: None 由调用方 (validate_segment) fail-closed 拒, 非放行 — 企业硬化默认。
 /// 不 canonicalize: homebrew /opt/homebrew/bin/git symlink → Cellar 真实路径会越界可信
 /// 前缀, 但 symlink 本身由包管理器写入可信目录, 写入需 root, 超出 ARCH-2 威胁模型
 /// (/tmp 投毒 + PATH 注入)。威胁 = 绝对路径投毒 + PATH 前置恶意 bin, 字面 starts_with 即拦。
@@ -953,6 +1000,16 @@ mod tests {
                 if let Some(s) = parent.to_str() {
                     trusted.push(s.to_string());
                 }
+            }
+        }
+        // ARCH-2: rustup 标准安装位 ($HOME/.cargo/bin) — 与 Executor::new 对齐登记。
+        // cargo/rustc 在此 (CI macos-14 runner = rustup, 非 homebrew)。非攻击者可控 (home 目录),
+        // 不违 /tmp 投毒威胁模型。登记使 allows_cargo_test / a1_toolchain_noarm 用例在
+        // rustup-only 环境通过; homebrew 机器 cargo 在 /opt/homebrew/bin 已基线可信。
+        if let Ok(home) = std::env::var("HOME") {
+            let cargo_bin = std::path::Path::new(&home).join(".cargo").join("bin");
+            if let Some(s) = cargo_bin.to_str() {
+                trusted.push(s.to_string());
             }
         }
         let refs: Vec<&str> = trusted.iter().map(String::as_str).collect();
@@ -1154,7 +1211,10 @@ mod tests {
 
     #[test]
     fn allows_python() {
-        let v = guard().validate("python -c \"print('hello')\"");
+        // D3-1: 内联解释器需 opt-in (此用例测白名单非 D3-1, 显式开启)
+        let v = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("python -c \"print('hello')\"");
         assert!(v.allowed, "应允许 python, reason={:?}", v.reason);
     }
 
@@ -1192,10 +1252,23 @@ mod tests {
 
     #[test]
     fn allows_go_and_tsc_whitelisted() {
+        // 白名单成员校验 (resolve 无关): go/tsc 须在白名单基线。
+        assert!(guard().whitelist_contains("go"), "go 应在白名单");
+        assert!(guard().whitelist_contains("tsc"), "tsc 应在白名单");
+        // D3-6: validate 现 fail-closed — 仅当二进制在测试机可解析时才断言 allowed。
+        // go 通常在 PATH (homebrew); tsc 常缺席 (项目级工具), 缺席时跳过 validate 断言。
         let g = guard().validate("go build ./...");
-        assert!(g.allowed, "go 应在白名单, reason={:?}", g.reason);
-        let t = guard().validate("tsc --noEmit app.ts");
-        assert!(t.allowed, "tsc 应在白名单, reason={:?}", t.reason);
+        if resolve_binary_path("go").is_some() {
+            assert!(g.allowed, "go (可解析) 应放行, reason={:?}", g.reason);
+        } else {
+            eprintln!("skip: go not on PATH, fail-closed path");
+        }
+        if resolve_binary_path("tsc").is_some() {
+            let t = guard().validate("tsc --noEmit app.ts");
+            assert!(t.allowed, "tsc (可解析) 应放行, reason={:?}", t.reason);
+        } else {
+            eprintln!("skip: tsc not on PATH, fail-closed path");
+        }
     }
 
     #[test]
@@ -1275,8 +1348,54 @@ mod tests {
             eprintln!("skip: /usr/bin/python3 not present on this machine");
             return;
         }
-        let v = guard().validate("/usr/bin/python3 -c \"print('hi')\"");
+        let v = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("/usr/bin/python3 -c \"print('hi')\"");
         assert!(v.allowed, "系统 python3 应放行, reason={:?}", v.reason);
+    }
+
+    #[test]
+    fn d311_blocks_inline_exec_payload_variants() {
+        // D3-11 (审计 0827 product): 内联解释器网关须覆盖 -c payload 所有变体, 不限危险词。
+        // agent-driven 模型可生成 exec()/os.system()/__import__ 等 one-liner 绕 regex 危险词枚举。
+        // 网关在 payload 内容前拦截 (binary+flag 级), 故任意 payload 一律拒 (默认 allow_inline=false)。
+        // 仅用白名单解释器 (python3/node) + 不含 Stage1 危险词 payload — 隔离测试网关本身
+        // (非白名单解释器如 ruby/perl 先被 Stage2 拦, 不达网关; 含危险词 payload 先被 Stage1 拦)。
+        for cmd in [
+            "python3 -c \"exec('print(1)')\"",
+            "python3 -c \"__import__('socket')\"",
+            "python3 -c \"print('x')\"",
+            "node -e \"require('fs')\"",
+            "node -e \"console.log('x')\"",
+        ] {
+            let v = guard().validate(cmd);
+            assert!(
+                !v.allowed,
+                "D3-11: 内联 -c/-e payload 须拒 (网关 binary+flag 级, 与 payload 无关): {cmd}, reason={:?}",
+                v.reason
+            );
+            assert!(
+                v.reason.as_deref().unwrap_or("").contains("-c")
+                    || v.reason.as_deref().unwrap_or("").contains("-e"),
+                "D3-11: 拒因须指 -c/-e 网关, 非 payload 危险词 (防误依赖 regex 枚举): reason={:?}",
+                v.reason
+            );
+        }
+        // 危险词 payload (含 rm -rf) 经 Stage1 拦 — 双层防御, 仍拒 (任一层拦即可)。
+        let v_danger = guard().validate("python3 -c \"os.system('rm -rf /')\"");
+        assert!(
+            !v_danger.allowed,
+            "D3-11: 含危险词 -c payload 须拒 (Stage1 或网关)"
+        );
+        // opt-in 后仍跑 (受信本地), payload 危险词由 Stage1/Stage2 regex 兜底。
+        let v2 = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("python3 -c \"print('safe')\"");
+        assert!(
+            v2.allowed,
+            "D3-11: opt-in 后无害 -c 须放行, reason={:?}",
+            v2.reason
+        );
     }
 
     #[test]
@@ -1304,14 +1423,47 @@ mod tests {
     }
 
     #[test]
-    fn arch2_unresolvable_binary_passes() {
-        // basename 命中白名单但二进制不存在 (如 `python` 此机器无) → 无投毒面 → 放行。
-        let v = guard().validate("python -c \"print('hi')\"");
-        // python 在白名单; 若此机器无 python 二进制, resolve=None → 放行 (非投毒)。
-        // 若机器恰好有 python (在可信目录), 也放行。两侧都应 allowed。
+    fn arch2_unresolvable_binary_fail_closed() {
+        // D3-6: basename 命中白名单但二进制不存在 → resolve=None → fail-closed 拒 (非放行)。
+        // 用白名单内但此机器不存在的名字 (rustup 白名单基线, 本机无)。
+        // 若机器恰好有 rustup, resolve=Some → 走 starts_with 分支 (非本测试目标), skip。
+        let probe = "rustup";
+        if resolve_binary_path(probe).is_some() {
+            eprintln!(
+                "skip: {} exists on this machine, fail-closed path not exercised",
+                probe
+            );
+            return;
+        }
+        let v = guard().validate(&format!("{} --version", probe));
         assert!(
-            v.allowed,
-            "不可解析的非投毒二进制应放行, reason={:?}",
+            !v.allowed,
+            "不可解析的二进制应 fail-closed 拒 (D3-6), reason={:?}",
+            v.reason
+        );
+        assert!(
+            v.reason.as_deref().unwrap().contains("无法解析"),
+            "应报无法解析原因, got={:?}",
+            v.reason
+        );
+    }
+
+    #[test]
+    fn arch2_nonexistent_absolute_path_fail_closed() {
+        // D3-6: 绝对路径但文件不存在 → resolve=None → fail-closed 拒。
+        // basename 取白名单内名 (python3), 路径在 /tmp 不存在 → resolve=None。
+        // basename = nonexistent-fe-python3-xyz 不在白名单 → 会先被白名单拒, 非本测试目标。
+        // 故用白名单 basename + 不存在父目录: /tmp/fe_no_such_dir/python3。
+        let cmd = "/tmp/fe_no_such_dir_xyz/python3 -c \"print(1)\"";
+        let v = guard().with_allow_inline_interpreter(true).validate(cmd);
+        assert!(
+            !v.allowed,
+            "不存在的绝对路径二进制应 fail-closed 拒 (D3-6), reason={:?}",
+            v.reason
+        );
+        assert!(
+            v.reason.as_deref().unwrap().contains("无法解析"),
+            "应报无法解析原因 (非白名单原因), got={:?}",
             v.reason
         );
     }
@@ -1664,13 +1816,17 @@ mod tests {
 
     #[test]
     fn allows_python_c_inline() {
-        let v = guard().validate("python3 -c \"print('hello')\"");
+        let v = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("python3 -c \"print('hello')\"");
         assert!(v.allowed, "python -c 应保留允许, reason={:?}", v.reason);
     }
 
     #[test]
     fn allows_node_e_inline() {
-        let v = guard().validate("node -e \"console.log(1)\"");
+        let v = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("node -e \"console.log(1)\"");
         assert!(v.allowed, "node -e 应保留允许, reason={:?}", v.reason);
     }
 
@@ -1766,9 +1922,26 @@ mod tests {
 
     #[test]
     fn with_extra_whitelist_allows_project_tool() {
-        let g = SecurityGuard::new().with_extra_whitelist(&["myproj-runner"]);
-        let v = g.validate("myproj-runner --version");
+        // D3-6: validate 现 fail-closed — 项目工具须真实存在于可信目录才能 resolve 通过。
+        let dir = std::env::temp_dir().join("fe_proj_tool_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("myproj-runner");
+        std::fs::write(&tool, "#!/bin/sh\necho run\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&tool).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&tool, perm).unwrap();
+        }
+        let g = SecurityGuard::new()
+            .with_extra_whitelist(&["myproj-runner"])
+            .with_trusted_bin_dirs(&[dir.to_str().unwrap()]);
+        let cmd = format!("{} --version", tool.display());
+        let v = g.validate(&cmd);
         assert!(v.allowed, "项目扩展工具应放行: {:?}", v.reason);
+        let _ = std::fs::remove_file(&tool);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -1784,6 +1957,52 @@ mod tests {
         // 基线工具不受扩展拒绝影响
         let v = g.validate("python3 --version");
         assert!(v.allowed, "基线工具不受影响: {:?}", v.reason);
+    }
+
+    #[test]
+    fn d3_1_inline_interpreter_blocked_by_default() {
+        // D3-1 (审计 0827 product): 企业硬化默认拒内联解释器 (python -c / node -e / ruby -e / perl -e),
+        // 防 agent-driven 任意 payload 绕白名单语义。Default SecurityGuard::new() 即拦。
+        let g = guard();
+        for cmd in [
+            "python3 -c 'print(1)'",
+            "python -c 'import os; os.system(\"x\")'",
+            "node -e 'console.log(1)'",
+            "ruby -e 'puts 1'",
+            "perl -e 'print 1'",
+            "perl5 -e 'print 1'",
+        ] {
+            let v = g.validate(cmd);
+            assert!(!v.allowed, "D3-1 默认应拒内联解释器: {}", cmd);
+        }
+    }
+
+    #[test]
+    fn d3_1_inline_interpreter_opt_in_allows() {
+        // D3-1: with_allow_inline_interpreter(true) opt-in 保留内联执行能力 (测试机/本地交互)。
+        let g = guard().with_allow_inline_interpreter(true);
+        for cmd in ["python3 -c 'print(1)'", "node -e 'console.log(1)'"] {
+            let v = g.validate(cmd);
+            assert!(
+                v.allowed,
+                "D3-1 opt-in 应放行内联解释器: {} — {:?}",
+                cmd, v.reason
+            );
+        }
+    }
+
+    #[test]
+    fn d3_1_inline_interpreter_preserves_normal_binary_use() {
+        // D3-1: 网关只拦 -c/-e/--eval/-p/--print; 普通解释器调用 (python3 script.py) 不受影响。
+        let g = guard();
+        for cmd in ["python3 --version", "python3 -m pytest", "node --version"] {
+            let v = g.validate(cmd);
+            assert!(
+                v.allowed,
+                "D3-1 不应影响普通解释器调用: {} — {:?}",
+                cmd, v.reason
+            );
+        }
     }
 
     #[test]
@@ -1870,7 +2089,21 @@ mod tests {
     #[test]
     fn reload_extras_replaces_not_accumulates() {
         // m-OPS-02: reload 重建语义 — 旧扩展丢弃, 新 extras 生效, 基线恒在
-        let g = SecurityGuard::new().with_extra_whitelist(&["tool-a", "tool-b"]);
+        // D3-6: validate 现 fail-closed — tool-c 须真实存在于可信目录才能 resolve 通过。
+        let dir = std::env::temp_dir().join("fe_reload_extras_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool_c = dir.join("tool-c");
+        std::fs::write(&tool_c, "#!/bin/sh\necho c\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&tool_c).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&tool_c, perm).unwrap();
+        }
+        let g = SecurityGuard::new()
+            .with_extra_whitelist(&["tool-a", "tool-b"])
+            .with_trusted_bin_dirs(&[dir.to_str().unwrap()]);
         assert!(g.whitelist_contains("tool-a") && g.whitelist_contains("tool-b"));
         // reload 仅给 tool-c → tool-a/tool-b 应消失 (非累加), tool-c 在, 基线 python 在
         g.reload_extras(&["tool-c"]);
@@ -1884,15 +2117,19 @@ mod tests {
         );
         assert!(g.whitelist_contains("tool-c"), "reload 应含新扩展 tool-c");
         assert!(g.whitelist_contains("python"), "基线恒在");
-        // 验证放行生效
+        // 验证放行生效 (tool-c 在可信目录 + 白名单 → resolve 通过)
+        let cmd = format!("{} --version", tool_c.display());
         assert!(
-            g.validate("tool-c --version").allowed,
-            "新扩展 tool-c 应放行"
+            g.validate(&cmd).allowed,
+            "新扩展 tool-c 应放行, reason={:?}",
+            g.validate(&cmd).reason
         );
         assert!(
             !g.validate("tool-a --version").allowed,
-            "旧扩展 tool-a 应已拦"
+            "旧扩展 tool-a 应已拦 (白名单缺失, resolve 前拒)"
         );
+        let _ = std::fs::remove_file(&tool_c);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

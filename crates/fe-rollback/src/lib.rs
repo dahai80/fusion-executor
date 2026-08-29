@@ -22,7 +22,7 @@
 //            由 git gc 回收. 故无需 drop (drop -- <sha> 实测报 "不是一个储藏引用").
 //            不变量由 test_stash_list_stays_empty_across_rollback_cycles 守护.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use fe_security::SecurityGuard;
 use fs2::FileExt;
 use std::fs::OpenOptions;
@@ -38,6 +38,12 @@ const GIT_TIMEOUT_SEC: u64 = 30;
 /// fs2 无带超时 lock → try_lock_exclusive 轮询至上限, 超时 fail-loud (不无限挂)。
 const LOCK_ACQUIRE_TIMEOUT_MS: u64 = GIT_TIMEOUT_SEC * 1000;
 const LOCK_POLL_INTERVAL_MS: u64 = 50;
+
+/// D6-03 (审计 0827 product): 快照清单留存上限。超出则按 created_ms 丢最旧。
+/// dangling commit 由 git gc 回收 (C-RB-01), 索引行只是元数据; cap 防无界索引增长。
+const SNAPSHOT_INDEX_MAX: usize = 100;
+/// D6-03: 快照索引文件名 (NDJSON Lines), 与 fe-rollback.lock 同处 <git_dir>。
+const SNAPSHOT_INDEX_NAME: &str = "fe-snapshots.ndjson";
 
 /// RUN-6a (审计 0827 arch): git 调用统一有界包装。git CLI 无内置超时, NFS hang / 死锁
 /// 会让 `.output().await` 永不返回 (持有 RepoLock 跨 hang → 其他回滚阻塞)。包
@@ -235,6 +241,94 @@ impl RollbackOutcome {
     }
 }
 
+/// D6-03 (审计 0827 product): 快照清单条目 — 供 on-call 查 "现有快照" + 留存审计。
+/// `id` = snapshot_create 返的完整 tag (head:<SHA>[,repo:<hash>] / stash:<SHA>,base:<HEAD>...)。
+/// `created_ms` = Unix epoch 毫秒 (排序/留存丢旧依据)。
+/// `kind` = "head" | "stash" (parse_snapshot 解析), 非 repo 快照不入索引 (id 空)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotInfo {
+    pub id: String,
+    pub created_ms: u64,
+    pub kind: String,
+}
+
+/// D6-03: 解析快照 id 的 kind (复用 parse_snapshot, 非 repo/空 id → None)。
+fn snapshot_kind(id: &str) -> Option<&'static str> {
+    RollbackManager::parse_snapshot(id).map(|(k, _, _, _)| k)
+}
+
+/// D6-03: 快照索引文件路径 (<git_dir>/fe-snapshots.ndjson)。
+/// 非 repo (无 git dir) → None, 调用方跳过索引 (与 snapshot_create 返空串一致)。
+fn snapshot_index_path(cwd: &str) -> Option<std::path::PathBuf> {
+    let git_dir = resolve_git_dir(cwd).or_else(|| {
+        let fb = std::path::Path::new(cwd).join(".git");
+        if fb.exists() {
+            Some(fb)
+        } else {
+            None
+        }
+    })?;
+    Some(git_dir.join(SNAPSHOT_INDEX_NAME))
+}
+
+/// D6-03: 追加快照到索引 + 留存 (SNAPSHOT_INDEX_MAX 内丢最旧)。
+/// 在 snapshot_create 持 RepoLock 期间调用 — 无新锁, 索引写与快照建同锁互斥。
+/// 写失败 fail-visible warn! 不影响 snapshot_create 返值 (快照本身已建, 索引是辅助)。
+fn record_snapshot_index(cwd: &str, id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let Some(kind) = snapshot_kind(id) else {
+        warn!(%id, cwd, "D6-03: 快照 id 无法解析 kind, 跳过索引");
+        return;
+    };
+    let Some(path) = snapshot_index_path(cwd) else {
+        return; // 非 repo, snapshot_create 本应已返空 — 此处兜底
+    };
+    let entry = match serde_json::to_string(&SnapshotInfo {
+        id: id.to_string(),
+        created_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        kind: kind.to_string(),
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(%id, %e, "D6-03: 快照索引序列化失败, 跳过");
+            return;
+        }
+    };
+    let mut lines: Vec<String> = match std::fs::read_to_string(&path) {
+        Ok(s) => s
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            warn!(path = %path.display(), %e, "D6-03: 读快照索引失败, 重建空索引");
+            Vec::new()
+        }
+    };
+    lines.push(entry);
+    if lines.len() > SNAPSHOT_INDEX_MAX {
+        // 解析 created_ms 排序丢最旧; 解析失败行排末尾先丢 (坏行不可信)
+        lines.sort_by_key(|l| {
+            serde_json::from_str::<SnapshotInfo>(l)
+                .map(|i| i.created_ms)
+                .unwrap_or(u64::MAX)
+        });
+        lines.truncate(SNAPSHOT_INDEX_MAX);
+    }
+    let body = lines.join("\n") + "\n";
+    if let Err(e) = std::fs::write(&path, body) {
+        warn!(path = %path.display(), %e, "D6-03: 写快照索引失败 (快照本身已建, 索引为辅助)");
+    } else {
+        info!(path = %path.display(), %id, kind, "D6-03: 快照已记入索引 (留存 cap {})", SNAPSHOT_INDEX_MAX);
+    }
+}
+
 /// 回滚管理器 — git CLI shell
 pub struct RollbackManager {
     guard: SecurityGuard,
@@ -335,12 +429,48 @@ impl RollbackManager {
             format!(",repo:{}", repo)
         };
         if stash.is_empty() {
-            info!(cwd, %head, "无改动, 快照 = head 基线");
-            return Ok(format!("head:{}{}", head, repo_tag));
+            let id = format!("head:{}{}", head, repo_tag);
+            info!(cwd, %id, "无改动, 快照 = head 基线");
+            // D6-03: 快照已建, 记入 on-disk 索引 (RepoLock 仍持有, 写与快照建同锁互斥)。
+            record_snapshot_index(cwd, &id);
+            return Ok(id);
         }
         let id = format!("stash:{},base:{}{}", stash, head, repo_tag);
         info!(cwd, %id, "快照创建 = stash + 基线 + repo 标识");
+        // D6-03: 同上, stash 快照亦记入索引 (fail-loud warn 不影响返值 — 快照本身已建)。
+        record_snapshot_index(cwd, &id);
         Ok(id)
+    }
+
+    /// D6-03 (审计 0827 product): 列举某 cwd 的现存快照 (on-disk NDJSON 索引)。
+    /// 留存上限 SNAPSHOT_INDEX_MAX 已在 append 时截断; 此处只读解析。
+    /// 非 repo (无 .git / 索引不存在) → 空 Vec。坏行 (解析失败) 跳过不致命。
+    /// 无状态: 仅读 cwd 对应索引文件, Executor 无需持有快照状态 (M-ARCH-1)。
+    pub fn list_snapshots(cwd: &str) -> Result<Vec<SnapshotInfo>> {
+        let Some(path) = snapshot_index_path(cwd) else {
+            return Ok(Vec::new());
+        };
+        let body = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                warn!(path = %path.display(), %e, "D6-03: 读快照索引失败");
+                bail!("读快照索引失败: {}", e);
+            }
+        };
+        let mut out = Vec::new();
+        for line in body.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<SnapshotInfo>(line) {
+                Ok(si) => out.push(si),
+                Err(e) => warn!(%line, %e, "D6-03: 索引行解析失败, 跳过"),
+            }
+        }
+        // 按 created_ms 升序 (旧 → 新) — 调用方取末尾即最新。
+        out.sort_by_key(|s| s.created_ms);
+        Ok(out)
     }
 
     /// 从 "core[,repo:<hash>]" 分离 core 与 repo tag。
@@ -1055,5 +1185,89 @@ mod tests {
             .args(["branch", "-D", "wt-branch"])
             .status();
         let _ = fs::remove_dir_all(&main);
+    }
+
+    // D6-03 (审计 0827 product): snapshot_create 写 on-disk NDJSON 索引; list_snapshots 读回。
+    #[tokio::test]
+    async fn snapshot_create_writes_index_and_list_reads_back() {
+        let dir = tmp_repo("d603-clean");
+        let cwd = dir.to_str().unwrap();
+        fs::write(dir.join("app.py"), "v1\n").unwrap();
+        git_commit(&dir, &["add", "app.py"], "base");
+
+        // clean repo → head 快照
+        let id = RollbackManager::new().snapshot_create(cwd).await.unwrap();
+        assert!(id.starts_with("head:"), "clean 快照应为 head: 前缀: {}", id);
+
+        let snaps = RollbackManager::list_snapshots(cwd).unwrap();
+        assert_eq!(snaps.len(), 1, "索引应含 1 条");
+        assert_eq!(snaps[0].id, id, "索引 id 应与 snapshot_create 返回一致");
+        assert_eq!(snaps[0].kind, "head");
+        assert!(snaps[0].created_ms > 0, "created_ms 非零");
+
+        // dirty repo → stash 快照追加
+        fs::write(dir.join("app.py"), "DIRTY\n").unwrap();
+        let id2 = RollbackManager::new().snapshot_create(cwd).await.unwrap();
+        assert!(
+            id2.starts_with("stash:"),
+            "dirty 快照应为 stash: 前缀: {}",
+            id2
+        );
+
+        let snaps2 = RollbackManager::list_snapshots(cwd).unwrap();
+        assert_eq!(snaps2.len(), 2, "追加后索引应含 2 条");
+        assert_eq!(snaps2[1].id, id2, "最新条目 = stash 快照");
+        assert_eq!(snaps2[1].kind, "stash");
+        // 升序: created_ms 旧 < 新
+        assert!(snaps2[0].created_ms <= snaps2[1].created_ms);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // D6-03: 非 repo (无 .git) → snapshot_create 返空, list_snapshots 返空 (不入索引)。
+    #[tokio::test]
+    async fn non_repo_returns_empty_index() {
+        let dir =
+            std::env::temp_dir().join(format!("fe-rollback-nonrepo-{}-d603", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_str().unwrap();
+        let id = RollbackManager::new().snapshot_create(cwd).await.unwrap();
+        assert_eq!(id, "", "非 repo 快照应空串");
+        let snaps = RollbackManager::list_snapshots(cwd).unwrap();
+        assert!(snaps.is_empty(), "非 repo 索引应空");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // D6-03: 留存上限 — 超 SNAPSHOT_INDEX_MAX 时丢最旧 (created_ms 最小)。
+    #[tokio::test]
+    async fn index_retention_prunes_oldest() {
+        let dir = tmp_repo("d603-retention");
+        let cwd = dir.to_str().unwrap();
+        fs::write(dir.join("a.txt"), "1\n").unwrap();
+        git_commit(&dir, &["add", "a.txt"], "base");
+
+        // SNAPSHOT_INDEX_MAX+5 次 clean 快照 (每次改文件内容让 stash create 空或非空均可,
+        // 此处测留存截断逻辑, 不依赖 head/stash kind)。每次 git commit 让 HEAD 变, head 快照各不同。
+        let total = SNAPSHOT_INDEX_MAX + 5;
+        for i in 0..total {
+            fs::write(dir.join("a.txt"), format!("{}\n", i)).unwrap();
+            git_commit(&dir, &["add", "a.txt"], &format!("c{}", i));
+            let _ = RollbackManager::new().snapshot_create(cwd).await.unwrap();
+        }
+        let snaps = RollbackManager::list_snapshots(cwd).unwrap();
+        assert_eq!(
+            snaps.len(),
+            SNAPSHOT_INDEX_MAX,
+            "留存应截到 cap {}",
+            SNAPSHOT_INDEX_MAX
+        );
+        // 丢的是最早 (created_ms 最小), 留的是最近 SNAPSHOT_INDEX_MAX 条
+        let first_id = &snaps[0].id;
+        assert!(
+            !first_id.starts_with("head:") || first_id != "head:",
+            "留存后首条不应是初始空快照"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

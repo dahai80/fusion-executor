@@ -62,11 +62,13 @@ pub use fe_tools::{
 // 构造失败 = 进程永久不可用, 无重试。故 panic 信息须含构建原因, 让调用方日志能定位根因;
 // 文档化约定: 首次 run() panic = 进程需重启, 无 Result 可捕获无降级 (sandbox/telemetry 全 async)。
 pub static BLOCKING_RT: LazyLock<Runtime> = LazyLock::new(|| {
+    // D4-12: cap workers at 8 — CLI/OS-tool 无需 32 核全开 (32 核机 spawn 32 worker 纯浪费线程栈)。
+    // 下限 2 保 execute/telemetry/IPC 并行; 上限 8 覆盖高并发 UDS, 余量靠 exec_sem 信号量节流。
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    let workers = workers.max(2);
-    info!(workers, "BLOCKING_RT 初始化多线程 runtime");
+    let workers = workers.clamp(2, 8);
+    info!(workers, "BLOCKING_RT 初始化多线程 runtime (D4-12 上限 8)");
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -84,6 +86,55 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_TIMEOUT: i32 = -124;
 pub const EXIT_BLOCKED: i32 = -1;
 
+/// D3-5/D3-10 (审计 0827 product): 命令日志脱敏 — command 字段直入 tracing JSON 日志
+/// (~/.fusion-executor/logs/fe.log), agent-driven 场景模型可生成含 secret 的内联命令
+/// (curl -H "Authorization: Bearer sk-ant-xxx" / export API_KEY=... / -u user:pass)。
+/// 无脱敏 → token 明文落盘, 同 UID 进程可读, 企业合规违规 (PCI-DSS/HIPAA)。
+///
+/// 纯日志侧过滤 (不改 ExecutionResult.command — 调用方需原始命令做回放/审计);
+/// 非 token 提取 (非金库) — 仅掩码疑似 secret 片段, 保守多掩少漏。
+/// 红线: 脱敏仅作用于日志 span/info, 不破坏 validate 校验 (validate 吃原始 req.command)。
+fn redact_command(cmd: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    // (?:...) 非捕获组避免影响 replace 回引用编号。case-insensitive (?i)。
+    static RE_BEARER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+\S+").unwrap());
+    static RE_SK: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bsk-[A-Za-z0-9_-]+").unwrap());
+    // KEY=VAL 形: key 命中敏感集 → 掩 VAL (VAL 不含空白, 含引号则到引号内整体)
+    // 形如 export PASSWORD=hunter2 / API_KEY="abc def" / --password=secret
+    static RE_KV: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)((?:password|passwd|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credential|authorization)\s*=\s*)("[^"]*"|\S+)"#,
+        )
+        .unwrap()
+    });
+    // curl basic auth: -u user:pass / --user user:pass (pass 为冒号后整段)
+    static RE_BASIC: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)(\B-u\b|--user)\s+(\S+):(\S+)").unwrap());
+    // -H/--header "Name: val" 中 Name 命中敏感集 → 掩整段引号内容
+    static RE_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)(-H|--header)\s+"((?:authorization|x-api-key|api-key|cookie|set-cookie)[^"]*)""#,
+        )
+        .unwrap()
+    });
+    let mut out = cmd.to_string();
+    out = RE_BEARER
+        .replace_all(&out, "Bearer [REDACTED]")
+        .into_owned();
+    out = RE_SK.replace_all(&out, "sk-[REDACTED]").into_owned();
+    out = RE_KV.replace_all(&out, "${1}[REDACTED]").into_owned();
+    out = RE_BASIC
+        .replace_all(&out, "${1} ${2}:[REDACTED]")
+        .into_owned();
+    out = RE_HEADER
+        .replace_all(&out, r#"${1} "[REDACTED]""#)
+        .into_owned();
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionRequest {
@@ -96,7 +147,10 @@ pub struct ExecutionRequest {
     pub timeout_sec: f64,
     #[serde(default)]
     pub env_vars: Option<std::collections::HashMap<String, String>>,
-    #[serde(default = "default_true")]
+    /// D5-2: 默认 false — 快照创建是 opt-in (每次 execute 跑 2 次 git spawn, 热路径成本
+    /// D4-11)。auto_rollback_policy.is_some() 时 fe-core 内部强制开快照 (回滚须快照, 调用方
+    /// 不应设两标志)。默认关 = 裸 run("echo") 不触发 git, 无意外延迟。
+    #[serde(default = "default_false")]
     pub enable_rollback_snapshot: bool,
     #[serde(default)]
     pub auto_rollback_policy: Option<RollbackPolicy>,
@@ -126,6 +180,11 @@ pub struct ExecutionRequest {
     /// 拦 FD 耗尽攻击 (海量打开 fd 击杀宿主)。0=不限 (受信场景 opt-out)。Darwin 实测生效 (errno 24 EMFILE)。
     #[serde(default = "default_nofile")]
     pub max_nofile: u32,
+    /// D3-4 (审计 0827 product): per-task RSS 上限 (MB)。Darwin RLIMIT_AS/RLIMIT_DATA 平台无效,
+    /// 改 sysinfo 轮询子进程树 RSS, 超限 kill 进程树 (exit_code -124, oom_killed=true)。
+    /// 默认 2048 — 拦内存炸弹击杀宿主。0=禁用 watchdog (受信 opt-out)。
+    #[serde(default = "default_rss_limit")]
+    pub rss_limit_mb: u32,
     /// M-OPS-06: 跨层关联 id。None 时 execute 入口自动生成 uuid v4, 贯穿日志/IPC/结果。
     #[serde(default)]
     pub trace_id: Option<String>,
@@ -143,12 +202,20 @@ fn default_nofile() -> u32 {
     1024
 }
 
+fn default_rss_limit() -> u32 {
+    2048
+}
+
 fn default_timeout() -> f64 {
     30.0
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -240,6 +307,10 @@ pub struct ExecutionResult {
     /// M-OPS-06: 跨层关联 id — 回填请求侧 trace_id (None 时入口自动生成)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// D3-4 (审计 0827 product): RSS watchdog 触发标记 — 子进程树 RSS 超 rss_limit_mb 被 kill。
+    /// 默认 false 省略 (skip_serializing_if is_false); exit_code 伴随 -124 (kill 约定)。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oom_killed: bool,
     /// RUN-11: 沙箱子进程 PID — 从 SandboxResult.pid 回填, 调用方据此传给 telemetry_stream
     /// 采样真实任务进程 (非 executor 自身)。stdio 路径有 pid; 拦截/超时路径无 → None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,6 +415,26 @@ pub struct AutoRollbackGuard {
     cwd: String,
     rollback: RollbackManager,
     pre_status: std::collections::HashSet<String>,
+    // D5-1: record_result 是否已被调用。Drop 时若未调 → 执行中途 panic/abort 提早 drop,
+    // warn! 显式暴露 snapshot_id 供调用方手动恢复 (Drop 不能 .await, 真回滚须调用方发起)。
+    // AtomicBool (非 Cell<bool>) — guard 跨 tokio::spawn move 须 Send, Cell 不 impl Sync。
+    recorded: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for AutoRollbackGuard {
+    fn drop(&mut self) {
+        // D5-1: 守卫未正常 record_result 就 drop = 执行中途 panic/abort/提前返回。
+        // 不能在 Drop 里 .await 做回滚 (async-in-Drop 不健全); 仅 loud warn + 暴露 snapshot_id,
+        // 让调用方见日志后手动 rollback(snapshot_id, cwd) 恢复 (Rule 12 fail-visible, honest path)。
+        if !self.recorded.load(std::sync::atomic::Ordering::Acquire) {
+            warn!(
+                snapshot = %self.snapshot_id,
+                cwd = %self.cwd,
+                "AutoRollbackGuard dropped 未调 record_result — 执行中途 panic/提前 drop; \
+                 调用方须手动 rollback(snapshot_id) 恢复 (Drop 无法 async 回滚)"
+            );
+        }
+    }
 }
 
 impl AutoRollbackGuard {
@@ -361,19 +452,26 @@ impl AutoRollbackGuard {
             cwd,
             rollback: RollbackManager::new(),
             pre_status,
+            recorded: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// 采集 git status --porcelain 行集 (去空白行)。命令前后各采一次, diff 出命令新增改动。
     /// L-CORE-02: git 失败 fail-loud (返 Err), 不再 `.unwrap_or(0)` 静默跳回滚。
+    /// D5-4: git status 包 tokio::time::timeout(10s) — NFS/挂死 git 不会无限阻塞执行; 超时
+    /// 返 Err (status 未知), detect_damage/调用方 fail-loud 处理 (回滚可能不精确, 但不挂死)。
     async fn capture_status(cwd: &str) -> Result<std::collections::HashSet<String>> {
-        let out = tokio::process::Command::new("git")
+        let fut = tokio::process::Command::new("git")
             .arg("-C")
             .arg(cwd)
             .args(["status", "--porcelain"])
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("git status 启动失败: {e}"))?;
+            .output();
+        let out = match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+            Ok(o) => o.map_err(|e| anyhow::anyhow!("git status 启动失败: {e}"))?,
+            Err(_) => {
+                anyhow::bail!("git status 超时 (>10s) — cwd={cwd}, status 未知 (D5-4)")
+            }
+        };
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             anyhow::bail!("git status 失败 (exit {}): {}", out.status, stderr);
@@ -423,6 +521,10 @@ impl AutoRollbackGuard {
     /// L-CORE-02: detect_damage 失败不再静默 (旧 .unwrap_or(0) 跳回滚); 现 propagate Err,
     /// 调用方 (execute_async/execute_streaming) 已 warn! 记录。
     pub async fn record_result(&self, result: &mut ExecutionResult) -> Result<()> {
+        // D5-1: 进 record_result 即视守卫已被正常消费 (即便早期 return 也是合法 "无需回滚")。
+        // Drop 据此区分 "已消费" vs "中途 panic/提前 drop 未消费"。set 在入口, 覆盖所有 return 路径。
+        self.recorded
+            .store(true, std::sync::atomic::Ordering::Release);
         if result.exit_code == 0 {
             return Ok(());
         }
@@ -508,6 +610,16 @@ impl Executor {
                 }
             }
         }
+        // ARCH-2: rustup 标准安装位 ($HOME/.cargo/bin) — cargo/rustc 在此。非攻击者可控
+        // (home 目录, rustup 写入需已具机器执行权), 不违 ARCH-2 /tmp 投毒 + PATH 前置威胁模型。
+        // 登记使 rustup-only 机器 (CI macos-14 runner) 的 `cargo build/test` 通过 — homebrew
+        // 机器 cargo 在 /opt/homebrew/bin 已基线可信, 不受影响。与 VIRTUAL_ENV/bin 同级信任。
+        if let Ok(home) = std::env::var("HOME") {
+            let cargo_bin = std::path::Path::new(&home).join(".cargo").join("bin");
+            if let Some(s) = cargo_bin.to_str() {
+                trusted.push(s.to_string());
+            }
+        }
         let trusted_refs: Vec<&str> = trusted.iter().map(String::as_str).collect();
         let security = if trusted_refs.is_empty() {
             SecurityGuard::new()
@@ -531,6 +643,25 @@ impl Executor {
     pub fn with_extra_whitelist(mut self, extras: &[&str]) -> Self {
         info!(count = extras.len(), "Executor 扩展白名单 (项目级放行)");
         self.security = self.security.with_extra_whitelist(extras);
+        self
+    }
+
+    /// ARCH-2 可信二进制目录透传 — 项目 bin 目录登记 (venv/exe 目录由 new() 自动登记;
+    /// 此 builder 供额外项目工具目录登记, 多用于测试与多 bin 路径部署)。透传 SecurityGuard。
+    pub fn with_trusted_bin_dirs(mut self, dirs: &[&str]) -> Self {
+        info!(
+            count = dirs.len(),
+            "Executor 登记额外可信二进制目录 (ARCH-2)"
+        );
+        self.security = self.security.with_trusted_bin_dirs(dirs);
+        self
+    }
+
+    /// D3-1 (审计 0827 product): 内联解释器网关透传。true=允许 python -c / node -e /
+    /// ruby -e / perl -e (保留 trusted-caller 内联执行能力); 默认 false (企业硬化拒内联代码,
+    /// 防 agent-driven 任意 payload 绕白名单语义)。透传 SecurityGuard.with_allow_inline_interpreter。
+    pub fn with_allow_inline_interpreter(mut self, allow: bool) -> Self {
+        self.security = self.security.with_allow_inline_interpreter(allow);
         self
     }
 
@@ -683,6 +814,12 @@ impl Executor {
         self.rollback.snapshot_create(cwd).await
     }
 
+    /// D6-03 (审计 0827 product): 快照清单 — 公开供 fe-pyo3/fe-ipc 直接调用。
+    /// 无状态 (M-ARCH-1): 仅读 cwd 对应 on-disk 索引, Executor 不持有快照状态。
+    pub async fn list_snapshots_async(&self, cwd: &str) -> Result<Vec<fe_rollback::SnapshotInfo>> {
+        fe_rollback::RollbackManager::list_snapshots(cwd)
+    }
+
     /// 回滚 — 公开供 fe-pyo3 直接调用。
     /// L-1 (审计 0827): rollback() 内部返 RollbackOutcome; 此包装映射 .applied → bool
     /// 保持 IPC/PyO3/Python 侧 bool 契约不变 (skipped_reason 细节经 ExecutionResult 4 层流通)。
@@ -709,10 +846,10 @@ impl Executor {
             tracing::Level::INFO,
             "execute",
             trace_id = %trace_id,
-            command = %req.command
+            command = %redact_command(&req.command)
         );
         let _enter = span.enter();
-        info!(command = %req.command, "execute_async — 校验中");
+        info!(command = %redact_command(&req.command), "execute_async — 校验中");
         let start = Instant::now();
         let verdict = self.security.validate(&req.command);
         if !verdict.allowed {
@@ -740,22 +877,39 @@ impl Executor {
             }
         }
 
-        // 快照 + 命令前 git status 快照 (caller-driven 锁定决策: 仅当 enable_rollback_snapshot 且有 cwd)
+        // 快照 + 命令前 git status 快照。
+        // D5-2: 默认 opt-in — want_snapshot = 显式 enable_rollback_snapshot || auto_rollback_policy.is_some()
+        //   (回滚须快照, 调用方传 policy 即隐式要快照, 不应再设两标志)。裸 run("echo") 默认不跑 git。
+        // D5-2 fail-loud: snapshot_create 失败不再 "非致命" info! 继续吞 — 改 warn! 显式暴露;
+        //   且若 caller 传了 auto_rollback_policy 但快照建不出 → 回滚保障失效, 标 rollback_unavailable。
         // C-CORE-01: pre_status 是命令前工作区状态, 供 guard diff 命令后状态找出命令新增改动
-        // (旧版非空即判毁损, __pycache__/WIP 误触发)。pre_status 与 snapshot 同期采集 (命令前)。
-        let (snapshot_id, pre_status) = if req.enable_rollback_snapshot {
+        //   (旧版非空即判毁损, __pycache__/WIP 误触发)。pre_status 与 snapshot 同期采集 (命令前)。
+        let want_snapshot = req.enable_rollback_snapshot || req.auto_rollback_policy.is_some();
+        let mut snapshot_create_err: Option<anyhow::Error> = None;
+        let (snapshot_id, pre_status) = if want_snapshot {
             if let Some(cwd) = &req.cwd {
                 let snap = self.rollback.snapshot_create(cwd).await;
                 let pre = AutoRollbackGuard::capture_status(cwd).await;
                 match (snap, pre) {
                     (Ok(id), Ok(st)) => {
-                        if !id.is_empty() {
+                        if id.is_empty() {
+                            // D5-6: want_snapshot=true 但快照 id 空 (非 git repo cwd) — 回滚无锚点,
+                            // 若 caller 传 policy 则保障失效, warn! 显式暴露 (非静默空 id)。
+                            if req.auto_rollback_policy.is_some() {
+                                warn!(cwd, "快照 id 空 (非 git repo) 但 caller 传 auto_rollback — 回滚无锚点, 保障失效");
+                            } else {
+                                info!(
+                                    cwd,
+                                    "快照 id 空 (非 git repo) — 无回滚锚点, 仅 pre_status 采集"
+                                );
+                            }
+                        } else {
                             info!(%id, "快照已创建");
                         }
                         (Some(id), st)
                     }
                     (Ok(id), Err(e)) => {
-                        // 命令前 status 采集失败 — 非 git repo 或 git 异常。pre_status 空集,
+                        // 命令前 status 采集失败 — 非 git repo 或 git 异常 (D5-4 可能超时)。pre_status 空集,
                         // guard detect 时 post 若非空则全部算命令新增 (保守: 当作全命令导致)。
                         warn!(error = %e, cwd, "命令前 git status 采集失败, pre_status 置空");
                         if !id.is_empty() {
@@ -764,7 +918,10 @@ impl Executor {
                         (Some(id), std::collections::HashSet::new())
                     }
                     (Err(e), _) => {
-                        info!(error = %e, "快照创建失败, 继续 (非致命)");
+                        // D5-2 fail-loud: 快照建不出 → warn! (升级 info!→warn!)。caller 传 policy 时
+                        // 标 rollback_unavailable (后续 result 构造后置位, 此处记 err 携带)。
+                        warn!(error = %e, cwd, "快照创建失败 — 回滚保障不可用 (D5-2 fail-loud)");
+                        snapshot_create_err = Some(e);
                         (None, std::collections::HashSet::new())
                     }
                 }
@@ -788,6 +945,7 @@ impl Executor {
             max_nproc: req.max_nproc,
             max_cpu_sec: req.max_cpu_sec,
             max_nofile: req.max_nofile,
+            rss_limit_mb: req.rss_limit_mb,
         };
         info!(
             seatbelt = req.seatbelt,
@@ -826,9 +984,16 @@ impl Executor {
             snapshot_id: sid_filtered.clone(),
             diagnostics: diag,
             trace_id: Some(trace_id),
-            pid: sb.pid, // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
+            oom_killed: sb.oom_killed, // D3-4: RSS watchdog 触发回填
+            pid: sb.pid,               // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
             ..Default::default()
         };
+
+        // D5-2 fail-loud: 快照建不出且 caller 传了 policy → 回滚无锚点, guard 不会构造,
+        // 调用方无信号知保障失效。标 rollback_unavailable=true (snapshot_create_err 已在上方记 warn!)。
+        if snapshot_create_err.is_some() && req.auto_rollback_policy.is_some() {
+            result.rollback_unavailable = true;
+        }
 
         // 自动回滚 (FR-04) — 调用方传 policy 且有快照+cwd 时, 单次内 guard 判定
         // pre_status 命令前已采集, 传入 guard 供 detect_damage diff (C-CORE-01)
@@ -872,10 +1037,10 @@ impl Executor {
             tracing::Level::INFO,
             "execute_stream",
             trace_id = %trace_id,
-            command = %req.command
+            command = %redact_command(&req.command)
         );
         let _enter = span.enter();
-        info!(command = %req.command, "execute_streaming — 校验中");
+        info!(command = %redact_command(&req.command), "execute_streaming — 校验中");
         let start = Instant::now();
         let verdict = self.security.validate(&req.command);
         if !verdict.allowed {
@@ -919,13 +1084,22 @@ impl Executor {
         }
 
         // 快照 + 命令前 git status 快照 (与 execute_async 同策略; C-CORE-01 pre_status diff)
-        let (snapshot_id, pre_status) = if req.enable_rollback_snapshot {
+        // D5-2/D5-6: 同 execute_async — want_snapshot 含 auto_rollback_policy; fail-loud + empty warn。
+        let want_snapshot = req.enable_rollback_snapshot || req.auto_rollback_policy.is_some();
+        let mut snapshot_create_err: Option<anyhow::Error> = None;
+        let (snapshot_id, pre_status) = if want_snapshot {
             if let Some(cwd) = &req.cwd {
                 let snap = self.rollback.snapshot_create(cwd).await;
                 let pre = AutoRollbackGuard::capture_status(cwd).await;
                 match (snap, pre) {
                     (Ok(id), Ok(st)) => {
-                        if !id.is_empty() {
+                        if id.is_empty() {
+                            if req.auto_rollback_policy.is_some() {
+                                warn!(cwd, "快照 id 空 (非 git repo) 但 caller 传 auto_rollback — 回滚无锚点, 保障失效 (streaming)");
+                            } else {
+                                info!(cwd, "快照 id 空 (非 git repo) — 无回滚锚点 (streaming)");
+                            }
+                        } else {
                             info!(%id, "快照已创建 (streaming)");
                         }
                         (Some(id), st)
@@ -938,7 +1112,8 @@ impl Executor {
                         (Some(id), std::collections::HashSet::new())
                     }
                     (Err(e), _) => {
-                        info!(error = %e, "快照创建失败, 继续 (非致命, streaming)");
+                        warn!(error = %e, cwd, "快照创建失败 — 回滚保障不可用 (D5-2 fail-loud, streaming)");
+                        snapshot_create_err = Some(e);
                         (None, std::collections::HashSet::new())
                     }
                 }
@@ -962,6 +1137,7 @@ impl Executor {
             max_nproc: req.max_nproc,
             max_cpu_sec: req.max_cpu_sec,
             max_nofile: req.max_nofile,
+            rss_limit_mb: req.rss_limit_mb,
         };
         info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg)?;
@@ -975,6 +1151,9 @@ impl Executor {
         let policy_for_done = req.auto_rollback_policy.clone();
         let cwd_for_guard = req.cwd.clone();
         let pre_status_for_guard = pre_status.clone();
+        // D5-2: 快照建不出 + policy → 标 rollback_unavailable (closure 内应用)
+        let snapshot_err_for_done = snapshot_create_err.is_some();
+        let policy_present = req.auto_rollback_policy.is_some();
 
         let (outer_tx, outer_rx) = mpsc::channel::<ExecutionStreamEvent>(64);
         // C-4: spawn 任务体包 catch_unwind — 病态 slicer/guard/unwrap panic 不静默丢 Done 帧。
@@ -1027,9 +1206,14 @@ impl Executor {
                                 snapshot_id: sid_filtered.clone(),
                                 diagnostics: diag,
                                 trace_id: Some(trace_id_for_done.clone()),
+                                oom_killed: sb.oom_killed, // D3-4: RSS watchdog 触发回填
                                 pid: sb.pid, // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
                                 ..Default::default()
                             };
+                            // D5-2 fail-loud: 快照建不出且 caller 传 policy → guard 不构造, 标 rollback_unavailable (streaming)
+                            if snapshot_err_for_done && policy_present {
+                                result.rollback_unavailable = true;
+                            }
                             // 自动回滚 (FR-04, 同 execute_async; pre_status diff C-CORE-01)
                             if let (Some(policy), Some(cwd), Some(sid)) = (
                                 policy_for_done.as_ref(),
@@ -1137,6 +1321,69 @@ mod tests {
             .unwrap()
     }
 
+    // D3-5/D3-10: 命令日志脱敏 — secret 模式掩码, 非 secret 保留
+    #[test]
+    fn redact_command_bearer_token() {
+        let r = redact_command("curl -H 'Authorization: Bearer sk-ant-abc123' https://api");
+        assert!(!r.contains("sk-ant-abc123"), "Bearer token 应脱敏: {r}");
+        assert!(r.contains("[REDACTED]"), "应含 [REDACTED] 占位: {r}");
+    }
+
+    #[test]
+    fn redact_command_sk_prefix() {
+        let r = redact_command("echo sk-proj-xyz789");
+        assert!(!r.contains("sk-proj-xyz789"), "sk- key 应脱敏: {r}");
+        assert!(r.contains("sk-[REDACTED]"), "应含 sk-[REDACTED]: {r}");
+    }
+
+    #[test]
+    fn redact_command_key_equals_value() {
+        let r = redact_command("export PASSWORD=hunter2 && curl https://api");
+        assert!(!r.contains("hunter2"), "PASSWORD 值应脱敏: {r}");
+        assert!(
+            r.contains("PASSWORD=[REDACTED]"),
+            "应含 PASSWORD=[REDACTED]: {r}"
+        );
+    }
+
+    #[test]
+    fn redact_command_api_key_quoted() {
+        let r = redact_command(r#"cli --api-key="abc def ghi""#);
+        assert!(!r.contains("abc def ghi"), "引号内 api_key 值应脱敏: {r}");
+        assert!(r.contains("[REDACTED]"), "应含 [REDACTED]: {r}");
+    }
+
+    #[test]
+    fn redact_command_curl_basic_auth() {
+        let r = redact_command("curl -u admin:s3cret https://api");
+        assert!(!r.contains("s3cret"), "basic auth 密码应脱敏: {r}");
+        assert!(r.contains("admin:[REDACTED]"), "应保留 user 掩 pass: {r}");
+    }
+
+    #[test]
+    fn redact_command_header_authorization() {
+        let r = redact_command(r#"curl -H "Authorization: Bearer xyz" https://api"#);
+        assert!(
+            !r.contains("Bearer xyz"),
+            "Authorization header 值应脱敏: {r}"
+        );
+    }
+
+    #[test]
+    fn redact_command_preserves_non_secret() {
+        let r = redact_command("pytest tests/ -v --tb=short");
+        assert_eq!(
+            r, "pytest tests/ -v --tb=short",
+            "无 secret 命令应原样保留: {r}"
+        );
+    }
+
+    #[test]
+    fn redact_command_case_insensitive() {
+        let r = redact_command("curl -H 'authorization: bearer tok' url");
+        assert!(!r.contains("tok"), "小写 authorization/bearer 应脱敏: {r}");
+    }
+
     #[test]
     fn execute_streaming_echo_chunk_then_done() {
         rt().block_on(async {
@@ -1155,6 +1402,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1194,6 +1442,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1224,6 +1473,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: Some("caller-tid-123".to_string()),
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1250,6 +1500,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: Some("blk-tid".to_string()),
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1277,6 +1528,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: Some("stream-tid".to_string()),
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1310,6 +1562,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1332,7 +1585,7 @@ mod tests {
     #[test]
     fn execute_streaming_timeout_done_frame() {
         rt().block_on(async {
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let req = ExecutionRequest {
                 command: "python3 -c \"while True: pass\"".to_string(),
                 task_id: None,
@@ -1347,6 +1600,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1366,7 +1620,7 @@ mod tests {
     #[test]
     fn execute_streaming_diagnostics_on_nonzero_exit() {
         rt().block_on(async {
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let req = ExecutionRequest {
                 command: "python3 -c \"raise ValueError('boom')\"".to_string(),
                 task_id: None,
@@ -1381,6 +1635,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
@@ -1437,9 +1692,10 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败");
             assert!(res.auto_rolled_back, "应自动回滚");
@@ -1470,6 +1726,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
             let ex = Executor::new();
@@ -1501,9 +1758,10 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0);
             assert!(!res.auto_rolled_back, "无 policy 不应回滚");
@@ -1539,9 +1797,10 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败");
             // 即使 max_consecutive_failures=99 (远超单次), 文件毁损仍立即回滚 — 字段不限制单次执行
@@ -1581,9 +1840,10 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败");
             assert!(
@@ -1687,9 +1947,10 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败 (python 抛错)");
             assert!(
@@ -1728,9 +1989,10 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let ex = Executor::new();
+            let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0, "应失败");
             assert!(

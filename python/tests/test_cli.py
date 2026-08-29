@@ -69,7 +69,16 @@ def test_rollback_without_cwd_raises():
 
 def test_cli_timeout_exit_code_124():
     # M-CLI-01: -124 超时映射 124 (旧版 -1/-124 全 → 1, 超时身份丢失)
-    code, out = _run_main(["fusion-executor", "python3 -c 'import time; time.sleep(30)'", "--timeout-sec", "1"])
+    # D3-1: python3 -c 需 --allow-inline-interpreter opt-in (企业硬化默认拒内联解释器)
+    code, out = _run_main(
+        [
+            "fusion-executor",
+            "python3 -c 'import time; time.sleep(30)'",
+            "--timeout-sec",
+            "1",
+            "--allow-inline-interpreter",
+        ]
+    )
     assert code == 124, f"超时应退 124, 得 {code}"
     data = json.loads(out)
     assert data["exit_code"] == -124
@@ -89,8 +98,15 @@ def test_cli_env_flag_invalid_returns_2():
 
 
 def test_cli_env_flag_passes_value():
+    # D3-1: python3 -c 需 --allow-inline-interpreter opt-in (企业硬化默认拒内联解释器)
     code, out = _run_main(
-        ["fusion-executor", "python3 -c 'import os; print(os.environ.get(\"FE_FLAG\"))'", "--env", "FE_FLAG=on"]
+        [
+            "fusion-executor",
+            "python3 -c 'import os; print(os.environ.get(\"FE_FLAG\"))'",
+            "--env",
+            "FE_FLAG=on",
+            "--allow-inline-interpreter",
+        ]
     )
     assert code == 0
     assert "on" in json.loads(out)["stdout"]
@@ -163,3 +179,21 @@ def test_cli_serve_flag_starts_and_cleans_socket():
             proc.wait(timeout=5.0)
         if os.path.exists(sock_path):
             os.unlink(sock_path)
+
+
+def test_cli_serve_keyboard_interrupt_exits_1(monkeypatch):
+    # D6-09: --serve 收 KeyboardInterrupt 应退 1 (非 0), 区分中断与正常停机。
+    import os
+
+    sock = "/tmp/fe-test-cli-kbi.sock"
+    if os.path.exists(sock):
+        os.unlink(sock)
+
+    def _raise_keyboardinterrupt(self, path=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(FusionSandboxExecutor, "serve", _raise_keyboardinterrupt)
+    code, _ = _run_main(["fusion-executor", "--serve", "--sock", sock])
+    assert code == 1, f"D6-09: serve KeyboardInterrupt 应退 1, 实际 {code}"
+    if os.path.exists(sock):
+        os.unlink(sock)

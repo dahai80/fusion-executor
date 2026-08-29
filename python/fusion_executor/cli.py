@@ -46,6 +46,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env", action="append", default=None, metavar="K=V", help="环境变量 (可多次)")
     parser.add_argument("--no-snapshot", action="store_true", help="禁用回滚快照")
     parser.add_argument("--auto-rollback", action="store_true", help="失败+文件毁损自动回滚")
+    # D3-1 (审计 0827 product): 内联解释器网关 opt-in。默认 False (企业硬化拒 python -c / node -e /
+    #   ruby -e / perl -e, 防 agent-driven 任意 payload 绕白名单语义); True 保留内联执行能力 (测试机/
+    #   本地交互依赖 python3 -c)。
+    parser.add_argument(
+        "--allow-inline-interpreter",
+        action="store_true",
+        help="允许内联解释器 (python -c / node -e / ruby -e / perl -e; 企业硬化默认拒)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="调试日志")
     return parser
 
@@ -77,10 +85,10 @@ def main() -> int:
         # M-5: serve 校验 sock 父目录可写 (cwd 用 executor 默认, 不校验)
         _validate_paths(None, args.sock)
         try:
-            FusionSandboxExecutor().serve(args.sock)
+            FusionSandboxExecutor(allow_inline_interpreter=args.allow_inline_interpreter).serve(args.sock)
         except KeyboardInterrupt:
-            log.info("serve 停机")
-            return 0
+            log.info("serve interrupted (KeyboardInterrupt)")
+            return 1
         return 0
 
     if not args.command:
@@ -94,7 +102,7 @@ def main() -> int:
     try:
         env_vars = _parse_env(args.env)
         policy = RollbackPolicy() if args.auto_rollback else None
-        executor = FusionSandboxExecutor()
+        executor = FusionSandboxExecutor(allow_inline_interpreter=args.allow_inline_interpreter)
         result = executor.run(
             args.command,
             cwd=args.cwd,
