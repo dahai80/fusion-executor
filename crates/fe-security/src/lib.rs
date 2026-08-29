@@ -1345,6 +1345,50 @@ mod tests {
     }
 
     #[test]
+    fn d311_blocks_inline_exec_payload_variants() {
+        // D3-11 (审计 0827 product): 内联解释器网关须覆盖 -c payload 所有变体, 不限危险词。
+        // agent-driven 模型可生成 exec()/os.system()/__import__ 等 one-liner 绕 regex 危险词枚举。
+        // 网关在 payload 内容前拦截 (binary+flag 级), 故任意 payload 一律拒 (默认 allow_inline=false)。
+        // 仅用白名单解释器 (python3/node) + 不含 Stage1 危险词 payload — 隔离测试网关本身
+        // (非白名单解释器如 ruby/perl 先被 Stage2 拦, 不达网关; 含危险词 payload 先被 Stage1 拦)。
+        for cmd in [
+            "python3 -c \"exec('print(1)')\"",
+            "python3 -c \"__import__('socket')\"",
+            "python3 -c \"print('x')\"",
+            "node -e \"require('fs')\"",
+            "node -e \"console.log('x')\"",
+        ] {
+            let v = guard().validate(cmd);
+            assert!(
+                !v.allowed,
+                "D3-11: 内联 -c/-e payload 须拒 (网关 binary+flag 级, 与 payload 无关): {cmd}, reason={:?}",
+                v.reason
+            );
+            assert!(
+                v.reason.as_deref().unwrap_or("").contains("-c")
+                    || v.reason.as_deref().unwrap_or("").contains("-e"),
+                "D3-11: 拒因须指 -c/-e 网关, 非 payload 危险词 (防误依赖 regex 枚举): reason={:?}",
+                v.reason
+            );
+        }
+        // 危险词 payload (含 rm -rf) 经 Stage1 拦 — 双层防御, 仍拒 (任一层拦即可)。
+        let v_danger = guard().validate("python3 -c \"os.system('rm -rf /')\"");
+        assert!(
+            !v_danger.allowed,
+            "D3-11: 含危险词 -c payload 须拒 (Stage1 或网关)"
+        );
+        // opt-in 后仍跑 (受信本地), payload 危险词由 Stage1/Stage2 regex 兜底。
+        let v2 = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("python3 -c \"print('safe')\"");
+        assert!(
+            v2.allowed,
+            "D3-11: opt-in 后无害 -c 须放行, reason={:?}",
+            v2.reason
+        );
+    }
+
+    #[test]
     fn arch2_allows_path_resolved_python3() {
         // bare `python3` 经 PATH 解析到 /opt/homebrew/bin/python3 或 /usr/bin/python3 → 放行。
         if std::env::var("PATH")

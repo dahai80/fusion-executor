@@ -46,7 +46,8 @@ class ExecutionRequest(BaseModel):
     enable_rollback_snapshot: bool = False
     auto_rollback_policy: RollbackPolicy | None = None
     seatbelt: bool = Field(
-        default=False, description="macOS seatbelt 运行时隔离 (sandbox-exec 禁网 + 危险二进制 execve deny)"
+        default=True,
+        description="macOS seatbelt 运行时隔离 (sandbox-exec 禁网 + 危险二进制 execve deny); 商用安全默认 True, 对齐 fe-core serde default_true + executor.run/run_async/shell_start 默认",
     )
     inherit_env: bool = Field(
         default=False,

@@ -241,6 +241,33 @@ def test_seatbelt_allows_whitelisted_echo(executor: FusionSandboxExecutor):
     assert "seatbelt_ok" in result.stdout
 
 
+def test_seatbelt_default_true_all_layers_no_drift():
+    # D1-2/D2-3 (审计 0827 arch ARCH-1 + product): seatbelt 默认值 4 层须一致 True。
+    # 历史 drift — models.py Pydantic 默认 False, 而 executor.run/run_async/shell_start 默认 True +
+    # Rust serde default_true。任一层默认 False = 商用静默关隔离 (绕 ARCH-1)。此测试锁住统一。
+    import inspect
+
+    from fusion_executor.models import ExecutionRequest
+
+    # 层 1: Pydantic ExecutionRequest 默认 True
+    assert ExecutionRequest(command="x").seatbelt is True, "ExecutionRequest.seatbelt 默认须 True"
+
+    # 层 2-3: FusionSandboxExecutor.run / run_streaming / shell_start 签名默认 True
+    # (run_async 吸收 **kw 转发 run, 无独立 seatbelt 形参, 不入此检查)
+    for name in ("run", "run_streaming", "shell_start"):
+        fn = getattr(FusionSandboxExecutor, name)
+        sig = inspect.signature(fn)
+        param = sig.parameters.get("seatbelt")
+        assert param is not None, f"{name} 须有 seatbelt 参数"
+        assert param.default is True, f"{name} seatbelt 默认须 True, 实际 {param.default!r}"
+
+    # 层 4: Rust serde default_true — Python ExecutionRequest 默认 True → 序列化含 seatbelt=true
+    # (native 反序列化对齐; ARCH-1 health 已断言 seatbelt_default_on)。
+    req = ExecutionRequest(command="echo drift_check")
+    dumped = req.model_dump()
+    assert dumped.get("seatbelt") is True, f"默认 request 序列化 seatbelt 须 True, 实际 {dumped.get('seatbelt')}"
+
+
 def test_run_populates_schema_fields(executor: FusionSandboxExecutor):
     result = executor.run("echo hi", task_id="task-abc")
     assert result.task_id == "task-abc"

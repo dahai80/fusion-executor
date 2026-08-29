@@ -774,6 +774,11 @@ impl Tools {
         cwd: Option<&str>,
         opts: &GrepOptions,
     ) -> Result<GrepOutput> {
+        // D4-7 (审计 0827 product): regex 每次 grep 调用重建 (RegexBuilder + opts.multiline 变体)。
+        // regex crate 编译是 µs 级 (无 backtracking NFA, 单遍 DFA 构建), 远小于文件遍历/IO 主导耗时;
+        // 缓存需 keyed by (pattern, multiline) 二元组, 增内存 + 并发锁, 收益 <1% (Rule 2 不投机)。
+        // 调用方高频重复同 pattern 可自行缓存 Regex 传 pattern→但 API 收 &str, 不接受预编译 Regex;
+        // 若未来 profiling 证编译占主耗时, 再加 LazyLock<HashMap<(String,bool), Regex>> (YAGNI now)。
         let re = regex::RegexBuilder::new(pattern)
             .multi_line(opts.multiline)
             // 多行模式: . 匹配换行 (ripgrep -U 语义, 跨行块匹配)

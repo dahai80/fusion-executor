@@ -72,6 +72,12 @@ const SENSITIVE_FS_PATHS: &[&str] = &[
 /// 构建 seatbelt profile 字符串 — allow default + 禁网 + 定向敏感路径 file-write* deny。
 /// 0827 C-16/A-12: 删 process-exec denylist (fe-security allowlist 覆盖), 加定向 FS deny。
 fn build_profile() -> String {
+    // D3-7 (审计 0827 product): (allow default) 取舍 — seatbelt 用 allowlist-by-default (fe-security
+    // 二进制白名单拦截非白名单 binary), 故 sandbox-exec profile 不再加 process-exec denylist (A-12 删)。
+    // allow default 让白名单 carrier (python3/node/cargo) 正常 fork/exec 链式子进程 (编译器/测试 runner
+    // spawn); 若改 deny default 会碎工具链 (cargo build → rustc spawn 被拦)。FS 隔离靠定向 file-write*
+    // deny (C-16 SENSITIVE_FS_PATHS), 网络隔离靠 deny network-outbound。逐进程强隔离非 seatbelt 职责
+    // (单层 denylist 弱: rm 重命名/symlink 绕过, A-12 已证), 归 fe-security allowlist 主导。
     let mut p = String::from("(version 1)(allow default)(deny network-outbound)");
     let home = std::env::var("HOME").unwrap_or_default();
     for path in SENSITIVE_FS_PATHS {

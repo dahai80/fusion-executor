@@ -1397,3 +1397,110 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version_info, m)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    // D1-1 (审计 0827 arch / product): fe-pyo3 零 Rust 单元测试 — pyclass From 转换是纯 Rust 逻辑
+    // (字段映射, 无 GIL), 直接 cargo test -p fe-pyo3 覆盖。防 4 层 wire 字段漂移 (Rule 9)。
+
+    use super::*;
+
+    #[test]
+    fn d11_execution_result_from_maps_all_fields() {
+        let rs = RsResult {
+            exit_code: 0,
+            stdout: "out".into(),
+            stderr: "err".into(),
+            task_id: Some("t-1".into()),
+            command: Some("echo".into()),
+            duration_sec: 1.25,
+            timed_out: false,
+            blocked_by_security: false,
+            security_reason: None,
+            snapshot_id: Some("snap-9".into()),
+            diagnostics: Some(RsDiag {
+                error_type: Some("ValueError".into()),
+                file_path: Some("a.py".into()),
+                line_number: Some(7),
+                code_snippet: Some("x = 1".into()),
+                raw_trace: Some("Traceback".into()),
+            }),
+            auto_rolled_back: false,
+            rollback_unavailable: true,
+            rollback_skipped_reason: Some("snapshot-stale".into()),
+            trace_id: Some("trace-42".into()),
+            oom_killed: true,
+            pid: Some(1234),
+        };
+        let py = PyExecutionResult::from(rs);
+        assert_eq!(py.exit_code, 0);
+        assert_eq!(py.stdout, "out");
+        assert_eq!(py.stderr, "err");
+        assert_eq!(py.task_id.as_deref(), Some("t-1"));
+        assert_eq!(py.command.as_deref(), Some("echo"));
+        assert!((py.duration_sec - 1.25).abs() < f64::EPSILON);
+        assert!(!py.timed_out);
+        assert!(!py.blocked_by_security);
+        assert!(py.security_reason.is_none());
+        assert_eq!(py.snapshot_id.as_deref(), Some("snap-9"));
+        let diag = py.diagnostics.expect("diagnostics 应 Some");
+        assert_eq!(diag.error_type.as_deref(), Some("ValueError"));
+        assert_eq!(diag.file_path.as_deref(), Some("a.py"));
+        assert_eq!(diag.line_number, Some(7));
+        assert_eq!(diag.code_snippet.as_deref(), Some("x = 1"));
+        assert_eq!(diag.raw_trace.as_deref(), Some("Traceback"));
+        assert!(!py.auto_rolled_back);
+        assert!(py.rollback_unavailable);
+        assert_eq!(
+            py.rollback_skipped_reason.as_deref(),
+            Some("snapshot-stale")
+        );
+        assert_eq!(py.trace_id.as_deref(), Some("trace-42"));
+        assert!(py.oom_killed);
+        assert_eq!(py.pid, Some(1234));
+    }
+
+    #[test]
+    fn d11_execution_result_from_none_diagnostics_is_none() {
+        let rs = RsResult::default();
+        let py = PyExecutionResult::from(rs);
+        assert!(py.diagnostics.is_none(), "无诊断时 PyDiagnostics 应 None");
+        assert_eq!(py.exit_code, 0);
+        assert!(py.trace_id.is_none());
+        assert!(!py.oom_killed);
+    }
+
+    #[test]
+    fn d11_tools_from_conversions_map_fields() {
+        let er = PyEditResult::from(RsEditResult {
+            ok: true,
+            path: Some("p.rs".into()),
+            error: None,
+            matches: 3,
+        });
+        assert!(er.ok);
+        assert_eq!(er.path.as_deref(), Some("p.rs"));
+        assert!(er.error.is_none());
+        assert_eq!(er.matches, 3);
+
+        let ge = PyGlobEntry::from(RsGlobEntry {
+            path: "src/a.py".into(),
+            is_dir: false,
+        });
+        assert_eq!(ge.path, "src/a.py");
+        assert!(!ge.is_dir);
+
+        let gm = PyGrepMatch::from(RsGrepMatch {
+            path: "b.go".into(),
+            line_number: 9,
+            content: "panic".into(),
+            context_before: vec!["ctx1".into()],
+            context_after: vec!["ctx2".into()],
+        });
+        assert_eq!(gm.path, "b.go");
+        assert_eq!(gm.line_number, 9);
+        assert_eq!(gm.content, "panic");
+        assert_eq!(gm.context_before, vec!["ctx1".to_string()]);
+        assert_eq!(gm.context_after, vec!["ctx2".to_string()]);
+    }
+}
