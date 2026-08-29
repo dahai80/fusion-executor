@@ -1002,6 +1002,16 @@ mod tests {
                 }
             }
         }
+        // ARCH-2: rustup 标准安装位 ($HOME/.cargo/bin) — 与 Executor::new 对齐登记。
+        // cargo/rustc 在此 (CI macos-14 runner = rustup, 非 homebrew)。非攻击者可控 (home 目录),
+        // 不违 /tmp 投毒威胁模型。登记使 allows_cargo_test / a1_toolchain_noarm 用例在
+        // rustup-only 环境通过; homebrew 机器 cargo 在 /opt/homebrew/bin 已基线可信。
+        if let Ok(home) = std::env::var("HOME") {
+            let cargo_bin = std::path::Path::new(&home).join(".cargo").join("bin");
+            if let Some(s) = cargo_bin.to_str() {
+                trusted.push(s.to_string());
+            }
+        }
         let refs: Vec<&str> = trusted.iter().map(String::as_str).collect();
         if refs.is_empty() {
             SecurityGuard::new()

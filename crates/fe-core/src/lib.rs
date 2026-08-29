@@ -610,6 +610,16 @@ impl Executor {
                 }
             }
         }
+        // ARCH-2: rustup 标准安装位 ($HOME/.cargo/bin) — cargo/rustc 在此。非攻击者可控
+        // (home 目录, rustup 写入需已具机器执行权), 不违 ARCH-2 /tmp 投毒 + PATH 前置威胁模型。
+        // 登记使 rustup-only 机器 (CI macos-14 runner) 的 `cargo build/test` 通过 — homebrew
+        // 机器 cargo 在 /opt/homebrew/bin 已基线可信, 不受影响。与 VIRTUAL_ENV/bin 同级信任。
+        if let Ok(home) = std::env::var("HOME") {
+            let cargo_bin = std::path::Path::new(&home).join(".cargo").join("bin");
+            if let Some(s) = cargo_bin.to_str() {
+                trusted.push(s.to_string());
+            }
+        }
         let trusted_refs: Vec<&str> = trusted.iter().map(String::as_str).collect();
         let security = if trusted_refs.is_empty() {
             SecurityGuard::new()
