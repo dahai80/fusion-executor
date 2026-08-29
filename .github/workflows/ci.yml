@@ -30,6 +30,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      # D3-6/ARCH-2: setup-python 把 python3 装到 hostedtoolcache 路径 (非基线 TRUSTED_BIN_DIRS)。
+      # cargo test 的 fe-core 用例 spawn `python3 -c ...` 子进程, Executor::new() 的 resolved-path
+      # fail-closed 校验会拦 hostedtoolcache python3 (不在可信目录) → 命令被阻, 7 个子进程用例红。
+      # 建 venv 并在 Test 步激活: VIRTUAL_ENV/bin 被 Executor::new() 自动登记为可信目录,
+      # python3 解析到 .venv/bin/python3 → 校验通过。与 Python job + 本地 venv 用法一致 (CLAUDE.md 强制 venv)。
+      - name: Create venv (cargo test spawns python3 subprocess; needs trusted-dir resolution)
+        run: python -m venv .venv
+
       - name: fmt check
         run: cargo fmt --all -- --check
 
@@ -40,7 +48,7 @@ jobs:
         run: cargo build --workspace --release
 
       - name: Test
-        run: cargo test --workspace --release
+        run: source .venv/bin/activate && cargo test --workspace --release
 
   python:
     name: Python build + test + lint
