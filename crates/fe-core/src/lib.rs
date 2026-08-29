@@ -596,6 +596,17 @@ impl Executor {
         self
     }
 
+    /// ARCH-2 可信二进制目录透传 — 项目 bin 目录登记 (venv/exe 目录由 new() 自动登记;
+    /// 此 builder 供额外项目工具目录登记, 多用于测试与多 bin 路径部署)。透传 SecurityGuard。
+    pub fn with_trusted_bin_dirs(mut self, dirs: &[&str]) -> Self {
+        info!(
+            count = dirs.len(),
+            "Executor 登记额外可信二进制目录 (ARCH-2)"
+        );
+        self.security = self.security.with_trusted_bin_dirs(dirs);
+        self
+    }
+
     /// D3-1 (审计 0827 product): 内联解释器网关透传。true=允许 python -c / node -e /
     /// ruby -e / perl -e (保留 trusted-caller 内联执行能力); 默认 false (企业硬化拒内联代码,
     /// 防 agent-driven 任意 payload 绕白名单语义)。透传 SecurityGuard.with_allow_inline_interpreter。

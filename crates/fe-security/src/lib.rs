@@ -409,7 +409,11 @@ impl SecurityGuard {
 
         // ARCH-2: resolved-path 校验 — basename 命中后须再确认二进制绝对路径落在可信目录内。
         // 防 /tmp/python3 (攻击者可控二进制) 同名投毒绕过: 能解析到绝对路径但不在可信目录 → 拒。
-        // 解析失败 (None) → 放行: 投毒须真实可执行二进制, 不可解析 = 无投毒面 (执行期 command-not-found 兜底)。
+        // D3-6 (审计 0827 product): 解析失败 (None) → fail-closed 拒 (非放行)。企业硬化默认:
+        // 不可解析的二进制不应通过安全门 (即便执行期会 command-not-found, 安全门本身不得 fail-open)。
+        // canonicalize 跳过 (by-design): homebrew /opt/homebrew/bin/git symlink → Cellar 真实路径越界
+        // 可信前缀, 但 symlink 由包管理器写入 /opt/homebrew/bin (root-gated), 超出 ARCH-2 威胁模型
+        // (/tmp 投毒 + PATH 前置恶意 bin)。字面 starts_with 即拦该威胁面。
         match resolve_binary_path(binary) {
             Some(abs) => {
                 if !self.trusted_bin_dirs.iter().any(|d| abs.starts_with(d)) {
@@ -423,10 +427,11 @@ impl SecurityGuard {
                 debug!(binary = binary, resolved = ?abs, "二进制可信目录校验通过");
             }
             None => {
-                debug!(
+                warn!(
                     binary = binary,
-                    "二进制路径无法解析, 跳过可信目录校验 (无投毒面)"
+                    "二进制路径无法解析, fail-closed 拒绝 (D3-6 企业硬化: 不可解析不放行)"
                 );
+                return Err(format!("二进制无法解析 (投毒防护 fail-closed): {}", binary));
             }
         }
 
@@ -909,6 +914,7 @@ fn basename(path: &str) -> &str {
 
 /// ARCH-2: 解析二进制绝对路径 (literal, 不 canonicalize)。绝对路径 → 原样;
 /// 相对名 (python3) → 扫 $PATH 各目录首个匹配 → join 字面路径。解析失败返 None。
+/// D3-6: None 由调用方 (validate_segment) fail-closed 拒, 非放行 — 企业硬化默认。
 /// 不 canonicalize: homebrew /opt/homebrew/bin/git symlink → Cellar 真实路径会越界可信
 /// 前缀, 但 symlink 本身由包管理器写入可信目录, 写入需 root, 超出 ARCH-2 威胁模型
 /// (/tmp 投毒 + PATH 注入)。威胁 = 绝对路径投毒 + PATH 前置恶意 bin, 字面 starts_with 即拦。
@@ -1232,10 +1238,23 @@ mod tests {
 
     #[test]
     fn allows_go_and_tsc_whitelisted() {
+        // 白名单成员校验 (resolve 无关): go/tsc 须在白名单基线。
+        assert!(guard().whitelist_contains("go"), "go 应在白名单");
+        assert!(guard().whitelist_contains("tsc"), "tsc 应在白名单");
+        // D3-6: validate 现 fail-closed — 仅当二进制在测试机可解析时才断言 allowed。
+        // go 通常在 PATH (homebrew); tsc 常缺席 (项目级工具), 缺席时跳过 validate 断言。
         let g = guard().validate("go build ./...");
-        assert!(g.allowed, "go 应在白名单, reason={:?}", g.reason);
-        let t = guard().validate("tsc --noEmit app.ts");
-        assert!(t.allowed, "tsc 应在白名单, reason={:?}", t.reason);
+        if resolve_binary_path("go").is_some() {
+            assert!(g.allowed, "go (可解析) 应放行, reason={:?}", g.reason);
+        } else {
+            eprintln!("skip: go not on PATH, fail-closed path");
+        }
+        if resolve_binary_path("tsc").is_some() {
+            let t = guard().validate("tsc --noEmit app.ts");
+            assert!(t.allowed, "tsc (可解析) 应放行, reason={:?}", t.reason);
+        } else {
+            eprintln!("skip: tsc not on PATH, fail-closed path");
+        }
     }
 
     #[test]
@@ -1346,16 +1365,47 @@ mod tests {
     }
 
     #[test]
-    fn arch2_unresolvable_binary_passes() {
-        // basename 命中白名单但二进制不存在 (如 `python` 此机器无) → 无投毒面 → 放行。
-        let v = guard()
-            .with_allow_inline_interpreter(true)
-            .validate("python -c \"print('hi')\"");
-        // python 在白名单; 若此机器无 python 二进制, resolve=None → 放行 (非投毒)。
-        // 若机器恰好有 python (在可信目录), 也放行。两侧都应 allowed。
+    fn arch2_unresolvable_binary_fail_closed() {
+        // D3-6: basename 命中白名单但二进制不存在 → resolve=None → fail-closed 拒 (非放行)。
+        // 用白名单内但此机器不存在的名字 (rustup 白名单基线, 本机无)。
+        // 若机器恰好有 rustup, resolve=Some → 走 starts_with 分支 (非本测试目标), skip。
+        let probe = "rustup";
+        if resolve_binary_path(probe).is_some() {
+            eprintln!(
+                "skip: {} exists on this machine, fail-closed path not exercised",
+                probe
+            );
+            return;
+        }
+        let v = guard().validate(&format!("{} --version", probe));
         assert!(
-            v.allowed,
-            "不可解析的非投毒二进制应放行, reason={:?}",
+            !v.allowed,
+            "不可解析的二进制应 fail-closed 拒 (D3-6), reason={:?}",
+            v.reason
+        );
+        assert!(
+            v.reason.as_deref().unwrap().contains("无法解析"),
+            "应报无法解析原因, got={:?}",
+            v.reason
+        );
+    }
+
+    #[test]
+    fn arch2_nonexistent_absolute_path_fail_closed() {
+        // D3-6: 绝对路径但文件不存在 → resolve=None → fail-closed 拒。
+        // basename 取白名单内名 (python3), 路径在 /tmp 不存在 → resolve=None。
+        // basename = nonexistent-fe-python3-xyz 不在白名单 → 会先被白名单拒, 非本测试目标。
+        // 故用白名单 basename + 不存在父目录: /tmp/fe_no_such_dir/python3。
+        let cmd = "/tmp/fe_no_such_dir_xyz/python3 -c \"print(1)\"";
+        let v = guard().with_allow_inline_interpreter(true).validate(cmd);
+        assert!(
+            !v.allowed,
+            "不存在的绝对路径二进制应 fail-closed 拒 (D3-6), reason={:?}",
+            v.reason
+        );
+        assert!(
+            v.reason.as_deref().unwrap().contains("无法解析"),
+            "应报无法解析原因 (非白名单原因), got={:?}",
             v.reason
         );
     }
@@ -1814,9 +1864,26 @@ mod tests {
 
     #[test]
     fn with_extra_whitelist_allows_project_tool() {
-        let g = SecurityGuard::new().with_extra_whitelist(&["myproj-runner"]);
-        let v = g.validate("myproj-runner --version");
+        // D3-6: validate 现 fail-closed — 项目工具须真实存在于可信目录才能 resolve 通过。
+        let dir = std::env::temp_dir().join("fe_proj_tool_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("myproj-runner");
+        std::fs::write(&tool, "#!/bin/sh\necho run\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&tool).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&tool, perm).unwrap();
+        }
+        let g = SecurityGuard::new()
+            .with_extra_whitelist(&["myproj-runner"])
+            .with_trusted_bin_dirs(&[dir.to_str().unwrap()]);
+        let cmd = format!("{} --version", tool.display());
+        let v = g.validate(&cmd);
         assert!(v.allowed, "项目扩展工具应放行: {:?}", v.reason);
+        let _ = std::fs::remove_file(&tool);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -1964,7 +2031,21 @@ mod tests {
     #[test]
     fn reload_extras_replaces_not_accumulates() {
         // m-OPS-02: reload 重建语义 — 旧扩展丢弃, 新 extras 生效, 基线恒在
-        let g = SecurityGuard::new().with_extra_whitelist(&["tool-a", "tool-b"]);
+        // D3-6: validate 现 fail-closed — tool-c 须真实存在于可信目录才能 resolve 通过。
+        let dir = std::env::temp_dir().join("fe_reload_extras_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool_c = dir.join("tool-c");
+        std::fs::write(&tool_c, "#!/bin/sh\necho c\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&tool_c).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&tool_c, perm).unwrap();
+        }
+        let g = SecurityGuard::new()
+            .with_extra_whitelist(&["tool-a", "tool-b"])
+            .with_trusted_bin_dirs(&[dir.to_str().unwrap()]);
         assert!(g.whitelist_contains("tool-a") && g.whitelist_contains("tool-b"));
         // reload 仅给 tool-c → tool-a/tool-b 应消失 (非累加), tool-c 在, 基线 python 在
         g.reload_extras(&["tool-c"]);
@@ -1978,15 +2059,19 @@ mod tests {
         );
         assert!(g.whitelist_contains("tool-c"), "reload 应含新扩展 tool-c");
         assert!(g.whitelist_contains("python"), "基线恒在");
-        // 验证放行生效
+        // 验证放行生效 (tool-c 在可信目录 + 白名单 → resolve 通过)
+        let cmd = format!("{} --version", tool_c.display());
         assert!(
-            g.validate("tool-c --version").allowed,
-            "新扩展 tool-c 应放行"
+            g.validate(&cmd).allowed,
+            "新扩展 tool-c 应放行, reason={:?}",
+            g.validate(&cmd).reason
         );
         assert!(
             !g.validate("tool-a --version").allowed,
-            "旧扩展 tool-a 应已拦"
+            "旧扩展 tool-a 应已拦 (白名单缺失, resolve 前拒)"
         );
+        let _ = std::fs::remove_file(&tool_c);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

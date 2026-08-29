@@ -3484,13 +3484,35 @@ mod tests {
     // m-OPS-02: env-var 测试串行化 (set_var/remove_var 跨并行测试竞态)。
     static MOPS02_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // D3-6: validate 现 fail-closed (不可解析二进制不放行)。SIGHUP reload 测试需真实二进制
+    // 落可信目录才能 resolve 通过, 故建临时 bin 目录 + 真实可执行文件 + 登记 Executor 可信目录。
+    fn mops02_make_tool(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+    }
+
     // m-OPS-02: reload_extra_whitelist 解析 FUSION_EXECUTOR_EXTRA_WHITELIST (逗号分割/去空白/去空) → Executor 白名单更新。
     #[test]
     fn mops02_reload_extra_whitelist_parses_env() {
         let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let executor = Arc::new(Executor::new());
-        // 先用 validate 断言非基线工具默认被拦
-        let v = executor.validate("sighup-tool-xyz --version");
+        // D3-6: 真实二进制 + 可信目录 + 绝对路径调用, 否则 validate fail-closed 拦 (resolve 失败)。
+        let dir = std::env::temp_dir().join("fe_mops02_sighup_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        mops02_make_tool(&dir, "sighup-tool-xyz");
+        mops02_make_tool(&dir, "other-tool");
+        let executor = Arc::new(Executor::new().with_trusted_bin_dirs(&[dir.to_str().unwrap()]));
+        let sighup_abs = dir.join("sighup-tool-xyz");
+        let other_abs = dir.join("other-tool");
+        // 先用 validate 断言非基线工具默认被拦 (白名单未含 → whitelist-reject)
+        let v = executor.validate(&format!("{} --version", sighup_abs.display()));
         assert!(!v.allowed, "扩展前 sighup-tool-xyz 应被拦");
         // 设 env → reload → 应放行
         std::env::set_var(
@@ -3498,36 +3520,51 @@ mod tests {
             " sighup-tool-xyz ,,other-tool ",
         );
         reload_extra_whitelist(&executor);
-        let v = executor.validate("sighup-tool-xyz --version");
-        assert!(v.allowed, "SIGHUP 重载后 sighup-tool-xyz 应放行");
-        let v = executor.validate("other-tool run");
-        assert!(v.allowed, "逗号第二项 other-tool 应放行");
+        let v = executor.validate(&format!("{} --version", sighup_abs.display()));
+        assert!(
+            v.allowed,
+            "SIGHUP 重载后 sighup-tool-xyz 应放行: {:?}",
+            v.reason
+        );
+        let v = executor.validate(&format!("{} run", other_abs.display()));
+        assert!(v.allowed, "逗号第二项 other-tool 应放行: {:?}", v.reason);
         // 基线恒在
         let v = executor.validate("python3 --version");
         assert!(v.allowed, "基线 python3 恒放行");
         std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // m-OPS-02: 空 env → 回退纯基线 (项目扩展清空)。
     #[test]
     fn mops02_reload_extra_whitelist_empty_clears_extras() {
         let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let executor = Arc::new(Executor::new());
+        // D3-6: 真实二进制 + 可信目录 + 绝对路径调用, 否则 validate fail-closed 拦。
+        let dir = std::env::temp_dir().join("fe_mops02_cleartool_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        mops02_make_tool(&dir, "temp-tool");
+        let executor = Arc::new(Executor::new().with_trusted_bin_dirs(&[dir.to_str().unwrap()]));
+        let temp_abs = dir.join("temp-tool");
         // 先加扩展
         std::env::set_var("FUSION_EXECUTOR_EXTRA_WHITELIST", "temp-tool");
         reload_extra_whitelist(&executor);
         assert!(
-            executor.validate("temp-tool run").allowed,
-            "先加 temp-tool 放行"
+            executor
+                .validate(&format!("{} run", temp_abs.display()))
+                .allowed,
+            "先加 temp-tool 放行: 详见 reload 后 validate reason"
         );
         // 清 env → reload → 回退基线
         std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
         reload_extra_whitelist(&executor);
         assert!(
-            !executor.validate("temp-tool run").allowed,
+            !executor
+                .validate(&format!("{} run", temp_abs.display()))
+                .allowed,
             "空 reload 后 temp-tool 应已拦 (回退基线)"
         );
         assert!(executor.validate("python3 --version").allowed, "基线恒在");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // m-OPS-02: reload_log_level 无 handle (tracing 未 init) → 不 panic, 仅 warn。
