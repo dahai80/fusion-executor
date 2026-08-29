@@ -667,7 +667,10 @@ impl PyExecutor {
         // Python 测试/调用方登记项目 bin 目录后, 扩展工具 resolve 通过才 allowed。
         if let Some(dirs) = trusted_bin_dirs.as_ref() {
             let dir_refs: Vec<&str> = dirs.iter().map(String::as_str).collect();
-            tracing::info!(count = dir_refs.len(), "PyExecutor 构造登记可信 bin 目录 (D3-6)");
+            tracing::info!(
+                count = dir_refs.len(),
+                "PyExecutor 构造登记可信 bin 目录 (D3-6)"
+            );
             inner = inner.with_trusted_bin_dirs(&dir_refs);
         }
         // D3-1 (审计 0827 product): 内联解释器网关 opt-in。默认 false (企业硬化拒 python -c /

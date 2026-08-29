@@ -20,7 +20,7 @@ def test_execution_request_defaults():
     req = ExecutionRequest(command="echo hi")
     assert req.command == "echo hi"
     assert req.timeout_sec == 30.0
-    assert req.enable_rollback_snapshot is True
+    assert req.enable_rollback_snapshot is False
     assert req.task_id is None
     assert req.env_vars is None
 

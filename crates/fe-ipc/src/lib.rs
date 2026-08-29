@@ -754,6 +754,30 @@ impl BroadcastHub {
             }
         }
     }
+
+    /// stdio 广播 (阻塞版) — done 帧专用。done 是流终止标记, 丢不得 (调用方见不到结束)。
+    /// 与 broadcast_stdio 区别: 用 `tx.send(frame).await` (等槽位) 而非 try_send (满即丢)。
+    /// D5-3: 旧版 done 也走 try_send, 慢消费者满通道时 done 被丢, 订阅方永不收尾 → 挂死。
+    async fn broadcast_stdio_blocking(&self, data: Value, source_conn: u64) {
+        let targets = self.collect_targets(CH_STDIO);
+        if targets.is_empty() {
+            return;
+        }
+        let task_id = data
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        for (sub_id, scope, tx) in targets {
+            if !scope.allows(task_id.as_deref(), source_conn) {
+                continue;
+            }
+            let frame = notification(sub_id.clone(), CH_STDIO, data.clone());
+            // 阻塞等槽位 — done 不可丢。tx 关闭 (订阅方断连) → send 返 Err, warn! 记 (非 panic)。
+            if tx.send(frame).await.is_err() {
+                warn!(%sub_id, "stdio done 帧发送失败 — 订阅方已断连 (D5-3)");
+            }
+        }
+    }
 }
 
 /// 构造 server-push notification Value。
@@ -1594,14 +1618,16 @@ async fn handle_execute_stream(
                 // L-6: streaming exec 完成也记指标 — 旧版漏 record_exec, Prometheus
                 // fe_exec_total 漏计流式执行 (仅非流式 execute 计)。与非流式 handler 对齐。
                 hub.record_exec(&r);
-                hub.broadcast_stdio(
+                // D5-3: done 帧走阻塞广播 — 不可丢 (订阅方须见流终止标记)。
+                hub.broadcast_stdio_blocking(
                     json!({
                         "task_id": task_id,
                         "event": "done",
                         "result": result_val.clone(),
                     }),
                     conn_id,
-                );
+                )
+                .await;
                 json!({"type": "done", "result": result_val})
             }
         };
@@ -1717,14 +1743,16 @@ async fn handle_method(
             // D4-9: 释放前刷新水位 (permit 即将 drop 归还)。
             metrics::gauge!("fe_exec_sem_available").set((exec_sem.available_permits() + 1) as f64);
             let val = serde_json::to_value(&r).unwrap_or(json!({}));
-            hub.broadcast_stdio(
+            // D5-3: done 帧走阻塞广播 — 不可丢 (订阅方须见流终止标记)。
+            hub.broadcast_stdio_blocking(
                 json!({
                     "task_id": task_id,
                     "event": "done",
                     "result": val.clone(),
                 }),
                 conn_id,
-            );
+            )
+            .await;
             Ok(val)
         }
         "executor.snapshot_create" => {

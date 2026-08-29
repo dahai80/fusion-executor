@@ -108,7 +108,7 @@ class FusionSandboxExecutor:
         cwd: str | None = None,
         timeout_sec: float = 30.0,
         env_vars: dict[str, str] | None = None,
-        enable_rollback_snapshot: bool = True,
+        enable_rollback_snapshot: bool = False,
         auto_rollback: RollbackPolicy | None = None,
         # ARCH-1: 默认 True — 对齐 fe-core serde default_true (商用安全默认)。
         # 受信本地 opt-out 显式传 seatbelt=False。原默认 False 与 UDS execute 路径 (serde 默认 true) 不一致。
@@ -230,7 +230,7 @@ class FusionSandboxExecutor:
         cwd: str | None = None,
         timeout_sec: float = 30.0,
         env_vars: dict[str, str] | None = None,
-        enable_rollback_snapshot: bool = True,
+        enable_rollback_snapshot: bool = False,
         auto_rollback: RollbackPolicy | None = None,
         # ARCH-1: 默认 True — 对齐 fe-core serde default_true + run() (见上注释)。
         seatbelt: bool = True,

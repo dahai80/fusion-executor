@@ -43,7 +43,7 @@ class ExecutionRequest(BaseModel):
     cwd: str | None = None
     timeout_sec: float = Field(default=30.0, description="秒; 超时退出码 -124")
     env_vars: dict[str, str] | None = None
-    enable_rollback_snapshot: bool = True
+    enable_rollback_snapshot: bool = False
     auto_rollback_policy: RollbackPolicy | None = None
     seatbelt: bool = Field(
         default=False, description="macOS seatbelt 运行时隔离 (sandbox-exec 禁网 + 危险二进制 execve deny)"

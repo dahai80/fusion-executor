@@ -373,7 +373,9 @@ impl ShellRegistry {
 /// reap=false: drop 阶段 waiter 线程随 PTY 关闭速退并回收, 此处仅信号不重复回收。
 impl Drop for ShellRegistry {
     fn drop(&mut self) {
-        // P-5: 锁内仅收集 (id, pid, grace) + take 所有 handle 供锁外 join, 释放 guard 后锁外 kill+join
+        // D5-5: 进程清理 + 线程回收 (m-PERF-02 已实装 kill+join, 本 Drop 验证无泄漏:
+        //   活跃 shell kill_process_group → reader/waiter 线程在 PTY 关闭后速退 → join 回收)。
+        //   P-5: 锁内仅收集 (id, pid, grace) + take 所有 handle 供锁外 join, 释放 guard 后锁外 kill+join
         let (active, all_handles) = {
             let mut g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
             let active: Vec<(String, Option<u32>, u64)> = g

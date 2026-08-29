@@ -147,7 +147,10 @@ pub struct ExecutionRequest {
     pub timeout_sec: f64,
     #[serde(default)]
     pub env_vars: Option<std::collections::HashMap<String, String>>,
-    #[serde(default = "default_true")]
+    /// D5-2: 默认 false — 快照创建是 opt-in (每次 execute 跑 2 次 git spawn, 热路径成本
+    /// D4-11)。auto_rollback_policy.is_some() 时 fe-core 内部强制开快照 (回滚须快照, 调用方
+    /// 不应设两标志)。默认关 = 裸 run("echo") 不触发 git, 无意外延迟。
+    #[serde(default = "default_false")]
     pub enable_rollback_snapshot: bool,
     #[serde(default)]
     pub auto_rollback_policy: Option<RollbackPolicy>,
@@ -209,6 +212,10 @@ fn default_timeout() -> f64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -408,6 +415,26 @@ pub struct AutoRollbackGuard {
     cwd: String,
     rollback: RollbackManager,
     pre_status: std::collections::HashSet<String>,
+    // D5-1: record_result 是否已被调用。Drop 时若未调 → 执行中途 panic/abort 提早 drop,
+    // warn! 显式暴露 snapshot_id 供调用方手动恢复 (Drop 不能 .await, 真回滚须调用方发起)。
+    // AtomicBool (非 Cell<bool>) — guard 跨 tokio::spawn move 须 Send, Cell 不 impl Sync。
+    recorded: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for AutoRollbackGuard {
+    fn drop(&mut self) {
+        // D5-1: 守卫未正常 record_result 就 drop = 执行中途 panic/abort/提前返回。
+        // 不能在 Drop 里 .await 做回滚 (async-in-Drop 不健全); 仅 loud warn + 暴露 snapshot_id,
+        // 让调用方见日志后手动 rollback(snapshot_id, cwd) 恢复 (Rule 12 fail-visible, honest path)。
+        if !self.recorded.load(std::sync::atomic::Ordering::Acquire) {
+            warn!(
+                snapshot = %self.snapshot_id,
+                cwd = %self.cwd,
+                "AutoRollbackGuard dropped 未调 record_result — 执行中途 panic/提前 drop; \
+                 调用方须手动 rollback(snapshot_id) 恢复 (Drop 无法 async 回滚)"
+            );
+        }
+    }
 }
 
 impl AutoRollbackGuard {
@@ -425,19 +452,26 @@ impl AutoRollbackGuard {
             cwd,
             rollback: RollbackManager::new(),
             pre_status,
+            recorded: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// 采集 git status --porcelain 行集 (去空白行)。命令前后各采一次, diff 出命令新增改动。
     /// L-CORE-02: git 失败 fail-loud (返 Err), 不再 `.unwrap_or(0)` 静默跳回滚。
+    /// D5-4: git status 包 tokio::time::timeout(10s) — NFS/挂死 git 不会无限阻塞执行; 超时
+    /// 返 Err (status 未知), detect_damage/调用方 fail-loud 处理 (回滚可能不精确, 但不挂死)。
     async fn capture_status(cwd: &str) -> Result<std::collections::HashSet<String>> {
-        let out = tokio::process::Command::new("git")
+        let fut = tokio::process::Command::new("git")
             .arg("-C")
             .arg(cwd)
             .args(["status", "--porcelain"])
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("git status 启动失败: {e}"))?;
+            .output();
+        let out = match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+            Ok(o) => o.map_err(|e| anyhow::anyhow!("git status 启动失败: {e}"))?,
+            Err(_) => {
+                anyhow::bail!("git status 超时 (>10s) — cwd={cwd}, status 未知 (D5-4)")
+            }
+        };
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             anyhow::bail!("git status 失败 (exit {}): {}", out.status, stderr);
@@ -487,6 +521,10 @@ impl AutoRollbackGuard {
     /// L-CORE-02: detect_damage 失败不再静默 (旧 .unwrap_or(0) 跳回滚); 现 propagate Err,
     /// 调用方 (execute_async/execute_streaming) 已 warn! 记录。
     pub async fn record_result(&self, result: &mut ExecutionResult) -> Result<()> {
+        // D5-1: 进 record_result 即视守卫已被正常消费 (即便早期 return 也是合法 "无需回滚")。
+        // Drop 据此区分 "已消费" vs "中途 panic/提前 drop 未消费"。set 在入口, 覆盖所有 return 路径。
+        self.recorded
+            .store(true, std::sync::atomic::Ordering::Release);
         if result.exit_code == 0 {
             return Ok(());
         }
@@ -829,22 +867,39 @@ impl Executor {
             }
         }
 
-        // 快照 + 命令前 git status 快照 (caller-driven 锁定决策: 仅当 enable_rollback_snapshot 且有 cwd)
+        // 快照 + 命令前 git status 快照。
+        // D5-2: 默认 opt-in — want_snapshot = 显式 enable_rollback_snapshot || auto_rollback_policy.is_some()
+        //   (回滚须快照, 调用方传 policy 即隐式要快照, 不应再设两标志)。裸 run("echo") 默认不跑 git。
+        // D5-2 fail-loud: snapshot_create 失败不再 "非致命" info! 继续吞 — 改 warn! 显式暴露;
+        //   且若 caller 传了 auto_rollback_policy 但快照建不出 → 回滚保障失效, 标 rollback_unavailable。
         // C-CORE-01: pre_status 是命令前工作区状态, 供 guard diff 命令后状态找出命令新增改动
-        // (旧版非空即判毁损, __pycache__/WIP 误触发)。pre_status 与 snapshot 同期采集 (命令前)。
-        let (snapshot_id, pre_status) = if req.enable_rollback_snapshot {
+        //   (旧版非空即判毁损, __pycache__/WIP 误触发)。pre_status 与 snapshot 同期采集 (命令前)。
+        let want_snapshot = req.enable_rollback_snapshot || req.auto_rollback_policy.is_some();
+        let mut snapshot_create_err: Option<anyhow::Error> = None;
+        let (snapshot_id, pre_status) = if want_snapshot {
             if let Some(cwd) = &req.cwd {
                 let snap = self.rollback.snapshot_create(cwd).await;
                 let pre = AutoRollbackGuard::capture_status(cwd).await;
                 match (snap, pre) {
                     (Ok(id), Ok(st)) => {
-                        if !id.is_empty() {
+                        if id.is_empty() {
+                            // D5-6: want_snapshot=true 但快照 id 空 (非 git repo cwd) — 回滚无锚点,
+                            // 若 caller 传 policy 则保障失效, warn! 显式暴露 (非静默空 id)。
+                            if req.auto_rollback_policy.is_some() {
+                                warn!(cwd, "快照 id 空 (非 git repo) 但 caller 传 auto_rollback — 回滚无锚点, 保障失效");
+                            } else {
+                                info!(
+                                    cwd,
+                                    "快照 id 空 (非 git repo) — 无回滚锚点, 仅 pre_status 采集"
+                                );
+                            }
+                        } else {
                             info!(%id, "快照已创建");
                         }
                         (Some(id), st)
                     }
                     (Ok(id), Err(e)) => {
-                        // 命令前 status 采集失败 — 非 git repo 或 git 异常。pre_status 空集,
+                        // 命令前 status 采集失败 — 非 git repo 或 git 异常 (D5-4 可能超时)。pre_status 空集,
                         // guard detect 时 post 若非空则全部算命令新增 (保守: 当作全命令导致)。
                         warn!(error = %e, cwd, "命令前 git status 采集失败, pre_status 置空");
                         if !id.is_empty() {
@@ -853,7 +908,10 @@ impl Executor {
                         (Some(id), std::collections::HashSet::new())
                     }
                     (Err(e), _) => {
-                        info!(error = %e, "快照创建失败, 继续 (非致命)");
+                        // D5-2 fail-loud: 快照建不出 → warn! (升级 info!→warn!)。caller 传 policy 时
+                        // 标 rollback_unavailable (后续 result 构造后置位, 此处记 err 携带)。
+                        warn!(error = %e, cwd, "快照创建失败 — 回滚保障不可用 (D5-2 fail-loud)");
+                        snapshot_create_err = Some(e);
                         (None, std::collections::HashSet::new())
                     }
                 }
@@ -920,6 +978,12 @@ impl Executor {
             pid: sb.pid,               // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
             ..Default::default()
         };
+
+        // D5-2 fail-loud: 快照建不出且 caller 传了 policy → 回滚无锚点, guard 不会构造,
+        // 调用方无信号知保障失效。标 rollback_unavailable=true (snapshot_create_err 已在上方记 warn!)。
+        if snapshot_create_err.is_some() && req.auto_rollback_policy.is_some() {
+            result.rollback_unavailable = true;
+        }
 
         // 自动回滚 (FR-04) — 调用方传 policy 且有快照+cwd 时, 单次内 guard 判定
         // pre_status 命令前已采集, 传入 guard 供 detect_damage diff (C-CORE-01)
@@ -1010,13 +1074,22 @@ impl Executor {
         }
 
         // 快照 + 命令前 git status 快照 (与 execute_async 同策略; C-CORE-01 pre_status diff)
-        let (snapshot_id, pre_status) = if req.enable_rollback_snapshot {
+        // D5-2/D5-6: 同 execute_async — want_snapshot 含 auto_rollback_policy; fail-loud + empty warn。
+        let want_snapshot = req.enable_rollback_snapshot || req.auto_rollback_policy.is_some();
+        let mut snapshot_create_err: Option<anyhow::Error> = None;
+        let (snapshot_id, pre_status) = if want_snapshot {
             if let Some(cwd) = &req.cwd {
                 let snap = self.rollback.snapshot_create(cwd).await;
                 let pre = AutoRollbackGuard::capture_status(cwd).await;
                 match (snap, pre) {
                     (Ok(id), Ok(st)) => {
-                        if !id.is_empty() {
+                        if id.is_empty() {
+                            if req.auto_rollback_policy.is_some() {
+                                warn!(cwd, "快照 id 空 (非 git repo) 但 caller 传 auto_rollback — 回滚无锚点, 保障失效 (streaming)");
+                            } else {
+                                info!(cwd, "快照 id 空 (非 git repo) — 无回滚锚点 (streaming)");
+                            }
+                        } else {
                             info!(%id, "快照已创建 (streaming)");
                         }
                         (Some(id), st)
@@ -1029,7 +1102,8 @@ impl Executor {
                         (Some(id), std::collections::HashSet::new())
                     }
                     (Err(e), _) => {
-                        info!(error = %e, "快照创建失败, 继续 (非致命, streaming)");
+                        warn!(error = %e, cwd, "快照创建失败 — 回滚保障不可用 (D5-2 fail-loud, streaming)");
+                        snapshot_create_err = Some(e);
                         (None, std::collections::HashSet::new())
                     }
                 }
@@ -1067,6 +1141,9 @@ impl Executor {
         let policy_for_done = req.auto_rollback_policy.clone();
         let cwd_for_guard = req.cwd.clone();
         let pre_status_for_guard = pre_status.clone();
+        // D5-2: 快照建不出 + policy → 标 rollback_unavailable (closure 内应用)
+        let snapshot_err_for_done = snapshot_create_err.is_some();
+        let policy_present = req.auto_rollback_policy.is_some();
 
         let (outer_tx, outer_rx) = mpsc::channel::<ExecutionStreamEvent>(64);
         // C-4: spawn 任务体包 catch_unwind — 病态 slicer/guard/unwrap panic 不静默丢 Done 帧。
@@ -1123,6 +1200,10 @@ impl Executor {
                                 pid: sb.pid, // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
                                 ..Default::default()
                             };
+                            // D5-2 fail-loud: 快照建不出且 caller 传 policy → guard 不构造, 标 rollback_unavailable (streaming)
+                            if snapshot_err_for_done && policy_present {
+                                result.rollback_unavailable = true;
+                            }
                             // 自动回滚 (FR-04, 同 execute_async; pre_status diff C-CORE-01)
                             if let (Some(policy), Some(cwd), Some(sid)) = (
                                 policy_for_done.as_ref(),
