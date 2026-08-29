@@ -350,8 +350,12 @@ impl Sandbox {
         let (tx, rx) = std_mpsc::channel::<Result<String>>();
         let _reader_handle = std::thread::spawn(move || {
             // 环形缓冲: 超过 max_cap 时只保留尾部 effective_max
-            let mut buf = Vec::<u8>::with_capacity(8192);
-            let mut tmp = [0u8; 4096];
+            // D4-5: 读缓冲 16KB (原 4KB) — 大输出时减半 read syscall 次数, 微秒级收益低风险。
+            // D4-8: 评估 VecDeque ring buffer 后否决 — 溢出 drain 在非热路径 (仅超大输出触发),
+            // 且最终 String::from_utf8_lossy 需连续切片, VecDeque 须 make_contiguous 额外 rotate,
+            // 无净收益 (pop_front O(keep) == Vec drain O(keep))。保留 Vec + drain (off-hot-path, 诚实标注)。
+            let mut buf = Vec::<u8>::with_capacity(16384);
+            let mut tmp = [0u8; 16384];
             loop {
                 match reader.read(&mut tmp) {
                     Ok(0) => break,
@@ -509,10 +513,11 @@ impl Sandbox {
         let tail_cap = effective_max;
 
         // stdout reader 线程 — 环形缓冲 (与 PTY 一致 OOM-cap)
+        // D4-5: 读缓冲 16KB (原 4KB) — 见 PTY 路径同款注释 (减半 syscall)。
         let (out_tx, out_rx) = std_mpsc::channel::<Result<String>>();
         let _out_handle = std::thread::spawn(move || {
-            let mut buf = Vec::<u8>::with_capacity(8192);
-            let mut tmp = [0u8; 4096];
+            let mut buf = Vec::<u8>::with_capacity(16384);
+            let mut tmp = [0u8; 16384];
             loop {
                 match stdout_handle.read(&mut tmp) {
                     Ok(0) => break,
@@ -536,10 +541,11 @@ impl Sandbox {
         });
 
         // stderr reader 线程 — 独立缓冲 (Issue #4 核心分离)
+        // D4-5: 读缓冲 16KB (原 4KB) — 见 PTY 路径同款注释 (减半 syscall)。
         let (err_tx, err_rx) = std_mpsc::channel::<Result<String>>();
         let _err_handle = std::thread::spawn(move || {
-            let mut buf = Vec::<u8>::with_capacity(8192);
-            let mut tmp = [0u8; 4096];
+            let mut buf = Vec::<u8>::with_capacity(16384);
+            let mut tmp = [0u8; 16384];
             loop {
                 match stderr_handle.read(&mut tmp) {
                     Ok(0) => break,
@@ -699,8 +705,8 @@ impl Sandbox {
         }
         let (inner_tx, mut inner_rx) = mpsc::channel::<ReaderMsg>(64);
         let _reader_handle = std::thread::spawn(move || {
-            let mut buf = Vec::<u8>::with_capacity(8192);
-            let mut tmp = [0u8; 4096];
+            let mut buf = Vec::<u8>::with_capacity(16384);
+            let mut tmp = [0u8; 16384];
             // L-SB-02: 跨块多字节 UTF-8 — 保留尾部不完整字节带入下块
             let mut pending: Vec<u8> = Vec::new();
             let mut overflow_marked = false;

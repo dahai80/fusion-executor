@@ -82,6 +82,7 @@ class FusionSandboxExecutor:
         extra_whitelist: list[str] | None = None,
         disable_bundle_allowlist: bool = False,
         allow_inline_interpreter: bool = False,
+        trusted_bin_dirs: list[str] | None = None,
     ) -> None:
         try:
             from ._native import NativeExecutor
@@ -92,7 +93,11 @@ class FusionSandboxExecutor:
         # D3-1 (审计 0827 product): allow_inline_interpreter=True 开启内联解释器 (python -c / node -e
         #   / ruby -e / perl -e); 默认 False (企业硬化拒内联代码, 防 agent-driven 任意 payload 绕白名单语义)。
         #   测试机/本地交互场景依赖 python3 -c, 显式传 True opt-in。
-        self._native = NativeExecutor(extra_whitelist, disable_bundle_allowlist, allow_inline_interpreter)
+        # D3-6 (审计 0827 product 4-layer): trusted_bin_dirs 登记项目工具所在目录 — extra_whitelist 的工具
+        #   须 resolve 到可信目录才放行 (fail-closed 防 /tmp/python3 投毒)。测试/调用方登记项目 bin 目录。
+        self._native = NativeExecutor(
+            extra_whitelist, disable_bundle_allowlist, allow_inline_interpreter, trusted_bin_dirs
+        )
         self._sock_path = sock_path
 
     def run(

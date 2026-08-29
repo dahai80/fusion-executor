@@ -62,11 +62,13 @@ pub use fe_tools::{
 // 构造失败 = 进程永久不可用, 无重试。故 panic 信息须含构建原因, 让调用方日志能定位根因;
 // 文档化约定: 首次 run() panic = 进程需重启, 无 Result 可捕获无降级 (sandbox/telemetry 全 async)。
 pub static BLOCKING_RT: LazyLock<Runtime> = LazyLock::new(|| {
+    // D4-12: cap workers at 8 — CLI/OS-tool 无需 32 核全开 (32 核机 spawn 32 worker 纯浪费线程栈)。
+    // 下限 2 保 execute/telemetry/IPC 并行; 上限 8 覆盖高并发 UDS, 余量靠 exec_sem 信号量节流。
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    let workers = workers.max(2);
-    info!(workers, "BLOCKING_RT 初始化多线程 runtime");
+    let workers = workers.clamp(2, 8);
+    info!(workers, "BLOCKING_RT 初始化多线程 runtime (D4-12 上限 8)");
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()

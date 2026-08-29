@@ -222,6 +222,9 @@ pub fn install_prometheus_recorder() -> Option<PrometheusHandle> {
             );
             metrics::describe_gauge!("fe_shell_active", "Active background shells");
             metrics::describe_gauge!("fe_connections", "Active UDS connections");
+            // D4-9: 非流式 exec_sem 可用许可 — LB/运维面板据此判饱和 (0=满载分流)。与 health
+            // response available_permits 同源; Prometheus exporter 镜像成 gauge 供 scrape。
+            metrics::describe_gauge!("fe_exec_sem_available", "Available exec semaphore permits");
             Some(handle)
         })
         .clone()
@@ -731,11 +734,16 @@ impl BroadcastHub {
     /// source_conn = 发起该命令的连接 conn_id (OwnConn 过滤用); data 含 task_id (Tasks 过滤用)。
     /// Blocker 10 (审计 2.9): 旧版无过滤全广播 = 跨租户泄漏 (Agent A 见 Agent B stdout)。
     fn broadcast_stdio(&self, data: Value, source_conn: u64) {
+        // D4-4: 快路径 — 0 stdio 订阅时跳过 task_id 提取 + 逐订阅 frame 构建 (避免无订阅时
+        // 仍锁 registry 建 Vec + clone Value)。collect_targets 空即无订阅, 直接返回零工作。
+        let targets = self.collect_targets(CH_STDIO);
+        if targets.is_empty() {
+            return;
+        }
         let task_id = data
             .get("task_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let targets = self.collect_targets(CH_STDIO);
         for (sub_id, scope, tx) in targets {
             if !scope.allows(task_id.as_deref(), source_conn) {
                 continue;
@@ -1664,6 +1672,8 @@ async fn handle_method(
             // 新版区分 alive/busy/dead: 短超时 (200ms) 探 BLOCKING_RT 响应 (空闲 worker 立即拾取);
             // 超时再查 exec_sem 可用许可 — 0=饱和 (忙碌但健康, LB 应分流非摘除), >0 仍超时=停摆 (真不健康)。
             let rt = probe_runtime(Duration::from_millis(200), exec_sem.available_permits()).await;
+            // D4-9: health 探针同步镜像 exec_sem 可用数成 Prometheus gauge (scrape 路径互补)。
+            metrics::gauge!("fe_exec_sem_available").set(exec_sem.available_permits() as f64);
             let deps = probe_dependencies().await;
             // 任一核心依赖缺失 → ok:false (依赖不健康 = 服务降级)
             let deps_ok = deps.iter().all(|d| d["ok"].as_bool() == Some(true));
@@ -1696,11 +1706,16 @@ async fn handle_method(
                 .acquire()
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("exec_sem 已关闭: {e}")))?;
+            // D4-9: 取 permit 后镜像可用数成 gauge (permit drop 在 handler 末尾, Rust 无 drop 钩子点位,
+            // 故 acquire 后即时 set 一次反映新水位; 下一请求 acquire 时再刷新)。
+            metrics::gauge!("fe_exec_sem_available").set(exec_sem.available_permits() as f64);
             let r: ExecutionResult = executor
                 .execute_async(req)
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("execute 失败: {}", e)))?;
             hub.record_exec(&r);
+            // D4-9: 释放前刷新水位 (permit 即将 drop 归还)。
+            metrics::gauge!("fe_exec_sem_available").set((exec_sem.available_permits() + 1) as f64);
             let val = serde_json::to_value(&r).unwrap_or(json!({}));
             hub.broadcast_stdio(
                 json!({
@@ -2636,6 +2651,19 @@ mod tests {
         assert!(
             text.contains("# TYPE fe_connections gauge"),
             "缺 fe_connections gauge: {text}"
+        );
+        // D4-9: exec_sem 可用许可 gauge — execute 后 health 路径镜像, 应含 HELP/TYPE/指标行。
+        assert!(
+            text.contains("# HELP fe_exec_sem_available"),
+            "缺 fe_exec_sem_available HELP: {text}"
+        );
+        assert!(
+            text.contains("# TYPE fe_exec_sem_available gauge"),
+            "缺 fe_exec_sem_available TYPE: {text}"
+        );
+        assert!(
+            text.contains("fe_exec_sem_available"),
+            "缺 fe_exec_sem_available 指标行: {text}"
         );
         let _ = std::fs::remove_file(&sock);
     }

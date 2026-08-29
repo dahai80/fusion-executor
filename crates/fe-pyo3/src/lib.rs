@@ -641,11 +641,12 @@ struct PyExecutor {
 #[pymethods]
 impl PyExecutor {
     #[new]
-    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false, allow_inline_interpreter=false))]
+    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false, allow_inline_interpreter=false, trusted_bin_dirs=None))]
     fn new(
         extra_whitelist: Option<Vec<String>>,
         disable_bundle_allowlist: bool,
         allow_inline_interpreter: bool,
+        trusted_bin_dirs: Option<Vec<String>>,
     ) -> Self {
         // extra_whitelist 经 with_extra_whitelist 烘焙进 inner 的 ArcSwap; A-4 后 serve() 共享
         // inner, 无需单独存。SIGHUP reload 从 FUSION_EXECUTOR_EXTRA_WHITELIST env 读 (m-OPS-02)。
@@ -661,6 +662,14 @@ impl PyExecutor {
             tracing::info!(count = extras.len(), "PyExecutor 构造带项目级白名单扩展");
             Executor::new().with_extra_whitelist(&extras)
         };
+        // D3-6 (审计 0827 product 4-layer): trusted_bin_dirs 注册项目工具所在目录 —
+        // extra_whitelist 的工具须 resolve 到可信目录才放行 (fail-closed 防 /tmp 投毒)。
+        // Python 测试/调用方登记项目 bin 目录后, 扩展工具 resolve 通过才 allowed。
+        if let Some(dirs) = trusted_bin_dirs.as_ref() {
+            let dir_refs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+            tracing::info!(count = dir_refs.len(), "PyExecutor 构造登记可信 bin 目录 (D3-6)");
+            inner = inner.with_trusted_bin_dirs(&dir_refs);
+        }
         // D3-1 (审计 0827 product): 内联解释器网关 opt-in。默认 false (企业硬化拒 python -c /
         // node -e / ruby -e / perl -e); true 保留 trusted-caller 内联执行能力 (测试机/本地交互)。
         if allow_inline_interpreter {

@@ -290,6 +290,10 @@ impl SecurityGuard {
 
     /// 校验入口 — 先正则快筛，再 token 解析防链式绕过
     pub fn validate(&self, command: &str) -> SecurityVerdict {
+        // D4-2/D4-3 perf 评估 (2026-08-29): 正则已 struct-field 缓存 (build_blocklist/redirect_re
+        // 在 new() 一次编译, 非每调编译) — 无 LazyLock 必要。resolve_binary_path 走 fs stat (非 CPU),
+        // 路径缓存仅对同进程内重复同名的二进制有益, validate 逐命令调用 binary 名罕密集重复;
+        // 加 Mutex<HashMap> 反在热路径引入锁竞争 (Rule 2 简单优先)。故两项均不改, 诚实标注。
         // M-SEC-05: 空字节清理 — 命令含 \0 拒绝 (echo hi\0id)
         if command.contains('\0') {
             return SecurityVerdict::block("命令含空字节 (null byte)", SecurityStage::Regex);

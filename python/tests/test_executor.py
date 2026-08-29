@@ -1324,9 +1324,14 @@ def test_validate_empty_command_raises_valueerror(executor: FusionSandboxExecuto
 
 
 # Issue #10: 白名单覆盖 + 项目级扩展 + 动态执行拦截
-def test_extra_whitelist_allows_project_tool():
-    ex = FusionSandboxExecutor(extra_whitelist=["myproj-runner"])
-    v = ex.validate("myproj-runner --version")
+# D3-6 (审计 0827 product): extra_whitelist 的工具须 resolve 到可信目录才放行 (fail-closed 防
+#   /tmp 投毒)。测试建真实可执行工具到临时 bin 目录, 登记 trusted_bin_dirs, 校验放行。
+def test_extra_whitelist_allows_project_tool(tmp_path):
+    tool = tmp_path / "myproj-runner"
+    tool.write_text("#!/bin/sh\necho run\n")
+    tool.chmod(0o755)
+    ex = FusionSandboxExecutor(extra_whitelist=["myproj-runner"], trusted_bin_dirs=[str(tmp_path)])
+    v = ex.validate(f"{tool} --version")
     assert v["allowed"] is True, v
 
 

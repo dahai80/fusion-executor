@@ -47,6 +47,7 @@
 
 use portable_pty::CommandBuilder;
 use std::process::Command;
+use std::sync::LazyLock;
 #[cfg(test)]
 use tracing::warn;
 use tracing::{debug, info};
@@ -82,6 +83,16 @@ fn build_profile() -> String {
         p.push_str(&format!("(deny file-write* (subpath \"{}\"))", resolved));
     }
     p
+}
+
+/// D4-1: seatbelt profile 缓存 — build_profile 首次构造后进 LazyLock, 后续 exec 复用同一 String
+/// (profile 是进程静态: HOME 在首调时解析, SIGHUP 重载白名单不影响 seatbelt profile —
+/// sandbox-exec profile 串不跟 env 联动)。消除每次 build_command 的 String 重建 + HOME env 查。
+static SEATBELT_PROFILE: LazyLock<String> = LazyLock::new(build_profile);
+
+/// 返回缓存的 seatbelt profile (D4-1)。测试仍可直调 build_profile 验证构造逻辑。
+fn profile() -> &'static str {
+    &SEATBELT_PROFILE
 }
 
 /// Issue #3 + RUN-10: 资源上限包装 — 在命令串前注入实测生效的 ulimit 内建。
@@ -130,7 +141,7 @@ pub fn build_command(
 ) -> CommandBuilder {
     let wrapped = wrap_rlimits(command, nproc, cpu_sec, nofile);
     if seatbelt {
-        let profile = build_profile();
+        let profile = profile();
         info!(
             profile_len = profile.len(),
             fs_paths = SENSITIVE_FS_PATHS.len(),
@@ -139,7 +150,7 @@ pub fn build_command(
         debug!(profile = %profile, "seatbelt profile");
         let mut cmd = CommandBuilder::new("sandbox-exec");
         cmd.arg("-p");
-        cmd.arg(&profile);
+        cmd.arg(profile);
         cmd.arg("sh");
         cmd.arg("-c");
         cmd.arg(&wrapped);
@@ -166,18 +177,14 @@ pub fn build_std_command(
 ) -> Command {
     let wrapped = wrap_rlimits(command, nproc, cpu_sec, nofile);
     if seatbelt {
-        let profile = build_profile();
+        let profile = profile();
         info!(
             profile_len = profile.len(),
             fs_paths = SENSITIVE_FS_PATHS.len(),
             "seatbelt (stdio) 运行时隔离启用 — sandbox-exec 包装 (禁网 + 定向 FS deny)"
         );
         let mut cmd = Command::new("sandbox-exec");
-        cmd.arg("-p")
-            .arg(&profile)
-            .arg("sh")
-            .arg("-c")
-            .arg(&wrapped);
+        cmd.arg("-p").arg(profile).arg("sh").arg("-c").arg(&wrapped);
         cmd
     } else {
         debug!("seatbelt (stdio) 未启用 — 裸 sh -c");
