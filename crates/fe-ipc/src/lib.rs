@@ -877,23 +877,70 @@ impl IpcServer {
         std::env::var("FUSION_EXECUTOR_SOCK").unwrap_or_else(|_| default_sock_path())
     }
 
-    /// 异步 serve — bind + unlink 旧 sock + chmod 0o600 + accept 循环
+    /// D6-07: bind socket 带陈旧 socket 自愈。
+    /// 旧版无条件 unlink 旧 socket 再 bind — 会劫持正在运行的实例 (D6-05 多实例冲突)。
+    /// 新版: 直接 bind; EADDRINUSE 时探测 liveness —
+    ///   connect 成功 = 有活实例 → fail-loud (拒绝劫持);
+    ///   connect 失败 = 陈旧死 socket → unlink + 重 bind 一次 (自愈)。
+    /// 残留竞态: check→rebind 窗口内他实例可能 bind 同路径, 二次 bind 仍失败 → fail-loud。
+    /// 真正原子需 bindfd+flock, 对 UDS 本地受信场景过度, 文档标注残留窗口可接受。
+    /// D6-08: 错误消息用英文 FATAL/WARN 关键词便于 ops grep/alert。
+    fn bind_with_stale_recovery(path: &Path) -> Result<UnixListener> {
+        match UnixListener::bind(path) {
+            Ok(l) => Ok(l),
+            Err(e) => {
+                // 仅 EADDRINUSE 走陈旧自愈; 其他 bind 错误 (权限/路径) 直接 fail-loud。
+                let in_use = e
+                    .raw_os_error()
+                    .map(|c| c == libc::EADDRINUSE || c == libc::EEXIST)
+                    .unwrap_or(false);
+                if !in_use {
+                    error!(sock = %path.display(), error = %e, "FATAL: socket bind failed");
+                    return Err(anyhow::anyhow!(
+                        "FATAL: socket bind failed: {}: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+                // D6-07: 探测占位 socket 是否活实例。
+                let live = std::os::unix::net::UnixStream::connect(path).is_ok();
+                if live {
+                    error!(sock = %path.display(), "FATAL: socket already in use — live instance detected, refusing to hijack; set FUSION_EXECUTOR_SOCK to run a second instance");
+                    return Err(anyhow::anyhow!(
+                        "FATAL: socket already in use (live instance on {}); \
+                         set FUSION_EXECUTOR_SOCK to run a second instance",
+                        path.display()
+                    ));
+                }
+                // 陈旧死 socket — unlink + 重 bind 一次。
+                warn!(sock = %path.display(), "WARN: stale socket detected (no live listener), unlinking and rebinding");
+                let _ = std::fs::remove_file(path);
+                UnixListener::bind(path).map_err(|e2| {
+                    error!(sock = %path.display(), error = %e2, "FATAL: socket rebind failed after stale cleanup");
+                    anyhow::anyhow!(
+                        "FATAL: socket rebind failed after stale cleanup: {}: {}",
+                        path.display(),
+                        e2
+                    )
+                })
+            }
+        }
+    }
+
+    /// 异步 serve — bind + chmod 0o600 + accept 循环
     /// 返回 (shutdown_tx, join_handle): 调用方发 shutdown_tx 触发优雅退出, 可 await join 等待清理
+    /// D6-05/07: bind 经 bind_with_stale_recovery — 活实例 fail-loud, 陈旧 socket 自愈 (不无条件 unlink)。
+    /// D6-05: 多实例需显式设 FUSION_EXECUTOR_SOCK (不同 socket) + FE_LOG_DIR (不同日志) 各实例独立。
     pub async fn serve(
         &self,
         sock_path: &str,
     ) -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
         let path = Path::new(sock_path).to_path_buf();
-        if path.exists() {
-            info!(sock = %path.display(), "清理旧 socket");
-            let _ = std::fs::remove_file(&path);
-        }
         // C-10: 先建 + 收紧父目录 0o700, 再 bind — 消除 bind→chmod 间窗口。
         // ensure_sock_dir 内对已存在目录也收紧权限 (旧版早 return 跳过 = 残留宽松目录)。
         // D3-8: 权限收紧失败 → fail-loud, serve 拒绝启动 (世界可读写 socket = M-SEC-01 绕过)。
         ensure_sock_dir(&path)?;
-        let listener = UnixListener::bind(&path)
-            .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", path.display(), e))?;
+        let listener = Self::bind_with_stale_recovery(&path)?;
         chmod_secure(&path)?;
         info!(sock = %path.display(), "IPC 服务器监听中");
         // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
@@ -931,12 +978,8 @@ impl IpcServer {
         let shells = self.shells.clone();
         fe_core::BLOCKING_RT.block_on(async move {
             let p = Path::new(&path).to_path_buf();
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
             ensure_sock_dir(&p)?;
-            let listener = UnixListener::bind(&p)
-                .map_err(|e| anyhow::anyhow!("bind {} 失败: {}", p.display(), e))?;
+            let listener = Self::bind_with_stale_recovery(&p)?;
             chmod_secure(&p)?;
             info!(sock = %p.display(), "IPC 服务器监听中 (blocking, 信号可停)");
             // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
@@ -4081,5 +4124,46 @@ mod tests {
             text.contains("fe_exec_duration_seconds_bucket{le=\"+Inf\"}"),
             "D6-02: 应有 +Inf 末桶行"
         );
+    }
+
+    // D6-07: bind_with_stale_recovery — 陈旧死 socket (无 listener) 应 unlink + rebind 成功。
+    #[tokio::test]
+    async fn d607_stale_socket_rebind_succeeds() {
+        let sock = tmp_sock("d607-stale");
+        // 留一个无 listener 的陈旧 socket 文件 (模拟崩溃残留)。
+        std::fs::File::create(&sock).unwrap();
+        assert!(Path::new(&sock).exists(), "前置: 陈旧 socket 存在");
+        let server = IpcServer::new();
+        let (_tx, join) = server
+            .serve(&sock)
+            .await
+            .expect("陈旧 socket 应自愈 rebind");
+        // 健康 roundtrip 证明 listener 真活。
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["ok"], true, "D6-07: 自愈后 listener 应响应");
+        let _ = std::fs::remove_file(&sock);
+        drop(join);
+    }
+
+    // D6-05: bind_with_stale_recovery — 活实例占位时应 fail-loud, 不劫持。
+    #[tokio::test]
+    async fn d605_live_socket_refuses_hijack() {
+        let sock = tmp_sock("d605-live");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        // 第二实例尝试同 socket → Err (活 listener 探测成功)。
+        let server2 = IpcServer::new();
+        let err = server2.serve(&sock).await;
+        assert!(err.is_err(), "D6-05: 活实例占位时应 fail-loud 拒绝劫持");
+        let msg = format!("{}", err.err().unwrap());
+        assert!(
+            msg.contains("already in use") || msg.contains("FATAL"),
+            "D6-05: 错误消息应含 already in use/FATAL 关键词, 实际: {msg}"
+        );
+        let _ = std::fs::remove_file(&sock);
     }
 }

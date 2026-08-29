@@ -179,3 +179,21 @@ def test_cli_serve_flag_starts_and_cleans_socket():
             proc.wait(timeout=5.0)
         if os.path.exists(sock_path):
             os.unlink(sock_path)
+
+
+def test_cli_serve_keyboard_interrupt_exits_1(monkeypatch):
+    # D6-09: --serve 收 KeyboardInterrupt 应退 1 (非 0), 区分中断与正常停机。
+    import os
+
+    sock = "/tmp/fe-test-cli-kbi.sock"
+    if os.path.exists(sock):
+        os.unlink(sock)
+
+    def _raise_keyboardinterrupt(self, path=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(FusionSandboxExecutor, "serve", _raise_keyboardinterrupt)
+    code, _ = _run_main(["fusion-executor", "--serve", "--sock", sock])
+    assert code == 1, f"D6-09: serve KeyboardInterrupt 应退 1, 实际 {code}"
+    if os.path.exists(sock):
+        os.unlink(sock)

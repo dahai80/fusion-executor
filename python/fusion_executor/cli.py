@@ -87,8 +87,8 @@ def main() -> int:
         try:
             FusionSandboxExecutor(allow_inline_interpreter=args.allow_inline_interpreter).serve(args.sock)
         except KeyboardInterrupt:
-            log.info("serve 停机")
-            return 0
+            log.info("serve interrupted (KeyboardInterrupt)")
+            return 1
         return 0
 
     if not args.command:
