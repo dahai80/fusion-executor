@@ -641,9 +641,8 @@ version = "0.2.5"
 dependencies = [
  "arc-swap",
  "criterion",
+ "fe-guard",
  "regex",
- "serde",
- "serde_json",
  "shell-words",
  "thiserror 2.0.20",
  "tracing",
