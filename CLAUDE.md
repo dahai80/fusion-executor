@@ -133,6 +133,60 @@ Python ≥3.11 (venv is 3.14). Runtime dep `pydantic>=2.0`. Test deps `pytest`/`
 - **fusion-executor ↔ fusion-mlx / fusion-gateway**: UDS comms (not HTTP/gRPC) — terminal Traceback-to-model-prompt transfer latency target <2ms.
 - **Replaces**: Claude SDK's BashTool/FileEdit/Glob/Grep + Docker sandbox, and DeepSeek Harness's SWE-bench container — but native (no Docker): macOS process isolation + Git snapshots, sandbox init overhead target <5ms.
 
+## fusion-guard 集成 (Phase 3, Issue #23)
+
+`fusion-executor` 是 fusion-guard 零信任动作授权 daemon 的**执行侧消费方**。guard (per-host UDS
+JSON-RPC daemon, Phase 0-2 已落地 14 fg-* crate) 在每条命令执行前裁决 allow/preview/redact/block
++ 风险等级 L1-L4, executor 据此决定执行/拒绝/传递 `guard_action_id` 供调用方审计。
+
+**跨工程约束**: fusion-guard 是 READ-ONLY 跨工程 — 本工程只消费 guard UDS wire 契约 (`/tmp/fusion-guard.sock`
+换行分隔 JSON), **不**改 fusion-guard 源码、**不**提 guard PR。本地镜像 wire 类型在 `crates/fe-guard`,
+保持 executor 构建独立于 fusion-guard。
+
+**默认 OFF (向后兼容)**: `FusionSandboxExecutor()` 不传 `guard_sock` → guard 关闭, 行为同 v0.2.5 (静态
+blocklist regex + 白名单栅栏)。开启: 显式传 `guard_sock='/tmp/fusion-guard.sock'` 或设环境变量
+`FUSION_GUARD_SOCK`。
+
+- `FusionSandboxExecutor(guard_sock=..., guard_tenant=...)` → 4 层 plumbing: Python `__init__` →
+  fe-pyo3 `PyExecutor::new` → fe-core `Executor::with_guard` → fe-security `SecurityGuard::with_guard`
+  (建 `GuardClient` + `ping` 探活 + `rules_dump` 种子缓存 epoch)。
+- `FUSION_GUARD_SOCK` / `FUSION_EXECUTOR_TENANT` 环境变量 = 隐式开启。`guard_tenant` 须匹配 guard 配置中
+  executor OS 身份 (UID) 绑定的 tenant, 否则每次 evaluate 返 -32001 (鉴权失败) → fail-closed block (非降级,
+  降级可能开门)。
+- `ExecutionResult.guard_action_id: str | None` — guard 判 Block/L3 时携带 guard 的 `action_id` (uuid),
+  供调用方审计/人工 confirm 回路; guard OFF 或 Allow/L1/L2 时 None。4 层 wire auto-flow (fe-core
+  serde → fe-pyo3 `#[pyo3(get)]` → Python Pydantic `_STRICT` → fe-ipc done frame serde-flatten)。
+
+**裁决映射** (`SecurityVerdict` ↔ `GuardVerdict`, fe-security 编排): `action==Block` OR `risk_level==L4`
+→ block (带 `risk_level`/`action_id`/`seatbelt_required`); `risk_level==L3` (requires_approval) → block
+(executor 无人工审批回路, L3 视同拒, 产 `action_id`); `action==Redact` → block (executor 整命令执行,
+不支持半 redact); `action==Preview` → allow 但 `requires_approval=true` 透传; `action==Allow` + L1/L2
+→ allow, 透传 `risk_level`/`seatbelt_required`。
+
+**Seatbelt 门控 (E7)**: guard 判 `seatbelt_required=true` + 调用方 `req.seatbelt != true` → fe-core
+`execute_async`/`execute_streaming` 入口拒绝 (exit -1, 不 spawn)。防降级到非沙箱执行高风险命令。
+
+**Pre-exec 路径复检 (H4 TOCTOU)**: fe-core 在 `validate()` 后、`sandbox.run` 前调
+`fe-security::recheck_binary(first_token)` — 复用 `resolve_binary_path` (同一套 `trusted_bin_dirs`,
+ARCH-2) + `std::fs::symlink_metadata` (safe Rust, 无 libc/unsafe) 拒执行前窗口新现 symlink。
+homebrew `/opt/homebrew/bin/x` → Cellar 是 by-design 不拒 (resolve 期非 symlink); 仅拒 validate 后变 symlink。
+SANDBOX_HARDENED_PATH (fe-sandbox spawn 期 PATH) 是另一道独立栅栏, 无需改 fe-sandbox。
+
+**降级 fail-closed (guard 宕机, 验收 #7)**: guard 调用失败 (`GuardError::Unavailable`/超时) → 不 fail-open:
+1. `run_cached_rules(command)` 命中 regex block 模式 → block;
+2. 未命中 → 交回现有 `validate()` 白名单栅栏 (非白名单 binary 即 block);
+3. `allow_inline_interpreter==true` + 缓存空/不可用 → 直接 block 内联形式 (无 guard 无法评估风险, fail-closed);
+4. 白名单 binary → allow 但 `warn!` "guard 宕机降级, 风险等级未知" (严于 guard 活时不放宽)。
+降级**无法**本地复现 guard 完整裁决 (tokenizer/AST/semantic 在 guard 内), 仅 regex-stage; 故降级 = **更严**。
+
+**R4 冲突消解 (编译期静态兜底)**: Issue #23 R4 原文 "retain `DANGEROUS_BINS` compile-time static fallback"
+与 0827 A-12 有意删除该 const 冲突。消解: 现有 fe-security 静态 `build_blocklist()` regex 危险模式 +
+`WHITELIST` 白名单即编译期 fail-closed 兜底栅栏; guard 宕机降级时, 这两套静态规则 + 缓存 regex 规则共同构成
+兜底, 满足 R4 安全意图。**不**重新引入已删除的 `DANGEROUS_BINS` const (违背 0827 A-12)。
+
+**guard start**: `cd /Users/dahai/fusion/fusion-guard && ./start.sh start|stop|status|doctor`
+(需先 `cargo build --release` 产 `target/release/fusion-guard`; sock `/tmp/fusion-guard.sock`)。
+
 ## Key Design Constraints (NFRs / SLA)
 
 - CLI sandbox init overhead <5ms; log-truncation + regex parse CPU <3% under high throughput.
