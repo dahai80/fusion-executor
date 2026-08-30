@@ -83,6 +83,8 @@ class FusionSandboxExecutor:
         disable_bundle_allowlist: bool = False,
         allow_inline_interpreter: bool = False,
         trusted_bin_dirs: list[str] | None = None,
+        guard_sock: str | None = None,
+        guard_tenant: str | None = None,
     ) -> None:
         try:
             from ._native import NativeExecutor
@@ -95,8 +97,19 @@ class FusionSandboxExecutor:
         #   测试机/本地交互场景依赖 python3 -c, 显式传 True opt-in。
         # D3-6 (审计 0827 product 4-layer): trusted_bin_dirs 登记项目工具所在目录 — extra_whitelist 的工具
         #   须 resolve 到可信目录才放行 (fail-closed 防 /tmp/python3 投毒)。测试/调用方登记项目 bin 目录。
+        # Issue #23 (Phase 3): guard 授权编排默认 OFF — 显式传 guard_sock 或设 FUSION_GUARD_SOCK 开启,
+        #   执行前向 fusion-guard daemon 询问每条命令裁决 (allow/preview/redact/block + 风险等级 L1-L4)。
+        #   guard 宕机降级 fail-closed (缓存 regex 规则 + 静态白名单栅栏, 永不 fail-open)。
+        #   guard_tenant / FUSION_EXECUTOR_TENANT 须匹配 guard 配置中本机身份绑定的 tenant, 否则鉴权失败。
+        guard_sock = guard_sock if guard_sock is not None else os.environ.get("FUSION_GUARD_SOCK")
+        guard_tenant = guard_tenant if guard_tenant is not None else os.environ.get("FUSION_EXECUTOR_TENANT")
         self._native = NativeExecutor(
-            extra_whitelist, disable_bundle_allowlist, allow_inline_interpreter, trusted_bin_dirs
+            extra_whitelist,
+            disable_bundle_allowlist,
+            allow_inline_interpreter,
+            trusted_bin_dirs,
+            guard_sock,
+            guard_tenant,
         )
         self._sock_path = sock_path
 
@@ -201,6 +214,7 @@ class FusionSandboxExecutor:
             trace_id=native.trace_id,
             oom_killed=native.oom_killed,
             pid=native.pid,
+            guard_action_id=native.guard_action_id,
         )
         logger.info(
             "run done exit=%s blocked=%s timed_out=%s oom=%s diag=%s rolled_back=%s rb_unavail=%s rb_skipped=%s dur=%.3fs",

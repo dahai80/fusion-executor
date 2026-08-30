@@ -691,6 +691,20 @@ impl Executor {
         self
     }
 
+    /// Issue #23 (fusion-guard Phase 3): 启用 guard 授权编排。透传 SecurityGuard.with_guard
+    /// (建 GuardClient + RulesCache, 探活 + 种子缓存)。guard 默认 OFF (向后兼容); 调用方显式传
+    /// guard_sock/guard_tenant (或 env FUSION_GUARD_SOCK/FUSION_EXECUTOR_TENANT) 才开启。
+    /// 开启后 validate() 走 guard 编排: 本地校验放行后调 guard.evaluate, 映射 GuardVerdict,
+    /// 宕机降级 fail-closed (缓存 regex + 白名单栅栏, 永不 fail-open)。
+    pub fn with_guard(mut self, sock: &str, tenant: &str) -> Self {
+        info!(
+            sock,
+            tenant, "Executor 启用 guard 授权编排 (Issue #23 Phase 3)"
+        );
+        self.security = self.security.with_guard(sock, tenant);
+        self
+    }
+
     /// m-OPS-02: SIGHUP 运行时白名单热重载 — 从基线 + extras 重建 (非累加)。
     /// &self (Executor 无状态约定, 仅透传 SecurityGuard.reload_extras 的 ArcSwap store)。
     /// fe-ipc SIGHUP 处理器读 FUSION_EXECUTOR_EXTRA_WHITELIST env → 逗号分割 → 调此。

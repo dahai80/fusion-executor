@@ -114,6 +114,11 @@ class ExecutionResult(BaseModel):
         description="沙箱子进程 PID — 调用方据此传 telemetry_stream(pid=...) 采样真实任务进程 "
         "(非 executor 自身, RUN-11); stdio 路径有, 拦截/超时路径无",
     )
+    guard_action_id: str | None = Field(
+        default=None,
+        description="guard 授权裁决 action_id (Issue #23 Phase 3) — guard 判 Block/L3 时返, "
+        "供调用方审计/人工 confirm 回路; guard OFF 或 Allow/L1/L2 时 None",
+    )
 
 
 class GuiResult(BaseModel):

@@ -1837,6 +1837,8 @@ async fn handle_method(
             let stage = verdict.stage.map(|s| match s {
                 fe_core::security::SecurityStage::Regex => "regex",
                 fe_core::security::SecurityStage::Tokenizer => "tokenizer",
+                // Issue #23: guard 编排映射的裁决阶段 (verdict 来自 guard.evaluate)。
+                fe_core::security::SecurityStage::Semantic => "semantic",
             });
             Ok(json!({
                 "allowed": allowed,

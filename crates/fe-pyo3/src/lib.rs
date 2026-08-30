@@ -107,6 +107,11 @@ struct PyExecutionResult {
     /// RUN-11: 沙箱子进程 PID (调用方据此传 telemetry_stream 采样真实任务)
     #[pyo3(get)]
     pid: Option<u32>,
+    /// Issue #23 (guard Phase 3): guard 判 block/preview 的裁决 action_id — 调用方据此向 guard
+    /// 发 confirm 审批回路 (executor 仅透传, 不发 confirm)。guard OFF 或 allow → None。
+    /// additive wire 字段, 4 层 From/Pydantic/done-frame auto-flow。
+    #[pyo3(get)]
+    guard_action_id: Option<String>,
 }
 
 impl From<RsResult> for PyExecutionResult {
@@ -129,6 +134,7 @@ impl From<RsResult> for PyExecutionResult {
             trace_id: r.trace_id,
             oom_killed: r.oom_killed,
             pid: r.pid,
+            guard_action_id: r.guard_action_id,
         }
     }
 }
@@ -641,12 +647,14 @@ struct PyExecutor {
 #[pymethods]
 impl PyExecutor {
     #[new]
-    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false, allow_inline_interpreter=false, trusted_bin_dirs=None))]
+    #[pyo3(signature = (extra_whitelist=None, disable_bundle_allowlist=false, allow_inline_interpreter=false, trusted_bin_dirs=None, guard_sock=None, guard_tenant=None))]
     fn new(
         extra_whitelist: Option<Vec<String>>,
         disable_bundle_allowlist: bool,
         allow_inline_interpreter: bool,
         trusted_bin_dirs: Option<Vec<String>>,
+        guard_sock: Option<String>,
+        guard_tenant: Option<String>,
     ) -> Self {
         // extra_whitelist 经 with_extra_whitelist 烘焙进 inner 的 ArcSwap; A-4 后 serve() 共享
         // inner, 无需单独存。SIGHUP reload 从 FUSION_EXECUTOR_EXTRA_WHITELIST env 读 (m-OPS-02)。
@@ -693,6 +701,16 @@ impl PyExecutor {
         // 则 record_exec_outcome 的 metrics::counter! 为 no-op。此处置装 (幂等 OnceLock),
         // 让进程内 execute 也能计数 Prometheus。失败仅 warn 不阻断 (降级 = 无 metrics, 非致命)。
         let _ = fe_ipc::install_prometheus_recorder();
+        // Issue #23 (guard Phase 3): guard 默认 OFF (向后兼容)。guard_sock Some → with_guard 开启
+        // 授权编排 (GuardClient + RulesCache, 探活 + 种子)。tenant None → 默认 "default"。
+        if let Some(sock) = guard_sock.as_deref() {
+            let tenant = guard_tenant
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("default");
+            tracing::info!(sock, tenant, "PyExecutor 构造启用 guard 授权 (Issue #23)");
+            inner = inner.with_guard(sock, tenant);
+        }
         Self {
             inner: Arc::new(inner),
             shells: Arc::new(ShellRegistry::new()),
@@ -833,6 +851,8 @@ impl PyExecutor {
         let stage_str = verdict.stage.map(|s| match s {
             fe_core::security::SecurityStage::Regex => "regex",
             fe_core::security::SecurityStage::Tokenizer => "tokenizer",
+            // Issue #23: guard 编排映射的裁决阶段。
+            fe_core::security::SecurityStage::Semantic => "semantic",
         });
         dict.set_item("stage", stage_str)?;
         Ok(dict)
@@ -1431,6 +1451,7 @@ mod tests {
             trace_id: Some("trace-42".into()),
             oom_killed: true,
             pid: Some(1234),
+            guard_action_id: Some("11111111-2222-3333-4444-555555555555".into()),
         };
         let py = PyExecutionResult::from(rs);
         assert_eq!(py.exit_code, 0);
@@ -1458,6 +1479,10 @@ mod tests {
         assert_eq!(py.trace_id.as_deref(), Some("trace-42"));
         assert!(py.oom_killed);
         assert_eq!(py.pid, Some(1234));
+        assert_eq!(
+            py.guard_action_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
     }
 
     #[test]
