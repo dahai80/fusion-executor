@@ -1820,3 +1820,84 @@ def test_run_streaming_rss_watchdog(executor: FusionSandboxExecutor):
     assert result is not None
     assert result.oom_killed, f"流式 Done 帧 oom_killed 应 true, exit={result.exit_code}"
     assert result.exit_code == -124, f"流式 OOM exit 应 -124, got {result.exit_code}"
+
+
+# ── Issue #23: fusion-guard Phase 3 集成 (guard OFF 默认 / guard_sock opt-in / 降级 fail-closed) ──
+# guard 默认 OFF — FusionSandboxExecutor() 不连 guard daemon, 行为同 v0.2.5 (回归红线)。
+# guard_sock 指向不存在 socket → fe-security 降级 fail-closed: 缓存规则 + 静态白名单栅栏,
+# 白名单 binary (echo) 仍放行 (严于 guard 活时不放宽), 非白名单/危险命令仍拦。guard_action_id
+# 仅 guard 判 Block/L3 时有值, guard OFF / 降级 allow 时 None。
+
+
+def test_guard_off_default_runs_normally():
+    # 默认无 guard_sock → guard OFF, echo 正常执行 (回归红线)
+    ex = FusionSandboxExecutor(allow_inline_interpreter=True)
+    r = ex.run("echo no-guard")
+    assert r.exit_code == 0
+    assert "no-guard" in r.stdout
+    assert r.guard_action_id is None, "guard OFF 时 guard_action_id 须 None"
+
+
+def test_guard_off_blocked_command_has_no_action_id():
+    # guard OFF 下 rm -rf / 仍被静态白名单栅栏拦 (降级 fail-closed 不放宽), 但无 guard_action_id
+    ex = FusionSandboxExecutor(allow_inline_interpreter=True)
+    r = ex.run("rm -rf /")
+    assert r.blocked_by_security
+    assert r.exit_code == -1
+    assert r.guard_action_id is None, "guard OFF 静态拦截不产 guard_action_id"
+
+
+def test_guard_sock_nonexistent_degrades_fail_closed():
+    # guard_sock 指不存在 socket → fe-security 探活失败降级 fail-closed。
+    # 白名单 echo 仍执行 (严于 guard 活时不放宽); rm -rf / 仍被静态栅栏/缓存规则拦。
+    ex = FusionSandboxExecutor(
+        allow_inline_interpreter=True,
+        guard_sock="/tmp/fe-guard-nonexistent-test.sock",
+        guard_tenant="test-tenant",
+    )
+    r_ok = ex.run("echo degraded")
+    assert r_ok.exit_code == 0, f"降级下白名单 echo 应执行, exit={r_ok.exit_code} reason={r_ok.security_reason}"
+    assert "degraded" in r_ok.stdout
+    assert r_ok.guard_action_id is None, "降级 allow 不产 guard_action_id"
+    r_blk = ex.run("rm -rf /")
+    assert r_blk.blocked_by_security
+    assert r_blk.exit_code == -1
+
+
+def test_guard_action_id_pydantic_roundtrip():
+    # guard_action_id 字段 Pydantic 往返 + extra=forbid 不破 (4 层字段集一致)
+    raw = {
+        "exit_code": -1,
+        "blocked_by_security": True,
+        "security_reason": "guard Block L4",
+        "guard_action_id": "11111111-2222-3333-4444-555555555555",
+    }
+    r = ExecutionResult.model_validate(raw)
+    assert r.guard_action_id == "11111111-2222-3333-4444-555555555555"
+    dumped = r.model_dump()
+    assert dumped["guard_action_id"] == "11111111-2222-3333-4444-555555555555"
+
+
+def test_guard_action_id_none_omitted_in_strict_roundtrip():
+    # guard_action_id None 时 Pydantic 不破 (默认 None); extra=forbid 不拒未知字段
+    r = ExecutionResult.model_validate({"exit_code": 0})
+    assert r.guard_action_id is None
+    assert r.model_dump()["guard_action_id"] is None
+
+
+def test_guard_env_var_enables_guard():
+    # FUSION_GUARD_SOCK env → __init__ 透传 guard (daemon 不存在 → 降级 fail-closed)
+    env_sock = "/tmp/fe-guard-env-test.sock"
+    old = os.environ.pop("FUSION_GUARD_SOCK", None)
+    try:
+        os.environ["FUSION_GUARD_SOCK"] = env_sock
+        ex = FusionSandboxExecutor(allow_inline_interpreter=True)
+        # echo 白名单 → 降级放行 (不放宽)
+        r = ex.run("echo env-guard")
+        assert r.exit_code == 0, f"env guard 降级下 echo 应执行, exit={r.exit_code}"
+        assert "env-guard" in r.stdout
+    finally:
+        if old is not None:
+            os.environ["FUSION_GUARD_SOCK"] = old
+        else:
+            os.environ.pop("FUSION_GUARD_SOCK", None)

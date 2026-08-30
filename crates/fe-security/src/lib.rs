@@ -9,12 +9,13 @@
 
 use std::collections::HashSet;
 use std::env;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use fe_guard::{GuardAction, GuardClient, GuardError, GuardVerdict, RiskLevel, RulesCache};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -24,17 +25,26 @@ pub enum SecurityError {
     Regex(#[from] regex::Error),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityStage {
     Regex,
     Tokenizer,
+    Semantic,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// SecurityVerdict 不跨 IPC/PyO3 序列化 (wire 只携 blocked_by_security:bool +
+// security_reason:Option<String>); 故不 derive Serialize/Deserialize — 增字段 wire-safe,
+// 且杜绝未来误跨 IPC 接它破 wire (fix #4)。guard 集成增 risk_level/requires_approval/
+// action_id/seatbelt_required 供 fe-core 强制层读取 (验收 #5 映射 + #3 seatbelt 门控)。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityVerdict {
     pub allowed: bool,
     pub reason: Option<String>,
     pub stage: Option<SecurityStage>,
+    pub risk_level: Option<RiskLevel>,
+    pub requires_approval: bool,
+    pub action_id: Option<String>,
+    pub seatbelt_required: bool,
 }
 
 impl SecurityVerdict {
@@ -43,6 +53,10 @@ impl SecurityVerdict {
             allowed: true,
             reason: None,
             stage: None,
+            risk_level: None,
+            requires_approval: false,
+            action_id: None,
+            seatbelt_required: false,
         }
     }
 
@@ -51,6 +65,36 @@ impl SecurityVerdict {
             allowed: false,
             reason: Some(reason.into()),
             stage: Some(stage),
+            risk_level: None,
+            requires_approval: false,
+            action_id: None,
+            seatbelt_required: false,
+        }
+    }
+
+    // guard 集成 (验收 #5): 从 GuardVerdict 映射, 携 risk_level/action_id/seatbelt_required。
+    // 调用点在 validate() guard 编排后, 用于 block (Block/L4/L3/Redact) 与 allow 透传 (Allow L1/L2)。
+    fn block_guard(reason: impl Into<String>, verdict: &GuardVerdict) -> Self {
+        Self {
+            allowed: false,
+            reason: Some(reason.into()),
+            stage: Some(SecurityStage::Semantic),
+            risk_level: Some(verdict.risk_level),
+            requires_approval: verdict.requires_approval,
+            action_id: verdict.action_id.map(|u| u.to_string()),
+            seatbelt_required: verdict.seatbelt_required,
+        }
+    }
+
+    fn allow_guard(verdict: &GuardVerdict) -> Self {
+        Self {
+            allowed: true,
+            reason: None,
+            stage: None,
+            risk_level: Some(verdict.risk_level),
+            requires_approval: verdict.requires_approval,
+            action_id: verdict.action_id.map(|u| u.to_string()),
+            seatbelt_required: verdict.seatbelt_required,
         }
     }
 }
@@ -192,6 +236,11 @@ pub struct SecurityGuard {
     // ruby -e / perl -e 等内联代码 (绕白名单语义, agent-driven 下模型可生成任意 payload);
     // true(trusted-caller opt-in)=保留内联执行能力。validate_argv gate 读此字段。
     allow_inline_interpreter: bool,
+    // Issue #23 (fusion-guard Phase 3): guard 集成 — 默认 None (guard OFF, 向后兼容)。
+    // Some(Arc<GuardClient>) 由 with_guard 开启。Arc 跨 Executor 线程共享 (Send+Sync)。
+    // RulesCache (Arc<RulesCache>) 缓存 guard.rules.dump 的 regex-stage 规则, guard 宕机降级用。
+    guard: Option<Arc<GuardClient>>,
+    guard_cache: Option<Arc<RulesCache>>,
 }
 
 impl Clone for SecurityGuard {
@@ -205,6 +254,9 @@ impl Clone for SecurityGuard {
             sensitive_paths_exp: self.sensitive_paths_exp.clone(),
             redirect_re: self.redirect_re.clone(),
             allow_inline_interpreter: self.allow_inline_interpreter,
+            // guard/cache 经 Arc::clone 便宜共享 (Arc<GuardClient>/Arc<RulesCache> 均 Clone)。
+            guard: self.guard.clone(),
+            guard_cache: self.guard_cache.clone(),
         }
     }
 }
@@ -236,6 +288,10 @@ impl SecurityGuard {
             // D3-1: 企业硬化默认 false — 拒内联解释器 -c/-e。trusted-caller opt-in 经
             // with_allow_inline_interpreter(true) 开启 (测试机/本地交互场景)。
             allow_inline_interpreter: false,
+            // Issue #23: guard 默认 OFF — None 走现有 validate() 不变 (向后兼容)。
+            // with_guard(sock, tenant) 开启 guard 集成 (构造 client + 缓存)。
+            guard: None,
+            guard_cache: None,
         }
     }
 
@@ -288,6 +344,81 @@ impl SecurityGuard {
         self
     }
 
+    // Issue #23 (fusion-guard Phase 3): 开启 guard 集成。opt-in — 默认 OFF, 调用方显式传
+    // guard_sock/guard_tenant (或 env FUSION_GUARD_SOCK/FUSION_EXECUTOR_TENANT) 才开启。
+    //
+    // 构造期: 建 GuardClient + RulesCache。探活 (ping) 成功 → rules_dump 种子缓存 (fix #1:
+    // 冷启动 caller_epoch 非 0, 之后 evaluate 携非零 epoch 让 guard 检 staleness)。
+    // 探活失败 → warn 降级, 仍存 client (连接惰性, evaluate 自带超时兜底) + 缓存从盘读
+    // (冷启动可能空)。无论探活成败, guard 开启 = validate() 走 guard 编排路径。
+    //
+    // 缓存目录 ~/.fusion-executor/guard-rules.json (HOME-private, 0o600)。
+    pub fn with_guard(mut self, sock: &str, tenant: &str) -> Self {
+        let cache_path = guard_cache_path();
+        let cache = RulesCache::new(cache_path);
+        let client = GuardClient::new(sock, tenant.to_string());
+        // 探活 + 种子 (fix #1)。ping 失败不阻塞构造 — 降级路径靠缓存 + 白名单栅栏。
+        match client.ping() {
+            Ok(ping) => {
+                debug!(rules_epoch = ping.rules_epoch, version = %ping.version, "guard ping ok — seeding rules cache");
+                match client.rules_dump(ping.rules_epoch) {
+                    Ok(rs) => {
+                        cache.refresh(rs);
+                        info!("guard rules cache seeded (degraded-mode fallback ready)");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "guard rules_dump failed — cache may be stale/cold, degrade will use disk");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, sock, "guard ping 不可达 — 降级 fail-closed (evaluate 将自超时兜底, cache 走盘)");
+            }
+        }
+        self.guard = Some(Arc::new(client));
+        self.guard_cache = Some(Arc::new(cache));
+        self
+    }
+
+    // guard 是否开启 (供 fe-core 强制层判断是否走 seatbelt 门控/TOCTOU 复检)。
+    pub fn guard_enabled(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    // H4 TOCTOU 路径复检 (验收 #4, fix #3): validate 后、spawn 前在 fe-core 调用。
+    // 复用 validate 期同一套 resolve_binary_path (DRY) + symlink_metadata 拒执行前窗口新现 symlink
+    // (validate 时非 symlink, recheck 时变 symlink → 拒; safe Rust, 无 libc/unsafe — O_NOFOLLOW
+    // 不可行且需 libc 违 unsafe_code=deny)。
+    // 注: homebrew /opt/homebrew/bin/git→Cellar symlink 是 by-design 不拒 (resolve_binary_path
+    // 文档); H4 仅拒 validate→recheck 之间新现的 symlink (TOCTOU 窗口被替换/投毒)。
+    pub fn recheck_binary(&self, first_token: &str) -> Result<PathBuf, String> {
+        let resolved = resolve_binary_path(first_token)
+            .ok_or_else(|| format!("TOCTOU 复检: 二进制路径执行前消失: {}", first_token))?;
+        let md = std::fs::symlink_metadata(&resolved).map_err(|e| {
+            format!(
+                "TOCTOU 复检: 路径 metadata 读取失败 {}: {}",
+                resolved.display(),
+                e
+            )
+        })?;
+        // symlink 处置: homebrew /opt/homebrew/bin/python3 → Cellar 是 by-design 受信 (包管理器写入,
+        // 需 root, 超出 ARCH-2 威胁模型), symlink 本身落在 trusted_bin_dirs 内 → 放行。
+        // 仅拒 symlink 落在可信目录外 (validate 时非 symlink 的可信 regular file, 执行前窗口被替换
+        // 为 symlink 指向攻击者路径 = TOCTOU 投毒)。这把 H4 拒 symlink 限制在"可信目录外的新现 symlink"。
+        if md.file_type().is_symlink()
+            && !self
+                .trusted_bin_dirs
+                .iter()
+                .any(|d| resolved.starts_with(d))
+        {
+            return Err(format!(
+                "TOCTOU 拒: 二进制路径执行前变 symlink 且不在可信目录 (validate 时非 symlink): {}",
+                resolved.display()
+            ));
+        }
+        Ok(resolved)
+    }
+
     /// 校验入口 — 先正则快筛，再 token 解析防链式绕过
     pub fn validate(&self, command: &str) -> SecurityVerdict {
         // D4-2/D4-3 perf 评估 (2026-08-29): 正则已 struct-field 缓存 (build_blocklist/redirect_re
@@ -326,10 +457,123 @@ impl SecurityGuard {
         }
 
         // Stage 2: Token 级链式解析 — 每段 argv[0] 白名单校验
-        match self.validate_tokens(trimmed) {
-            Ok(()) => SecurityVerdict::allow(),
-            Err(reason) => SecurityVerdict::block(reason, SecurityStage::Tokenizer),
+        let local_ok = match self.validate_tokens(trimmed) {
+            Ok(()) => true,
+            Err(reason) => {
+                // 本地拒 → guard 不推翻本地拒绝 (双向纵深), 直接返。
+                return SecurityVerdict::block(reason, SecurityStage::Tokenizer);
+            }
+        };
+
+        // Issue #23: guard 编排 (验收 #5/#6/#7)。本地允许后, guard 开启则调 evaluate。
+        // guard OFF → 沿用现有 allow (向后兼容, 行为同现状)。
+        if !local_ok {
+            return SecurityVerdict::allow();
         }
+        match &self.guard {
+            None => SecurityVerdict::allow(),
+            Some(client) => self.guard_authorize(client, trimmed),
+        }
+    }
+
+    // guard 编排: 调 evaluate 取裁决, 映射 SecurityVerdict (验收 #5); 失败降级 fail-closed (验收 #7)。
+    fn guard_authorize(&self, client: &Arc<GuardClient>, command: &str) -> SecurityVerdict {
+        // caller_epoch 取缓存 epoch (fix #1: with_guard 种子后非 0, 让 guard 检 staleness)。
+        let caller_epoch = self.guard_cache.as_ref().map(|c| c.epoch()).unwrap_or(0);
+        match client.evaluate(
+            command,
+            caller_epoch,
+            "fusion-executor",
+            "execute",
+            "shell",
+            None,
+        ) {
+            Ok(v) => self.map_guard_verdict(&v),
+            Err(e) => self.guard_degrade(command, &e),
+        }
+    }
+
+    // GuardVerdict → SecurityVerdict 映射 (验收 #5)。
+    fn map_guard_verdict(&self, v: &GuardVerdict) -> SecurityVerdict {
+        // Block OR L4 → 绝对拒 (验收 #6: executor 不执行)。
+        if v.action.is_block() || matches!(v.risk_level, RiskLevel::L4) {
+            return SecurityVerdict::block_guard(format!("guard 拒绝 (Block/L4): {}", v.reason), v);
+        }
+        // L3 (requires_approval) → executor 无人工审批回路, 视同拒 (用户决策: L3 = block fail-closed)。
+        if matches!(v.risk_level, RiskLevel::L3) {
+            return SecurityVerdict::block_guard(format!("guard 要求审批 (L3): {}", v.reason), v);
+        }
+        // Redact → executor 整命令执行, 不支持流式改写 → 拒 (防半 redact 误执行)。
+        if matches!(v.action, GuardAction::Redact) {
+            return SecurityVerdict::block_guard(
+                format!("guard 要求 redact, executor 不支持流式改写: {}", v.reason),
+                v,
+            );
+        }
+        // Preview → allow 但透传 requires_approval (调用方可观察, 不本批实装 confirm 回路)。
+        // Allow + L1/L2 → allow, 透传 risk_level/seatbelt_required (验收 #3 seatbelt 门控源)。
+        SecurityVerdict::allow_guard(v)
+    }
+
+    // 降级 fail-closed (验收 #7): guard 宕机/超时/不可达 → 永不 fail-open。
+    // 严于 live guard: 缓存 regex 命中即 block + 非白名单 binary 已被 validate_tokens 拦 (栅栏)。
+    fn guard_degrade(&self, command: &str, e: &GuardError) -> SecurityVerdict {
+        // -32001 鉴权失败 = 误配, 非 daemon 宕机 → fail-closed block (fix #9, 降级可能开门)。
+        if let GuardError::Unauthorized(msg) = e {
+            warn!(error = %msg, "guard 鉴权失败 (-32001) — 误配 fail-closed block");
+            return SecurityVerdict::block(
+                format!("guard 鉴权失败, 拒绝执行 (检查 tenant 绑定): {}", msg),
+                SecurityStage::Semantic,
+            );
+        }
+        warn!(error = %e, "guard 不可达 — 降级 fail-closed (缓存 + 白名单栅栏)");
+        // 缓存 regex 命中 → block (严于 live guard)。
+        if let Some(cache) = &self.guard_cache {
+            if let Some(hit) = cache.run_cached_rules(command) {
+                debug!(reason = %hit.reason, "guard 宕机, 缓存规则命中 block");
+                return SecurityVerdict::block_guard(
+                    format!("guard 不可达, 缓存命中: {}", hit.reason),
+                    &hit,
+                );
+            }
+        }
+        // 缓存未命中 + allow_inline_interpreter==true + 命中内联形式 → block (fix #2:
+        // 无 guard 无法评估风险, fail-closed; 防 python -c "os.system('rm -rf /')")。
+        if self.allow_inline_interpreter && self.is_inline_interpreter(command) {
+            warn!("guard 宕机 + 缓存空 + 内联解释器 — fail-closed block (无 guard 无法评估风险)");
+            return SecurityVerdict::block(
+                "guard 不可达, 内联解释器高风险, 拒绝 (降级 fail-closed)",
+                SecurityStage::Semantic,
+            );
+        }
+        // 缓存未命中 + 白名单 binary (validate_tokens 已过) → allow + warn (风险等级未知)。
+        // 永不 fail-open: 降级路径不比 guard 活时宽松 — 非白名单 binary 已在 validate_tokens 被拦。
+        debug!("guard 宕机, 缓存未命中, 白名单 binary allow (风险等级未知)");
+        SecurityVerdict::allow()
+    }
+
+    // 原始字符串探测内联解释器 (python -c / node -e / ruby -e / perl -e), 降级路径用。
+    // 不走 token parse (validate_tokens 已过白名单栅栏, 此处仅判内联形式本身 — 无 guard 无法评估
+    // -c/-e payload 风险, fail-closed 拒)。与 validate_argv 的精确 argv 级判不同, 此处保守宽匹配。
+    fn is_inline_interpreter(&self, command: &str) -> bool {
+        let lower = command.to_lowercase();
+        let inline_flags = ["-c", "-e", "--eval", "-p", "--print"];
+        // 解释器名 (含可能的版本后缀 python3.12) + 后续出现内联 flag 即命中。
+        let inline_interps = [
+            "python", "python2", "python3", "node", "ruby", "perl", "perl5",
+        ];
+        let has_interp = inline_interps
+            .iter()
+            .any(|i| lower == *i || lower.starts_with(&format!("{} ", i)));
+        if !has_interp {
+            return false;
+        }
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        words.iter().skip(1).any(|w| {
+            inline_flags
+                .iter()
+                .any(|f| *w == *f || w.starts_with(&format!("{}=", f)))
+        })
     }
 
     /// 校验 cwd — 禁止敏感路径 / 禁止 .. 逃逸
@@ -949,6 +1193,21 @@ fn resolve_binary_path(binary: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// guard 规则缓存路径: ~/.fusion-executor/guard-rules.json (HOME-private 0o700 目录, 0o600 文件)。
+// 不引 dirs crate — std::env::var("HOME")。目录不存在则建 (0o700); 解析失败返临时回退 (不崩)。
+fn guard_cache_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = Path::new(&home).join(".fusion-executor");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(dir = %dir.display(), error = %e, "guard 缓存目录创建失败 — 用临时回退");
+        return PathBuf::from("/tmp/fusion-executor-guard-rules.json");
+    }
+    // best-effort 0o700 (mkdir 默认受 umask; 显式 set_permissions 静默失败不崩)
+    let perms = std::fs::Permissions::from_mode(0o700);
+    let _ = std::fs::set_permissions(&dir, perms);
+    dir.join("guard-rules.json")
 }
 
 /// C-SEC-05: 检测 shell 命令替换 — 拒绝 $(/反引号/`<(>`/`<<<`
@@ -2331,5 +2590,371 @@ mod tests {
         let g = SecurityGuard::new().with_extra_whitelist(&["bash"]);
         let v = g.validate("bash -c 'rm -rf /'");
         assert!(!v.allowed, "bash 不入白名单, 应被 Stage-2 拦");
+    }
+
+    // ---------- Issue #23 guard 集成测试 ----------
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    // mock guard server: 读一行 JSON-RPC 请求, 按 method 回预设响应。每条命令可注入 verdict JSON。
+    // 用闭包 closure 接收 method+content → 回 response body (result 字段 JSON 字符串) 或 None (不回, 模拟宕机断连)。
+    struct MockGuard {
+        sock: PathBuf,
+        _handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for MockGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.sock);
+        }
+    }
+
+    // verdict_body: 构造 guard.evaluate result JSON (GuardVerdict 形状)。
+    fn verdict_json(
+        action: &str,
+        risk: &str,
+        reason: &str,
+        requires_approval: bool,
+        seatbelt: bool,
+        action_id: Option<&str>,
+    ) -> String {
+        let action_id_field = match action_id {
+            Some(id) => format!(",\"action_id\":\"{}\"", id),
+            None => String::new(),
+        };
+        format!(
+            "{{\"action\":\"{}\",\"risk_level\":\"{}\",\"reason\":\"{}\",\"stage\":\"semantic\",\"requires_approval\":{},\"seatbelt_required\":{},\"verdict_epoch\":1,\"verdict_ttl_secs\":60,\"inferred_category\":\"test\"{}}}",
+            action, risk, reason, requires_approval, seatbelt, action_id_field
+        )
+    }
+
+    // 起 mock guard: 按 command → verdict_json 闭包回 evaluate; ping/rules_dump 回固定值。
+    // error_body Some(code,msg) → 回 JSON-RPC error 而非 result (模拟 -32001 等)。
+    fn spawn_mock_guard<F>(verdict_for: F) -> MockGuard
+    where
+        F: Fn(&str) -> Option<(String, Option<(i32, String)>)> + Send + 'static,
+    {
+        let sock = std::env::temp_dir().join(format!(
+            "fe-guard-mock-{}-{}.sock",
+            std::process::id(),
+            guard_mock_seq()
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("mock bind");
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                // 粗解析 method + content (位置 params[0] = content, params[1] = caller_epoch)
+                let method = extract_json_field(&line, "method");
+                let id = extract_json_field(&line, "id")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(1);
+                let resp = match method.as_deref() {
+                    Some("guard.ping") => {
+                        format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"pong\":true,\"version\":\"mock\",\"rules_epoch\":1}}}}\n", id)
+                    }
+                    Some("guard.rules.dump") => {
+                        format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"rules\":[],\"epoch\":1}}}}\n", id)
+                    }
+                    Some("guard.evaluate") => {
+                        let content = extract_json_field(&line, "content").unwrap_or_default();
+                        match verdict_for(&content) {
+                            Some((_body, Some((code, msg)))) => {
+                                format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{},\"message\":\"{}\"}}}}\n", id, code, msg)
+                            }
+                            Some((body, None)) => {
+                                format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}\n", id, body)
+                            }
+                            None => {
+                                // 模拟宕机: 断连不回 (evaluate 客户端 read 超时/EOF → Unavailable)
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                continue;
+                            }
+                        }
+                    }
+                    _ => format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":-32601,\"message\":\"method not found\"}}}}\n", id),
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        MockGuard {
+            sock: sock_clone,
+            _handle: Some(handle),
+        }
+    }
+
+    // 全局递增序号, 避免同进程多 mock socket 名冲突 (Math::random 不可用 — 用 AtomicU64)。
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static MOCK_SEQ: AtomicU64 = AtomicU64::new(0);
+    fn guard_mock_seq() -> u64 {
+        MOCK_SEQ.fetch_add(1, AtomicOrdering::SeqCst)
+    }
+
+    // 粗提取 JSON 行中首个 "field":"value" 的 value (不引完整 JSON 解析, 测试用, 限定 mock 协议)。
+    fn extract_json_field(line: &str, field: &str) -> Option<String> {
+        let needle = format!("\"{}\":", field);
+        let idx = line.find(&needle)?;
+        let rest = &line[idx + needle.len()..].trim_start();
+        if let Some(s) = rest.strip_prefix('"') {
+            let end = s.find('"')?;
+            Some(s[..end].to_string())
+        } else {
+            let end = rest.find(|c: char| c == ',' || c == '}' || c.is_whitespace())?;
+            Some(rest[..end].trim().to_string())
+        }
+    }
+
+    // guard OFF (默认 new) → validate 行为同现状: echo allow, rm -rf 拒 (Stage-1 regex)。
+    #[test]
+    fn guard_off_regression_unchanged() {
+        let g = SecurityGuard::new();
+        assert!(!g.guard_enabled(), "默认 guard OFF");
+        assert!(g.validate("echo hi").allowed, "guard OFF echo allow");
+        assert!(
+            !g.validate("rm -rf /").allowed,
+            "guard OFF rm -rf 仍被 Stage-1 拦"
+        );
+    }
+
+    // guard ON + Allow L1 → allow, 透传 risk_level/seatbelt_required (验收 #5)。
+    #[test]
+    fn guard_on_allow_l1_passes_through() {
+        let mock = spawn_mock_guard({
+            let allow = verdict_json("allow", "l1", "low risk", false, false, None);
+            move |_cmd| Some((allow.clone(), None))
+        });
+        let g = guard().with_guard(mock.sock.to_str().unwrap(), "tenant");
+        let v = g.validate("echo hi");
+        assert!(v.allowed, "guard Allow L1 → executor allow");
+        assert_eq!(v.risk_level, Some(RiskLevel::L1), "risk_level 透传 L1");
+        assert!(!v.seatbelt_required, "L1 不要求 seatbelt");
+    }
+
+    // guard ON + Block L4 → block, 带 action_id/seatbelt_required (验收 #5/#6: executor 不执行)。
+    #[test]
+    fn guard_on_block_l4_blocked_with_action_id() {
+        let mock = spawn_mock_guard({
+            let block = verdict_json(
+                "block",
+                "l4",
+                "destructive",
+                false,
+                true,
+                Some("11111111-1111-1111-1111-111111111111"),
+            );
+            move |_cmd| Some((block.clone(), None))
+        });
+        let g = guard().with_guard(mock.sock.to_str().unwrap(), "tenant");
+        let v = g.validate("echo hi");
+        assert!(!v.allowed, "guard Block L4 → executor 拒");
+        assert_eq!(v.risk_level, Some(RiskLevel::L4));
+        assert!(v.seatbelt_required, "L4 透传 seatbelt_required");
+        assert_eq!(
+            v.action_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111"),
+            "action_id 透传"
+        );
+    }
+
+    // guard ON + L3 requires_approval → block (executor 无人工审批回路, 用户决策 L3=fail-closed)。
+    #[test]
+    fn guard_on_l3_requires_approval_blocked() {
+        let mock = spawn_mock_guard({
+            let l3 = verdict_json(
+                "preview",
+                "l3",
+                "needs approval",
+                true,
+                true,
+                Some("22222222-2222-2222-2222-222222222222"),
+            );
+            move |_cmd| Some((l3.clone(), None))
+        });
+        let g = guard().with_guard(mock.sock.to_str().unwrap(), "tenant");
+        let v = g.validate("echo hi");
+        assert!(!v.allowed, "guard L3 → executor 拒 (无审批回路)");
+        assert_eq!(v.risk_level, Some(RiskLevel::L3));
+        assert!(v.requires_approval, "requires_approval 透传");
+    }
+
+    // guard ON + Redact → block (executor 整命令执行, 不支持流式改写)。
+    #[test]
+    fn guard_on_redact_blocked() {
+        let mock = spawn_mock_guard({
+            let redact = verdict_json("redact", "l2", "secrets", false, false, None);
+            move |_cmd| Some((redact.clone(), None))
+        });
+        let g = guard().with_guard(mock.sock.to_str().unwrap(), "tenant");
+        let v = g.validate("echo hi");
+        assert!(!v.allowed, "guard Redact → executor 拒 (不支持流式改写)");
+    }
+
+    // guard 宕机 (socket 不存在) → 降级 fail-closed: 白名单 binary allow + warn (风险未知), 非 fail-open。
+    #[test]
+    fn guard_down_degrade_whitelist_binary_allow() {
+        let sock = std::env::temp_dir().join(format!(
+            "fe-guard-nodown-{}-{}.sock",
+            std::process::id(),
+            guard_mock_seq()
+        ));
+        let _ = std::fs::remove_file(&sock);
+        // with_guard ping 不可达 → warn 降级, 仍存 Some(client); evaluate 连不存在的 socket → Unavailable → 降级。
+        let g = guard().with_guard(sock.to_str().unwrap(), "tenant");
+        let v = g.validate("echo hi");
+        assert!(
+            v.allowed,
+            "guard 宕机 + 缓存未命中 + 白名单 binary → allow (风险未知, 非放行高危)"
+        );
+    }
+
+    // guard 宕机 + -32001 鉴权失败 → block 非 degrade (fix #9: 误配 fail-closed, 不开门)。
+    #[test]
+    fn guard_unauthorized_blocks_not_degrades() {
+        let mock = spawn_mock_guard({
+            move |_cmd| {
+                Some((
+                    String::new(),
+                    Some((-32001, "tenant not allowed".to_string())),
+                ))
+            }
+        });
+        let g = guard().with_guard(mock.sock.to_str().unwrap(), "tenant");
+        let v = g.validate("echo hi");
+        assert!(
+            !v.allowed,
+            "-32001 鉴权失败 → block (误配 fail-closed, 不降级开门)"
+        );
+    }
+
+    // guard 宕机 + allow_inline_interpreter + 缓存空 → 内联解释器 fail-closed block (fix #2)。
+    #[test]
+    fn guard_down_inline_interpreter_fail_closed() {
+        let sock = std::env::temp_dir().join(format!(
+            "fe-guard-noinline-{}-{}.sock",
+            std::process::id(),
+            guard_mock_seq()
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let g = guard()
+            .with_allow_inline_interpreter(true)
+            .with_guard(sock.to_str().unwrap(), "tenant");
+        // python 在白名单, -c 被内联网关放行 (allow_inline_interpreter=true), 但 guard 宕机降级 → block。
+        let v = g.validate("python3 -c \"print('hi')\"");
+        assert!(
+            !v.allowed,
+            "guard 宕机 + 内联解释器 + 缓存空 → fail-closed block (fix #2)"
+        );
+    }
+
+    // guard 宕机 + 缓存规则命中 → block (严于 live guard)。
+    // 需先种缓存: with_guard ping 成功 + rules_dump 拿规则 → cache.refresh。这里 mock ping+rules_dump 返回规则,
+    // 但 evaluate 宕机 (断连) → 走 degrade → run_cached_rules 命中 block。
+    #[test]
+    fn guard_down_cached_rule_hit_blocks() {
+        // mock: ping/rules_dump 回规则 (含一条 rm -rf block), evaluate 断连。
+        let block_rule_json = "{\"name\":\"rmrf\",\"pattern\":\"rm\\\\s+-rf\",\"stage\":\"regex\",\"action\":\"block\",\"risk_level\":\"l4\",\"reason\":\"rm -rf\",\"scope\":\"command\"}";
+        let sock = std::env::temp_dir().join(format!(
+            "fe-guard-cachehit-{}-{}.sock",
+            std::process::id(),
+            guard_mock_seq()
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("cachehit bind");
+        let rules_json = block_rule_json.to_string();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let method = extract_json_field(&line, "method");
+                let id = extract_json_field(&line, "id")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(1);
+                let resp = match method.as_deref() {
+                    Some("guard.ping") => format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"pong\":true,\"version\":\"mock\",\"rules_epoch\":1}}}}\n", id),
+                    Some("guard.rules.dump") => format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"rules\":[{}],\"epoch\":1}}}}\n", id, rules_json),
+                    // evaluate → 断连 (模拟宕机, 走降级)
+                    Some("guard.evaluate") => { let _ = stream.shutdown(std::net::Shutdown::Both); continue; }
+                    _ => format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":-32601,\"message\":\"nf\"}}}}\n", id),
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let g = guard().with_guard(sock.to_str().unwrap(), "tenant");
+        let v = g.validate("rm -rf /");
+        assert!(!v.allowed, "guard 宕机 + 缓存规则命中 rm -rf → block");
+        let _ = std::fs::remove_file(&sock);
+        drop(handle);
+    }
+
+    // recheck_binary (fix #3): 非 symlink binary → Ok; 路径消失 → Err; 可信目录外 symlink → Err。
+    // homebrew /opt/homebrew/bin/* symlink 落在 trusted_bin_dirs → by-design 放行 (ARCH-2 威胁模型外)。
+    #[test]
+    fn recheck_binary_rejects_symlink_and_missing() {
+        let g = guard();
+        // 白名单 binary (echo) recheck → Ok (非 symlink, 存在)。
+        let r = g.recheck_binary("echo");
+        assert!(r.is_ok(), "echo recheck 应 Ok, got {:?}", r);
+        // 不存在 binary → Err。
+        let r2 = g.recheck_binary("definitely-not-a-binary-xyz-123");
+        assert!(r2.is_err(), "不存在 binary recheck → Err");
+    }
+
+    // recheck_binary 可信目录内 symlink 放行 (homebrew): /opt/homebrew/bin/python3 是 symlink → Cellar,
+    // 但落在 trusted_bin_dirs (/opt/homebrew/bin) 内 → by-design 放行, 不误拒真实执行环境。
+    #[test]
+    fn recheck_binary_allows_trusted_dir_symlink() {
+        let g = guard();
+        // python3 在 homebrew 上是 /opt/homebrew/bin/python3 → Cellar symlink。
+        // 若解析到且在 trusted_bin_dirs 内 → Ok (不因 symlink 误拒)。
+        if let Some(resolved) = resolve_binary_path("python3") {
+            let is_sym = std::fs::symlink_metadata(&resolved)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_sym {
+                let r = g.recheck_binary("python3");
+                assert!(
+                    r.is_ok(),
+                    "可信目录内 symlink binary (homebrew) recheck 应 Ok, got {:?}",
+                    r
+                );
+            }
+            // python3 非白名单 → validate 仍拒, 但 recheck 只复检路径不变 symlink, 不查白名单。
+        }
+        // 构造可信目录外 symlink → Err (TOCTOU 投毒模拟)。
+        let tmp = std::env::temp_dir().join(format!("fe-recheck-sym-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let target = std::env::temp_dir().join("fe-recheck-sym-target");
+        let _ = std::fs::write(&target, b"#!/bin/sh\nexit 0\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let _ = symlink(&target, &tmp);
+        }
+        // tmp 不在任何 trusted_bin_dirs (在 temp_dir) → symlink recheck Err。
+        let r3 = g.recheck_binary(tmp.to_str().unwrap());
+        assert!(
+            r3.is_err(),
+            "可信目录外 symlink recheck 应 Err, got {:?}",
+            r3
+        );
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&target);
     }
 }

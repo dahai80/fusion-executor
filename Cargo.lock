@@ -532,6 +532,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fe-guard"
+version = "0.2.5"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "fe-gui"
 version = "0.2.5"
 dependencies = [
@@ -629,9 +641,8 @@ version = "0.2.5"
 dependencies = [
  "arc-swap",
  "criterion",
+ "fe-guard",
  "regex",
- "serde",
- "serde_json",
  "shell-words",
  "thiserror 2.0.20",
  "tracing",

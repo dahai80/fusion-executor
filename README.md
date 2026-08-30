@@ -315,6 +315,40 @@ Protocol: newline-delimited JSON-RPC 2.0, error codes -32700/-32600/-32601/-3260
 
 The fusion-code TS client sketch is in `docs/ipc-client-typescript.md`; fusion-studio uses the existing `IPCClient.swift udsCall` pointed at the same socket.
 
+## Guard Integration (v0.2.6 — Issue #23 Phase 3)
+
+`fusion-executor` is the **execution-side consumer** of the `fusion-guard` zero-trust action-authorization daemon (a separate per-host UDS service, `/tmp/fusion-guard.sock`, Phase 0-2 complete). Before each command runs, the executor asks guard for an `allow`/`preview`/`redact`/`block` verdict + risk level L1-L4, then executes / rejects / forwards the `guard_action_id` for caller audit.
+
+**Guard is OFF by default** (backward-compatible with v0.2.5 — the static blocklist regex + whitelist fence still applies). Enable it explicitly:
+
+```python
+from fusion_executor import FusionSandboxExecutor
+
+# Explicit guard socket + tenant
+ex = FusionSandboxExecutor(guard_sock="/tmp/fusion-guard.sock", guard_tenant="default")
+
+# Or via env vars (FUSION_GUARD_SOCK / FUSION_EXECUTOR_TENANT)
+# FUSION_GUARD_SOCK=/tmp/fusion-guard.sock python -c "..."
+
+r = ex.run("echo hi")  # guard Allow L1 -> exit 0, guard_action_id=None
+r = ex.run("rm -rf /")  # guard Block L4 -> blocked_by_security=True,
+#                     guard_action_id="<uuid>" set, NOT executed
+```
+
+- **`guard_action_id: str | None`** on `ExecutionResult` — guard sets a uuid `action_id` when it judges Block/L3; forwarded 4-layer for caller audit / human-confirm loop. `None` when guard is OFF or verdict is Allow/L1/L2.
+- **Verdict mapping** — `action==Block` OR `risk_level==L4` → block (carries `risk_level`/`action_id`/`seatbelt_required`); `risk_level==L3` (requires_approval) → block (executor has no human-approval loop, L3 treated as reject, still emits `action_id`); `action==Redact` → block (executor runs whole commands, no half-redact); `action==Preview` → allow but `requires_approval=true` passed through; `action==Allow` + L1/L2 → allow, passes `risk_level`/`seatbelt_required`.
+- **Seatbelt gating (E7)** — if guard says `seatbelt_required=true` and the caller's `req.seatbelt != true`, `execute_async`/`execute_streaming` reject at entry (exit -1, no spawn). Prevents degrading a high-risk command to a non-sandboxed run.
+- **Pre-exec TOCTOU recheck (H4)** — after `validate()`, before `sandbox.run`, fe-core calls `fe-security::recheck_binary(first_token)`: reuses `resolve_binary_path` (same `trusted_bin_dirs`, ARCH-2) + `std::fs::symlink_metadata` (safe Rust, no libc/unsafe) to reject a symlink that newly appears in the validate→spawn window. Homebrew `/opt/homebrew/bin/x → Cellar` symlinks are by-design allowed (not a symlink at resolve time); only a path that *becomes* a symlink after validation is blocked.
+- **Degraded fail-closed (guard down)** — if guard is unreachable / times out, the executor **never fails open**:
+  1. cached regex rules (`run_cached_rules`) hit a block pattern → block;
+  2. no cache hit → falls back to the existing `validate()` whitelist fence (non-whitelisted binary → block);
+  3. `allow_inline_interpreter==true` + cache empty/unavailable → block inline forms outright (no guard = can't assess risk, fail-closed);
+  4. whitelisted binary → allow but `WARN`-logs "guard down, degraded, risk level unknown" (never wider than guard-live).
+  The degrade path **cannot** locally reproduce guard's full verdict (tokenizer/AST/semantic stages live inside guard), only the regex stage — so degrade is **stricter**, not looser.
+- **R4 conflict resolution (compile-time static fallback)** — Issue #23 R4 ("retain `DANGEROUS_BINS` compile-time static fallback") conflicts with the 0827 A-12 audit that deliberately deleted that const. Resolution: the existing fe-security static `build_blocklist()` regex danger patterns + `WHITELIST` are the compile-time fail-closed fence; together with cached regex rules they form the guard-down fallback, satisfying R4's safety intent. The deleted `DANGEROUS_BINS` const is **not** reintroduced.
+- **Cross-project boundary** — `fusion-guard` is read-only: the executor only consumes guard's UDS wire contract, mirrors wire types locally in `crates/fe-guard`, does **not** edit fusion-guard source or file guard PRs. `guard_tenant` must match a tenant bound to the executor's OS identity (UID) in guard's config, else every `evaluate` returns -32001 (auth failure) → fail-closed block (not degrade — degrading on auth failure could open a door).
+- **Guard lifecycle** — `cd /Users/dahai/fusion/fusion-guard && ./start.sh start|stop|status|doctor` (build `target/release/fusion-guard` first via `cargo build --release`; sock `/tmp/fusion-guard.sock`).
+
 ## Operations (运维)
 
 Operability surface landed in the 0826 enterprise audit fix pass (C-OPS-01..06, C-SEC-02, C-SEC-03):

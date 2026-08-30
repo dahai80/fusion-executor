@@ -1,5 +1,5 @@
 [package]
-name = "fe-security"
+name = "fe-guard"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,19 +7,12 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-regex.workspace = true
-shell-words.workspace = true
 tracing.workspace = true
-arc-swap.workspace = true
-fe-guard.workspace = true
+uuid.workspace = true
+regex.workspace = true
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-criterion.workspace = true
-
-[[bench]]
-name = "security_parse"
-harness = false
