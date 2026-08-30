@@ -315,6 +315,11 @@ pub struct ExecutionResult {
     /// 采样真实任务进程 (非 executor 自身)。stdio 路径有 pid; 拦截/超时路径无 → None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Issue #23 (guard Phase 3): guard 判 block 的裁决 action_id — 调用方据此向 guard 发 confirm 审批回路
+    /// (executor 本身不发 confirm, 仅透传)。仅 guard 介入且判 block/preview 时填充; guard OFF 或 allow → None。
+    /// additive wire 字段 (skip_serializing_if None), 4 层 auto-flow (fe-pyo3 From + Pydantic + fe-ipc done serde-flatten)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_action_id: Option<String>,
 }
 
 impl ExecutionResult {
@@ -341,6 +346,27 @@ impl ExecutionResult {
             task_id,
             command,
             trace_id,
+            ..Default::default()
+        }
+    }
+
+    /// Issue #23 (guard Phase 3): guard 判 block 的拦截结果 — 携带 guard action_id 供调用方 confirm 回路。
+    /// 签名与 blocked_with 一致 + action_id (fix #5: 不扩展 blocked_with 调用点, 独立构造器)。
+    pub fn blocked_by_guard(
+        reason: impl Into<String>,
+        action_id: Option<String>,
+        task_id: Option<String>,
+        command: Option<String>,
+        trace_id: Option<String>,
+    ) -> Self {
+        Self {
+            exit_code: EXIT_BLOCKED,
+            blocked_by_security: true,
+            security_reason: Some(reason.into()),
+            task_id,
+            command,
+            trace_id,
+            guard_action_id: action_id,
             ..Default::default()
         }
     }
@@ -855,8 +881,23 @@ impl Executor {
         if !verdict.allowed {
             let reason = verdict.reason.unwrap_or_else(|| "未知原因".to_string());
             info!(%reason, "安全校验拦截");
-            return Ok(ExecutionResult::blocked_with(
+            // Issue #23: guard 判 block 携带 action_id 透传 (调用方 confirm 回路); 非 guard 拦截 action_id=None 同 blocked_with。
+            return Ok(ExecutionResult::blocked_by_guard(
                 reason,
+                verdict.action_id.clone(),
+                req.task_id.clone(),
+                Some(req.command.clone()),
+                Some(trace_id),
+            ));
+        }
+        // Issue #23 验收 #3 (seatbelt 门控 E7): guard 判高风险要求 seatbelt, 但调用方未启用 → 拒绝执行
+        // (防降级到非沙箱执行高风险命令)。guard OFF 时 seatbelt_required=false, 不触发。
+        if verdict.seatbelt_required && !req.seatbelt {
+            let reason = "guard 要求 seatbelt 隔离但调用方未启用 (E7 seatbelt gating)";
+            warn!(%reason, action_id = ?verdict.action_id, "seatbelt 门控拦截");
+            return Ok(ExecutionResult::blocked_by_guard(
+                reason,
+                verdict.action_id.clone(),
                 req.task_id.clone(),
                 Some(req.command.clone()),
                 Some(trace_id),
@@ -868,6 +909,23 @@ impl Executor {
             if !cwd_v.allowed {
                 let reason = cwd_v.reason.unwrap_or_else(|| "cwd 非法".to_string());
                 info!(%reason, "cwd 校验拦截");
+                return Ok(ExecutionResult::blocked_with(
+                    reason,
+                    req.task_id.clone(),
+                    Some(req.command.clone()),
+                    Some(trace_id),
+                ));
+            }
+        }
+
+        // Issue #23 验收 #4 (H4 TOCTOU 复检): validate 解析 binary 路径后, spawn 前复检 —
+        // 拒绝执行前窗口新现的 symlink (validate 时非 symlink, recheck 时变 symlink → 拒),
+        // 路径消失亦拒。safe Rust (symlink_metadata, 无 libc/unsafe)。homebrew Cellar symlink by-design 不拒
+        // (validate 期就是 symlink, 非执行前窗口新现)。仅白名单 binary 第一 token 可解析 → 非白名单已被前面拦。
+        let first_token = req.command.split_whitespace().next().unwrap_or("");
+        if !first_token.is_empty() {
+            if let Err(reason) = self.security.recheck_binary(first_token) {
+                warn!(%reason, first_token, "TOCTOU 复检拦截 — 执行前 binary 路径变更");
                 return Ok(ExecutionResult::blocked_with(
                     reason,
                     req.task_id.clone(),
@@ -1046,12 +1104,35 @@ impl Executor {
         if !verdict.allowed {
             let reason = verdict.reason.unwrap_or_else(|| "未知原因".to_string());
             info!(%reason, "安全校验拦截 (streaming)");
+            let action_id = verdict.action_id.clone();
             let (tx, rx) = mpsc::channel(8);
             let handle = tokio::spawn(async move {
                 let _ = tx
                     .send(ExecutionStreamEvent::Done(Box::new(
-                        ExecutionResult::blocked_with(
+                        ExecutionResult::blocked_by_guard(
                             reason,
+                            action_id,
+                            req.task_id.clone(),
+                            Some(req.command.clone()),
+                            Some(trace_id),
+                        ),
+                    )))
+                    .await;
+            });
+            return Ok((rx, handle));
+        }
+        // Issue #23 验收 #3 (seatbelt 门控 E7, streaming 同步路径): guard 要求 seatbelt 但调用方未启用 → 拒。
+        if verdict.seatbelt_required && !req.seatbelt {
+            let reason = "guard 要求 seatbelt 隔离但调用方未启用 (E7 seatbelt gating, streaming)";
+            warn!(%reason, action_id = ?verdict.action_id, "seatbelt 门控拦截 (streaming)");
+            let action_id = verdict.action_id.clone();
+            let (tx, rx) = mpsc::channel(8);
+            let handle = tokio::spawn(async move {
+                let _ = tx
+                    .send(ExecutionStreamEvent::Done(Box::new(
+                        ExecutionResult::blocked_by_guard(
+                            reason,
+                            action_id,
                             req.task_id.clone(),
                             Some(req.command.clone()),
                             Some(trace_id),
@@ -1066,6 +1147,28 @@ impl Executor {
             if !cwd_v.allowed {
                 let reason = cwd_v.reason.unwrap_or_else(|| "cwd 非法".to_string());
                 info!(%reason, "cwd 校验拦截 (streaming)");
+                let (tx, rx) = mpsc::channel(8);
+                let handle = tokio::spawn(async move {
+                    let _ = tx
+                        .send(ExecutionStreamEvent::Done(Box::new(
+                            ExecutionResult::blocked_with(
+                                reason,
+                                req.task_id.clone(),
+                                Some(req.command.clone()),
+                                Some(trace_id),
+                            ),
+                        )))
+                        .await;
+                });
+                return Ok((rx, handle));
+            }
+        }
+
+        // Issue #23 验收 #4 (H4 TOCTOU 复检, streaming 同步路径): spawn 前复检 binary 路径非新现 symlink/消失。
+        let first_token = req.command.split_whitespace().next().unwrap_or("");
+        if !first_token.is_empty() {
+            if let Err(reason) = self.security.recheck_binary(first_token) {
+                warn!(%reason, first_token, "TOCTOU 复检拦截 (streaming) — 执行前 binary 路径变更");
                 let (tx, rx) = mpsc::channel(8);
                 let handle = tokio::spawn(async move {
                     let _ = tx

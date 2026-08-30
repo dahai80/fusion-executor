@@ -401,9 +401,18 @@ impl SecurityGuard {
                 e
             )
         })?;
-        if md.file_type().is_symlink() {
+        // symlink 处置: homebrew /opt/homebrew/bin/python3 → Cellar 是 by-design 受信 (包管理器写入,
+        // 需 root, 超出 ARCH-2 威胁模型), symlink 本身落在 trusted_bin_dirs 内 → 放行。
+        // 仅拒 symlink 落在可信目录外 (validate 时非 symlink 的可信 regular file, 执行前窗口被替换
+        // 为 symlink 指向攻击者路径 = TOCTOU 投毒)。这把 H4 拒 symlink 限制在"可信目录外的新现 symlink"。
+        if md.file_type().is_symlink()
+            && !self
+                .trusted_bin_dirs
+                .iter()
+                .any(|d| resolved.starts_with(d))
+        {
             return Err(format!(
-                "TOCTOU 拒: 二进制路径执行前变 symlink (validate 时非 symlink): {}",
+                "TOCTOU 拒: 二进制路径执行前变 symlink 且不在可信目录 (validate 时非 symlink): {}",
                 resolved.display()
             ));
         }
@@ -2894,7 +2903,8 @@ mod tests {
         drop(handle);
     }
 
-    // recheck_binary (fix #3): 非 symlink binary → Ok; 路径消失 → Err; symlink → Err。
+    // recheck_binary (fix #3): 非 symlink binary → Ok; 路径消失 → Err; 可信目录外 symlink → Err。
+    // homebrew /opt/homebrew/bin/* symlink 落在 trusted_bin_dirs → by-design 放行 (ARCH-2 威胁模型外)。
     #[test]
     fn recheck_binary_rejects_symlink_and_missing() {
         let g = guard();
@@ -2904,5 +2914,47 @@ mod tests {
         // 不存在 binary → Err。
         let r2 = g.recheck_binary("definitely-not-a-binary-xyz-123");
         assert!(r2.is_err(), "不存在 binary recheck → Err");
+    }
+
+    // recheck_binary 可信目录内 symlink 放行 (homebrew): /opt/homebrew/bin/python3 是 symlink → Cellar,
+    // 但落在 trusted_bin_dirs (/opt/homebrew/bin) 内 → by-design 放行, 不误拒真实执行环境。
+    #[test]
+    fn recheck_binary_allows_trusted_dir_symlink() {
+        let g = guard();
+        // python3 在 homebrew 上是 /opt/homebrew/bin/python3 → Cellar symlink。
+        // 若解析到且在 trusted_bin_dirs 内 → Ok (不因 symlink 误拒)。
+        if let Some(resolved) = resolve_binary_path("python3") {
+            let is_sym = std::fs::symlink_metadata(&resolved)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_sym {
+                let r = g.recheck_binary("python3");
+                assert!(
+                    r.is_ok(),
+                    "可信目录内 symlink binary (homebrew) recheck 应 Ok, got {:?}",
+                    r
+                );
+            }
+            // python3 非白名单 → validate 仍拒, 但 recheck 只复检路径不变 symlink, 不查白名单。
+        }
+        // 构造可信目录外 symlink → Err (TOCTOU 投毒模拟)。
+        let tmp = std::env::temp_dir().join(format!("fe-recheck-sym-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let target = std::env::temp_dir().join("fe-recheck-sym-target");
+        let _ = std::fs::write(&target, b"#!/bin/sh\nexit 0\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let _ = symlink(&target, &tmp);
+        }
+        // tmp 不在任何 trusted_bin_dirs (在 temp_dir) → symlink recheck Err。
+        let r3 = g.recheck_binary(tmp.to_str().unwrap());
+        assert!(
+            r3.is_err(),
+            "可信目录外 symlink recheck 应 Err, got {:?}",
+            r3
+        );
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&target);
     }
 }
