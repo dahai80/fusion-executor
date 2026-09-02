@@ -244,14 +244,26 @@ ex.serve()  # background, or run in another process; socket at ~/.fusion-executo
 # Launch a long-running stream (id = 51) over a raw UDS socket
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(ex._sock_path)
-sock.sendall((json.dumps({
-    "jsonrpc": "2.0", "id": 51, "method": "executor.execute_stream",
-    "params": {"command": "python3 -c 'import time; time.sleep(1000)'",
-               "enable_rollback_snapshot": False, "timeout_sec": 120},
-}) + "\n").encode())
+sock.sendall(
+    (
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "executor.execute_stream",
+                "params": {
+                    "command": "python3 -c 'import time; time.sleep(1000)'",
+                    "enable_rollback_snapshot": False,
+                    "timeout_sec": 120,
+                },
+            }
+        )
+        + "\n"
+    ).encode()
+)
 
 # ...later, abort it:
-ok = ex.cancel_stream(51)        # → True (found + cancelled)
+ok = ex.cancel_stream(51)  # -> True (found + cancelled)
 # read the Done frame on `sock`: exit_code=-1, cancelled=True
 ```
 
