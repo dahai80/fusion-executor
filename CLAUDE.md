@@ -21,7 +21,7 @@ Dual-mode controlled execution engine (CLI + Native GUI) for Apple Silicon / mac
 
 ## Data Schema (Pydantic)
 
-The wire contract — `ExecutionRequest` in, `ExecutionResult` out. `ExecutionResult` carries: `exit_code` (0 ok / -124 timeout / -1 blocked-or-internal-error), truncated `stdout`/`stderr`, `task_id`/`command`/`duration_sec` (PRD §4.1, v1.3 — request-side identity + wall-clock), `timed_out`, `blocked_by_security` + `security_reason`, `snapshot_id` for rollback. Diagnostics Slicer runs when `exit_code != 0`: regex-extract Traceback/Error/Exception lines → Tree-sitter AST to locate offending file:line → emit compact JSON (`error_type`, `file_path`, `line_number`, `code_snippet`, `raw_trace`) sized for a prompt.
+The wire contract — `ExecutionRequest` in, `ExecutionResult` out. `ExecutionResult` carries: `exit_code` (0 ok / -124 timeout / -1 blocked-or-internal-error), truncated `stdout`/`stderr`, `task_id`/`command`/`duration_sec` (PRD §4.1, v1.3 — request-side identity + wall-clock), `timed_out`, `blocked_by_security` + `security_reason`, `snapshot_id` for rollback, `cancelled` (Issue #32 — server-side deterministic cancel: `executor.cancel {id}` over UDS → fe-sandbox `kill_process_group_async` SIGINT→KILL_GRACE_MS grace→SIGKILL killpg + ppid-tree descendant walk for setsid orphans, Done frame `exit_code -1` + `cancelled true`; cooperative stop is NOT the cancel path). Diagnostics Slicer runs when `exit_code != 0`: regex-extract Traceback/Error/Exception lines → Tree-sitter AST to locate offending file:line → emit compact JSON (`error_type`, `file_path`, `line_number`, `code_snippet`, `raw_trace`) sized for a prompt.
 
 v1.3 adds native file-tool wire models (fe-tools, replaces Claude SDK FileEdit/Glob/Grep): `EditResult{ok, path, error, matches}` (file_edit unique-match replace + apply_patch + replace_function all return this), `GlobEntry{path, is_dir}`, `GrepMatch{path, line_number, content}`. Surgical Patch Engine: `apply_patch` (diffy Unified Diff, full-rewrite forbidden) + `replace_function` (tree-sitter AST function-level replace, no full-file rewrite).
 
@@ -186,6 +186,22 @@ SANDBOX_HARDENED_PATH (fe-sandbox spawn 期 PATH) 是另一道独立栅栏, 无�
 
 **guard start**: `cd /Users/dahai/fusion/fusion-guard && ./start.sh start|stop|status|doctor`
 (需先 `cargo build --release` 产 `target/release/fusion-guard`; sock `/tmp/fusion-guard.sock`)。
+
+## Issue #32 — Server-Side Deterministic Cancel (in-flight executeStream)
+
+Cancel an in-flight `execute_stream` from the server side with a **deterministic** process-tree kill (not a cooperative stop request). Designed for the fusion-code client to abort a runaway long-running command without leaving orphans.
+
+**Cancel semantics** — cancel = local deterministic kill via SIGINT→SIGKILL of the whole process group, NOT a cooperative "please stop" request. The `executor.cancel` UDS method resolves the in-flight stream by its JSON-RPC request id, fires a `oneshot::channel` that fe-sandbox's `run_streaming` `tokio::select!` (biased) is waiting on, then `kill_process_group_async(pid)` runs: `killpg(-pgid, SIGINT)` → `KILL_GRACE_MS` (500ms) grace → `killpg(-pgid, SIGKILL)` → ppid-tree descendant walk (`collect_descendants` + `kill_descendants_ppid`, RUN-9 setsid-orphan fallback). The Done frame returns `exit_code: -1` + `cancelled: true`.
+
+**4-layer wiring**:
+1. **fe-sandbox** `run_streaming(cfg, cancel_rx: Option<oneshot::Receiver<()>>)` — `tokio::select!` (biased) over exit_fut / cancel_fut (Box::pin, Receiver !Unpin) / outer_tx.closed() / inner_rx.recv(). Cancel branch → `kill_process_group_async(pid)` → `cancelled=true`, break. PTY path uses portable-pty `setsid` (child = group leader); stdio path uses `CommandExt::process_group(0)` so `killpg(-child_pid)` reaches the whole group.
+2. **fe-core** `execute_streaming(&self, req, cancel_rx: Option<Receiver<()>>)` — threads `Some(cancel_rx)` to `self.sandbox.run_streaming`; `ExecutionResult` gains `cancelled: bool` (`#[serde(default, skip_serializing_if="is_false")]`); Done frame backfills `cancelled: sb.cancelled`. In-process `execute_streaming(req, None)` path is never cancellable (no serve() running → no registry).
+3. **fe-ipc** `StreamRegistry = Mutex<HashMap<String, oneshot::Sender<()>>>` keyed by stringified JSON-RPC id — lives in the IPC layer (like `ShellRegistry`/`BroadcastHub`, M-ARCH-1 — **Executor stays stateless**). `handle_execute_stream` creates `(tx, rx) = oneshot::channel()`, stores tx under `id.to_string()`, passes `Some(rx)` to execute_streaming, deregisters after done/drop. New UDS arm `executor.cancel {id}` → `registry.cancel(id)` → `sender.send(())` → response `{ok, cancelled}`. Cancel works **cross-connection**: `dispatch_request` spawns a tokio task per request, so read_task keeps reading while a stream runs — a cancel on a second connection reaches the shared registry while the stream is in-flight.
+4. **fe-pyo3** `PyExecutionResult.cancelled` (`#[pyo3(get)]` + From). **Python** `ExecutionResult.cancelled` Pydantic field (`_STRICT` extra=forbid) + `FusionSandboxExecutor.cancel_stream(stream_id, *, sock_path=None) -> bool` — opens a fresh UDS connection, sends `executor.cancel {id}`, returns `bool(result.cancelled)`, raises on JSON-RPC error. `stream_id` = the JSON-RPC request id of the `execute_stream` call.
+
+**Client contract** (fusion-code, READ-ONLY): sends `executor.cancel` RPC with `{id}` = JSON-RPC request id of the execute_stream call. Best-effort fail-soft — unknown id → `{ok:false, cancelled:false}`, no exception. The client keeps the execute_stream connection open to read the terminal Done frame (`exit_code -1`, `cancelled true`).
+
+**0 new unsafe** — reuses fe-sandbox `kill_process_group_async` (nix `killpg`/`kill`, all safe). Acceptance (Issue #32): cancel `sleep 1000` (or `python3 -c "while True: pass"`) → child + descendants exit within `KILL_GRACE_MS` + SIGKILL; no orphans under load (ppid-tree walk catches setsid escapees); cancel semantics documented here. 500 Rust + 210 Python (1 skip TCC) green, clippy `--all-targets -D warnings` clean (only upstream block v0.1.6), fmt/ruff clean, maturin builds.
 
 ## Key Design Constraints (NFRs / SLA)
 

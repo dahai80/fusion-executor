@@ -53,7 +53,7 @@ try:
 except Exception as _e:  # native 扩展未构建/不可用 — 回退兜底但 warn 不静默
     import warnings
 
-    warnings.warn(f"native 扩展加载失败 ({_e!r}); 功能降级, __version__ 回退 0.2.6", RuntimeWarning, stacklevel=2)
-    __version__ = "0.2.6"
+    warnings.warn(f"native 扩展加载失败 ({_e!r}); 功能降级, __version__ 回退 0.2.7", RuntimeWarning, stacklevel=2)
+    __version__ = "0.2.7"
     __git_sha__ = "unknown"
     __build_time__ = "0"

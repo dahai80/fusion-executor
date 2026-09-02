@@ -320,6 +320,11 @@ pub struct ExecutionResult {
     /// additive wire 字段 (skip_serializing_if None), 4 层 auto-flow (fe-pyo3 From + Pydantic + fe-ipc done serde-flatten)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_action_id: Option<String>,
+    /// Issue #32: server-side cancel 触发确定性进程树 kill。true → 调用方发 executor.cancel,
+    /// fe-sandbox 收 oneshot 后 kill_process_group (SIGINT→grace→SIGKILL + ppid 树), exit_code=-1。
+    /// false → 正常完成/超时/OOM/消费者断开/安全拦截。additive wire (skip_serializing_if is_false)。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancelled: bool,
 }
 
 impl ExecutionResult {
@@ -1099,6 +1104,7 @@ impl Executor {
     pub async fn execute_streaming(
         &self,
         req: ExecutionRequest,
+        cancel_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(mpsc::Receiver<ExecutionStreamEvent>, JoinHandle<()>)> {
         // M-OPS-06/m-OPS-03: 入口解析 trace_id + span (同 execute_async)
         let trace_id = req
@@ -1257,7 +1263,7 @@ impl Executor {
             rss_limit_mb: req.rss_limit_mb,
         };
         info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
-        let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg)?;
+        let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg, cancel_rx)?;
 
         #[cfg(feature = "diagnostics")]
         let slicer = self.slicer.clone();
@@ -1325,6 +1331,7 @@ impl Executor {
                                 trace_id: Some(trace_id_for_done.clone()),
                                 oom_killed: sb.oom_killed, // D3-4: RSS watchdog 触发回填
                                 pid: sb.pid, // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
+                                cancelled: sb.cancelled, // Issue #32: server-side cancel 透传
                                 ..Default::default()
                             };
                             // D5-2 fail-loud: 快照建不出且 caller 传 policy → guard 不构造, 标 rollback_unavailable (streaming)
@@ -1522,7 +1529,7 @@ mod tests {
                 rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
+            let (mut rx, handle) = ex.execute_streaming(req, None).await.unwrap();
             let mut combined = String::new();
             let mut done = None;
             while let Some(ev) = rx.recv().await {
@@ -1648,7 +1655,7 @@ mod tests {
                 rss_limit_mb: default_rss_limit(),
                 trace_id: Some("stream-tid".to_string()),
             };
-            let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
+            let (mut rx, handle) = ex.execute_streaming(req, None).await.unwrap();
             let mut done = None;
             while let Some(ev) = rx.recv().await {
                 if let ExecutionStreamEvent::Done(r) = ev {
@@ -1682,7 +1689,7 @@ mod tests {
                 rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
+            let (mut rx, handle) = ex.execute_streaming(req, None).await.unwrap();
             let mut frames = 0;
             let mut blocked = false;
             while let Some(ev) = rx.recv().await {
@@ -1720,7 +1727,7 @@ mod tests {
                 rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
+            let (mut rx, handle) = ex.execute_streaming(req, None).await.unwrap();
             let mut done = None;
             while let Some(ev) = rx.recv().await {
                 if let ExecutionStreamEvent::Done(r) = ev {
@@ -1755,7 +1762,7 @@ mod tests {
                 rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
-            let (mut rx, handle) = ex.execute_streaming(req).await.unwrap();
+            let (mut rx, handle) = ex.execute_streaming(req, None).await.unwrap();
             let mut done = None;
             while let Some(ev) = rx.recv().await {
                 if let ExecutionStreamEvent::Done(r) = ev {
@@ -1767,6 +1774,60 @@ mod tests {
             assert_ne!(done.exit_code, 0);
             let diag = done.diagnostics.expect("非零退出应填 diagnostics");
             assert_eq!(diag.error_type.as_deref(), Some("ValueError"));
+        });
+    }
+
+    #[test]
+    fn execute_streaming_cancel_kills_process_tree_issue32() {
+        // Issue #32: server-side cancel → execute_streaming 收 cancel_rx → kill 进程树
+        // → Done 帧 exit_code -1, cancelled true, 非 timeout。在 cancel timeout 内退出。
+        rt().block_on(async {
+            let ex = Executor::new().with_allow_inline_interpreter(true);
+            let req = ExecutionRequest {
+                command: "python3 -c \"while True: pass\"".to_string(),
+                task_id: Some("cancel-test".to_string()),
+                cwd: None,
+                timeout_sec: 100.0,
+                env_vars: None,
+                enable_rollback_snapshot: false,
+                auto_rollback_policy: None,
+                seatbelt: false,
+                inherit_env: false,
+                use_pty: true,
+                max_nproc: 1024,
+                max_cpu_sec: 0,
+                max_nofile: 1024,
+                rss_limit_mb: default_rss_limit(),
+                trace_id: None,
+            };
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            let start = std::time::Instant::now();
+            let (mut rx, handle) = ex.execute_streaming(req, Some(cancel_rx)).await.unwrap();
+            // 500ms 后发 cancel — 优于 timeout_sec 100s
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = cancel_tx.send(());
+            let mut done = None;
+            while let Some(ev) = rx.recv().await {
+                if let ExecutionStreamEvent::Done(r) = ev {
+                    done = Some(r);
+                }
+            }
+            handle.await.unwrap();
+            let done = done.expect("应收到 Done 帧");
+            assert_eq!(
+                done.exit_code, -1,
+                "Issue #32: cancel 应产 exit_code -1 (blocked/internal 约定)"
+            );
+            assert!(done.cancelled, "Issue #32: cancelled 应透传 true");
+            assert!(
+                !done.timed_out,
+                "Issue #32: cancel 非 timeout — 不应填 timed_out"
+            );
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "Issue #32: cancel 应在 cancel timeout 内完成, 实际 {:?}",
+                start.elapsed()
+            );
         });
     }
 

@@ -112,6 +112,10 @@ struct PyExecutionResult {
     /// additive wire 字段, 4 层 From/Pydantic/done-frame auto-flow。
     #[pyo3(get)]
     guard_action_id: Option<String>,
+    /// Issue #32: server-side cancel 触发确定性进程树 kill (exit_code=-1, cancelled=true)。
+    /// 调用方发 executor.cancel → fe-sandbox kill_process_group。additive wire, 4 层 auto-flow。
+    #[pyo3(get)]
+    cancelled: bool,
 }
 
 impl From<RsResult> for PyExecutionResult {
@@ -135,6 +139,7 @@ impl From<RsResult> for PyExecutionResult {
             oom_killed: r.oom_killed,
             pid: r.pid,
             guard_action_id: r.guard_action_id,
+            cancelled: r.cancelled,
         }
     }
 }
@@ -982,7 +987,7 @@ impl PyExecutor {
         }; // L-PYO3-01: execute_streaming async → 释 GIL 后在 BLOCKING_RT block_on (旧版持 GIL
            // 整个 spawn + 校验期间, 阻塞 Python 线程; detach 后 Python 可并发跑其他协程)
         let (rx, handle) = py
-            .detach(|| fe_core::BLOCKING_RT.block_on(self.inner.execute_streaming(req)))
+            .detach(|| fe_core::BLOCKING_RT.block_on(self.inner.execute_streaming(req, None)))
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("execute_streaming 失败: {e}"))
             })?;
@@ -1452,6 +1457,7 @@ mod tests {
             oom_killed: true,
             pid: Some(1234),
             guard_action_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            cancelled: true,
         };
         let py = PyExecutionResult::from(rs);
         assert_eq!(py.exit_code, 0);
@@ -1483,6 +1489,7 @@ mod tests {
             py.guard_action_id.as_deref(),
             Some("11111111-2222-3333-4444-555555555555")
         );
+        assert!(py.cancelled, "Issue #32: cancelled 应透传 true");
     }
 
     #[test]
