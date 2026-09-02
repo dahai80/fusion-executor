@@ -183,6 +183,17 @@ for frame in ex.run_streaming("echo hi", enable_rollback_snapshot=False):
 
 拦截 (安全违规) → 仅单帧 done, 无 chunk。超时 → done 帧 `timed_out=True, exit_code=-124`。失败命令 → done 帧含 `diagnostics`。
 
+### 服务端确定性取消 (v0.2.7 — Issue #32)
+
+从服务端用**确定性**进程树 kill 取消正在运行的 `execute_stream` — 非协作式 "请停止" 请求。为调用方 (如 fusion-code) 中止失控长跑命令不留孤儿进程而设计。
+
+`cancel_stream(stream_id)` 打开新的 UDS 连接发送 `executor.cancel {id}`, 其中 `stream_id` = `execute_stream` 调用的 JSON-RPC 请求 id。服务端解析运行中的流, 触发 fe-sandbox `run_streaming` 的 `tokio::select!` 正在等待的 oneshot, 然后执行 `kill_process_group_async` (SIGINT → 500ms 宽限 → SIGKILL 整个进程组, 再加 ppid 树后代遍历兜底 `setsid` 孤儿)。原流连接收到终止 Done 帧: `exit_code: -1` + `cancelled: true`。
+
+- 取消**跨连接**: 第二条连接可取消另一条连接启动的流 (`StreamRegistry` 全服务端共享)。调用方保持 execute_stream 连接打开以读取终止 Done 帧。
+- 未知 `stream_id` → 返 `False` (best-effort, 不抛异常)。
+- 进程内 `run_streaming()` 路径 (无 `serve()` 运行) 不可取消 — 取消仅适用于经 UDS 服务端流。
+- `ExecutionResult.cancelled: bool` 非取消路径恒 `False`; 仅真正触发取消时 `True`。
+
 ### 自动回滚 (v1.4 — FR-04 可选策略)
 
 `run()` / `run_streaming()` 接受可选 `auto_rollback: RollbackPolicy`。启用后, 命令失败 (`exit_code != 0`) 且检测到工作区文件改动 (`git status --porcelain` 非空) 时, 自动 `rollback(本次快照)`, 标记 `result.auto_rolled_back=True`。Executor 仍无状态 — guard 生命周期限单次执行, 不跨请求累积失败计数 (连续失败计数归 caller 自愈循环)。

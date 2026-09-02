@@ -78,6 +78,11 @@ pub struct SandboxResult {
     /// exit_code=-124 (与 timeout 共用杀约定, timed_out=false)。false → 未达上限或 watchdog 禁用。
     #[serde(default, skip_serializing_if = "is_false")]
     pub oom_killed: bool,
+    /// Issue #32: server-side cancel 触发确定性进程树 kill。true → 调用方发 executor.cancel,
+    /// sandbox 收 oneshot 后 kill_process_group (SIGINT→grace→SIGKILL + ppid 树), exit_code=-1。
+    /// false → 正常完成 / 超时 / OOM / 消费者断开。与 cancelled 互斥区分 (cancel = 外部显式请求)。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancelled: bool,
     /// RUN-11: 沙箱子进程 PID — 调用方据此传 telemetry_stream 采样真实任务进程 (非 executor 自身)。
     /// PTY/stdio spawn 路径有; 拦截/空命令/取消收尾路径视情形 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,7 +476,8 @@ impl Sandbox {
             stderr: String::new(),
             timed_out,
             oom_killed,
-            pid, // RUN-11: 回填子进程 PID (PTY 路径 child.process_id())
+            cancelled: false, // Issue #32: 非流式 run 无 cancel 通道
+            pid,              // RUN-11: 回填子进程 PID (PTY 路径 child.process_id())
         })
     }
 
@@ -637,7 +643,8 @@ impl Sandbox {
             stderr,
             timed_out,
             oom_killed,
-            pid, // RUN-11: 回填子进程 PID (stdio 路径 child.id())
+            cancelled: false, // Issue #32: 非流式 run 无 cancel 通道
+            pid,              // RUN-11: 回填子进程 PID (stdio 路径 child.id())
         })
     }
 
@@ -647,6 +654,7 @@ impl Sandbox {
     pub fn run_streaming(
         &self,
         cfg: SandboxConfig,
+        cancel_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(mpsc::Receiver<StreamEvent>, tokio::task::JoinHandle<()>)> {
         if cfg.command.trim().is_empty() {
             let (tx, rx) = mpsc::channel(8);
@@ -776,6 +784,7 @@ impl Sandbox {
         // Blocker 6 (审计 2.1): 消费者断开 → kill 子进程, 防孤儿。pid 克隆供 phase-1 循环用
         // (exit_fut 闭包也需 pid 作超时 kill, 克隆避免 move 后无法引用)
         let pid_for_cancel = pid;
+        let cancel_rx = cancel_rx;
         let handle = tokio::spawn(async move {
             // D3-4: RSS watchdog — exit_fut 内持 oom_rx 第 3 分支, 超限先于 timeout 杀进程树。
             // oneshot 在 exit_fut 内创建, 保证 watchdog 任务与 exit_fut 同 spawn 作用域生命周期一致。
@@ -823,6 +832,20 @@ impl Sandbox {
             let mut exit_done: Option<(bool, bool, i32)> = None;
             // Blocker 6: 消费者断开标志 — send 失败后 kill 子进程并跳出
             let mut cancelled = false;
+            // Issue #32: cancel 标志 — 区分 cancel (外部显式请求) vs 消费者断开 (Blocker 6),
+            // Done 帧 cancelled 字段据此设 (cancel=true 仅 cancel 路径, 断开=false)。
+            let mut cancel_requested = false;
+
+            // Issue #32: cancel future — hoisted outside loop (oneshot::Receiver !Unpin,
+            // Pin::new fails; Box::pin once, .as_mut() poll). pending-forever 若无 cancel_rx.
+            let mut cancel_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                if let Some(rx) = cancel_rx {
+                    Box::pin(async move {
+                        let _ = rx.await;
+                    })
+                } else {
+                    Box::pin(std::future::pending::<()>())
+                };
 
             // 阶段 1: exit 与 chunk 并发 — 未收到 exit 前无超时收 chunk
             while exit_done.is_none() {
@@ -830,6 +853,15 @@ impl Sandbox {
                     biased; // L-SB-01: exit 优先
                     e = &mut exit_fut => {
                         exit_done = Some(e);
+                    }
+                    // Issue #32: server-side cancel → 确定性进程树 kill (非协作停). 复用 kill_process_group
+                    // (SIGINT→KILL_GRACE_MS grace→SIGKILL + kill_descendants_ppid 防 setsid 孤儿).
+                    _ = cancel_fut.as_mut() => {
+                        warn!(?pid_for_cancel, "streaming 收到 cancel 请求, kill 进程树 (Issue #32)");
+                        let _ = kill_process_group_async(pid_for_cancel).await;
+                        cancelled = true;
+                        cancel_requested = true;
+                        break;
                     }
                     // Blocker 6: 消费者断开 outer_rx (即使无输出静默期) → closed() 就绪 → kill 子进程
                     _ = outer_tx.closed() => {
@@ -864,7 +896,11 @@ impl Sandbox {
             // Blocker 6: 消费者断开后 exit_fut 仍持 wait_fut, abort 释放; 子进程已 kill。
             // 不走 phase-2 (exit_done=None → unwrap panic); 直接合成 cancelled Done 收尾。
             if cancelled {
-                debug!(?pid_for_cancel, "streaming 已取消 (消费者断开), 收尾");
+                debug!(
+                    ?pid_for_cancel,
+                    cancelled_by_cancel = cancel_requested,
+                    "streaming 已取消, 收尾"
+                );
                 let raw_output = eof_output.unwrap_or_default();
                 let stdout = truncate_output(&raw_output.replace("\r\n", "\n"), max_output_final);
                 let _ = outer_tx
@@ -874,7 +910,8 @@ impl Sandbox {
                         stderr: String::new(),
                         timed_out: false,
                         oom_killed: false, // D3-4: 取消路径无 OOM (kill 由消费者断开触发非 watchdog)
-                        pid: pid_for_cancel, // RUN-11: 回填子进程 PID (取消收尾, 子已 kill)
+                        cancelled: cancel_requested, // Issue #32: 仅 cancel 请求路径 true, 消费者断开 false
+                        pid: pid_for_cancel,         // RUN-11: 回填子进程 PID (取消收尾, 子已 kill)
                     }))
                     .await;
                 return;
@@ -926,6 +963,7 @@ impl Sandbox {
                     stderr: String::new(),
                     timed_out,
                     oom_killed,
+                    cancelled: false,    // Issue #32: 正常完成路径非 cancel
                     pid: pid_for_cancel, // RUN-11: 回填子进程 PID (正常完成)
                 }))
                 .await;
@@ -1579,7 +1617,7 @@ mod tests {
     fn run_streaming_echo() {
         let runtime = rt();
         runtime.block_on(async {
-            let (mut rx, handle) = Sandbox::new().run_streaming(cfg("echo hi")).unwrap();
+            let (mut rx, handle) = Sandbox::new().run_streaming(cfg("echo hi"), None).unwrap();
             let mut combined = String::new();
             let mut done = None;
             while let Some(ev) = rx.recv().await {
@@ -1606,7 +1644,7 @@ mod tests {
         runtime.block_on(async {
             let mut c = cfg("python3 -c \"while True: pass\"");
             c.timeout_sec = 1.0;
-            let (mut rx, handle) = Sandbox::new().run_streaming(c).unwrap();
+            let (mut rx, handle) = Sandbox::new().run_streaming(c, None).unwrap();
             let mut done = None;
             while let Some(ev) = rx.recv().await {
                 if let StreamEvent::Done(r) = ev {
@@ -1626,7 +1664,7 @@ mod tests {
         let runtime = rt();
         runtime.block_on(async {
             let (mut rx, handle) = Sandbox::new()
-                .run_streaming(SandboxConfig::default())
+                .run_streaming(SandboxConfig::default(), None)
                 .unwrap();
             let mut done = None;
             while let Some(ev) = rx.recv().await {
@@ -1638,6 +1676,36 @@ mod tests {
             let done = done.unwrap();
             assert_eq!(done.exit_code, 0);
             assert!(done.stdout.is_empty());
+        });
+    }
+
+    #[test]
+    fn run_streaming_cancel_kills_process_tree() {
+        let runtime = rt();
+        let start = std::time::Instant::now();
+        runtime.block_on(async {
+            let mut c = cfg("python3 -c \"while True: pass\"");
+            c.timeout_sec = 100.0;
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            let (mut rx, handle) = Sandbox::new().run_streaming(c, Some(cancel_rx)).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            cancel_tx.send(()).expect("cancel send");
+            let mut done = None;
+            while let Some(ev) = rx.recv().await {
+                if let StreamEvent::Done(r) = ev {
+                    done = Some(r);
+                }
+            }
+            handle.await.unwrap();
+            let done = done.expect("应收到 Done");
+            assert_eq!(done.exit_code, -1, "cancel 路径 exit_code 应 -1");
+            assert!(done.cancelled, "cancelled 应 true (Issue #32)");
+            assert!(!done.timed_out, "非超时");
+            assert!(
+                start.elapsed().as_secs() < 5,
+                "cancel 应快速终止, 耗时 {:?}",
+                start.elapsed()
+            );
         });
     }
 
@@ -1796,7 +1864,7 @@ mod tests {
             max_nofile: 1024,
             rss_limit_mb: DEFAULT_RSS_LIMIT_MB,
         };
-        let (mut rx, handle) = sb.run_streaming(cfg).unwrap();
+        let (mut rx, handle) = sb.run_streaming(cfg, None).unwrap();
         // 收首块 (含 "started"), 确认子进程已起
         let first = rx.recv().await.expect("应收到首块");
         let first_data = match first {
@@ -2298,7 +2366,7 @@ mod tests {
             max_nofile: 1024,
             rss_limit_mb: 256,
         };
-        let (mut rx, handle) = sb.run_streaming(cfg).unwrap();
+        let (mut rx, handle) = sb.run_streaming(cfg, None).unwrap();
         let mut done_oom = false;
         let mut exit_code = -999;
         while let Some(ev) = rx.recv().await {

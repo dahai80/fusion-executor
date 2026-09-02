@@ -1901,3 +1901,89 @@ def test_guard_env_var_enables_guard():
             os.environ["FUSION_GUARD_SOCK"] = old
         else:
             os.environ.pop("FUSION_GUARD_SOCK", None)
+
+
+def test_execution_result_cancelled_field_default_false(
+    executor: FusionSandboxExecutor,
+):
+    # Issue #32: ExecutionResult.cancelled 默认 False, 正常 run 不置 true。
+    r = executor.run("echo nocancel", enable_rollback_snapshot=False)
+    assert r.exit_code == 0
+    assert r.cancelled is False, "非 cancel 路径 cancelled 应 False"
+    assert "nocancel" in r.stdout
+
+
+def test_execution_result_cancelled_field_in_extra_forbid_rejects():
+    # _STRICT extra=forbid: cancelled 已是合法字段, Pydantic 接受; 未知字段仍拒。
+    from pydantic import ValidationError
+
+    r = ExecutionResult(exit_code=0, cancelled=True)
+    assert r.cancelled is True
+    with pytest.raises(ValidationError):
+        ExecutionResult(exit_code=0, bogus_field=1)  # type: ignore[call-arg]
+
+
+def test_cancel_stream_unknown_id_over_uds(uds_server: str):
+    # Issue #32: cancel 未知 stream_id → False (best-effort, 不抛)。
+    ex = FusionSandboxExecutor(allow_inline_interpreter=True)
+    ok = ex.cancel_stream(99999, sock_path=uds_server)
+    assert ok is False, "未知 stream_id 应返 False"
+
+
+def test_cancel_stream_kills_inflight_over_uds(uds_server: str, tmp_path):
+    # Issue #32: 长跑 execute_stream + cancel_stream → Done exit_code -1 + cancelled true。
+    # 用原生 UDS 客户端发 execute_stream (id=51) 并读流, 另发 cancel — 因 run_streaming 是
+    # in-process 路径 (不经 serve), 此测走原生 UDS 验证 serve 侧 cancel。
+    import socket
+
+    script = tmp_path / "spin.py"
+    script.write_text("while True:\n    pass\n")
+    path = uds_server
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    sock.settimeout(12.0)
+    req = {
+        "jsonrpc": "2.0",
+        "id": 51,
+        "method": "executor.execute_stream",
+        "params": {
+            "command": f"python3 {script}",
+            "enable_rollback_snapshot": False,
+            "timeout_sec": 120,
+        },
+    }
+    sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+    # 等流启动
+    import time
+
+    time.sleep(0.6)
+    # cancel 走 wrapper (同 socket path, 跨连接 StreamRegistry 共享)
+    ex = FusionSandboxExecutor(allow_inline_interpreter=True)
+    ok = ex.cancel_stream(51, sock_path=path)
+    assert ok is True, "应找到 in-flight 流 id=51 并下发 cancel"
+    # 读 done 帧
+    buf = b""
+    done = None
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        while b"\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        if b"\n" not in buf:
+            break
+        line, buf = buf.split(b"\n", 1)
+        line = line.decode("utf-8").strip()
+        if not line:
+            continue
+        v = json.loads(line)
+        if v.get("id") != 51:
+            continue
+        if v.get("result", {}).get("type") == "done":
+            done = v["result"]["result"]
+            break
+    sock.close()
+    assert done is not None, "Issue #32: 应收到 done 帧"
+    assert done["exit_code"] == -1, "Issue #32: cancel done exit_code 应 -1"
+    assert done["cancelled"] is True, "Issue #32: cancelled 应透传 true"

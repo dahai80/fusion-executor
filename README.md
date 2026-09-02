@@ -6,7 +6,7 @@ Controlled execution sandbox + macOS OS-level control hub. Runs shell commands s
 
 Rust core + PyO3/maturin Python bindings. First maturin/PyO3 project in the Fusion monorepo (the other 23 Python projects use setuptools).
 
-**Status: v0.2.4 released** — security + sandbox + diagnostics slicer + Git rollback + UDS JSON-RPC IPC service + macOS GUI (AXUIElement + CoreGraphics + CGEvent key synthesis + modifier combos + scroll/drag/wait + double_click/right_click/hover + window control close/minimize/zoom/resize) + live stdio streaming (NDJSON chunk/done) + screenshot width/height metadata + native file tools (file_edit/glob/grep — native replacement for Claude SDK FileEdit/Glob/Grep) + surgical patch engine (Unified Diff apply + function-level replace, full-rewrite forbidden) + Data Schema §4.1 backfill (task_id/command/duration_sec) + auto-rollback (FR-04 optional policy, git-status damage detection triggers) + live telemetry (10Hz CPU/mem UDS broadcast, GPU caller-injected) + macOS seatbelt runtime sandbox (sandbox-exec, deny network + 13 dangerous binaries) + cross-node rollback registry (FNV-1a repo identifier) + bidirectional IPC server-push (BroadcastHub three-channel telemetry/stdio/screenshot, per-sub scope isolation) + Pydantic strict schema (extra=forbid). Diagnostics slicer covers 8 languages (Python/TS/Node/Bun/Rust/Go-panic/Swift/Go-compile). 18 GuiAction variants, 0 hand-written unsafe blocks outside the audited fe-gui scope. glob/grep ripgrep parity (#7): three grep output modes (content/files_with_matches/count), -A/-B/-C context lines, multiline (-U), -g glob include/exclude, gitignore-aware glob walk. Enterprise hardening (v0.2.1–v0.2.3): ShellRegistry moved out of stateless Executor (M-ARCH-1) + structured JSON logging with daily-rolling file + stderr tee + SIGHUP hot-reload (log level + whitelist extras) + Prometheus metrics export over UDS (no HTTP port) + cross-layer trace_id + logging spans + glob E1 spec alignment (#20, `*` not crossing `/`, `**` crossing dirs). **v0.2.4 enterprise-publishable upgrade**: product-readiness audit (`audit/fusion-executor-audit-result-product-0827.md`, 6 real CRITICAL + 33 MAJOR/MINOR + D3-1 inline-interpreter gateway) all landed across 16 batches on branch `fix/enterprise-upgrade-0828` — seatbelt default True (4-layer aligned) + resolved-path whitelist (trusted bin dirs, rejects same-name poisoning) + per-task RSS watchdog (OOM kill, Darwin RLIMIT_AS no-op) + rlimit NOFILE/NPROC + ppid-tree kill (no setsid escape) + git timeout + RepoLock non-async + worktree gitdir + stream/exec semaphore split + prompt-injection sanitize + default bundle allowlist + screenshot Screen-Recording TCC split + child-pid telemetry + default socket `~/.fusion-executor/fe.sock` + Subscription crash marker + inline-interpreter gateway (`python -c`/`node -e` blocked by default, opt-in for trusted-caller) + D4 perf (LazyLock profile cache, 16KB reads, broadcast fast-path, worker clamp) + fe-pyo3 first Rust unit tests. **476 Rust + 195 Python tests green; clippy `--all-targets -D warnings` clean; fmt/ruff clean; maturin builds.** Four audit passes all defects fixed — defect audit (T1–T9, 68 defects) + commercial-grade integration audit (11 Blockers + 13 MAJOR/MINOR, FAIL → PASS) + enterprise audit (10 CRITICAL + 15 MAJOR + 12 MINOR, all landed) + adversarial hardening pass (0827: 18 CRITICAL + 18 LOGIC-BUG + 12 ARCHITECTURE + 7 PERFORMANCE + 12 MAINTAINABILITY = 67 findings, all P0-P3 landed) + product-readiness audit (0827-product: 6 CRITICAL + 33 MAJOR/MINOR, enterprise-publishable). See `examples/` for runnable demos and `docs/INDEX.md` for the documentation map.
+**Status: v0.2.7 released** — controlled execution sandbox (Security Guard + PTY/stdio sandbox + Git rollback + Diagnostics Slicer for 8 languages) + macOS OS-level control hub (Computer Use via Accessibility API + CoreGraphics + CGEvent synthesis: 18 GuiAction variants) + UDS JSON-RPC IPC service + live stdio streaming + native file tools (file_edit/glob/grep/write_file/multi_edit/notebook_edit + surgical patch engine) + background shells + auto-rollback + live telemetry + bidirectional server-push + macOS seatbelt + fusion-guard zero-trust authorization (Phase 3, default OFF) + server-side deterministic cancel of in-flight streams (Issue #32). Four audit passes all defects fixed; 500 Rust + 210 Python tests green; clippy `--all-targets -D warnings` clean; fmt/ruff clean; maturin builds. See `examples/` for runnable demos and `docs/INDEX.md` for the documentation map.
 
 ## Architecture
 
@@ -227,6 +227,38 @@ Frame format (`ExecutionStreamEvent`, serde tag="type"):
 - done: `{"type":"done", exit_code:..., stdout:..., diagnostics:...}` (ExecutionResult fields flattened into the same object, not nested)
 
 Blocked (security violation) → only a single done frame, no chunks. Timeout → done frame `timed_out=True, exit_code=-124`. Failing command → done frame includes `diagnostics`.
+
+## Server-Side Cancel (v0.2.7 — Issue #32)
+
+Cancel an in-flight `execute_stream` from the server side with a **deterministic** process-tree kill — not a cooperative "please stop" request. Built for clients (e.g. fusion-code) to abort a runaway long-running command without leaving orphan processes.
+
+`cancel_stream(stream_id)` opens a fresh UDS connection and sends `executor.cancel {id}`, where `stream_id` is the JSON-RPC request id of the `execute_stream` call. The server resolves the in-flight stream, fires an oneshot that fe-sandbox's `run_streaming` `tokio::select!` is waiting on, then runs `kill_process_group_async` (SIGINT → 500ms grace → SIGKILL of the whole process group, plus a ppid-tree descendant walk to catch `setsid` orphans). The original stream connection receives the terminal Done frame with `exit_code: -1` and `cancelled: true`.
+
+```python
+import socket, json
+from fusion_executor import FusionSandboxExecutor, ExecutionResult
+
+ex = FusionSandboxExecutor(allow_inline_interpreter=True)
+ex.serve()  # background, or run in another process; socket at ~/.fusion-executor/fe.sock
+
+# Launch a long-running stream (id = 51) over a raw UDS socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(ex._sock_path)
+sock.sendall((json.dumps({
+    "jsonrpc": "2.0", "id": 51, "method": "executor.execute_stream",
+    "params": {"command": "python3 -c 'import time; time.sleep(1000)'",
+               "enable_rollback_snapshot": False, "timeout_sec": 120},
+}) + "\n").encode())
+
+# ...later, abort it:
+ok = ex.cancel_stream(51)        # → True (found + cancelled)
+# read the Done frame on `sock`: exit_code=-1, cancelled=True
+```
+
+- Cancel is **cross-connection**: a second connection can cancel a stream started on another connection (the `StreamRegistry` is shared across the whole server). The client keeps the execute_stream connection open to read the terminal Done frame.
+- Unknown `stream_id` → returns `False` (best-effort, no exception).
+- The in-process `run_streaming()` path (no `serve()` running) is never cancellable — cancel only applies to streams served over UDS.
+- `ExecutionResult.cancelled: bool` is `False` on every non-cancel path; `True` only when a cancel actually fired.
 
 ## Auto-rollback (v1.4 — FR-04 optional policy)
 

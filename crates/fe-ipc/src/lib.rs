@@ -797,12 +797,79 @@ fn notification(sub_id: String, channel: &str, data: Value) -> Value {
 
 /// IPC 服务器 — 持有 Arc<Executor> + Arc<BroadcastHub> + Arc<ShellRegistry>,
 /// 换行分隔 JSON-RPC 2.0 over UDS。
+/// Issue #32: in-flight 流式执行注册表 — M-ARCH-1 同 ShellRegistry/BroadcastHub, 状态在 IPC 层,
+/// Executor 保持 per-task 无状态。key = JSON-RPC 请求 id 的字符串形式 (execute_stream 的 id),
+/// value = oneshot::Sender<()>。executor.cancel {id} 查表 send(()) → fe-sandbox kill 进程树。
+/// 流结束 (正常 Done / 消费者断开) 后 deregister, 防泄漏。
+pub struct StreamRegistry {
+    entries: Mutex<HashMap<String, oneshot::Sender<()>>>,
+}
+
+impl StreamRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for StreamRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamRegistry {
+    /// 注册一个 in-flight 流 — 返回 cancel_rx 传给 execute_streaming。
+    /// id 重复 (同连接同 id 复用) → 旧 Sender drop (其 rx 返 Err, 不影响旧流), 新覆盖。
+    pub fn register(&self, id: String) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel::<()>();
+        let mut map = self.entries.lock().expect("StreamRegistry 锁中毒");
+        if map.contains_key(&id) {
+            warn!(stream_id = %id, "流 id 重复, 覆盖旧 cancel Sender (旧流不受影响)");
+        }
+        map.insert(id, tx);
+        rx
+    }
+
+    /// 取消一个 in-flight 流 — 返回 true 若找到并 send 成功, false 若 id 不存在 (已结束或未知)。
+    pub fn cancel(&self, id: &str) -> bool {
+        let tx = {
+            let mut map = self.entries.lock().expect("StreamRegistry 锁中毒");
+            map.remove(id)
+        };
+        match tx {
+            Some(tx) => {
+                if tx.send(()).is_ok() {
+                    info!(stream_id = %id, "cancel 已下发 (Issue #32)");
+                    true
+                } else {
+                    // rx 已 drop (流刚结束) — send Err, 视为未取消
+                    info!(stream_id = %id, "cancel 找到但流已结束 (rx drop)");
+                    false
+                }
+            }
+            None => {
+                info!(stream_id = %id, "cancel 未找到 id (已结束或未知)");
+                false
+            }
+        }
+    }
+
+    /// 流结束后注销 — 防泄漏 (Done/断开后清表)。幂等。
+    pub fn deregister(&self, id: &str) {
+        let mut map = self.entries.lock().expect("StreamRegistry 锁中毒");
+        map.remove(id);
+    }
+}
+
 /// M-ARCH-1: ShellRegistry 移此层 (与 BroadcastHub 并列) — Executor 保持 per-task 无状态;
 /// IPC 层重启 Executor 不丢后台 shell 句柄; serve-path 与 in-process path 可共享同一 registry。
 pub struct IpcServer {
     executor: Arc<Executor>,
     hub: Arc<BroadcastHub>,
     shells: Arc<fe_core::shell::ShellRegistry>,
+    streams: Arc<StreamRegistry>,
 }
 
 impl IpcServer {
@@ -811,10 +878,12 @@ impl IpcServer {
         let executor = Arc::new(Executor::new());
         let hub = BroadcastHub::new(executor.clone());
         let shells = Arc::new(fe_core::shell::ShellRegistry::new());
+        let streams = Arc::new(StreamRegistry::new());
         Self {
             executor,
             hub,
             shells,
+            streams,
         }
     }
 
@@ -823,10 +892,12 @@ impl IpcServer {
         let executor = Arc::new(executor);
         let hub = BroadcastHub::new(executor.clone());
         let shells = Arc::new(fe_core::shell::ShellRegistry::new());
+        let streams = Arc::new(StreamRegistry::new());
         Self {
             executor,
             hub,
             shells,
+            streams,
         }
     }
 
@@ -838,10 +909,12 @@ impl IpcServer {
         info!("IpcServer::with_executor_and_shells() — 共享 ShellRegistry");
         let executor = Arc::new(executor);
         let hub = BroadcastHub::new(executor.clone());
+        let streams = Arc::new(StreamRegistry::new());
         Self {
             executor,
             hub,
             shells,
+            streams,
         }
     }
 
@@ -855,16 +928,23 @@ impl IpcServer {
     ) -> Self {
         info!("IpcServer::with_executor_arc_and_shells() — 共享 Executor Arc + ShellRegistry");
         let hub = BroadcastHub::new(executor.clone());
+        let streams = Arc::new(StreamRegistry::new());
         Self {
             executor,
             hub,
             shells,
+            streams,
         }
     }
 
     /// M-ARCH-1: 暴露 registry 引用 (health probe / dispatch 取用)。
     pub fn shells(&self) -> &Arc<fe_core::shell::ShellRegistry> {
         &self.shells
+    }
+
+    /// Issue #32: 暴露 StreamRegistry 引用 (serve 路径线程 accept_loop/handle_conn)。
+    pub fn streams(&self) -> &Arc<StreamRegistry> {
+        &self.streams
     }
 
     /// 解析 socket 路径 — 参数覆盖 > 环境变量 FUSION_EXECUTOR_SOCK > 默认
@@ -953,12 +1033,22 @@ impl IpcServer {
         let executor = self.executor.clone();
         let hub = self.hub.clone();
         let shells = self.shells.clone();
+        let streams = self.streams.clone();
         // m-OPS-02: SIGHUP 配置热重载任务 — 与 accept_loop 并行, 退出时 abort
         let sighup_task = tokio::spawn(handle_sighup_reload(executor.clone()));
         // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
         let drain_deadline = resolve_shutdown_timeout();
         let join = tokio::spawn(async move {
-            accept_loop(listener, executor, hub, shells, shutdown_rx, drain_deadline).await;
+            accept_loop(
+                listener,
+                executor,
+                hub,
+                shells,
+                streams,
+                shutdown_rx,
+                drain_deadline,
+            )
+            .await;
             sighup_task.abort();
             let _ = std::fs::remove_file(&path);
         });
@@ -976,6 +1066,7 @@ impl IpcServer {
         let executor = self.executor.clone();
         let hub = self.hub.clone();
         let shells = self.shells.clone();
+        let streams = self.streams.clone();
         fe_core::BLOCKING_RT.block_on(async move {
             let p = Path::new(&path).to_path_buf();
             ensure_sock_dir(&p)?;
@@ -995,7 +1086,7 @@ impl IpcServer {
             // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
             let drain_deadline = resolve_shutdown_timeout();
             // accept_loop 运行至 shutdown_notify (信号) 或 shutdown_rx 触发, 内部 drain in-flight
-            accept_loop(listener, executor, hub, shells, rx, drain_deadline).await;
+            accept_loop(listener, executor, hub, shells, streams, rx, drain_deadline).await;
             signal_task.abort();
             sighup_task.abort();
             let _ = std::fs::remove_file(&p);
@@ -1114,6 +1205,7 @@ async fn accept_loop(
     executor: Arc<Executor>,
     hub: Arc<BroadcastHub>,
     shells: Arc<fe_core::shell::ShellRegistry>,
+    streams: Arc<StreamRegistry>,
     mut shutdown_rx: oneshot::Receiver<()>,
     drain_deadline: Duration,
 ) {
@@ -1155,10 +1247,11 @@ async fn accept_loop(
                         let ex = executor.clone();
                         let h = hub.clone();
                         let sh = shells.clone();
+                        let st = streams.clone();
                         let es = exec_sem.clone();
                         let ss = stream_sem.clone();
                         let handle = tokio::spawn(async move {
-                            handle_conn(stream, ex, h, sh, es, ss).await;
+                            handle_conn(stream, ex, h, sh, st, es, ss).await;
                             drop(permit);
                         });
                         conns.lock().await.push(handle);
@@ -1246,6 +1339,7 @@ async fn handle_conn(
     executor: Arc<Executor>,
     hub: Arc<BroadcastHub>,
     shells: Arc<fe_core::shell::ShellRegistry>,
+    streams: Arc<StreamRegistry>,
     exec_sem: Arc<Semaphore>,
     stream_sem: Arc<Semaphore>,
 ) {
@@ -1300,6 +1394,7 @@ async fn handle_conn(
     let read_hub = hub.clone();
     let read_exec = executor.clone();
     let read_shells = shells.clone();
+    let read_streams = streams.clone();
     let read_push_tx = push_tx.clone();
     let read_writer = writer.clone();
     let read_close = close_tx;
@@ -1357,12 +1452,13 @@ async fn handle_conn(
         let ex = read_exec.clone();
         let h = read_hub.clone();
         let sh = read_shells.clone();
+        let st = read_streams.clone();
         let ptx = read_push_tx.clone();
         let es = exec_sem.clone();
         let ss = stream_sem.clone();
         let handle = tokio::spawn(async move {
             dispatch_request(
-                &w, req_id, method, params, &ex, &h, &sh, conn_id, &ptx, &es, &ss,
+                &w, req_id, method, params, &ex, &h, &sh, &st, conn_id, &ptx, &es, &ss,
             )
             .await;
         });
@@ -1388,17 +1484,24 @@ async fn dispatch_request(
     executor: &Arc<Executor>,
     hub: &Arc<BroadcastHub>,
     shells: &Arc<fe_core::shell::ShellRegistry>,
+    streams: &Arc<StreamRegistry>,
     conn_id: u64,
     push_tx: &mpsc::Sender<Value>,
     exec_sem: &Arc<Semaphore>,
     stream_sem: &Arc<Semaphore>,
 ) {
     if method == "executor.execute_stream" {
-        if let Err(e) =
-            handle_execute_stream(writer, id, params, executor, hub, conn_id, stream_sem).await
+        if let Err(e) = handle_execute_stream(
+            writer, id, params, executor, hub, streams, conn_id, stream_sem,
+        )
+        .await
         {
             warn!(error = %e, "execute_stream 写帧失败");
         }
+        return;
+    }
+    if method == "executor.cancel" {
+        handle_cancel(writer, id, params, streams).await;
         return;
     }
     if method == "executor.telemetry_stream" {
@@ -1604,12 +1707,14 @@ async fn write_line(writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>, 
 /// v1.5 #14: chunk/done 同时广播给 stdio 订阅 (跨连接 fan-out)。
 /// chunk: {"jsonrpc":"2.0","id":id,"result":{"type":"chunk","data":"..."}}
 /// done:  {"jsonrpc":"2.0","id":id,"result":{"type":"done","result":{...ExecutionResult}}}
+#[allow(clippy::too_many_arguments)]
 async fn handle_execute_stream(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
     id: Value,
     params: Value,
     executor: &Arc<Executor>,
     hub: &Arc<BroadcastHub>,
+    streams: &Arc<StreamRegistry>,
     conn_id: u64,
     stream_sem: &Arc<Semaphore>,
 ) -> Result<()> {
@@ -1634,9 +1739,14 @@ async fn handle_execute_stream(
         .acquire()
         .await
         .map_err(|e| anyhow::anyhow!("stream_sem 已关闭: {e}"))?;
-    let (mut rx, handle) = match executor.execute_streaming(req).await {
+    // Issue #32: 注册 in-flight 流 — cancel_rx 传给 execute_streaming。
+    // id 字符串化作 StreamRegistry key (executor.cancel {id} 查表)。流结束 deregister。
+    let stream_id = id.to_string();
+    let cancel_rx = streams.register(stream_id.clone());
+    let (mut rx, handle) = match executor.execute_streaming(req, Some(cancel_rx)).await {
         Ok(p) => p,
         Err(e) => {
+            streams.deregister(&stream_id);
             let frame = serde_json::to_string(&err_resp(
                 id,
                 ERR_INTERNAL,
@@ -1681,7 +1791,31 @@ async fn handle_execute_stream(
         }
     }
     let _ = handle.await;
+    streams.deregister(&stream_id);
     Ok(())
+}
+
+/// Issue #32: executor.cancel — 服务端确定性 kill in-flight 流的进程树。
+/// params: {id: <JSON-RPC id>} — id 须与 execute_stream 的请求 id 一致 (StreamRegistry key)。
+/// 响应: {ok: true, cancelled: true} 若找到并下发 cancel; {ok: false, cancelled: false} 若 id 不存在
+/// (已结束或未知)。cancel = 本地确定性 kill 进程树 (非协作停止请求) — 下发后 fe-sandbox SIGINT→
+/// SIGKILL 进程组, Done 帧 exit_code -1 + cancelled true。调用方 best-effort: cancel 发出后仍应读 done 帧。
+async fn handle_cancel(
+    writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
+    id: Value,
+    params: Value,
+    streams: &Arc<StreamRegistry>,
+) {
+    // id 可为 number/string/null — 与 StreamRegistry key (id.to_string()) 对齐。
+    let target = params.get("id").cloned().unwrap_or(Value::Null);
+    let target_str = target.to_string();
+    let cancelled = streams.cancel(&target_str);
+    let resp = ok_resp(id, json!({ "ok": cancelled, "cancelled": cancelled }));
+    let frame = serde_json::to_string(&resp)
+        .unwrap_or_else(|_| err_str(Value::Null, ERR_INTERNAL, "cancel 响应序列化失败"))
+        + "\n";
+    let mut w = writer.lock().await;
+    let _ = w.write_all(frame.as_bytes()).await;
 }
 
 /// 实时遥测流 (请求发起, 非 subscribe) — 逐帧写出 TelemetrySample, 共用 id。
@@ -4165,6 +4299,104 @@ mod tests {
         assert!(
             msg.contains("already in use") || msg.contains("FATAL"),
             "D6-05: 错误消息应含 already in use/FATAL 关键词, 实际: {msg}"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // ── Issue #32: server-side cancel (deterministic kill) ──
+
+    /// execute_stream 长跑任务 + 同连接 executor.cancel → Done 帧 exit_code -1 + cancelled true。
+    /// 多路复用: read_task 每请求 spawn, 同连接 cancel 帧与 stream 帧交错写共享 writer。
+    #[tokio::test]
+    async fn issue32_cancel_inflight_stream_kills_process_over_uds() {
+        let sock = tmp_sock("cancel-stream");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let mut s = UnixStream::connect(&sock).await.unwrap();
+        // python3 白名单, 非内联 (脚本路径) 过 D3-1 网关; seatbelt 默认 true 但 macOS 上
+        // 非 seatbelt 退化为 rlimit, 仍能跑。长跑防自然退出抢在 cancel 前。
+        let script = std::env::temp_dir().join(format!("fe-cancel-{}.py", std::process::id()));
+        std::fs::write(&script, b"while True:\n    pass\n").unwrap();
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"executor.execute_stream","params":{{"command":"python3 {script}","enable_rollback_snapshot":false,"timeout_sec":120}}}}"#,
+            script = script.display()
+        );
+        s.write_all((req + "\n").as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(s);
+        // 等流启动 (读首 chunk 或确定 spawn 已跑): sleep 500ms 后发 cancel。
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // cancel 须同连接发送 — reader 已占用读侧, 但写侧仍可用? BufReader 包装了 s 的所有权。
+        // 故改: 用第二个连接发 cancel (cancel 跨连接生效, StreamRegistry 全 server 共享)。
+        let cancel_resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":99,"method":"executor.cancel","params":{"id":5}}"#,
+        )
+        .await;
+        assert_eq!(cancel_resp["id"], 99, "cancel 响应带请求 id");
+        assert_eq!(
+            cancel_resp["result"]["ok"], true,
+            "应找到 in-flight 流 id=5"
+        );
+        assert_eq!(
+            cancel_resp["result"]["cancelled"], true,
+            "cancel 应下发成功"
+        );
+        // 读 stream 的 done 帧 — cancel 后进程树被 kill, done exit_code -1 + cancelled true。
+        let mut buf = Vec::new();
+        let mut done: Option<Value> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            buf.clear();
+            let read_fut = reader.read_until(b'\n', &mut buf);
+            let n = match tokio::time::timeout_at(deadline, read_fut).await {
+                Ok(n) => n.unwrap_or(0),
+                Err(_) => break, // 超时兜底, 避测试挂死
+            };
+            if n == 0 {
+                break;
+            }
+            let line = String::from_utf8_lossy(&buf).trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["id"] != 5 {
+                continue;
+            }
+            if v["result"]["type"].as_str().unwrap_or("") == "done" {
+                done = Some(v);
+                break;
+            }
+        }
+        let done = done.expect("Issue #32: 应收到 done 帧");
+        assert_eq!(
+            done["result"]["result"]["exit_code"], -1,
+            "Issue #32: cancel done exit_code 应为 -1"
+        );
+        assert_eq!(
+            done["result"]["result"]["cancelled"], true,
+            "Issue #32: cancelled 应透传 true"
+        );
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// cancel 未知 id → {ok:false, cancelled:false}, 不崩。
+    #[tokio::test]
+    async fn issue32_cancel_unknown_id_returns_false() {
+        let sock = tmp_sock("cancel-unknown");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let resp = rpc(
+            &sock,
+            r#"{"jsonrpc":"2.0","id":8,"method":"executor.cancel","params":{"id":9999}}"#,
+        )
+        .await;
+        assert_eq!(resp["id"], 8);
+        assert_eq!(resp["result"]["ok"], false, "未知 id 应 ok false");
+        assert_eq!(
+            resp["result"]["cancelled"], false,
+            "未知 id 应 cancelled false"
         );
         let _ = std::fs::remove_file(&sock);
     }

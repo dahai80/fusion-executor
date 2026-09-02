@@ -767,6 +767,39 @@ class FusionSandboxExecutor:
         finally:
             sock.close()
 
+    def cancel_stream(self, stream_id, *, sock_path: str | None = None) -> bool:
+        # Issue #32: 服务端确定性 cancel — 向运行中的 serve() 发 executor.cancel {id},
+        # 下发后 fe-sandbox SIGINT→SIGKILL 进程树 (非协作停止), 对应 execute_stream 的 Done 帧
+        # exit_code -1 + cancelled true。stream_id = execute_stream 的 JSON-RPC 请求 id
+        # (融合 fusion-code 客户端契约)。best-effort: 已结束/未知 id → False, 不抛。
+        path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
+        req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "executor.cancel",
+            "params": {"id": stream_id},
+        }
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
+        try:
+            sock.connect(path)
+            sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0].decode("utf-8").strip()
+            resp = json.loads(line) if line else {}
+            if "error" in resp:
+                raise RuntimeError(f"cancel_stream 失败: {resp['error']}")
+            ok = bool(resp.get("result", {}).get("cancelled", False))
+            logger.info("cancel_stream id=%s cancelled=%s", stream_id, ok)
+            return ok
+        finally:
+            sock.close()
+
     def serve(self, sock_path: str | None = None) -> None:
         # C-PYO3-02: 旧版裸 self._native.serve() — fe-pyo3 serve_blocking 无 shutdown
         # 句柄, SIGINT/SIGTERM 不解 socket 残留。改信号处理 + try/finally 清理:

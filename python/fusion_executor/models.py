@@ -119,6 +119,11 @@ class ExecutionResult(BaseModel):
         description="guard 授权裁决 action_id (Issue #23 Phase 3) — guard 判 Block/L3 时返, "
         "供调用方审计/人工 confirm 回路; guard OFF 或 Allow/L1/L2 时 None",
     )
+    cancelled: bool = Field(
+        default=False,
+        description="服务端确定性 cancel 标记 (Issue #32) — executor.cancel 下发后 fe-sandbox "
+        "SIGINT→SIGKILL 进程组, Done 帧 exit_code -1 + cancelled true; 非 cancel 路径 False",
+    )
 
 
 class GuiResult(BaseModel):
