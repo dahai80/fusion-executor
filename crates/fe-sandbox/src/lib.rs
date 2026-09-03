@@ -1001,22 +1001,54 @@ pub fn truncate_output(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    // 一次遍历取所有 char 的字节起点偏移 — 单 Vec<usize> (N*8 字节) 远小于 Vec<char> (N*4)
-    // 但 char_indices 已逐 char 产出, 峰值 = 偏移表; 全量 ASCII 64MB → 512MB 偏移表仍大。
-    // 故仅取需要的 3 个边界偏移 (head 尾, tail 头, total), 不存全表。
-    let total_chars = s.chars().count();
+    // D4-perf-fix: 单次 char_indices 遍历收集 total_chars + head_end_byte (第 HEAD_CHARS 个 char
+    // 的字节偏移) + tail_start_byte (倒数第 TAIL_CHARS 个 char 的字节偏移, 用环形缓冲只留末
+    // TAIL_CHARS+1 个偏移)。取代旧版 4 趟 O(n) 扫描 (chars().count + 2× nth_char_byte_offset +
+    // out.chars().count)。环形缓冲 = (TAIL_CHARS+1)*8 字节 ≈ 65KB, 远小于全偏移表。
+    let mut total_chars: usize = 0;
+    let mut head_end_byte: Option<usize> = None;
+    // 环形缓冲: 末 (TAIL_CHARS+1) 个 char 的字节起始偏移, 容量固定 TAIL_CHARS+1
+    let cap = TAIL_CHARS + 1;
+    let mut ring: Vec<usize> = Vec::with_capacity(cap);
+    for (i, _) in s.char_indices() {
+        if head_end_byte.is_none() && total_chars == HEAD_CHARS {
+            head_end_byte = Some(i);
+        }
+        if ring.len() == cap {
+            ring.remove(0);
+        }
+        ring.push(i);
+        total_chars += 1;
+    }
     if total_chars <= max {
         return s.to_string();
     }
+    // ring 现含末 cap 个 char 的偏移; ring[0] = 倒数第 min(cap,total) 个 char 的字节起点。
+    // tail_start = 第 (total - TAIL_CHARS) 个 char 的偏移 = ring 中倒数第 TAIL_CHARS 个的前一个,
+    // 即 ring[len - TAIL_CHARS - 1] (当 total > TAIL_CHARS)。
+    let tail_start_byte = if total_chars > TAIL_CHARS {
+        ring[ring.len() - TAIL_CHARS - 1]
+    } else {
+        0
+    };
     if max <= HEAD_CHARS + TAIL_CHARS {
         // 极小上限: 只保留尾部 max 个 char — 找第 (total-max) 个 char 的字节偏移
         let skip = total_chars.saturating_sub(max);
-        let byte_start = nth_char_byte_offset(s, skip);
+        let byte_start = if skip == 0 {
+            0
+        } else if skip >= total_chars {
+            s.len()
+        } else {
+            nth_char_byte_offset(s, skip)
+        };
         return s[byte_start..].to_string();
     }
-    let head_end_byte = nth_char_byte_offset(s, HEAD_CHARS);
-    let tail_start_char = total_chars - TAIL_CHARS;
-    let tail_start_byte = nth_char_byte_offset(s, tail_start_char);
+    let head_end_byte = head_end_byte.unwrap_or(s.len());
+    let tail_start_byte = if total_chars > TAIL_CHARS {
+        tail_start_byte
+    } else {
+        s.len()
+    };
     let dropped = total_chars - HEAD_CHARS - TAIL_CHARS;
     let out = format!(
         "{}\n[truncated {} chars]\n{}",
@@ -1024,10 +1056,21 @@ pub fn truncate_output(s: &str, max: usize) -> String {
         dropped,
         &s[tail_start_byte..]
     );
-    // L-SB-04: head+marker+tail 超 max 时回退 tail-only
-    if out.chars().count() > max {
+    // L-SB-04: head+marker+tail 超 max 时回退 tail-only。
+    // D4-perf-fix: 用算术算 out 的 char 数 (head_chars + marker_chars + tail_chars) 取代
+    // out.chars().count() 全量遍历。marker = "\n[truncated N chars]\n", 其 char 数 = 字节数
+    // (纯 ASCII), 跳过格式化再数。
+    let marker = format!("\n[truncated {} chars]\n", dropped);
+    let out_chars = HEAD_CHARS + marker.chars().count() + TAIL_CHARS.min(total_chars);
+    if out_chars > max {
         let skip = total_chars.saturating_sub(max);
-        let byte_start = nth_char_byte_offset(s, skip);
+        let byte_start = if skip == 0 {
+            0
+        } else if skip >= total_chars {
+            s.len()
+        } else {
+            nth_char_byte_offset(s, skip)
+        };
         return s[byte_start..].to_string();
     }
     out

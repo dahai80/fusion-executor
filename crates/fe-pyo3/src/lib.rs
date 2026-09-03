@@ -522,13 +522,25 @@ impl PyStreamIterator {
                 )));
             }
         };
-        // serde → JSON 字符串 → python json.loads → dict (与 gui_action 路径一致)
-        let json_str = serde_json::to_string(&ev)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("帧序列化失败: {e}")))?;
-        let obj = py
-            .import("json")?
-            .call_method1("loads", (json_str,))?
-            .unbind();
+        // Perf CRITICAL #2: 热路径 (Chunk 高频) 不走 serde→JSON 字符串→json.loads 往返
+        // (每帧全量 serialize+deserialize, 高帧率破 UDS <2ms NFR)。Chunk 直接构 PyDict;
+        // Done 冷路径 (一次, ~20 字段) 保 JSON 往返 (复用 ExecutionResult serde 形状, DRY)。
+        let obj: Py<PyAny> = match &ev {
+            ExecutionStreamEvent::Chunk { data } => {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item("type", "chunk")?;
+                d.set_item("data", data.clone())?;
+                d.into_any().unbind()
+            }
+            ExecutionStreamEvent::Done(_) => {
+                let json_str = serde_json::to_string(&ev).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("帧序列化失败: {e}"))
+                })?;
+                py.import("json")?
+                    .call_method1("loads", (json_str,))?
+                    .unbind()
+            }
+        };
         if matches!(ev, ExecutionStreamEvent::Done(_)) {
             self.saw_done = true;
             self.rx = None;
