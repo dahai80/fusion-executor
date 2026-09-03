@@ -102,6 +102,9 @@ pyo3 = { version = "0.29" }
 # 基准测试 (P5 dev-dep)
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# 属性测试 (ReDoS / tokenizer panic 搜寻, stable toolchain — cargo-fuzz 需 nightly 本机无)
+proptest = { version = "1" }
+
 # 内部 crate
 fe-core = { path = "crates/fe-core" }
 fe-security = { path = "crates/fe-security" }
