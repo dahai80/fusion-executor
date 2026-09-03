@@ -20,6 +20,8 @@ use fe_core::{
     Diagnostics as RsDiag, ExecutionRequest, ExecutionResult as RsResult, ExecutionStreamEvent,
     Executor, RollbackPolicy,
 };
+// Issue #34: 每命令 seatbelt profile (fe-core re-export fe_sandbox as sandbox)。
+use fe_core::sandbox::seatbelt::SandboxProfile;
 use fe_ipc::IpcServer;
 
 /// C-3: 流式迭代器 __next__ 每帧 recv 超时 (秒)。沙箱 timeout_sec 上限 DEFAULT_TIMEOUT_CAP_SEC=120s
@@ -729,7 +731,8 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None, max_nofile=None, rss_limit_mb=None, trace_id=None))]
+                        max_nproc=None, max_cpu_sec=None, max_nofile=None, rss_limit_mb=None,
+                        trace_id=None, sandbox=None))]
     fn execute_sync(
         &self,
         py: Python<'_>,
@@ -748,6 +751,7 @@ impl PyExecutor {
         max_nofile: Option<u32>,
         rss_limit_mb: Option<u32>,
         trace_id: Option<String>,
+        sandbox: Option<Bound<'_, PyAny>>,
     ) -> PyResult<PyExecutionResult> {
         // L-PYO3-02: policy 入参无效应 fail-loud (旧版 warn+None 静默吞错, 调用方以为开了回滚实则没开)
         let policy = match auto_rollback_policy {
@@ -766,6 +770,24 @@ impl PyExecutor {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "auto_rollback_policy 反序列化失败: {e}"
                     ))
+                })?
+            }),
+        };
+        // Issue #34: sandbox profile — PyAny → json.dumps → serde_json::from_str (同 auto_rollback_policy 模式)。
+        let sandbox_profile = match sandbox {
+            None => None,
+            Some(obj) => Some({
+                let json_str: String = py
+                    .import("json")
+                    .and_then(|json| json.call_method1("dumps", (&obj,)))
+                    .and_then(|s| s.extract::<String>())
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "sandbox 转 JSON 失败: {e}"
+                        ))
+                    })?;
+                serde_json::from_str::<SandboxProfile>(&json_str).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("sandbox 反序列化失败: {e}"))
                 })?
             }),
         };
@@ -788,6 +810,7 @@ impl PyExecutor {
             max_nofile: max_nofile.unwrap_or(1024),
             rss_limit_mb: rss_limit_mb.unwrap_or(2048),
             trace_id,
+            sandbox: sandbox_profile,
         };
         // M-PYO3-02: 内部错误 fail-loud (旧版伪造 exit_code=-1 ExecutionResult, 调用方无法区分
         // 安全拦截与 executor bug; execute 仅在 sandbox 内部异常返 Err, 应上抛)
@@ -926,7 +949,8 @@ impl PyExecutor {
     #[pyo3(signature = (command, task_id=None, cwd=None, timeout_sec=None, env_vars=None,
                         enable_rollback_snapshot=None, auto_rollback_policy=None,
                         seatbelt=None, inherit_env=None, use_pty=None,
-                        max_nproc=None, max_cpu_sec=None, max_nofile=None, rss_limit_mb=None, trace_id=None))]
+                        max_nproc=None, max_cpu_sec=None, max_nofile=None, rss_limit_mb=None,
+                        trace_id=None, sandbox=None))]
     fn execute_streaming(
         &self,
         py: Python<'_>,
@@ -945,6 +969,7 @@ impl PyExecutor {
         max_nofile: Option<u32>,
         rss_limit_mb: Option<u32>,
         trace_id: Option<String>,
+        sandbox: Option<Bound<'_, PyAny>>,
     ) -> PyResult<PyStreamIterator> {
         let policy = match auto_rollback_policy {
             None => None,
@@ -962,6 +987,24 @@ impl PyExecutor {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "auto_rollback_policy 反序列化失败: {e}"
                     ))
+                })?
+            }),
+        };
+        // Issue #34: sandbox profile (同 execute_sync 模式)。
+        let sandbox_profile = match sandbox {
+            None => None,
+            Some(obj) => Some({
+                let json_str: String = py
+                    .import("json")
+                    .and_then(|json| json.call_method1("dumps", (&obj,)))
+                    .and_then(|s| s.extract::<String>())
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "sandbox 转 JSON 失败: {e}"
+                        ))
+                    })?;
+                serde_json::from_str::<SandboxProfile>(&json_str).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("sandbox 反序列化失败: {e}"))
                 })?
             }),
         };
@@ -984,6 +1027,7 @@ impl PyExecutor {
             max_nofile: max_nofile.unwrap_or(1024),
             rss_limit_mb: rss_limit_mb.unwrap_or(2048),
             trace_id,
+            sandbox: sandbox_profile,
         }; // L-PYO3-01: execute_streaming async → 释 GIL 后在 BLOCKING_RT block_on (旧版持 GIL
            // 整个 spawn + 校验期间, 阻塞 Python 线程; detach 后 Python 可并发跑其他协程)
         let (rx, handle) = py

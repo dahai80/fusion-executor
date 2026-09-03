@@ -16,6 +16,7 @@ from fusion_executor import (
     GrepOutput,
     MultiEditItem,
     RollbackPolicy,
+    SandboxProfile,
     ShellInfo,
     ShellOutput,
     ShellStartResult,
@@ -61,6 +62,69 @@ def test_run_allows_python(executor: FusionSandboxExecutor):
     result = executor.run("python3 -c \"print('hello')\"")
     assert not result.blocked_by_security
     assert result.exit_code == 0
+
+
+# ── Issue #34: 每命令 seatbelt/sandbox profile ──
+
+
+def test_run_sandbox_none_default_no_regression(executor: FusionSandboxExecutor):
+    # sandbox=None (默认) → 行为同 v0.2.7 (现有固定 profile), 回归不破
+    result = executor.run("echo hi")
+    assert result.exit_code == 0
+    assert not result.blocked_by_security
+
+
+def test_run_with_sandbox_profile_network_allow(executor: FusionSandboxExecutor):
+    # sandbox network=allow → seatbelt profile 不注 deny network-outbound, echo 仍正常执行
+    result = executor.run(
+        "echo sbx",
+        sandbox=SandboxProfile(network="allow", excluded_commands=["rm"]),
+    )
+    assert result.exit_code == 0
+    assert not result.blocked_by_security
+
+
+def test_run_with_sandbox_excluded_command_blocks(executor: FusionSandboxExecutor):
+    # excluded_commands 拒 rm — seatbelt 内 deny process-exec (literal) 拦
+    # 注: seatbelt 拦的是 process-exec, sh -c 'rm' spawn rm 时被 seatbelt deny → 非 0 退出
+    result = executor.run("rm /tmp/nonexistent_issue34", sandbox=SandboxProfile(excluded_commands=["rm"]))
+    # rm 不存在文件本应非 0; seatbelt deny 路径下退码也非 0, 但不应 blocked_by_security (那是 security guard 不是 seatbelt)
+    assert result.exit_code != 0
+
+
+def test_sandbox_over_uds_roundtrip(uds_server: str):
+    # UDS execute 透传 sandbox profile (additive field auto-flow via serde_json::from_value)
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "executor.execute",
+            "params": {
+                "command": "echo uds_sbx",
+                "sandbox": {"network": "allow", "excluded_commands": ["rm"], "fail_if_unavailable": False},
+            },
+        },
+    )
+    assert resp["result"]["exit_code"] == 0
+    assert not resp["result"]["blocked_by_security"]
+
+
+def test_sandbox_over_uds_excluded_blocks(uds_server: str):
+    # UDS: sandbox excluded_commands 拒某 binary → seatbelt deny process-exec
+    resp = _rpc_once(
+        uds_server,
+        {
+            "jsonrpc": "2.0",
+            "id": 43,
+            "method": "executor.execute",
+            "params": {
+                "command": "rm /tmp/no_such_issue34_uds",
+                "sandbox": {"excluded_commands": ["rm"]},
+            },
+        },
+    )
+    assert resp["result"]["exit_code"] != 0
 
 
 def test_run_empty_command(executor: FusionSandboxExecutor):

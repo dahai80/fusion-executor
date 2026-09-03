@@ -188,6 +188,12 @@ pub struct ExecutionRequest {
     /// M-OPS-06: 跨层关联 id。None 时 execute 入口自动生成 uuid v4, 贯穿日志/IPC/结果。
     #[serde(default)]
     pub trace_id: Option<String>,
+    /// Issue #34: 每命令可配置 seatbelt/sandbox profile (网络/文件系统/排除命令)。
+    /// None → 现有固定 profile (默认禁网 + 敏感路径 file-write deny), 行为同 v0.2.7 (默认关, opt-in)。
+    /// Some → build_profile_from 按 profile 生成 seatbelt policy; fail_if_unavailable=true 且
+    /// sandbox-exec 不可用时 fail-closed 拦截 (exit -1, 不 spawn)。匹配 fusion-code SandboxSettings。
+    #[serde(default)]
+    pub sandbox: Option<fe_sandbox::seatbelt::SandboxProfile>,
 }
 
 fn default_use_pty() -> bool {
@@ -922,6 +928,22 @@ impl Executor {
                 Some(trace_id),
             ));
         }
+        // Issue #34: 每命令 sandbox profile fail-closed — 调用方请求定制 profile 且 fail_if_unavailable=true,
+        // 但 sandbox-exec 不在 PATH → 拒绝执行 (防静默降级到无 seatbelt)。req.seatbelt=false 时不触发
+        // (调用方显式 opt-out 沙箱, profile 字段对裸命令无意义, 仅 seatbelt 路径消费)。
+        if let Some(sp) = &req.sandbox {
+            if sp.fail_if_unavailable && !fe_sandbox::seatbelt::seatbelt_available() {
+                let reason =
+                    "请求 sandbox profile 但 sandbox-exec 不可用 (fail_if_unavailable fail-closed)";
+                warn!(%reason, command = %redact_command(&req.command), "sandbox profile 门控拦截");
+                return Ok(ExecutionResult::blocked_with(
+                    reason.to_string(),
+                    req.task_id.clone(),
+                    Some(req.command.clone()),
+                    Some(trace_id),
+                ));
+            }
+        }
         // cwd 校验
         if let Some(cwd) = &req.cwd {
             let cwd_v = self.security.validate_cwd(cwd);
@@ -1023,6 +1045,7 @@ impl Executor {
             max_cpu_sec: req.max_cpu_sec,
             max_nofile: req.max_nofile,
             rss_limit_mb: req.rss_limit_mb,
+            sandbox_profile: req.sandbox.clone(),
         };
         info!(
             seatbelt = req.seatbelt,
@@ -1162,6 +1185,27 @@ impl Executor {
             });
             return Ok((rx, handle));
         }
+        // Issue #34: sandbox profile fail-closed (streaming 同步路径)。
+        if let Some(sp) = &req.sandbox {
+            if sp.fail_if_unavailable && !fe_sandbox::seatbelt::seatbelt_available() {
+                let reason = "请求 sandbox profile 但 sandbox-exec 不可用 (fail_if_unavailable fail-closed, streaming)";
+                warn!(%reason, command = %redact_command(&req.command), "sandbox profile 门控拦截 (streaming)");
+                let (tx, rx) = mpsc::channel(8);
+                let handle = tokio::spawn(async move {
+                    let _ = tx
+                        .send(ExecutionStreamEvent::Done(Box::new(
+                            ExecutionResult::blocked_with(
+                                reason.to_string(),
+                                req.task_id.clone(),
+                                Some(req.command.clone()),
+                                Some(trace_id),
+                            ),
+                        )))
+                        .await;
+                });
+                return Ok((rx, handle));
+            }
+        }
         if let Some(cwd) = &req.cwd {
             let cwd_v = self.security.validate_cwd(cwd);
             if !cwd_v.allowed {
@@ -1261,6 +1305,7 @@ impl Executor {
             max_cpu_sec: req.max_cpu_sec,
             max_nofile: req.max_nofile,
             rss_limit_mb: req.rss_limit_mb,
+            sandbox_profile: req.sandbox.clone(),
         };
         info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg, cancel_rx)?;
@@ -1528,6 +1573,7 @@ mod tests {
                 max_nofile: 1024,
                 rss_limit_mb: default_rss_limit(),
                 trace_id: None,
+                sandbox: None,
             };
             let (mut rx, handle) = ex.execute_streaming(req, None).await.unwrap();
             let mut combined = String::new();
@@ -1567,6 +1613,7 @@ mod tests {
                 max_cpu_sec: 0,
                 max_nofile: 1024,
                 rss_limit_mb: default_rss_limit(),
+                sandbox: None,
                 trace_id: None,
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1599,6 +1646,7 @@ mod tests {
                 max_nofile: 1024,
                 rss_limit_mb: default_rss_limit(),
                 trace_id: Some("caller-tid-123".to_string()),
+                sandbox: None,
             };
             let r = ex.execute_async(req).await.unwrap();
             assert_eq!(r.trace_id.as_deref(), Some("caller-tid-123"));
@@ -1625,6 +1673,7 @@ mod tests {
                 max_cpu_sec: 0,
                 max_nofile: 1024,
                 rss_limit_mb: default_rss_limit(),
+                sandbox: None,
                 trace_id: Some("blk-tid".to_string()),
             };
             let r = ex.execute_async(req).await.unwrap();
@@ -1652,6 +1701,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                sandbox: None,
                 rss_limit_mb: default_rss_limit(),
                 trace_id: Some("stream-tid".to_string()),
             };
@@ -1686,6 +1736,7 @@ mod tests {
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
+                sandbox: None,
                 rss_limit_mb: default_rss_limit(),
                 trace_id: None,
             };
@@ -1723,6 +1774,7 @@ mod tests {
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
+                sandbox: None,
                 max_nofile: 1024,
                 rss_limit_mb: default_rss_limit(),
                 trace_id: None,
@@ -1757,6 +1809,7 @@ mod tests {
                 inherit_env: false,
                 use_pty: true,
                 max_nproc: 1024,
+                sandbox: None,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
                 rss_limit_mb: default_rss_limit(),
@@ -1794,6 +1847,7 @@ mod tests {
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
+                sandbox: None,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
                 max_nofile: 1024,
@@ -1866,6 +1920,7 @@ mod tests {
                 auto_rollback_policy: Some(RollbackPolicy::default()),
                 seatbelt: false,
                 inherit_env: false,
+                sandbox: None,
                 use_pty: true,
                 max_nproc: 1024,
                 max_cpu_sec: 0,
@@ -1899,6 +1954,7 @@ mod tests {
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: Some(RollbackPolicy::default()),
                 seatbelt: false,
+                sandbox: None,
                 inherit_env: false,
                 use_pty: true,
                 max_nproc: 1024,
@@ -1930,6 +1986,7 @@ mod tests {
                 env_vars: None,
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: None,
+                sandbox: None,
                 seatbelt: false,
                 inherit_env: false,
                 use_pty: true,
@@ -1977,6 +2034,7 @@ mod tests {
                 max_nofile: 1024,
                 rss_limit_mb: default_rss_limit(),
                 trace_id: None,
+                sandbox: None,
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
@@ -2010,6 +2068,7 @@ mod tests {
                 cwd: Some(cwd),
                 timeout_sec: 15.0,
                 env_vars: None,
+                sandbox: None,
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: Some(RollbackPolicy::default()),
                 seatbelt: false,
@@ -2116,6 +2175,7 @@ mod tests {
                 task_id: None,
                 cwd: Some(cwd.clone()),
                 timeout_sec: 15.0,
+                sandbox: None,
                 env_vars: None,
                 enable_rollback_snapshot: true,
                 auto_rollback_policy: Some(RollbackPolicy::default()),
@@ -2157,6 +2217,7 @@ mod tests {
                 command: cmd.to_string(),
                 task_id: None,
                 cwd: Some(cwd),
+                sandbox: None,
                 timeout_sec: 15.0,
                 env_vars: None,
                 enable_rollback_snapshot: true,

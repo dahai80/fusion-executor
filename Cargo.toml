@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -90,6 +90,9 @@ fs2 = "0.4"
 
 # 实时遥测 (fe-telemetry) — CPU/内存采样, GPU 由调用方注入
 sysinfo = "0.32"
+
+# Issue #34: seatbelt 可用性探活 — which::which 解析 sandbox-exec 在 PATH
+which = "7"
 
 # Python 绑定 (fe-pyo3) — 0.29 支持 Python 3.14
 # extension-module 由 maturin 通过 pyproject features=["pyo3/extension-module"] 注入;
