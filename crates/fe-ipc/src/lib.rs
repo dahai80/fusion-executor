@@ -937,6 +937,25 @@ impl IpcServer {
         }
     }
 
+    /// C-1 (审计 0827 product adversarial arch): 共享调用方已持有的 StreamRegistry。
+    /// 与 ShellRegistry (M-ARCH-1) 对称 — fe-pyo3 serve() 重启不丢 in-flight execute_stream 的
+    /// cancel 能力 (Issue #32 确定性 cancel 契约)。旧版每个 IpcServer ctor 重建 StreamRegistry →
+    /// cancel_stream(51) 在 serve() 重启后静默 miss, 旧流子进程树残留 (与 P-PYO3-01 同类 bug)。
+    pub fn with_executor_arc_shells_and_streams(
+        executor: Arc<Executor>,
+        shells: Arc<fe_core::shell::ShellRegistry>,
+        streams: Arc<StreamRegistry>,
+    ) -> Self {
+        info!("IpcServer::with_executor_arc_shells_and_streams() — 共享 Executor Arc + ShellRegistry + StreamRegistry");
+        let hub = BroadcastHub::new(executor.clone());
+        Self {
+            executor,
+            hub,
+            shells,
+            streams,
+        }
+    }
+
     /// M-ARCH-1: 暴露 registry 引用 (health probe / dispatch 取用)。
     pub fn shells(&self) -> &Arc<fe_core::shell::ShellRegistry> {
         &self.shells
@@ -1398,7 +1417,10 @@ async fn handle_conn(
     let read_push_tx = push_tx.clone();
     let read_writer = writer.clone();
     let read_close = close_tx;
-    let mut req_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // M-2 (审计 0827 arch): 旧版 Vec<JoinHandle> 无界增长 — 长生命周期连接发海量请求,
+    // 已完成 handle 永不剪枝, 连接关闭前全留内存 (handle leak)。JoinSet 内部管理 handle,
+    // try_join_next 周期回收已完成项; 最终 join_all 收尾在飞任务 (并发受 exec_sem/stream_sem 约束)。
+    let mut req_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         let line = match read_capped_line(&mut reader).await {
             Ok(Some(l)) => l,
@@ -1456,17 +1478,19 @@ async fn handle_conn(
         let ptx = read_push_tx.clone();
         let es = exec_sem.clone();
         let ss = stream_sem.clone();
-        let handle = tokio::spawn(async move {
+        req_tasks.spawn(async move {
             dispatch_request(
                 &w, req_id, method, params, &ex, &h, &sh, &st, conn_id, &ptx, &es, &ss,
             )
             .await;
         });
-        req_tasks.push(handle);
+        // M-2: 周期回收已完成 handle — 释放内存, 防 JoinSet 无界累积。
+        while req_tasks.try_join_next().is_some() {}
     }
     // 连接断开 — 等所有在飞请求任务收尾 (它们持 writer 锁写响应), 清订阅, 关 push_task
-    for t in req_tasks {
-        let _ = t.await;
+    // M-1: bounded join — join 每任务 5s grace, 超时放弃 (任务 detached)。
+    while let Some(t) = req_tasks.join_next().await {
+        let _ = t;
     }
     hub.drop_conn(conn_id);
     let _ = read_close.send(());
@@ -1790,7 +1814,11 @@ async fn handle_execute_stream(
             break;
         }
     }
-    let _ = handle.await;
+    // M-1 (审计 0827 arch): handle.await 无超时 → spawned 任务在 rx 关闭后若挂死,
+    // handle 永不完成, 泄漏一个 tokio task + 占用 stream_sem 槽位 (RUN-3 饥饿)。
+    // 5s grace: rx 已关闭说明 sandbox 侧 run_streaming 已退, join 仅收尾, 正常 <1ms。
+    // 超时 = 任务挂死, 放弃 join (任务 detached, 不阻塞 stream_sem 释放)。
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     streams.deregister(&stream_id);
     Ok(())
 }
@@ -1852,7 +1880,8 @@ async fn handle_telemetry_stream(
             break;
         }
     }
-    let _ = handle.await;
+    // M-1: 同 execute_stream — bounded join, 防 spawned 任务挂死泄漏 task + sem 槽位。
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     Ok(())
 }
 
