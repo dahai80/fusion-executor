@@ -6,7 +6,7 @@ Controlled execution sandbox + macOS OS-level control hub. Runs shell commands s
 
 Rust core + PyO3/maturin Python bindings. First maturin/PyO3 project in the Fusion monorepo (the other 23 Python projects use setuptools).
 
-**Status: v0.2.7 released** — controlled execution sandbox (Security Guard + PTY/stdio sandbox + Git rollback + Diagnostics Slicer for 8 languages) + macOS OS-level control hub (Computer Use via Accessibility API + CoreGraphics + CGEvent synthesis: 18 GuiAction variants) + UDS JSON-RPC IPC service + live stdio streaming + native file tools (file_edit/glob/grep/write_file/multi_edit/notebook_edit + surgical patch engine) + background shells + auto-rollback + live telemetry + bidirectional server-push + macOS seatbelt + fusion-guard zero-trust authorization (Phase 3, default OFF) + server-side deterministic cancel of in-flight streams (Issue #32). Four audit passes all defects fixed; 500 Rust + 210 Python tests green; clippy `--all-targets -D warnings` clean; fmt/ruff clean; maturin builds. See `examples/` for runnable demos and `docs/INDEX.md` for the documentation map.
+**Status: v0.2.8 released** — controlled execution sandbox (Security Guard + PTY/stdio sandbox + Git rollback + Diagnostics Slicer for 8 languages) + macOS OS-level control hub (Computer Use via Accessibility API + CoreGraphics + CGEvent synthesis: 18 GuiAction variants) + UDS JSON-RPC IPC service + live stdio streaming + native file tools (file_edit/glob/grep/write_file/multi_edit/notebook_edit + surgical patch engine) + background shells + auto-rollback + live telemetry + bidirectional server-push + macOS seatbelt + fusion-guard zero-trust authorization (Phase 3, default OFF) + server-side deterministic cancel of in-flight streams (Issue #32). Four audit passes all defects fixed; 500 Rust + 210 Python tests green; clippy `--all-targets -D warnings` clean; fmt/ruff clean; maturin builds. See `examples/` for runnable demos and `docs/INDEX.md` for the documentation map.
 
 ## Architecture
 
@@ -271,6 +271,39 @@ ok = ex.cancel_stream(51)  # -> True (found + cancelled)
 - Unknown `stream_id` → returns `False` (best-effort, no exception).
 - The in-process `run_streaming()` path (no `serve()` running) is never cancellable — cancel only applies to streams served over UDS.
 - `ExecutionResult.cancelled: bool` is `False` on every non-cancel path; `True` only when a cancel actually fired.
+
+## Per-command Sandbox Profile (v0.2.8 — Issue #34)
+
+Enable seatbelt/sandbox for the detached executor subprocess with a **per-command** profile — sandbox-independence for fusion-code G2. Each `ExecutionRequest` carries an optional `sandbox: SandboxProfile` that tunes the macOS `sandbox-exec` profile for that single command. Default-off / opt-in: a `None` profile preserves the existing fixed profile byte-for-byte (default deny network-outbound + directed SENSITIVE_FS_PATHS file-write deny), so existing deployments behave identically.
+
+```python
+from fusion_executor import FusionSandboxExecutor, SandboxProfile
+
+ex = FusionSandboxExecutor(allow_inline_interpreter=True)
+
+# Default (None) — behavior identical to v0.2.7
+r = ex.run("echo hi")
+assert r.exit_code == 0
+
+# Per-command: allow network, block specific binaries via seatbelt deny process-exec
+r = ex.run(
+    "curl https://example.com",
+    sandbox=SandboxProfile(network="allow", excluded_commands=["rm", "curl"]),
+)
+
+# Fail-closed: if sandbox-exec is unavailable AND fail_if_unavailable=True, the
+# command is blocked (exit_code -1) rather than running without isolation.
+r = ex.run("risky --flag", sandbox=SandboxProfile(fail_if_unavailable=True))
+```
+
+`SandboxProfile` fields (matches fusion-code `SandboxSettings`):
+
+- `network: str | None` — `"allow"` omits the network deny; `"deny"` (or None) keeps `deny network-outbound`. None does not override the default.
+- `filesystem: str | None` — `"allow"` omits FS deny; `"deny_write"` (default) keeps directed sensitive-path file-write deny; `"deny"` adds a global `file-write*` deny.
+- `excluded_commands: list[str]` — command names injected as `(deny process-exec (literal "<name>"))` into the seatbelt profile. Strings are sanitized (strips `"`, `\`, control chars) to prevent profile-syntax injection.
+- `fail_if_unavailable: bool` — `True` = fail-closed when `sandbox-exec` is not on PATH (exit_code -1, no spawn); `False` (default) = silently degrade to running without seatbelt.
+
+The profile is an additive RPC field (`sandbox: { network?, filesystem?, excluded_commands? }`) — it auto-flows through the 4 layers (fe-core `ExecutionRequest.sandbox` → fe-ipc `serde_json::from_value(params)` → fe-pyo3 PyAny→serde → Python Pydantic `_STRICT`). Existing `executor.execute` / `execute_stream` UDS methods accept it with no method-level wiring changes.
 
 ## Auto-rollback (v1.4 — FR-04 optional policy)
 

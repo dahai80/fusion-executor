@@ -16,7 +16,7 @@ use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use portable_pty::{NativePtySystem, PtySize, PtySystem};
 
-mod seatbelt;
+pub mod seatbelt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -129,6 +129,10 @@ pub struct SandboxConfig {
     /// 改 sysinfo 轮询子进程树 RSS, 超限 kill 进程树 (exit_code=-124, oom_killed=true)。
     /// 默认 DEFAULT_RSS_LIMIT_MB (2048)。0=禁用 watchdog (受信场景 opt-out, 仅靠 timeout 兜底)。
     pub rss_limit_mb: u32,
+    /// Issue #34: 每命令可配置 seatbelt profile。None → 现有固定 profile (禁网 + 定向 FS deny, 字节一致);
+    /// Some → build_profile_from 按 network/filesystem/excluded_commands 参数化。default-off opt-in。
+    /// fail_if_unavailable=true 时 fe-core 入口校验 seatbelt 可用性, 不可用则 fail-closed 拒执行。
+    pub sandbox_profile: Option<seatbelt::SandboxProfile>,
 }
 
 impl Default for SandboxConfig {
@@ -146,6 +150,7 @@ impl Default for SandboxConfig {
             max_cpu_sec: 0,
             max_nofile: 1024,
             rss_limit_mb: DEFAULT_RSS_LIMIT_MB,
+            sandbox_profile: None,
         }
     }
 }
@@ -323,6 +328,7 @@ impl Sandbox {
             cfg.max_nproc,
             cfg.max_cpu_sec,
             cfg.max_nofile,
+            cfg.sandbox_profile.as_ref(),
         );
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
@@ -494,6 +500,7 @@ impl Sandbox {
             cfg.max_nproc,
             cfg.max_cpu_sec,
             cfg.max_nofile,
+            cfg.sandbox_profile.as_ref(),
         );
         if let Some(cwd) = &cfg.cwd {
             cmd.current_dir(cwd);
@@ -680,6 +687,7 @@ impl Sandbox {
             cfg.max_nproc,
             cfg.max_cpu_sec,
             cfg.max_nofile,
+            cfg.sandbox_profile.as_ref(),
         );
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
@@ -1341,6 +1349,7 @@ pub fn spawn_pty(cfg: &SandboxConfig) -> Result<SpawnedPty> {
         cfg.max_nproc,
         cfg.max_cpu_sec,
         cfg.max_nofile,
+        cfg.sandbox_profile.as_ref(),
     );
     if let Some(cwd) = &cfg.cwd {
         cmd.cwd(cwd);
@@ -1863,6 +1872,7 @@ mod tests {
             max_cpu_sec: 0,
             max_nofile: 1024,
             rss_limit_mb: DEFAULT_RSS_LIMIT_MB,
+            sandbox_profile: None,
         };
         let (mut rx, handle) = sb.run_streaming(cfg, None).unwrap();
         // 收首块 (含 "started"), 确认子进程已起
@@ -2365,6 +2375,7 @@ mod tests {
             max_cpu_sec: 0,
             max_nofile: 1024,
             rss_limit_mb: 256,
+            sandbox_profile: None,
         };
         let (mut rx, handle) = sb.run_streaming(cfg, None).unwrap();
         let mut done_oom = false;

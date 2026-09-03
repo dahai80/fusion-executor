@@ -194,6 +194,38 @@ for frame in ex.run_streaming("echo hi", enable_rollback_snapshot=False):
 - 进程内 `run_streaming()` 路径 (无 `serve()` 运行) 不可取消 — 取消仅适用于经 UDS 服务端流。
 - `ExecutionResult.cancelled: bool` 非取消路径恒 `False`; 仅真正触发取消时 `True`。
 
+### 每命令沙箱 profile (v0.2.8 — Issue #34)
+
+为分离的 executor 子进程启用 seatbelt/沙箱 — fusion-code G2 沙箱独立。每个 `ExecutionRequest` 携带可选 `sandbox: SandboxProfile`, 为该单条命令调优 macOS `sandbox-exec` profile。默认关 / opt-in: `None` profile 字节保留现有固定 profile (默认禁网 + 定向敏感路径 file-write deny), 现有部署行为完全一致。
+
+```python
+from fusion_executor import FusionSandboxExecutor, SandboxProfile
+
+ex = FusionSandboxExecutor(allow_inline_interpreter=True)
+
+# 默认 (None) — 行为同 v0.2.7
+r = ex.run("echo hi")
+assert r.exit_code == 0
+
+# 每命令: 放行网络, 经 seatbelt deny process-exec 拦指定二进制
+r = ex.run(
+    "curl https://example.com",
+    sandbox=SandboxProfile(network="allow", excluded_commands=["rm", "curl"]),
+)
+
+# fail-closed: sandbox-exec 不可用 且 fail_if_unavailable=True 时, 拦截命令 (exit_code -1) 不 spawn
+r = ex.run("risky --flag", sandbox=SandboxProfile(fail_if_unavailable=True))
+```
+
+`SandboxProfile` 字段 (匹配 fusion-code `SandboxSettings`):
+
+- `network: str | None` — `"allow"` 不注 network deny; `"deny"` (或 None) 保留 `deny network-outbound`。None 不覆盖默认。
+- `filesystem: str | None` — `"allow"` 不注 FS deny; `"deny_write"` (默认) 保留定向敏感路径 file-write deny; `"deny"` 加全局 `file-write*` deny。
+- `excluded_commands: list[str]` — 注入 `(deny process-exec (literal "<名>"))` 到 seatbelt profile。字符串经净化 (剥 `"`、`\`、控制符) 防 profile 语法注入。
+- `fail_if_unavailable: bool` — `True` = sandbox-exec 不在 PATH 时 fail-closed (exit_code -1, 不 spawn); `False` (默认) = 静默降级到无 seatbelt 执行。
+
+profile 是 additive RPC 字段 (`sandbox: { network?, filesystem?, excluded_commands? }`), 经 4 层自动流通 (fe-core `ExecutionRequest.sandbox` → fe-ipc `serde_json::from_value(params)` → fe-pyo3 PyAny→serde → Python Pydantic `_STRICT`)。现有 `executor.execute` / `execute_stream` UDS 方法接受它, 无方法级 wiring 改动。
+
 ### 自动回滚 (v1.4 — FR-04 可选策略)
 
 `run()` / `run_streaming()` 接受可选 `auto_rollback: RollbackPolicy`。启用后, 命令失败 (`exit_code != 0`) 且检测到工作区文件改动 (`git status --porcelain` 非空) 时, 自动 `rollback(本次快照)`, 标记 `result.auto_rolled_back=True`。Executor 仍无状态 — guard 生命周期限单次执行, 不跨请求累积失败计数 (连续失败计数归 caller 自愈循环)。

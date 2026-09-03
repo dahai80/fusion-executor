@@ -19,6 +19,7 @@ from .models import (
     GuiResult,
     MultiEditItem,
     RollbackPolicy,
+    SandboxProfile,
     ShellInfo,
     ShellOutput,
     ShellStartResult,
@@ -133,6 +134,7 @@ class FusionSandboxExecutor:
         max_nofile: int = 1024,
         rss_limit_mb: int = 2048,
         trace_id: str | None = None,
+        sandbox: SandboxProfile | None = None,
     ) -> ExecutionResult:
         # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
         if not isinstance(command, str):
@@ -169,6 +171,7 @@ class FusionSandboxExecutor:
             rss_limit_mb,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
+        sandbox_dict = sandbox.model_dump() if sandbox is not None else None
         native = self._native.execute_sync(
             command,
             task_id,
@@ -185,6 +188,7 @@ class FusionSandboxExecutor:
             max_nofile,
             rss_limit_mb,
             trace_id,
+            sandbox_dict,
         )
         diag = None
         if native.diagnostics is not None:
@@ -255,6 +259,7 @@ class FusionSandboxExecutor:
         max_nofile: int = 1024,
         rss_limit_mb: int = 2048,
         trace_id: str | None = None,
+        sandbox: SandboxProfile | None = None,
     ) -> Iterator[str | ExecutionResult]:
         # M-PY-01: 同 run() 前置校验
         if not isinstance(command, str):
@@ -287,6 +292,7 @@ class FusionSandboxExecutor:
             rss_limit_mb,
         )
         policy_dict = auto_rollback.model_dump() if auto_rollback is not None else None
+        sandbox_dict = sandbox.model_dump() if sandbox is not None else None
         it = self._native.execute_streaming(
             command,
             task_id,
@@ -303,6 +309,7 @@ class FusionSandboxExecutor:
             max_nofile,
             rss_limit_mb,
             trace_id,
+            sandbox_dict,
         )
         for frame in it:
             # L-PY-02: 严格键 (旧 .get(default) 吞 serde bug, 缺字段静默成功看像 blocked)

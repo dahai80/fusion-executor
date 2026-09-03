@@ -203,6 +203,24 @@ Cancel an in-flight `execute_stream` from the server side with a **deterministic
 
 **0 new unsafe** — reuses fe-sandbox `kill_process_group_async` (nix `killpg`/`kill`, all safe). Acceptance (Issue #32): cancel `sleep 1000` (or `python3 -c "while True: pass"`) → child + descendants exit within `KILL_GRACE_MS` + SIGKILL; no orphans under load (ppid-tree walk catches setsid escapees); cancel semantics documented here. 500 Rust + 210 Python (1 skip TCC) green, clippy `--all-targets -D warnings` clean (only upstream block v0.1.6), fmt/ruff clean, maturin builds.
 
+## Issue #34 — Per-command Seatbelt/Sandbox Profile (sandbox-independence for fusion-code G2)
+
+Enable seatbelt/sandbox for the detached executor subprocess with a **per-command** configurable profile. Each `ExecutionRequest` carries an optional `sandbox: SandboxProfile` (`#[serde(default)]`) that tunes the macOS `sandbox-exec` profile for that single command. **Default-off / opt-in**: a `None` profile preserves the existing fixed profile byte-for-byte (default deny network-outbound + directed `SENSITIVE_FS_PATHS` file-write deny), so existing deployments behave identically — no byte drift.
+
+**SandboxProfile wire model** (fe-sandbox `seatbelt.rs`, matches fusion-code `SandboxSettings`):
+- `network: Option<SandboxNetworkMode>` — `Allow` omits the network deny; `Deny` (default) keeps `deny network-outbound`. None does not override the default.
+- `filesystem: Option<SandboxFsMode>` — `Allow` omits FS deny; `DenyWrite` (default) keeps directed sensitive-path file-write deny; `Deny` adds a global `file-write*` deny (Darwin 25 NO-OP noted).
+- `excluded_commands: Vec<String>` — command names injected as `(deny process-exec (literal "<name>"))`. Strings sanitized (`sanitize_profile_string` strips `"`, `\`, control chars) to prevent profile-syntax injection; empty-after-sanitize entries skipped.
+- `fail_if_unavailable: bool` — `true` = fail-closed when `sandbox-exec` is not on PATH (`seatbelt_available()` probes via `which::which`): `execute_async`/`execute_streaming` reject with `exit_code -1`, no spawn. `false` (default) = silently degrade to running without seatbelt.
+
+**4-layer wiring** (additive field, auto-flow):
+1. **fe-sandbox** `SandboxConfig.sandbox_profile: Option<seatbelt::SandboxProfile>` (last field, `#[serde(default)]`); `build_command`/`build_std_command` accept `sandbox_profile: Option<&SandboxProfile>` — `Some` → `build_profile_from` (parameterized), `None` → cached `profile()` (fixed, byte-identical to v0.2.7). `SandboxNetworkMode`/`SandboxFsMode` enums (`#[serde(rename_all="snake_case")]`, `#[default]` Deny/DenyWrite); `SandboxProfile` struct (`#[serde(rename_all="snake_case", deny_unknown_fields)]`, all `#[serde(default)]`).
+2. **fe-core** `ExecutionRequest.sandbox: Option<fe_sandbox::seatbelt::SandboxProfile>` (`#[serde(default)]`); `execute_async`/`execute_streaming` fail-closed gate (`fail_if_unavailable=true` + `!seatbelt_available()` → `blocked_with` exit -1, no spawn) + pass `sandbox_profile: req.sandbox.clone()` into `sb_cfg`.
+3. **fe-ipc** auto-flow — `executor.execute`/`execute_stream` parse `ExecutionRequest` via `serde_json::from_value(params)`; additive `sandbox` field requires no method-level wiring.
+4. **fe-pyo3** `execute_sync`/`execute_streaming` accept `sandbox: Option<Bound<'_, PyAny>>`; PyAny→serde via `py.import("json").call_method1("dumps", (&obj,))` → `serde_json::from_str`. **Python** `SandboxProfile` Pydantic (`_STRICT` extra=forbid) + `ExecutionRequest.sandbox: SandboxProfile | None` + `run()`/`run_streaming()` `sandbox: SandboxProfile | None = None` kwarg (passes `sandbox.model_dump()` as last native arg; None → native None).
+
+**0 new unsafe** — reuses fe-sandbox safe wrappers + `which` crate (v7) PATH probe. `build_profile_from(None)` equals fixed `build_profile()` (byte-identical assertion in unit test). Baseline preserved: `sandbox=None` is byte-identical to v0.2.7. Acceptance (Issue #34): per-command profile reaches seatbelt; `excluded_commands` denies the named binary via seatbelt (not security guard — non-zero exit, not `blocked_by_security`); `fail_if_unavailable=true` fails closed when sandbox-exec absent; default-off preserves existing behavior. 510 Rust + 214 Python (6 skip TCC) green, clippy `--all-targets -D warnings` clean (only upstream block v0.1.6), fmt/ruff clean, maturin builds.
+
 ## Key Design Constraints (NFRs / SLA)
 
 - CLI sandbox init overhead <5ms; log-truncation + regex parse CPU <3% under high throughput.

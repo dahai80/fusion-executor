@@ -36,6 +36,28 @@ class RollbackPolicy(BaseModel):
     file_damage_check: bool = Field(default=True, description="失败时检测文件毁损 (git status) 触发回滚")
 
 
+class SandboxProfile(BaseModel):
+    model_config = _STRICT
+    # Issue #34: 每命令 seatbelt/sandbox profile (匹配 fusion-code SandboxSettings)。
+    # None/默认关 → 现有固定 profile (默认禁网 + 敏感路径 file-write deny), 行为同 v0.2.7。
+    network: str | None = Field(
+        default=None,
+        description="网络策略: allow=放行出网; deny=禁网 (deny network-outbound, 现有默认). None=不覆盖默认",
+    )
+    filesystem: str | None = Field(
+        default=None,
+        description="文件系统策略: allow=不注 FS deny; deny_write=定向敏感路径 file-write deny (默认); deny=全局 file-write deny (Darwin 25 NO-OP). None=不覆盖默认",
+    )
+    excluded_commands: list[str] = Field(
+        default_factory=list,
+        description="seatbelt 内 deny process-exec 的命令名列表 (literal 路径匹配)",
+    )
+    fail_if_unavailable: bool = Field(
+        default=False,
+        description="sandbox-exec 不可用时 fail-closed 拦截 (exit -1, 不 spawn); False=静默降级到无 seatbelt",
+    )
+
+
 class ExecutionRequest(BaseModel):
     model_config = _STRICT
     command: str
@@ -76,6 +98,12 @@ class ExecutionRequest(BaseModel):
     trace_id: str | None = Field(
         default=None,
         description="跨层关联 id; None 时执行入口自动生成 uuid v4, 贯穿日志/IPC/结果 (M-OPS-06)",
+    )
+    sandbox: SandboxProfile | None = Field(
+        default=None,
+        description="Issue #34: 每命令 seatbelt/sandbox profile (网络/文件系统/排除命令); "
+        "None=现有固定 profile (默认禁网+敏感路径 file-write deny), 行为同 v0.2.7; "
+        "fail_if_unavailable=true 且 sandbox-exec 不可用时 fail-closed 拦截 (exit -1)",
     )
 
 

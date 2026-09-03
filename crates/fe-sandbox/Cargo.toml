@@ -19,6 +19,8 @@ libc.workspace = true
 # RUN-9 (审计 0827): ppid-tree 进程遍历 — setsid 孙进程逃逸进程组, killpg 杀不到;
 # sysinfo 遍历全进程按 ppid 树兜底杀后代 (跨组孤儿)。复用 fe-telemetry 同依赖。
 sysinfo.workspace = true
+# Issue #34: seatbelt 可用性探活 (sandbox-exec PATH 解析)
+which.workspace = true
 
 [lints]
 workspace = true

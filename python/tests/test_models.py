@@ -12,6 +12,7 @@ from fusion_executor import (
     GrepMatch,
     GuiResult,
     RollbackPolicy,
+    SandboxProfile,
     TelemetrySample,
 )
 
@@ -78,6 +79,7 @@ def test_execution_result_timeout_code():
         (GlobEntry, {"path": "x"}, "nope"),
         (GrepMatch, {"path": "x", "line_number": 1, "content": "c"}, "nope"),
         (TelemetrySample, {"ts_ms": 1, "cpu_pct": 0.0, "mem_mb": 0.0}, "nope"),
+        (SandboxProfile, {"network": "allow"}, "nope"),
     ],
 )
 def test_models_reject_extra_fields(model, valid_kwargs, extra_field):
@@ -108,3 +110,48 @@ def test_diagnostics_partial_none_ok():
     assert d.error_type is None
     assert d.line_number is None
     assert Diagnostics.model_validate({}) == d
+
+
+# ── Issue #34: SandboxProfile Pydantic 往返 ──
+
+
+def test_sandbox_profile_defaults():
+    # 默认: 全 None/False/空 — 行为同 v0.2.7 (sandbox=None 语义)
+    p = SandboxProfile()
+    assert p.network is None
+    assert p.filesystem is None
+    assert p.excluded_commands == []
+    assert p.fail_if_unavailable is False
+
+
+def test_sandbox_profile_round_trip():
+    p = SandboxProfile(
+        network="allow",
+        filesystem="deny",
+        excluded_commands=["rm", "curl"],
+        fail_if_unavailable=True,
+    )
+    dumped = p.model_dump()
+    assert dumped["network"] == "allow"
+    assert dumped["filesystem"] == "deny"
+    assert dumped["excluded_commands"] == ["rm", "curl"]
+    assert dumped["fail_if_unavailable"] is True
+    restored = SandboxProfile.model_validate(dumped)
+    assert restored == p
+
+
+def test_execution_request_sandbox_field():
+    # ExecutionRequest.sandbox additive — None 默认不破回归, Some 透传
+    req_default = ExecutionRequest(command="echo hi")
+    assert req_default.sandbox is None
+    req_sbx = ExecutionRequest(
+        command="echo hi",
+        sandbox=SandboxProfile(network="allow", excluded_commands=["rm"]),
+    )
+    assert req_sbx.sandbox is not None
+    assert req_sbx.sandbox.network == "allow"
+    assert req_sbx.sandbox.excluded_commands == ["rm"]
+    # 往返保持
+    dumped = req_sbx.model_dump()
+    restored = ExecutionRequest.model_validate(dumped)
+    assert restored.sandbox == req_sbx.sandbox

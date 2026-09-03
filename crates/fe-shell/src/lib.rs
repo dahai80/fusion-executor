@@ -151,6 +151,7 @@ impl ShellRegistry {
             max_cpu_sec: p.max_cpu_sec,
             max_nofile: p.max_nofile,
             rss_limit_mb: 0, // D3-4: 后台 shell 不加 RSS 上限 — poll-model 长驻任务, 调用方自管 kill_shell
+            sandbox_profile: None,
         };
         let spawned: SpawnedPty = match spawn_pty(&sb_cfg) {
             Ok(s) => s,
