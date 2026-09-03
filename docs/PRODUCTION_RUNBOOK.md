@@ -262,6 +262,48 @@ cd /Users/dahai/fusion/fusion-guard && ./start.sh start|stop|status|doctor
 # socket: /tmp/fusion-guard.sock (requires cargo build --release first)
 ```
 
+### Guard upstream mitigation (headless Keychain hang — fusion-guard issue #17)
+
+**Cross-project constraint:** fusion-guard is READ-ONLY for this repo. The
+upstream issue is tracked on the guard side:
+[fusion-guard #17 — start.sh Keychain hangs headless/CI/SSH](https://github.com/dahai80/fusion-guard/issues/17).
+
+**Symptom:** `./start.sh start` on a headless/SSH/CI host blocks indefinitely
+when guard attempts to read a secret from the macOS Keychain (no GUI session →
+the Keychain authorization prompt never appears and the call never returns).
+This blocks guard startup, so every executor `evaluate` times out at the 2s
+UDS deadline and the executor enters **degraded fail-closed** mode (§9
+"Degraded fail-closed"). Commands are still safe (fail-closed never opens a
+door) but risk-level-aware verdicts are unavailable — inline interpreters are
+unconditionally blocked and whitelisted binaries run with an "unknown risk"
+warning.
+
+**Mitigations (operator-side, no guard source change in this repo):**
+
+1. **Run guard on a GUI-capable host.** The simplest fix: run guard on a host
+   with an active GUI session (logged-in user, display or VNC/screen-sharing).
+   This is the same constraint as `gui_action` (§8). For pure headless command
+   execution, leave guard OFF (`FusionSandboxExecutor()` with no `guard_sock`)
+   — the executor's own static blocklist + whitelist fence is sufficient and
+   has no Keychain dependency.
+2. **Set `FUSION_GUARD_ALLOW_NO_SECRET=1` if/when guard exposes it.** Issue #17
+   requests this escape hatch. Until guard ships it, this env var has no effect
+   on this side (the executor does not read it — it only consumes the UDS
+   wire). Track the guard issue for the fix.
+3. **Accept degraded mode.** If guard must run headless and hangs, kill the
+   hung guard process; the executor detects the unreachable socket and
+   degrades fail-closed automatically. This is safe by design — degraded mode
+   is **stricter** than live guard, never more permissive.
+4. **Do not run guard detached under launchd on a headless host** until #17 is
+   resolved — a launchd-restarted guard that hangs on Keychain will repeatedly
+   block. Prefer the in-process executor path (`ex.run()`) without
+   `guard_sock` for headless automation.
+
+**This repo's obligation is fulfilled:** the executor degrades safely when
+guard is unavailable, and this document records the upstream boundary. The
+fix (Keychain headless escape hatch) belongs on fusion-guard and follows the
+monorepo issue→PR→code flow.
+
 ## 10. Incident Response Procedures
 
 ### 10.1 Server won't start / socket bind fails

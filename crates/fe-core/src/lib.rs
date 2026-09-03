@@ -81,6 +81,34 @@ pub static BLOCKING_RT: LazyLock<Runtime> = LazyLock::new(|| {
         })
 });
 
+// IPC_RT — IPC 服务器扇出专属多线程 runtime (serve_blocking 入口)。
+// 审计 gap #5 (soak_stress.py 死锁): 旧版 serve_blocking 跑在共享 BLOCKING_RT (上限 8 worker),
+// 64 连接 = ~128 长任务 (push_task + read_loop) + 64 dispatch task 全挤 8 worker → dispatch 饥饿,
+// 响应帧写不出 → client recv 30s 超时。解法: 专属 IPC_RT 按 IPC 扇出放宽 worker (clamp 4-16),
+// 与 BLOCKING_RT (in-process execute_sync 路径) 隔离。fe-core execute_async/execute_streaming 用裸
+// tokio::spawn (落 caller runtime = IPC_RT), 故 IPC 任务图干净隔离, BLOCKING_RT 仅留 run() 路径。
+// spawn_blocking 落 per-runtime 阻塞池 (512 线程), 远超 MAX_CONCURRENT_EXECS=16, 不饱和。
+pub static IPC_RT: LazyLock<Runtime> = LazyLock::new(|| {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let workers = workers.clamp(4, 16);
+    info!(
+        workers,
+        "IPC_RT 初始化多线程 runtime (IPC 扇出专属, 4-16 worker)"
+    );
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            panic!(
+                "IPC_RT init failed: tokio runtime 构建失败 — {e}. \
+                 此 panic 不可恢复 (LazyLock 中毒), 进程需重启。worker_threads={workers}"
+            )
+        })
+});
+
 /// 退出码约定: 0=成功, -124=超时, -1=拦截/内部异常
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_TIMEOUT: i32 = -124;

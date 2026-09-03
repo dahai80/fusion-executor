@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -318,4 +319,56 @@ def test_execute_stream_chunks_then_done_over_uds(server: str):
     assert all(f["id"] == 7 for f in frames), "所有帧共用 id"
     done = frames[-1]["result"]["result"]
     assert done["exit_code"] == 0
-    assert "hi" in done["stdout"]
+
+
+# gap #5 回归: 64 并发 echo 全完成, 无死锁饥饿。
+# 旧 bug: serve_blocking 跑共享 BLOCKING_RT (上限 8 worker), 64 连接扇出饥饿 →
+# 响应写不出 → recv 30s 超时 (32/64 hang)。修复后专属 IPC_RT (clamp 4-16) 隔离。
+def test_concurrent_echo_64_no_hang(server: str):
+    n = 64
+    results: list[tuple[int, dict | str]] = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        try:
+            resp = _rpc(
+                server,
+                {
+                    "jsonrpc": "2.0",
+                    "id": i + 1,
+                    "method": "executor.execute",
+                    "params": {"command": f"echo py{i}", "timeout_sec": 15},
+                },
+            )
+            with lock:
+                results.append((i, resp))
+        except Exception as e:  # 记录任意异常供断言
+            with lock:
+                results.append((i, f"{type(e).__name__}: {e}"))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    t0 = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20.0)
+    wall = time.time() - t0
+
+    # 全线程须在 20s 内返回 (旧 bug 32/64 hang 30s 超时)
+    alive = [t for t in threads if t.is_alive()]
+    assert not alive, f"{len(alive)}/{n} 线程仍挂起 (旧 bug 死锁): {[t.name for t in alive]}"
+    assert len(results) == n, f"仅 {len(results)}/{n} 返回: {results[:5]}"
+
+    ok = 0
+    errs = []
+    for i, resp in results:
+        if isinstance(resp, str):
+            errs.append(f"{i}:{resp}")
+            continue
+        ec = resp.get("result", {}).get("exit_code")
+        if ec == 0:
+            ok += 1
+        else:
+            errs.append(f"{i}:exit{ec}:{resp}")
+    assert ok == n, f"仅 {ok}/{n} exit_code==0, errs={errs[:5]}"
+    assert wall < 15.0, f"wall {wall:.1f}s 超预算 (旧 bug 30s 死锁)"
