@@ -476,7 +476,56 @@ Auto-rollback restores a pre-exec git snapshot on failure + detected file damage
 
 The `SandboxProfile.filesystem="deny"` adds a global `file-write*` deny, but on Darwin 25 this is a documented **no-op** (Apple deprecates global file-write deny in this seatbelt dialect). `DenyWrite` (directed sensitive-path deny) is the effective default and is enforced. Operators should not rely on `filesystem="deny"` as a hard write-block on Darwin 25+.
 
-## 14. Troubleshooting
+## 14. Testing & Verification Harnesses
+
+The repo ships three operational harnesses (under `scripts/`) plus property tests in the Rust core. Run them before tagging a release or after a concurrency/security change.
+
+### 14.1 Property tests — `crates/fe-security`
+
+Stable-toolchain property tests (`proptest`, no nightly/cargo-fuzz needed) hunt for panics and ReDoS in the security guard's `validate()` entry chokepoint. 256 cases per test over generated commands, dangerous prefixes, regex-stress inputs, and compound commands.
+
+```bash
+cd /Users/dahai/fusion && source .venv/bin/activate && cd fusion-executor
+cargo test -p fe-security proptest                # validate_never_panics / dangerous_prefixes_blocked / no_redos / compound_nonwhitelisted_blocked
+```
+
+### 14.2 Load/stress soak — `scripts/soak_stress.py`
+
+Drives a real `serve()` subprocess under sustained concurrent load (80 exec + 30 streams + 20 shell lifecycle + cancel-under-load + metrics) to verify bounded concurrency holds with no deadlock, no hang, no memory blowup. Exit 0 = soak passed. This is the acceptance gate for the IPC runtime (dedicated `IPC_RT`, gap #5).
+
+```bash
+python scripts/soak_stress.py                     # ~30s, 12/12 checks, exit 0
+```
+
+### 14.3 Long stability — `scripts/long_stability.py`
+
+Runs N minutes of mixed exec + stream traffic against a real `serve()` subprocess at fixed concurrency (8 workers), sampling server RSS at intervals to verify: no memory leak (RSS growth < 200MB cap), no request hang (every call returns within a 60s budget), low error rate (<1% under steady load), and the server stays alive. Exit 0 = stability passed. Acceptance for enterprise gap #6 (no long stability test).
+
+```bash
+python scripts/long_stability.py                  # default 3 min
+python scripts/long_stability.py 10               # 10 min
+```
+
+### 14.4 Degraded-mode smoke — `scripts/smoke_degraded_mode.py`
+
+Smoke-checks the guard-down fail-closed path (regex blocklist + whitelist栅栏 still gate when guard is unavailable). Run when touching the guard integration (§9) or the degraded-mode logic.
+
+### 14.5 Full verify gate
+
+The complete pre-release gate, run from the repo root after `source .venv/bin/activate`:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # only upstream block v0.1.6 remains
+cargo test --workspace
+maturin develop --release
+ruff check . && ruff format --check .
+pytest python/tests
+python scripts/soak_stress.py
+python scripts/long_stability.py
+```
+
+## 15. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|

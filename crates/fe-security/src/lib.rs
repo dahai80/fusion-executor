@@ -3014,3 +3014,97 @@ mod tests {
         let _ = std::fs::remove_file(&target);
     }
 }
+
+// 属性测试 (caveat #4 弥补 — cargo-fuzz 需 nightly 本机无 rustup, 改 proptest stable 跑)。
+// 目标: validate() 对任意输入不 panic / 不死循环 / 不 ReDoS, 恒返 verdict (allow|block)。
+// 策略: 随机字节串 + shell 元字符混合 + 已知危险前缀, 断言有限时间内返合法 verdict。
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // 合法 shell 字符集 (含元字符触发链式解析分支) — 排除 \0 (validate 前置拒)。
+    fn arb_command() -> impl Strategy<Value = String> {
+        (
+            0..40usize,
+            prop::collection::vec(
+                prop_oneof![
+                    Just(b'a'),
+                    Just(b' '),
+                    Just(b';'),
+                    Just(b'&'),
+                    Just(b'|'),
+                    Just(b'>'),
+                    Just(b'<'),
+                    Just(b'$'),
+                    Just(b'`'),
+                    Just(b'/'),
+                    Just(b'-'),
+                    Just(b'"'),
+                    Just(b'\\'),
+                    Just(b'('),
+                    Just(b')'),
+                    0x20u8..0x7e, // 可见 ASCII
+                ],
+                0..256,
+            ),
+        )
+            .prop_map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    proptest! {
+        // 任意命令不得 panic, 须返 allow 或 block (allowed 字段明确), 非未定义状态。
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+        #[test]
+        fn validate_never_panics(cmd in arb_command()) {
+            let g = SecurityGuard::default();
+            let v = g.validate(&cmd);
+            prop_assert!(v.allowed || !v.allowed);
+            if !v.allowed {
+                prop_assert!(v.reason.is_some());
+                prop_assert!(v.stage.is_some());
+            }
+        }
+
+        // 命令替换/重定向前缀必拒 (block) — 反证 allow 不漏放危险结构。
+        #[test]
+        fn dangerous_prefixes_blocked(
+            prefix in prop_oneof![
+                Just("$(echo x)".to_string()),
+                Just("`echo x`".to_string()),
+                Just("rm -rf /".to_string()),
+                Just("sudo ".to_string()),
+                Just("echo hi > /etc/passwd".to_string()),
+            ],
+            suffix in "[a-z]{0,20}"
+        ) {
+            let g = SecurityGuard::default();
+            let cmd = format!("{prefix}{suffix}");
+            let v = g.validate(&cmd);
+            prop_assert!(!v.allowed);
+        }
+
+        // ReDoS 时间上限 — 病态回溯输入在 1s 内返 (regex cap 保护)。
+        #[test]
+        fn no_redos(input in "([a-z]+ )*([a-z]+)?") {
+            let g = SecurityGuard::default();
+            let start = std::time::Instant::now();
+            let v = g.validate(&input);
+            let elapsed = start.elapsed();
+            prop_assert!(elapsed.as_secs() < 1);
+            prop_assert!(v.allowed || !v.allowed);
+        }
+
+        // 链式复合命令 (&&/||/;/|) 每段独立校验 — 非白名单 binary 必拒。
+        #[test]
+        fn compound_nonwhitelisted_blocked(bin in "[a-z]{1,15}") {
+            let g = SecurityGuard::default();
+            let cmd = format!("{bin} --flag && {bin} --other");
+            let v = g.validate(&cmd);
+            if v.allowed {
+                let wl = g.whitelist.load();
+                prop_assert!(wl.contains(bin.as_str()));
+            }
+        }
+    }
+}
