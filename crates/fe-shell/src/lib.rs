@@ -501,6 +501,35 @@ fn join_reaped(reaped: Vec<(String, ShellHandle)>) {
     }
 }
 
+/// Drop join 超时上限 (毫秒) — waiter 线程阻塞 child.wait(), kill 失败 (pid 重用/僵尸/setsid 脱组) 时
+/// child.wait() 永不返 → 无界 join 阻塞 serve() 退出。超时 detach (线程随进程退出被 OS 杀, 不阻塞 Drop)。
+const DROP_JOIN_TIMEOUT_MS: u64 = 2000;
+const DROP_JOIN_POLL_MS: u64 = 50;
+
+/// C-OPS-fix: 有界 join — is_finished() 轮询, 超时 detach (防 serve() 退出挂死)。
+fn join_thread_bounded(t: Option<std::thread::JoinHandle<()>>, shell_id: &str, label: &str) {
+    let Some(t) = t else {
+        return;
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(DROP_JOIN_TIMEOUT_MS);
+    while std::time::Instant::now() < deadline {
+        if t.is_finished() {
+            if let Err(e) = t.join() {
+                warn!(%shell_id, label, error = ?e, "{label} 线程 join 失败 (panic?)");
+            }
+            debug!(%shell_id, label, "{label} 线程 join 回收完成");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(DROP_JOIN_POLL_MS));
+    }
+    warn!(
+        %shell_id, label, timeout_ms = DROP_JOIN_TIMEOUT_MS,
+        "{label} 线程 join 超时 — detach (进程退出由 OS 回收, 防 serve() 挂死)"
+    );
+    drop(t);
+}
+
 /// m-SEC-01: 当前 ms since epoch (reader 线程刷新 last_output_ms + idle 判定用)
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -513,16 +542,8 @@ fn now_ms() -> u64 {
 /// 已退 shell join 即返; 活跃 shell 调用方应先 kill (PTY 关闭后线程速退)。
 /// P-5: 必须在 Mutex guard 释放后调用 (锁外 join 防 reader panic 永阻塞死锁)。
 fn join_handle_threads(h: &mut ShellHandle, shell_id: &str) {
-    if let Some(t) = h.reader_thread.take() {
-        if let Err(e) = t.join() {
-            warn!(%shell_id, error = ?e, "reader 线程 join 失败 (panic?)");
-        }
-    }
-    if let Some(t) = h.waiter_thread.take() {
-        if let Err(e) = t.join() {
-            warn!(%shell_id, error = ?e, "waiter 线程 join 失败 (panic?)");
-        }
-    }
+    join_thread_bounded(h.reader_thread.take(), shell_id, "reader");
+    join_thread_bounded(h.waiter_thread.take(), shell_id, "waiter");
 }
 
 /// 跨块多字节 UTF-8 — 保留尾部不完整字节 (同 fe-sandbox L-SB-02)
@@ -863,5 +884,43 @@ mod tests {
         let after = reg.shell_output(&id).unwrap();
         assert!(!after.running, "M-9: kill_grace_ms 生效, shell 应结束");
         assert!(t0.elapsed() < Duration::from_secs(5), "kill 不应挂死");
+    }
+
+    /// C-OPS-fix: join_thread_bounded 超时 detach — 永阻塞线程超 DROP_JOIN_TIMEOUT_MS 后返,
+    /// 不挂死调用方 (防 serve() 退出 hang)。已退线程立即回收 (is_finished=true)。
+    #[test]
+    fn join_thread_bounded_detaches_blocking_thread() {
+        let blocking = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let t0 = std::time::Instant::now();
+        join_thread_bounded(Some(blocking), "sh-test", "waiter");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(DROP_JOIN_TIMEOUT_MS)
+                && t0.elapsed() < Duration::from_millis(DROP_JOIN_TIMEOUT_MS + 1000),
+            "blocking thread should detach after ~{}ms, actual {:?}",
+            DROP_JOIN_TIMEOUT_MS,
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn join_thread_bounded_reclaims_finished_thread() {
+        let done = std::thread::spawn(|| {});
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = std::time::Instant::now();
+        join_thread_bounded(Some(done), "sh-test", "reader");
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "finished thread should reclaim immediately, actual {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn join_thread_bounded_none_noop() {
+        let t0 = std::time::Instant::now();
+        join_thread_bounded(None, "sh-test", "reader");
+        assert!(t0.elapsed() < Duration::from_millis(10));
     }
 }

@@ -22,7 +22,7 @@ use fe_core::{
 };
 // Issue #34: 每命令 seatbelt profile (fe-core re-export fe_sandbox as sandbox)。
 use fe_core::sandbox::seatbelt::SandboxProfile;
-use fe_ipc::IpcServer;
+use fe_ipc::{IpcServer, StreamRegistry};
 
 /// C-3: 流式迭代器 __next__ 每帧 recv 超时 (秒)。沙箱 timeout_sec 上限 DEFAULT_TIMEOUT_CAP_SEC=120s
 /// (fe-sandbox, 私有不导出), 加 10s grace 给转发任务发 Done → 130s。超时 → PyTimeoutError
@@ -522,13 +522,25 @@ impl PyStreamIterator {
                 )));
             }
         };
-        // serde → JSON 字符串 → python json.loads → dict (与 gui_action 路径一致)
-        let json_str = serde_json::to_string(&ev)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("帧序列化失败: {e}")))?;
-        let obj = py
-            .import("json")?
-            .call_method1("loads", (json_str,))?
-            .unbind();
+        // Perf CRITICAL #2: 热路径 (Chunk 高频) 不走 serde→JSON 字符串→json.loads 往返
+        // (每帧全量 serialize+deserialize, 高帧率破 UDS <2ms NFR)。Chunk 直接构 PyDict;
+        // Done 冷路径 (一次, ~20 字段) 保 JSON 往返 (复用 ExecutionResult serde 形状, DRY)。
+        let obj: Py<PyAny> = match &ev {
+            ExecutionStreamEvent::Chunk { data } => {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item("type", "chunk")?;
+                d.set_item("data", data.clone())?;
+                d.into_any().unbind()
+            }
+            ExecutionStreamEvent::Done(_) => {
+                let json_str = serde_json::to_string(&ev).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("帧序列化失败: {e}"))
+                })?;
+                py.import("json")?
+                    .call_method1("loads", (json_str,))?
+                    .unbind()
+            }
+        };
         if matches!(ev, ExecutionStreamEvent::Done(_)) {
             self.saw_done = true;
             self.rx = None;
@@ -649,6 +661,9 @@ struct PyExecutor {
     // M-ARCH-1: ShellRegistry 归 PyExecutor (非 Executor)。serve() 时 self.shells.clone()
     // (Arc 浅拷) 共享进 IpcServer — in-process path 与 serve-path 同一 registry, serve 重启不丢句柄。
     shells: Arc<ShellRegistry>,
+    // C-1 (arch adversarial): StreamRegistry 同 M-ARCH-1 对称归 PyExecutor。serve() 重启
+    // 共享同一 registry — in-flight execute_stream 的 cancel (Issue #32) 不因 serve() 重入静默 miss。
+    streams: Arc<StreamRegistry>,
 }
 
 #[pymethods]
@@ -721,6 +736,7 @@ impl PyExecutor {
         Self {
             inner: Arc::new(inner),
             shells: Arc::new(ShellRegistry::new()),
+            streams: Arc::new(StreamRegistry::new()),
         }
     }
 
@@ -1421,8 +1437,12 @@ impl PyExecutor {
         }
         let sock = IpcServer::resolve_sock(sock_path.as_deref());
         // A-4: 共享 Executor Arc — in-process path 与 serve-path 同一白名单 (SIGHUP 重载两者皆生效)。
-        let server =
-            IpcServer::with_executor_arc_and_shells(self.inner.clone(), self.shells.clone());
+        // C-1 (arch adversarial): 共享 StreamRegistry — serve() 重入不丢 in-flight cancel (Issue #32)。
+        let server = IpcServer::with_executor_arc_shells_and_streams(
+            self.inner.clone(),
+            self.shells.clone(),
+            self.streams.clone(),
+        );
         tracing::info!(sock = %sock, "PyO3 serve() — 启动 IPC 服务器 (共享 Executor Arc, 释 GIL, 信号可停)");
         // C-PYO3-02: 释 GIL 跑 serve_blocking — Rust 侧 tokio::signal 监听 SIGINT/SIGTERM
         // 中断 accept_loop (不依赖 Python 信号 handler, 后者在 GIL 持有时不执行)。

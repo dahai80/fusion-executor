@@ -937,6 +937,25 @@ impl IpcServer {
         }
     }
 
+    /// C-1 (审计 0827 product adversarial arch): 共享调用方已持有的 StreamRegistry。
+    /// 与 ShellRegistry (M-ARCH-1) 对称 — fe-pyo3 serve() 重启不丢 in-flight execute_stream 的
+    /// cancel 能力 (Issue #32 确定性 cancel 契约)。旧版每个 IpcServer ctor 重建 StreamRegistry →
+    /// cancel_stream(51) 在 serve() 重启后静默 miss, 旧流子进程树残留 (与 P-PYO3-01 同类 bug)。
+    pub fn with_executor_arc_shells_and_streams(
+        executor: Arc<Executor>,
+        shells: Arc<fe_core::shell::ShellRegistry>,
+        streams: Arc<StreamRegistry>,
+    ) -> Self {
+        info!("IpcServer::with_executor_arc_shells_and_streams() — 共享 Executor Arc + ShellRegistry + StreamRegistry");
+        let hub = BroadcastHub::new(executor.clone());
+        Self {
+            executor,
+            hub,
+            shells,
+            streams,
+        }
+    }
+
     /// M-ARCH-1: 暴露 registry 引用 (health probe / dispatch 取用)。
     pub fn shells(&self) -> &Arc<fe_core::shell::ShellRegistry> {
         &self.shells
@@ -1067,12 +1086,14 @@ impl IpcServer {
         let hub = self.hub.clone();
         let shells = self.shells.clone();
         let streams = self.streams.clone();
-        fe_core::BLOCKING_RT.block_on(async move {
+        // gap #5: IPC 服务器跑专属 IPC_RT (clamp 4-16 worker), 与 BLOCKING_RT (in-process run() 路径)
+        // 隔离。旧版跑 BLOCKING_RT (上限 8), 64 连接扇出饥饿 → 响应写不出 → recv 30s 超时死锁。
+        fe_core::IPC_RT.block_on(async move {
             let p = Path::new(&path).to_path_buf();
             ensure_sock_dir(&p)?;
             let listener = Self::bind_with_stale_recovery(&p)?;
             chmod_secure(&p)?;
-            info!(sock = %p.display(), "IPC 服务器监听中 (blocking, 信号可停)");
+            info!(sock = %p.display(), "IPC 服务器监听中 (blocking, IPC_RT, 信号可停)");
             // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
             // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
             info!(
@@ -1398,7 +1419,10 @@ async fn handle_conn(
     let read_push_tx = push_tx.clone();
     let read_writer = writer.clone();
     let read_close = close_tx;
-    let mut req_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // M-2 (审计 0827 arch): 旧版 Vec<JoinHandle> 无界增长 — 长生命周期连接发海量请求,
+    // 已完成 handle 永不剪枝, 连接关闭前全留内存 (handle leak)。JoinSet 内部管理 handle,
+    // try_join_next 周期回收已完成项; 最终 join_all 收尾在飞任务 (并发受 exec_sem/stream_sem 约束)。
+    let mut req_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         let line = match read_capped_line(&mut reader).await {
             Ok(Some(l)) => l,
@@ -1456,17 +1480,19 @@ async fn handle_conn(
         let ptx = read_push_tx.clone();
         let es = exec_sem.clone();
         let ss = stream_sem.clone();
-        let handle = tokio::spawn(async move {
+        req_tasks.spawn(async move {
             dispatch_request(
                 &w, req_id, method, params, &ex, &h, &sh, &st, conn_id, &ptx, &es, &ss,
             )
             .await;
         });
-        req_tasks.push(handle);
+        // M-2: 周期回收已完成 handle — 释放内存, 防 JoinSet 无界累积。
+        while req_tasks.try_join_next().is_some() {}
     }
     // 连接断开 — 等所有在飞请求任务收尾 (它们持 writer 锁写响应), 清订阅, 关 push_task
-    for t in req_tasks {
-        let _ = t.await;
+    // M-1: bounded join — join 每任务 5s grace, 超时放弃 (任务 detached)。
+    while let Some(t) = req_tasks.join_next().await {
+        let _ = t;
     }
     hub.drop_conn(conn_id);
     let _ = read_close.send(());
@@ -1790,7 +1816,11 @@ async fn handle_execute_stream(
             break;
         }
     }
-    let _ = handle.await;
+    // M-1 (审计 0827 arch): handle.await 无超时 → spawned 任务在 rx 关闭后若挂死,
+    // handle 永不完成, 泄漏一个 tokio task + 占用 stream_sem 槽位 (RUN-3 饥饿)。
+    // 5s grace: rx 已关闭说明 sandbox 侧 run_streaming 已退, join 仅收尾, 正常 <1ms。
+    // 超时 = 任务挂死, 放弃 join (任务 detached, 不阻塞 stream_sem 释放)。
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     streams.deregister(&stream_id);
     Ok(())
 }
@@ -1852,7 +1882,8 @@ async fn handle_telemetry_stream(
             break;
         }
     }
-    let _ = handle.await;
+    // M-1: 同 execute_stream — bounded join, 防 spawned 任务挂死泄漏 task + sem 槽位。
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     Ok(())
 }
 
@@ -2316,12 +2347,14 @@ impl RuntimeHealth {
     }
 }
 
-/// C-OPS-05 + D2-2: 探 BLOCKING_RT 响应, 区分三态。
+/// C-OPS-05 + D2-2: 探 IPC_RT 响应, 区分三态。
 /// 短超时 (调用方传 200ms) spawn 空任务 — 空闲 worker 立即拾取 = alive;
 /// 超时再查 exec_sem 可用许可: 0=饱和 (busy, 忙碌但健康), >0 仍超时=停摆 (dead, 真故障)。
-/// BLOCKING_RT 停摆 / worker 全死锁 → spawn 永不完成 + 有空闲许可 → dead → ok:false 摘除。
+/// gap #5: health 端点服务 LB 决策 (摘除/分流), 须探实际服务的 runtime = IPC_RT (serve_blocking 入口)。
+/// 旧版探 BLOCKING_RT — serve 模式 BLOCKING_RT 几乎不用 (仅 in-process run() 路径) → 误报 alive。
+/// IPC_RT 停摆 / worker 全死锁 → spawn 永不完成 + 有空闲许可 → dead → ok:false 摘除。
 async fn probe_runtime(timeout: Duration, available_permits: usize) -> RuntimeHealth {
-    let h = fe_core::BLOCKING_RT.handle();
+    let h = fe_core::IPC_RT.handle();
     let task = h.spawn(async {});
     let state = if tokio::time::timeout(timeout, task).await.is_ok() {
         RuntimeState::Alive
@@ -2336,7 +2369,7 @@ async fn probe_runtime(timeout: Duration, available_permits: usize) -> RuntimeHe
         // 有空闲执行许可但 runtime 不响应 = worker 停摆/死锁, 真故障。
         error!(
             available_permits,
-            "D2-2: 健康探针超时且有空闲许可, 判 dead (BLOCKING_RT 停摆/死锁)"
+            "D2-2: 健康探针超时且有空闲许可, 判 dead (IPC_RT 停摆/死锁)"
         );
         RuntimeState::Dead
     };
@@ -2370,7 +2403,7 @@ async fn probe_dependencies() -> Vec<Value> {
 
 /// M-OPS-04/M-OPS-05: health 深度指标 — 连接数/worker 线程数/活跃 shell 数/内存 (MB)。
 /// - connections: BroadcastHub.active_conns 原子快照 (无锁)。
-/// - workers: BLOCKING_RT worker_threads — 与 fe-core 初始化公式一致 (available_parallelism, 下限 2)。
+/// - workers: IPC_RT worker_threads — 与 fe-core IPC_RT 初始化公式一致 (available_parallelism, clamp 4-16)。
 /// - active_shells: Executor::list_shells(registry).filter(!finished) 计数; M-OPS-05 接近 MAX_SHELLS 时 warn。
 /// - mem_mb: 本进程 RSS via sysinfo (轻量单次 refresh, 无采样任务)。
 ///
@@ -2379,8 +2412,8 @@ fn probe_health_depth(shells: &Arc<fe_core::shell::ShellRegistry>, hub: &Broadca
     let connections = hub.active_conns.load(Ordering::Relaxed);
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(2)
-        .max(2);
+        .unwrap_or(4)
+        .clamp(4, 16);
     let sh = Executor::list_shells(shells);
     let active_shells = sh.iter().filter(|s| !s.finished).count();
     // M-OPS-05: 接近上限告警 (80%) — 防 registry 打满导致新 shell_start 被迫 reap。
@@ -2582,7 +2615,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
         )
         .await;
-        // C-OPS-05: ok 由真实探针决定 (BLOCKING_RT + git 依赖), CI 环境 git 存在 → ok=true。
+        // C-OPS-05: ok 由真实探针决定 (IPC_RT + git 依赖), CI 环境 git 存在 → ok=true。
         assert_eq!(resp["result"]["ok"], true);
         // ARCH-1: seatbelt 治理信号 — execute 默认开启 (商用安全默认)。
         assert_eq!(resp["result"]["seatbelt_default_on"], true);
@@ -2593,11 +2626,11 @@ mod tests {
             "ax_trusted 应为布尔: {}",
             resp["result"]["ax_trusted"]
         );
-        // C-OPS-05: runtime 探针 — BLOCKING_RT spawn 空任务超时探活
+        // C-OPS-05: runtime 探针 — IPC_RT spawn 空任务超时探活
         // D2-2: runtime 三态 (alive/busy/dead); 空闲测试环境应 alive, ok=true。
         assert_eq!(
             resp["result"]["runtime"]["ok"], true,
-            "runtime 应健康 (BLOCKING_RT 可响应): {}",
+            "runtime 应健康 (IPC_RT 可响应): {}",
             resp["result"]["runtime"]
         );
         assert!(
@@ -2627,6 +2660,49 @@ mod tests {
             git_dep["version"].is_string(),
             "git 应报 version: {}",
             git_dep
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // gap #5 回归: 64 并发 echo 全完成, 无死锁饥饿。
+    // 旧 bug: serve_blocking 跑共享 BLOCKING_RT (上限 8 worker), 64 连接扇出饥饿 →
+    // 响应写不出 → recv 30s 超时 (32/64 hang)。修复后专属 IPC_RT (clamp 4-16) 隔离。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_echo_64_all_complete() {
+        let sock = tmp_sock("conc64");
+        let server = IpcServer::new();
+        let (_tx, _join) = server.serve(&sock).await.unwrap();
+        let n = 64usize;
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = sock.clone();
+            handles.push(tokio::spawn(async move {
+                let req = format!(
+                    r#"{{"jsonrpc":"2.0","id":{i},"method":"executor.execute","params":{{"command":"echo {i}"}}}}"#
+                );
+                let t0 = std::time::Instant::now();
+                let resp = rpc(&s, &req).await;
+                (i, resp, t0.elapsed())
+            }));
+        }
+        let mut ok = 0usize;
+        let mut max_dur = std::time::Duration::ZERO;
+        for h in handles {
+            let (i, resp, dur) = h.await.unwrap();
+            assert_eq!(
+                resp["result"]["exit_code"], 0,
+                "conn {i}: 响应异常 (旧 bug 此处 hang 超时): {resp}"
+            );
+            ok += 1;
+            if dur > max_dur {
+                max_dur = dur;
+            }
+        }
+        assert_eq!(ok, n, "应全部 {n} 完成, 实际 {ok}");
+        // 旧 bug max dur ~30s (recv 超时); 修复后应 <15s 预算。
+        assert!(
+            max_dur.as_secs() < 15,
+            "max dur {max_dur:?} 超预算 (旧 bug 32 hang 30s)"
         );
         let _ = std::fs::remove_file(&sock);
     }

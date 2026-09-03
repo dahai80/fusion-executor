@@ -53,6 +53,11 @@ static TRACING_INIT: OnceLock<bool> = OnceLock::new();
 static FIRST_HANDLE: OnceLock<Option<FilterHandle>> = OnceLock::new();
 /// WorkerGuard 永存槽 (drop 会丢未刷缓冲)。
 static LOG_GUARD: OnceLock<Option<WorkerGuard>> = OnceLock::new();
+/// stderr NonBlocking guard 永存槽 — stderr 经独立写线程, 防 worker 线程串行阻塞在全局 stderr mutex。
+/// 修复: 80 并发 execute_async 各发 tracing event → fmt layer → Tee::write_all → Stderr::write_all
+/// 取 stderr 内部 pthread_mutex; 8 tokio worker 全串行化在该锁 → 吞吐崩溃 → soak 超时。
+/// 包 NonBlocking 后 worker 只投递 channel, 由专用写线程持 stderr 锁, 不阻塞 reactor。
+static STDERR_GUARD: OnceLock<Option<WorkerGuard>> = OnceLock::new();
 
 /// 默认 EnvFilter directive (INFO) — SIGHUP 无 RUST_LOG 时回退。
 pub const DEFAULT_FILTER_DIRECTIVE: &str = "info";
@@ -110,16 +115,32 @@ fn build_subscriber() -> Result<FilterHandle, InitError> {
     })
 }
 
-/// 解析双输出 writer — file (FE_LOG_DIR 滚动) + stderr。文件不可用 → 仅 stderr。
+/// 解析双输出 writer — file (FE_LOG_DIR 滚动) + stderr, **两者均经 NonBlocking**。
+///
+/// 关键: stderr 必须包 NonBlocking。原版裸 `std::io::stderr` 在 tokio worker 线程同步取
+/// stderr 内部 pthread_mutex; 80 并发 execute_async 各发 tracing event → fmt layer →
+/// Tee::write_all → Stderr::write_all → 全 8 worker 串行化在该锁 → 吞吐崩溃 → soak 超时
+/// (macOS sample 证: 7/8 worker 永久阻塞 __psynch_mutexwait ← Stderr::write_all)。
+/// 包 NonBlocking 后 worker 只向 channel 投递字节, 由专用写线程持 stderr 锁, 不阻塞 reactor。
 /// 返 BoxMakeWriter 擦除类型, 保 'static (with_filter 要求 Layer: 'static)。
 fn resolve_writer() -> BoxMakeWriter {
+    let stderr_nb = make_stderr_non_blocking();
     match resolve_file_writer() {
         Some((nb, guard)) => {
             LOG_GUARD.set(Some(guard)).ok();
-            BoxMakeWriter::new(nb.and(std::io::stderr))
+            BoxMakeWriter::new(nb.and(stderr_nb))
         }
-        None => BoxMakeWriter::new(std::io::stderr),
+        None => BoxMakeWriter::new(stderr_nb),
     }
+}
+
+/// stderr 包 NonBlocking — 专用写线程持 stderr 锁, 防 worker 线程串行阻塞。
+/// guard 存 STDERR_GUARD 永存 (drop 丢未刷缓冲)。构造失败 (理论上 NonBlocking 对 stderr
+/// 不会失败) → 回退裸 stderr (保降级路径有输出, 优于无日志)。
+fn make_stderr_non_blocking() -> NonBlocking {
+    let (nb, guard) = tracing_appender::non_blocking(std::io::stderr());
+    STDERR_GUARD.set(Some(guard)).ok();
+    nb
 }
 
 /// 解析文件 writer — FE_LOG_DIR (默认 ~/.fusion-executor/logs), 每日 rolling fe.log。

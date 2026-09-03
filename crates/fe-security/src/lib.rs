@@ -570,9 +570,13 @@ impl SecurityGuard {
         }
         let words: Vec<&str> = lower.split_whitespace().collect();
         words.iter().skip(1).any(|w| {
-            inline_flags
-                .iter()
-                .any(|f| *w == *f || w.starts_with(&format!("{}=", f)))
+            inline_flags.iter().any(|f| {
+                *w == *f
+                    || w.starts_with(&format!("{}=", f))
+                    // 附着形式: -cPAYLOAD / -ePAYLOAD (短选项无 = 紧贴 payload)。
+                    // 与 validate_argv 网关对齐 — 防 -c'import os;...' 单 token 绕降级路径。
+                    || (f.starts_with('-') && !f.starts_with("--") && w.starts_with(f) && w.len() > f.len())
+            })
         })
     }
 
@@ -737,9 +741,17 @@ impl SecurityGuard {
                 "python" | "python2" | "python3" | "node" | "ruby" | "perl" | "perl5"
             );
             if is_inline_interp
-                && args
-                    .iter()
-                    .any(|a| matches!(a.as_str(), "-c" | "-e" | "-E" | "--eval" | "-p" | "--print"))
+                && args.iter().any(|a| {
+                    let a = a.as_str();
+                    // 精确 flag + 附着形式 (-cPAYLOAD / -ePAYLOAD, shell_words 不拆附着 token)
+                    // + 长选项 = 形式 (--eval=PAYLOAD)。附着形式是 D3-1 网关关键缺口:
+                    // python3 -c'import os;os.system("id")' 单 token 绕过精确 matches!("-c")。
+                    matches!(a, "-c" | "-e" | "-E" | "--eval" | "-p" | "--print")
+                        || (a.starts_with("-c") && a.len() > 2)
+                        || (a.starts_with("-e") && a.len() > 2)
+                        || a.starts_with("--eval=")
+                        || a.starts_with("--print=")
+                })
             {
                 warn!(
                     "D3-1 内联解释器拦截: {} -c/-e 被拒 (企业硬化默认; allow_inline_interpreter opt-in)",
@@ -1656,6 +1668,50 @@ mod tests {
         assert!(
             v2.allowed,
             "D3-11: opt-in 后无害 -c 须放行, reason={:?}",
+            v2.reason
+        );
+    }
+
+    #[test]
+    fn d312_blocks_inline_exec_attached_form() {
+        // D3-12 (审计 0827 product adversarial): 附着形式 -cPAYLOAD / -ePAYLOAD 绕过网关。
+        // shell_words 不拆附着 token → python3 -c'print(1)' 单 token, 精确 matches!("-c") 漏。
+        // 真实解释器接受附着形式 (python3 -c'print("hi")' 执行; perl -e'print 1' 执行;
+        // ruby -e'puts 1' 执行), 故附着形式与空格分隔等价可执行 → 须同等拦截。
+        // 仅白名单解释器 + 无害 payload (隔离测网关本身)。
+        for cmd in [
+            "python3 -cprint('hi')",
+            "python3 -c'print(\"hi\")'",
+            "python3 -c\"print('hi')\"",
+            "python3 -cprint(1+1)",
+            "python3 --eval=print(1)",
+            "python3 --print=print(1)",
+        ] {
+            let v = guard().validate(cmd);
+            assert!(
+                !v.allowed,
+                "D3-12: 附着形式 -cPAYLOAD 须拒 (与 -c 空格分隔等价可执行): {cmd}, reason={:?}",
+                v.reason
+            );
+        }
+        // 降级路径 (is_inline_interpreter) 亦须覆盖附着形式 — 防 guard 宕机时降级 fail-open。
+        let g = guard(); // allow_inline=false 默认
+        for cmd in [
+            "python3 -cprint('hi')",
+            "python3 -c'import os; os.system(\"id\")'",
+        ] {
+            assert!(
+                g.is_inline_interpreter(cmd),
+                "D3-12: is_inline_interpreter 须识别附着 -cPAYLOAD (降级 fail-closed): {cmd}"
+            );
+        }
+        // opt-in 后附着形式无害 payload 须放行 (受信本地)。
+        let v2 = guard()
+            .with_allow_inline_interpreter(true)
+            .validate("python3 -cprint('safe')");
+        assert!(
+            v2.allowed,
+            "D3-12: opt-in 后附着 -c 无害 payload 须放行, reason={:?}",
             v2.reason
         );
     }
