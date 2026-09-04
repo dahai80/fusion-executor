@@ -160,6 +160,9 @@ struct PyGuiResult {
     screenshot_width: Option<u32>,
     #[pyo3(get)]
     screenshot_height: Option<u32>,
+    /// #38: backing scale factor — 物理 PNG 像素 / 逻辑点 (Retina=2.0)
+    #[pyo3(get)]
+    scale_factor: f32,
     #[pyo3(get)]
     error: Option<String>,
 }
@@ -172,6 +175,7 @@ impl From<RsGuiResult> for PyGuiResult {
             screenshot_png_b64: r.screenshot_png_b64,
             screenshot_width: r.screenshot_width,
             screenshot_height: r.screenshot_height,
+            scale_factor: r.scale_factor,
             error: r.error,
         }
     }
@@ -920,6 +924,7 @@ impl PyExecutor {
                     screenshot_png_b64: None,
                     screenshot_width: None,
                     screenshot_height: None,
+                    scale_factor: 1.0,
                     error: Some(format!("action 入参无效: {e}")),
                 };
             }
@@ -934,6 +939,7 @@ impl PyExecutor {
                     screenshot_png_b64: None,
                     screenshot_width: None,
                     screenshot_height: None,
+                    scale_factor: 1.0,
                     error: Some(format!("action 反序列化失败: {e}")),
                 };
             }
@@ -952,10 +958,37 @@ impl PyExecutor {
                     screenshot_png_b64: None,
                     screenshot_width: None,
                     screenshot_height: None,
+                    scale_factor: 1.0,
                     error: Some(format!("gui_action 失败: {e}")),
                 }
             }
         }
+    }
+
+    /// #39: gui_action_batch(actions: list[dict]) -> list[NativeGuiResult]
+    /// 顺序执行多动作, 收集每步结果。经 json.dumps → serde 反序列化 Vec<GuiAction>。
+    fn gui_action_batch(
+        &self,
+        py: Python<'_>,
+        actions: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<PyGuiResult>> {
+        let json_str: String = py
+            .import("json")?
+            .call_method1("dumps", (actions,))?
+            .extract()?;
+        let gui_actions: Vec<GuiAction> = match serde_json::from_str(&json_str) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(error = %e, json = %json_str, "gui_action_batch 反序列化失败");
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "actions 反序列化失败: {e}"
+                )));
+            }
+        };
+        let results = py
+            .detach(|| self.inner.gui_action_batch(gui_actions))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+        Ok(results.into_iter().map(PyGuiResult::from).collect())
     }
 
     /// execute_streaming(command, task_id=None, cwd=None, timeout_sec=30.0, env_vars=None,

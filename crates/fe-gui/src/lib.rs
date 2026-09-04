@@ -67,7 +67,13 @@ pub enum GuiAction {
         key: String,
         duration_ms: u64,
     },
-    Screenshot {},
+    Screenshot {
+        // #40: 敏感区遮罩 — true 时遍历 AX 树查 AXSecureTextField (密码框) 位置/尺寸,
+        // 对截图 PNG 对应像素区涂黑后编码, 防 VLM 泄露凭据。需 Accessibility TCC
+        // (AX 树遍历); 未授权时跳过遮罩并 warn (截图仍返回, 仅未遮罩)。
+        #[serde(default)]
+        mask_sensitive: bool,
+    },
     InspectTree {},
     Scroll {
         dx: i32,
@@ -120,7 +126,17 @@ pub struct GuiResult {
     pub screenshot_png_b64: Option<String>,
     pub screenshot_width: Option<u32>,
     pub screenshot_height: Option<u32>,
+    // #38: backing scale factor — 物理 PNG 像素 / 逻辑点 (Retina=2.0, 非 Retina=1.0)。
+    // 坐标契约: 所有 GuiAction x/y 输入 + inspect_tree AXPosition = 逻辑点;
+    //           screenshot_width/height = 物理像素。调用方据此双向换算 (pixel = point * scale)。
+    // 非 screenshot 结果默认 1.0 (无截图时无意义但向后兼容 absent=1.0)。
+    #[serde(default = "default_scale_factor")]
+    pub scale_factor: f32,
     pub error: Option<String>,
+}
+
+fn default_scale_factor() -> f32 {
+    1.0
 }
 
 /// 单个 UI 节点 — InspectTree 输出的树节点
@@ -283,8 +299,8 @@ impl GuiController {
         // IMPL-9: Screenshot 走 CoreGraphics (CGWindowListCreateImage) 需 Screen Recording TCC,
         // 非 Accessibility TCC — 两权限独立。AX 未授权但 Screen Recording 授权时仍应可截图。
         // 提到 ax_trusted 闸门前, 让 screenshot() 自探 Screen Recording (CGImage None → 降级)。
-        if let GuiAction::Screenshot {} = &action {
-            return self.screenshot();
+        if let GuiAction::Screenshot { mask_sensitive } = &action {
+            return self.screenshot(*mask_sensitive);
         }
         if !Self::ax_trusted() {
             warn!("AX 未授权 (TCC Accessibility) — GUI 操作降级");
@@ -305,7 +321,7 @@ impl GuiController {
             GuiAction::HoldKey { key, duration_ms } => self.hold_key(&key, duration_ms),
             // IMPL-9: Screenshot 已在 ax_trusted 闸门前 early-return (Screen Recording TCC 独立)。
             // 走到此说明 early-return 被重构破 — fail-loud (非 crash), 同 Wait 兜底模式。
-            GuiAction::Screenshot {} => Ok(GuiResult {
+            GuiAction::Screenshot { .. } => Ok(GuiResult {
                 ok: false,
                 error: Some("internal: Screenshot 未在 early-return 处理 (invariant 破坏)".into()),
                 ..Default::default()
@@ -342,6 +358,23 @@ impl GuiController {
                 ..Default::default()
             }),
         }
+    }
+
+    /// #39: 批量原子动作管线 — 顺序执行多个 GuiAction, 收集每步 GuiResult。
+    /// 非事务 (单步失败不中止后续 — 调用方据每步 ok 自决重试/补偿); 中止语义由调用方
+    /// 读 results 断点实现 (executor 不可知意图)。空 actions 返空 Vec。顺序保证 (非并行),
+    /// 因 GUI 动作有隐含时序 (focus→click→type)。
+    pub fn gui_action_batch(&self, actions: Vec<GuiAction>) -> Result<Vec<GuiResult>> {
+        info!(count = actions.len(), "gui_action_batch 开始");
+        let mut results = Vec::with_capacity(actions.len());
+        for (i, action) in actions.into_iter().enumerate() {
+            let res = self.execute(action)?;
+            let ok = res.ok;
+            results.push(res);
+            info!(step = i, ok, "gui_action_batch 步完成");
+        }
+        info!(count = results.len(), "gui_action_batch 结束");
+        Ok(results)
     }
 
     fn focus_app(&self, bundle_id: &str) -> Result<GuiResult> {
@@ -935,10 +968,102 @@ impl GuiController {
         }
     }
 
+    /// #40: 收集焦点 app 焦点窗口内所有 AXSecureTextField (密码框) 的逻辑点矩形 (x, y, w, h)。
+    /// 递归遍历 AX 子树 (复用 build_node 的深度/节点上限防爆炸)。AX 未授权时返空 Vec
+    /// (调用方 screenshot 已在 ax_trusted() 闸门内调用, 此处仍 fail-soft)。
+    fn collect_secure_rects() -> Vec<(f64, f64, f64, f64)> {
+        let app = match Self::focused_app() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "collect_secure_rects: 取 focused app 失败 — 返空");
+                return vec![];
+            }
+        };
+        let win = match app.focused_window().or_else(|_| app.main_window()) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "collect_secure_rects: 取 focused window 失败 — 返空");
+                return vec![];
+            }
+        };
+        let mut rects = vec![];
+        let mut count = 0usize;
+        Self::collect_secure_rects_rec(&win, 0, &mut count, &mut rects);
+        rects
+    }
+
+    fn collect_secure_rects_rec(
+        elem: &AXUIElement,
+        depth: usize,
+        count: &mut usize,
+        rects: &mut Vec<(f64, f64, f64, f64)>,
+    ) {
+        if *count >= MAX_TREE_NODES || depth >= MAX_TREE_DEPTH {
+            return;
+        }
+        *count += 1;
+        // AXSecureTextField: subrole == kAXSecureTextFieldSubrole (密码框显式标记)
+        let is_secure = elem
+            .subrole()
+            .map(|s| s == kAXSecureTextFieldSubrole)
+            .unwrap_or(false);
+        if is_secure {
+            if let (Some((x, y)), Some((w, h))) = (Self::read_position(elem), Self::read_size(elem))
+            {
+                rects.push((x, y, w, h));
+            }
+        }
+        if let Ok(child_arr) = elem.children() {
+            for c in child_arr.iter() {
+                if *count >= MAX_TREE_NODES {
+                    break;
+                }
+                Self::collect_secure_rects_rec(&c, depth + 1, count, rects);
+            }
+        }
+    }
+
+    /// #40: 对 RGBA 缓冲区原地涂黑敏感区。rects 是逻辑点 (x, y, w, h); scale 转 物理像素。
+    /// 坐标系换算: AX 原点左上 (y 向下), 位图上下文原点左下 (行 0 = 底) — 故位图行 = h_px - 1 - y_px。
+    /// 越界裁剪到 [0, w_px)/[0, h_px) 防 panic。
+    fn mask_rgba_inplace(
+        rgba: &mut [u8],
+        w_px: usize,
+        h_px: usize,
+        scale: f32,
+        rects: &[(f64, f64, f64, f64)],
+    ) {
+        let bytes_per_row = w_px * 4;
+        for &(lx, ly, lw, lh) in rects {
+            // 逻辑点 → 物理像素 (向下取整 + clamp)
+            let x0 = ((lx * scale as f64).floor() as isize).max(0) as usize;
+            let y0 = ((ly * scale as f64).floor() as isize).max(0) as usize;
+            let x1 = (((lx + lw) * scale as f64).ceil() as isize).min(w_px as isize) as usize;
+            let y1 = (((ly + lh) * scale as f64).ceil() as isize).min(h_px as isize) as usize;
+            if x0 >= x1 || y0 >= y1 || x0 >= w_px || y0 >= h_px {
+                continue;
+            }
+            // 涂黑: RGBA = (0,0,0,255)。y 翻转 — 位图行 0 在底。
+            for py in y0..y1 {
+                let row = h_px - 1 - py;
+                let base = row * bytes_per_row + x0 * 4;
+                for px in 0..(x1 - x0) {
+                    let i = base + px * 4;
+                    rgba[i] = 0;
+                    rgba[i + 1] = 0;
+                    rgba[i + 2] = 0;
+                    rgba[i + 3] = 255;
+                }
+            }
+        }
+    }
+
     /// 截图 — CGWindowListCreateImage 全屏 → CGImage → 位图上下文取 RGBA → PNG → base64
     /// Screen Recording TCC 未授权时 CGImage 为 None → 返回明确错误。
-    fn screenshot(&self) -> Result<GuiResult> {
-        info!("Screenshot");
+    /// #40: mask_sensitive=true 时遍历 AX 树查 AXSecureTextField (密码框) 区块, 对 RGBA
+    /// 像素涂黑后编码 — 防 VLM 泄露凭据。需 Accessibility TCC; 未授权跳过遮罩 + warn。
+    fn screenshot(&self, mask_sensitive: bool) -> Result<GuiResult> {
+        info!(mask_sensitive, "Screenshot");
         let bounds = CGRect {
             origin: core_graphics::geometry::CGPoint { x: 0.0, y: 0.0 },
             size: core_graphics::geometry::CGSize {
@@ -965,7 +1090,50 @@ impl GuiController {
                 });
             }
         };
-        let png_b64 = match Self::cgimage_to_png_b64(&img) {
+        let (mut rgba, vw, vh) = match Self::cgimage_to_rgba(&img) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "截图编码失败 — 降级");
+                return Ok(GuiResult {
+                    ok: false,
+                    error: Some(format!("screenshot-encode-failed: {e}")),
+                    ..Default::default()
+                });
+            }
+        };
+        // #38: scale_factor = 物理像素 / 逻辑点。CGDisplay::main().bounds() 返主屏逻辑点尺寸;
+        // screenshot 是全屏物理像素 (img.width/height)。Retina 上 = 2.0, 非 Retina = 1.0。
+        // bounds.width 为 0 (罕见异常) 时降级 1.0 防 NaN。
+        let scale_factor = {
+            let main = CGDisplay::main();
+            let logical_w = main.bounds().size.width;
+            if logical_w > 0.0 {
+                (img.width() as f32 / logical_w as f32).max(1.0)
+            } else {
+                warn!("主屏逻辑宽度为 0 — scale_factor 降级 1.0");
+                1.0
+            }
+        };
+        info!(scale_factor, "Screenshot scale_factor 计算完成");
+        // #40: 敏感区遮罩 — AXSecureTextField (密码框) 像素涂黑。
+        let masked_count = if mask_sensitive {
+            if Self::ax_trusted() {
+                let rects = Self::collect_secure_rects();
+                if !rects.is_empty() {
+                    Self::mask_rgba_inplace(&mut rgba, vw, vh, scale_factor, &rects);
+                }
+                rects.len()
+            } else {
+                warn!("mask_sensitive=true 但 AX 未授权 — 跳过敏感区遮罩 (截图未遮罩返回)");
+                0
+            }
+        } else {
+            0
+        };
+        if masked_count > 0 {
+            info!(masked_count, "敏感区遮罩完成 (AXSecureTextField 区块涂黑)");
+        }
+        let png_b64 = match Self::rgba_to_png_b64(&rgba, vw, vh) {
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "截图编码失败 — 降级");
@@ -981,11 +1149,13 @@ impl GuiController {
             screenshot_png_b64: Some(png_b64),
             screenshot_width: Some(img.width() as u32),
             screenshot_height: Some(img.height() as u32),
+            scale_factor,
             ..Default::default()
         })
     }
 
-    /// CGImage → RGBA → PNG → base64。用位图上下文统一像素格式 (避免源图 alpha/bgr 差异)。
+    /// CGImage → RGBA Vec<u8> (预乘, premultiplied last) + 宽高。位图上下文统一像素格式。
+    /// 返回 Vec 以便调用方 (mask) 原地改像素后再编码。
     ///
     /// M-12.3: 位图上下文用 kCGImageAlphaPremultipliedLast — CoreGraphics 返回**预乘 RGBA**
     /// (RGB 已乘 alpha)。PNG 标准期望**非预乘** (straight) alpha。此处直接编码预乘像素,
@@ -993,7 +1163,7 @@ impl GuiController {
     /// 仅含透明窗/菜单阴影的截图边缘可能色偏。已知取舍 (Rule 2 最小改): 显式 unpremultiply 需逐像素
     /// 除法 (4*w*h 次, 满屏 4M+ ops) 且 alpha=0 除零特判 — 当前调用方 (mlx-vlm 视觉 grounding)
     /// 不依赖精确 alpha, 色偏在容差内, 不实装。若未来需精确 alpha, 在此循环 unpremultiply。
-    fn cgimage_to_png_b64(img: &CGImage) -> Result<String> {
+    fn cgimage_to_rgba(img: &CGImage) -> Result<(Vec<u8>, usize, usize)> {
         let w = img.width();
         let h = img.height();
         if w == 0 || h == 0 {
@@ -1018,7 +1188,13 @@ impl GuiController {
             },
         };
         ctx.draw_image(rect, img);
-        let rgba: &[u8] = ctx.data();
+        // ctx.data() 是 &[u8] 借用 ctx — copy 到 Vec 后 ctx 可 drop, 再原地 mask。
+        let rgba: Vec<u8> = ctx.data().to_vec();
+        Ok((rgba, w, h))
+    }
+
+    /// RGBA Vec → PNG → base64。
+    fn rgba_to_png_b64(rgba: &[u8], w: usize, h: usize) -> Result<String> {
         let mut buf: Vec<u8> = Vec::with_capacity(0);
         {
             let mut enc = Encoder::new(&mut buf, w as u32, h as u32);
@@ -1420,7 +1596,12 @@ mod tests {
                 key: "Return".into(),
                 modifiers: vec![],
             },
-            GuiAction::Screenshot {},
+            GuiAction::Screenshot {
+                mask_sensitive: false,
+            },
+            GuiAction::Screenshot {
+                mask_sensitive: true,
+            },
             GuiAction::InspectTree {},
             GuiAction::Scroll {
                 dx: 0,
@@ -1477,7 +1658,10 @@ mod tests {
 
     #[test]
     fn gui_action_tag_snake_case() {
-        let s = serde_json::to_string(&GuiAction::Screenshot {}).unwrap();
+        let s = serde_json::to_string(&GuiAction::Screenshot {
+            mask_sensitive: false,
+        })
+        .unwrap();
         assert!(s.contains("\"kind\":\"screenshot\""), "tag snake_case: {s}");
         let s = serde_json::to_string(&GuiAction::InspectTree {}).unwrap();
         assert!(
@@ -1519,7 +1703,11 @@ mod tests {
     #[test]
     fn execute_degrades_without_ax_trust() {
         let ctrl = GuiController::new();
-        let r = ctrl.execute(GuiAction::Screenshot {}).unwrap();
+        let r = ctrl
+            .execute(GuiAction::Screenshot {
+                mask_sensitive: false,
+            })
+            .unwrap();
         // IMPL-9: screenshot 走 Screen Recording TCC (CoreGraphics), 非 Accessibility 闸门。
         // 两路径均合法, 不强断言 ok 字面:
         //   CI 无 Screen Recording → ok:false + screen-recording-permission-required;
@@ -2137,13 +2325,15 @@ mod tests {
         }
     }
 
-    /// M-12.3: cgimage_to_png_b64 文档注释显式标注预乘 RGBA 取舍 (代码已改, 仅验存续+不变接口)。
-    /// 编译期保证: 此测试存在即回归守护 (注释删了不报错, 但维持显式标注是 contract)。
+    /// M-12.3: cgimage_to_rgba + rgba_to_png_b64 文档注释显式标注预乘 RGBA 取舍。
+    /// 编译期保证: 两函数可寻址 (拆分后接口, 不破坏调用方)。
+    #[allow(clippy::type_complexity)]
     #[test]
     fn m12_3_premultiplied_rgba_doc_anchors() {
-        // 截图全屏 alpha=255 (不透明) — 预乘无差异; M-12.3 注释覆盖半透明窗边缘色偏取舍。
-        // 此处仅断言方法签名稳定 (不破坏调用方), 实际色偏取舍见 cgimage_to_png_b64 注释。
-        let _: fn(&CGImage) -> Result<String> = GuiController::cgimage_to_png_b64;
+        let f1 = GuiController::cgimage_to_rgba as fn(&CGImage) -> Result<(Vec<u8>, usize, usize)>;
+        let f2 = GuiController::rgba_to_png_b64 as fn(&[u8], usize, usize) -> Result<String>;
+        assert!(std::ptr::addr_of!(f1) as usize != 0);
+        assert!(std::ptr::addr_of!(f2) as usize != 0);
     }
 
     /// RUN-12: 默认 GuiController::new() 受限 — 非默认集 bundle 被 check_bundle_allowed 拒。
@@ -2172,7 +2362,11 @@ mod tests {
     #[test]
     fn impl9_screenshot_bypasses_accessibility_gate() {
         let ctrl = GuiController::new();
-        let r = ctrl.execute(GuiAction::Screenshot {}).unwrap();
+        let r = ctrl
+            .execute(GuiAction::Screenshot {
+                mask_sensitive: false,
+            })
+            .unwrap();
         // 关键: screenshot 不经 Accessibility 闸门, 故 error 不应是 accessibility-permission-required
         assert_ne!(
             r.error.as_deref(),
@@ -2190,6 +2384,123 @@ mod tests {
                 "IMPL-9: CI 应返 screen-recording 错误: {:?}",
                 r.error
             );
+        }
+    }
+
+    /// #38: GuiResult.scale_factor serde 默认 1.0 (absent field → 1.0, 向后兼容)。
+    #[test]
+    fn gui_result_scale_factor_serde_default() {
+        let json = r#"{"ok":true}"#;
+        let r: GuiResult = serde_json::from_str(json).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.scale_factor, 1.0, "absent scale_factor 应默认 1.0");
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(
+            s.contains("\"scale_factor\":1.0"),
+            "scale_factor 应序列化: {s}"
+        );
+    }
+
+    /// #40: Screenshot mask_sensitive serde 默认 false (absent → false, 不遮罩)。
+    #[test]
+    fn screenshot_mask_sensitive_serde_default() {
+        let s = r#"{"kind":"screenshot"}"#;
+        let a: GuiAction = serde_json::from_str(s).unwrap();
+        match a {
+            GuiAction::Screenshot { mask_sensitive } => {
+                assert!(!mask_sensitive, "absent mask_sensitive 应默认 false");
+            }
+            _ => panic!("deser 应为 Screenshot"),
+        }
+        let s2 = r#"{"kind":"screenshot","mask_sensitive":true}"#;
+        let a2: GuiAction = serde_json::from_str(s2).unwrap();
+        match a2 {
+            GuiAction::Screenshot { mask_sensitive } => {
+                assert!(mask_sensitive, "显式 mask_sensitive:true 应保留");
+            }
+            _ => panic!("deser 应为 Screenshot"),
+        }
+    }
+
+    /// #40: mask_rgba_inplace 涂黑逻辑点矩形 (含 Y 翻转)。
+    /// 构造 2×2 RGBA 全白, rect 覆盖整图 → 全黑。scale=1.0。
+    #[test]
+    fn mask_rgba_inplace_full_cover() {
+        let mut rgba = vec![255u8; 2 * 2 * 4];
+        let rects = vec![(0.0f64, 0.0, 2.0, 2.0)];
+        GuiController::mask_rgba_inplace(&mut rgba, 2, 2, 1.0, &rects);
+        for px in rgba.chunks(4) {
+            assert_eq!(px, &[0, 0, 0, 255], "全图应涂黑 RGBA(0,0,0,255)");
+        }
+    }
+
+    /// #40: mask_rgba_inplace 局部矩形 + scale=2.0 + Y 翻转正确性。
+    /// 4×4 图, rect (1,1,1,1) 逻辑点 → scale 2 → 像素区 [2,4)×[2,4) (物理)。
+    /// Y 翻转: 物理行 = h-1-py, py∈[2,4) → 行 [0,2) (顶两行)。
+    #[test]
+    fn mask_rgba_inplace_partial_scale_yflip() {
+        let mut rgba = vec![255u8; 4 * 4 * 4];
+        let rects = vec![(1.0f64, 1.0, 1.0, 1.0)];
+        GuiController::mask_rgba_inplace(&mut rgba, 4, 4, 2.0, &rects);
+        let is_black = |x: usize, y: usize| -> bool {
+            let row = 4 - 1 - y;
+            let i = (row * 4 + x) * 4;
+            rgba[i] == 0 && rgba[i + 1] == 0 && rgba[i + 2] == 0 && rgba[i + 3] == 255
+        };
+        // py∈[2,4), px∈[2,4) 应黑
+        for y in 2..4 {
+            for x in 2..4 {
+                assert!(is_black(x, y), "({x},{y}) 应黑");
+            }
+        }
+        // 其余应白
+        for y in 0..4 {
+            for x in 0..4 {
+                if !(2..4).contains(&x) || !(2..4).contains(&y) {
+                    assert!(!is_black(x, y), "({x},{y}) 应白");
+                }
+            }
+        }
+    }
+
+    /// #40: mask_rgba_inplace 越界裁剪 (rect 超图边界) 不 panic。
+    #[test]
+    fn mask_rgba_inplace_oob_clamp() {
+        let mut rgba = vec![255u8; 2 * 2 * 4];
+        let rects = vec![(-5.0f64, -5.0, 100.0, 100.0)];
+        GuiController::mask_rgba_inplace(&mut rgba, 2, 2, 1.0, &rects);
+        for px in rgba.chunks(4) {
+            assert_eq!(px, &[0, 0, 0, 255], "超界 rect 应裁剪到全图涂黑");
+        }
+    }
+
+    /// #39: gui_action_batch 空 actions → 空 Vec。
+    #[test]
+    fn gui_action_batch_empty() {
+        let ctrl = GuiController::new();
+        let results = ctrl.gui_action_batch(vec![]).unwrap();
+        assert!(results.is_empty(), "空 batch 应返空 Vec");
+    }
+
+    /// #39: gui_action_batch 顺序执行多动作, 收集每步结果。
+    /// CI 无 TCC: Wait trusted-independent ok:true, Click 降级 ok:false。
+    #[test]
+    fn gui_action_batch_sequential_collects() {
+        let ctrl = GuiController::new();
+        let actions = vec![
+            GuiAction::Wait { seconds: 0.0 },
+            GuiAction::Click {
+                ax_label: None,
+                ax_position: None,
+            },
+            GuiAction::Wait { seconds: 0.0 },
+        ];
+        let results = ctrl.gui_action_batch(actions).unwrap();
+        assert_eq!(results.len(), 3, "应收集 3 步结果");
+        assert!(results[0].ok, "Wait[0] trusted-independent 应 ok");
+        assert!(results[2].ok, "Wait[2] trusted-independent 应 ok");
+        if !GuiController::ax_trusted() {
+            assert!(!results[1].ok, "CI 无 TCC: Click[1] 应降级 ok:false");
         }
     }
 }
