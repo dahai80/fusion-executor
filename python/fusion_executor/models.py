@@ -161,6 +161,10 @@ class GuiResult(BaseModel):
     screenshot_png_b64: str | None = None
     screenshot_width: int | None = None
     screenshot_height: int | None = None
+    # #38: backing scale factor — 物理 PNG 像素 / 逻辑点 (Retina=2.0, 非 Retina=1.0)。
+    # 坐标契约: GuiAction x/y 输入 + inspect_tree AXPosition = 逻辑点;
+    #           screenshot_width/height = 物理像素。调用方据此换算 (pixel = point * scale)。
+    scale_factor: float = 1.0
     error: str | None = None
 
 

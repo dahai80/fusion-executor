@@ -600,3 +600,102 @@ def test_subscription_close_idempotent():
     sub.close()
     sub.close()  # 二次不抛
     assert sub._sock is None
+
+
+# ── #38/#39/#40 (v0.2.10) scale_factor + mask_sensitive + gui_action_batch ──
+
+
+def test_gui_result_scale_factor_default_and_roundtrip():
+    # #38: GuiResult.scale_factor 默认 1.0, 序列化往返保持
+    r = GuiResult(ok=True, scale_factor=2.0)
+    assert r.scale_factor == 2.0
+    d = r.model_dump()
+    assert d["scale_factor"] == 2.0
+    back = GuiResult.model_validate(d)
+    assert back.scale_factor == 2.0
+    # 默认
+    assert GuiResult().scale_factor == 1.0
+
+
+def test_gui_action_screenshot_mask_sensitive_default_false():
+    # #40: screenshot 默认 mask_sensitive=false (不遮蔽), 走 TCC-skip 守卫 (CI 路径)
+    ex = FusionSandboxExecutor()
+    # 无 TCC → 降级 skip mask, 仍返回 GuiResult (不崩)
+    r = ex.gui_action({"kind": "screenshot"})
+    assert isinstance(r, GuiResult)
+
+
+def test_gui_action_screenshot_mask_sensitive_true_when_trusted():
+    # #40: trusted 机 mask_sensitive=true → 遮蔽 secure field, ok=True + 有 PNG
+    if not _ax_trusted():
+        pytest.skip("AX/Screen Recording 未授权 — 跳过 mask_sensitive 真实截图测试 (CI 路径)")
+    ex = FusionSandboxExecutor()
+    r = ex.gui_action({"kind": "screenshot", "mask_sensitive": True})
+    assert r.ok is True
+    assert r.screenshot_png_b64 is not None
+    raw = base64.b64decode(r.screenshot_png_b64)
+    assert raw[:8] == b"\x89PNG\r\n\x1a\n"
+    assert r.scale_factor >= 1.0
+
+
+def test_gui_action_batch_empty_returns_empty():
+    # #39: 空批 → 空列表 (不调 native)
+    ex = FusionSandboxExecutor()
+    results = ex.gui_action_batch([])
+    assert results == []
+
+
+def test_gui_action_batch_sequential_collects_per_step():
+    # #39: 多动作顺序执行, 每步返 GuiResult; Wait ok=True, 未知键 ok=False 降级
+    ex = FusionSandboxExecutor()
+    results = ex.gui_action_batch(
+        [
+            {"kind": "wait", "seconds": 0.0},
+            {"kind": "key_press", "key": "totally-fake-key"},
+            {"kind": "wait", "seconds": 0.0},
+        ]
+    )
+    assert len(results) == 3
+    assert all(isinstance(r, GuiResult) for r in results)
+    assert results[0].ok is True
+    assert results[1].ok is False
+    assert "unknown-key" in results[1].error
+    assert results[2].ok is True
+
+
+def test_gui_action_batch_non_list_raises():
+    ex = FusionSandboxExecutor()
+    with pytest.raises(TypeError, match="actions 必须为 list"):
+        ex.gui_action_batch({"kind": "wait"})  # type: ignore[arg-type]
+
+
+def test_gui_action_batch_item_missing_kind_raises():
+    ex = FusionSandboxExecutor()
+    with pytest.raises(ValueError, match="缺 'kind'"):
+        ex.gui_action_batch([{"seconds": 0.0}])
+
+
+def test_gui_action_batch_over_uds(server: str):
+    # #39: UDS roundtrip — wait ok + 未知键降级
+    resp = _rpc(
+        server,
+        {
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "executor.gui_action_batch",
+            "params": {
+                "actions": [
+                    {"kind": "wait", "seconds": 0.0},
+                    {"kind": "key_press", "key": "totally-fake-key"},
+                ]
+            },
+        },
+    )
+    assert resp["jsonrpc"] == "2.0"
+    assert resp["id"] == 42
+    results = resp["result"]
+    assert isinstance(results, list)
+    assert len(results) == 2
+    assert results[0]["ok"] is True
+    assert results[1]["ok"] is False
+    assert "unknown-key" in results[1]["error"]

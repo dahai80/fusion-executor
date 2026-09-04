@@ -651,6 +651,7 @@ class FusionSandboxExecutor:
             screenshot_png_b64=native.screenshot_png_b64,
             screenshot_width=native.screenshot_width,
             screenshot_height=native.screenshot_height,
+            scale_factor=native.scale_factor,
             error=native.error,
         )
         logger.info(
@@ -661,6 +662,40 @@ class FusionSandboxExecutor:
             result.error,
         )
         return result
+
+    def gui_action_batch(self, actions: list[dict]) -> list[GuiResult]:
+        # #39: 批量原子动作管线 — 顺序执行多动作, 收集每步 GuiResult。
+        # 非事务: 单步失败不中止后续 (调用方据每步 ok 自决重试/补偿)。
+        if not isinstance(actions, list):
+            raise TypeError(f"actions 必须为 list, 得 {type(actions).__name__}")
+        for i, a in enumerate(actions):
+            if not isinstance(a, dict):
+                raise TypeError(f"actions[{i}] 必须为 dict, 得 {type(a).__name__}")
+            if "kind" not in a:
+                raise ValueError(f"actions[{i}] 缺 'kind' 字段")
+            kind = a["kind"]
+            if not isinstance(kind, str):
+                raise TypeError(f"actions[{i}]['kind'] 必须为 str, 得 {type(kind).__name__}")
+        logger.debug("gui_action_batch count=%d", len(actions))
+        natives = self._native.gui_action_batch(actions)
+        results = [
+            GuiResult(
+                ok=n.ok,
+                node_tree=n.node_tree,
+                screenshot_png_b64=n.screenshot_png_b64,
+                screenshot_width=n.screenshot_width,
+                screenshot_height=n.screenshot_height,
+                scale_factor=n.scale_factor,
+                error=n.error,
+            )
+            for n in natives
+        ]
+        logger.info(
+            "gui_action_batch done count=%d ok_count=%d",
+            len(results),
+            sum(1 for r in results if r.ok),
+        )
+        return results
 
     def telemetry_stream(
         self,

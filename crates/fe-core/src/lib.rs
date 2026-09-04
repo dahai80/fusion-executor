@@ -768,6 +768,12 @@ impl Executor {
         self.gui.execute(action)
     }
 
+    /// #39: 批量 GUI 动作管线 — 顺序执行多动作, 收集每步结果。
+    #[cfg(feature = "gui")]
+    pub fn gui_action_batch(&self, actions: Vec<GuiAction>) -> Result<Vec<GuiResult>> {
+        self.gui.gui_action_batch(actions)
+    }
+
     /// 原生文件工具 — file_edit (PRD FileEdit 本地化, #6 replace_all)
     pub fn file_edit(
         &self,

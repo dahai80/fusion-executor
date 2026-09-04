@@ -672,9 +672,12 @@ impl BroadcastHub {
                 break;
             }
             let executor = self.executor.clone();
-            let shot =
-                tokio::task::spawn_blocking(move || executor.gui_action(GuiAction::Screenshot {}))
-                    .await;
+            let shot = tokio::task::spawn_blocking(move || {
+                executor.gui_action(GuiAction::Screenshot {
+                    mask_sensitive: false,
+                })
+            })
+            .await;
             let data = match shot {
                 Ok(Ok(r)) => {
                     let val = serde_json::to_value(&r).unwrap_or(json!({"ok": false}));
@@ -2049,6 +2052,17 @@ async fn handle_method(
                 .gui_action(action)
                 .map_err(|e| (ERR_INTERNAL, format!("gui_action 失败: {e}")))?;
             Ok(serde_json::to_value(&result).unwrap_or(json!({})))
+        }
+        "executor.gui_action_batch" => {
+            let actions_val = params
+                .get("actions")
+                .ok_or((ERR_INVALID_REQ, "缺少 actions".to_string()))?;
+            let actions: Vec<GuiAction> = serde_json::from_value(actions_val.clone())
+                .map_err(|e| (ERR_INVALID_REQ, format!("actions 反序列化失败: {e}")))?;
+            let results = executor
+                .gui_action_batch(actions)
+                .map_err(|e| (ERR_INTERNAL, format!("gui_action_batch 失败: {e}")))?;
+            Ok(serde_json::to_value(&results).unwrap_or(json!({})))
         }
         "executor.metrics" => {
             // C-OPS-05: 自服务指标 — exec 计数 + duration/stdio 聚合 + rollback 计数。
