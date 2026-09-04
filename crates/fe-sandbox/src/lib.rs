@@ -2360,10 +2360,13 @@ mod tests {
     // 平台无效, 改轮询缓解 (非纯代码修堆限制)。exit_code -124 复用超时约定。
     #[test]
     fn rss_watchdog_kills_memory_bomb() {
-        // 内存炸弹: 100 × 10MB 独立 bytearray (各占实内存) → RSS 膨胀触发 watchdog (256MB 上限)
+        // 内存炸弹: 100 × 10MB 独立 bytearray → RSS 膨胀触发 watchdog。
+        // 阈值 64MB: macOS 内存压缩会把 1GB 虚存压到 ~200MB 物理实存 (ru_maxrss 实测),
+        // 物理 RSS 才是 OOM 真指标 — watchdog 按物理 RSS 裁决正确。64MB 给压缩 3x 余量,
+        // 既能稳定触发, 又保留有意义的 OOM 阈值语义。
         let start = std::time::Instant::now();
         let mut c = cfg("python3 -c \"x=[bytearray(b'a'*10**7) for _ in range(100)]; import time; time.sleep(5)\"");
-        c.rss_limit_mb = 256;
+        c.rss_limit_mb = 64;
         c.timeout_sec = 10.0;
         let r = rt().block_on(Sandbox::new().run(c)).unwrap();
         assert!(
@@ -2417,7 +2420,7 @@ mod tests {
             max_nproc: 1024,
             max_cpu_sec: 0,
             max_nofile: 1024,
-            rss_limit_mb: 256,
+            rss_limit_mb: 64,
             sandbox_profile: None,
         };
         let (mut rx, handle) = sb.run_streaming(cfg, None).unwrap();
