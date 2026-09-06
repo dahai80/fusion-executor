@@ -165,6 +165,9 @@ class GuiResult(BaseModel):
     # 坐标契约: GuiAction x/y 输入 + inspect_tree AXPosition = 逻辑点;
     #           screenshot_width/height = 物理像素。调用方据此换算 (pixel = point * scale)。
     scale_factor: float = 1.0
+    # #43: 显示器清单 JSON (display_info 动作填) — [{id, scale, bounds:{x,y,w,h}, primary}]。
+    # None=非 display_info 结果 (向后兼容)。fusion-osagent 据此取 scale, 移除硬编码 2.0。
+    displays: str | None = None
     error: str | None = None
 
 

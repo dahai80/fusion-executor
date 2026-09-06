@@ -163,6 +163,9 @@ struct PyGuiResult {
     /// #38: backing scale factor — 物理 PNG 像素 / 逻辑点 (Retina=2.0)
     #[pyo3(get)]
     scale_factor: f32,
+    /// #43: 显示器清单 JSON (display_info 填), None=非 display_info 结果
+    #[pyo3(get)]
+    displays: Option<String>,
     #[pyo3(get)]
     error: Option<String>,
 }
@@ -176,6 +179,7 @@ impl From<RsGuiResult> for PyGuiResult {
             screenshot_width: r.screenshot_width,
             screenshot_height: r.screenshot_height,
             scale_factor: r.scale_factor,
+            displays: r.displays,
             error: r.error,
         }
     }
@@ -925,6 +929,7 @@ impl PyExecutor {
                     screenshot_width: None,
                     screenshot_height: None,
                     scale_factor: 1.0,
+                    displays: None,
                     error: Some(format!("action 入参无效: {e}")),
                 };
             }
@@ -940,6 +945,7 @@ impl PyExecutor {
                     screenshot_width: None,
                     screenshot_height: None,
                     scale_factor: 1.0,
+                    displays: None,
                     error: Some(format!("action 反序列化失败: {e}")),
                 };
             }
@@ -959,6 +965,7 @@ impl PyExecutor {
                     screenshot_width: None,
                     screenshot_height: None,
                     scale_factor: 1.0,
+                    displays: None,
                     error: Some(format!("gui_action 失败: {e}")),
                 }
             }

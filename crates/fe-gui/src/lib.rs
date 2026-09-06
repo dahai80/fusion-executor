@@ -117,6 +117,16 @@ pub enum GuiAction {
     Wait {
         seconds: f64,
     },
+    // #44: 批量鼠标移动 — 有序点序列, 单次 UDS 往返原子完成 (避免 N 次 hover round-trip)。
+    // CGEvent MouseMoved (无按键) 沿 waypoints 线性插值平滑; duration_ms 总时长分摊到每段。
+    MovePath {
+        points: Vec<(f64, f64)>,
+        #[serde(default)]
+        duration_ms: u64,
+    },
+    // #43: 显示器能力查询 — 列举所有活跃显示器 (id/scale/bounds/primary), trusted-independent
+    // (走 CGDisplay 非 AX)。fusion-osagent 据此取 scale_factor, 移除硬编码 2.0 假设。
+    DisplayInfo {},
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -132,6 +142,10 @@ pub struct GuiResult {
     // 非 screenshot 结果默认 1.0 (无截图时无意义但向后兼容 absent=1.0)。
     #[serde(default = "default_scale_factor")]
     pub scale_factor: f32,
+    // #43: 显示器清单 JSON (display_info 动作填) — [{id, scale, bounds:{x,y,w,h}, primary}]。
+    // additive: 非 display_info 结果为 None, 向后兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displays: Option<String>,
     pub error: Option<String>,
 }
 
@@ -302,6 +316,10 @@ impl GuiController {
         if let GuiAction::Screenshot { mask_sensitive } = &action {
             return self.screenshot(*mask_sensitive);
         }
+        // #43: DisplayInfo 走 CGDisplay (非 AX), trusted-independent — 提到 ax_trusted 闸门前。
+        if let GuiAction::DisplayInfo {} = &action {
+            return self.display_info();
+        }
         if !Self::ax_trusted() {
             warn!("AX 未授权 (TCC Accessibility) — GUI 操作降级");
             return Ok(GuiResult {
@@ -355,6 +373,17 @@ impl GuiController {
             GuiAction::Wait { .. } => Ok(GuiResult {
                 ok: false,
                 error: Some("internal: Wait 未在 early-return 处理 (invariant 破坏)".into()),
+                ..Default::default()
+            }),
+            // #44: move_path — N waypoints 鼠标移动, MouseMoved 插值, 单次往返原子完成。
+            GuiAction::MovePath {
+                points,
+                duration_ms,
+            } => self.move_path(points, duration_ms),
+            // #43: DisplayInfo 已在 ax_trusted 前早 return; 走到此说明 early-return 被重构破。
+            GuiAction::DisplayInfo {} => Ok(GuiResult {
+                ok: false,
+                error: Some("internal: DisplayInfo 未在 early-return 处理 (invariant 破坏)".into()),
                 ..Default::default()
             }),
         }
@@ -859,11 +888,28 @@ impl GuiController {
         let mut count = 0usize;
         let root = Self::build_node(&win, 0, &mut count);
         let tree = serde_json::to_string(&root).map_err(|e| anyhow!("节点树序列化失败: {e}"))?;
+        // #43: inspect_tree 亦填 scale_factor — 旧版 ..Default::default() 默认 1.0, Retina 机
+        // 调用方误判坐标空间。复用主屏 scale (与 screenshot 同源), 无截图但坐标契约一致。
+        let scale_factor = Self::compute_scale_factor();
         Ok(GuiResult {
             ok: true,
             node_tree: Some(tree),
+            scale_factor,
             ..Default::default()
         })
+    }
+
+    /// #38/#43: 主屏 backing scale factor = 物理像素 / 逻辑点 (Retina=2.0, 非 Retina=1.0)。
+    /// screenshot + inspect_tree + display_info 共用; bounds.width=0 时降级 1.0 防 NaN。
+    fn compute_scale_factor() -> f32 {
+        let main = CGDisplay::main();
+        let logical_w = main.bounds().size.width;
+        if logical_w > 0.0 {
+            (main.pixels_wide() as f32 / logical_w as f32).max(1.0)
+        } else {
+            warn!("主屏逻辑宽度为 0 — scale_factor 降级 1.0");
+            1.0
+        }
     }
 
     fn build_node(elem: &AXUIElement, depth: usize, count: &mut usize) -> UiNode {
@@ -1104,16 +1150,7 @@ impl GuiController {
         // #38: scale_factor = 物理像素 / 逻辑点。CGDisplay::main().bounds() 返主屏逻辑点尺寸;
         // screenshot 是全屏物理像素 (img.width/height)。Retina 上 = 2.0, 非 Retina = 1.0。
         // bounds.width 为 0 (罕见异常) 时降级 1.0 防 NaN。
-        let scale_factor = {
-            let main = CGDisplay::main();
-            let logical_w = main.bounds().size.width;
-            if logical_w > 0.0 {
-                (img.width() as f32 / logical_w as f32).max(1.0)
-            } else {
-                warn!("主屏逻辑宽度为 0 — scale_factor 降级 1.0");
-                1.0
-            }
-        };
+        let scale_factor = Self::compute_scale_factor();
         info!(scale_factor, "Screenshot scale_factor 计算完成");
         // #40: 敏感区遮罩 — AXSecureTextField (密码框) 像素涂黑。
         let masked_count = if mask_sensitive {
@@ -1435,6 +1472,112 @@ impl GuiController {
         })
     }
 
+    /// #44: 批量鼠标移动 — 沿有序 waypoints 发 MouseMoved (无按键), 单次往返原子完成。
+    /// duration_ms 总时长分摊到段数, 每段内线性插值 (默认每段 8 帧); 空序列拒绝。
+    fn move_path(&self, points: Vec<(f64, f64)>, duration_ms: u64) -> Result<GuiResult> {
+        info!(n = points.len(), duration_ms, "MovePath");
+        if points.len() < 2 {
+            warn!(
+                n = points.len(),
+                "MovePath 点数 < 2 — 拒绝 (至少需起止两点)"
+            );
+            return Ok(GuiResult {
+                ok: false,
+                error: Some("move_path 需至少 2 个点".into()),
+                ..Default::default()
+            });
+        }
+        if let Some(r) = self.focused_not_allowed() {
+            return Ok(r);
+        }
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("CGEventSource 创建失败 (move_path)"))?;
+        let segments = (points.len() - 1) as u64;
+        // 每段时长 (µs); duration_ms=0 时取 0 → 瞬时移动仍逐帧 post (无 sleep)。
+        let per_seg_us = if duration_ms > 0 {
+            (duration_ms * 1000) / segments.max(1)
+        } else {
+            0
+        };
+        let frames_per_seg: u64 = 8;
+        for w in points.windows(2) {
+            let from = w[0];
+            let to = w[1];
+            for i in 1..=frames_per_seg {
+                let t = i as f64 / frames_per_seg as f64;
+                let x = from.0 + (to.0 - from.0) * t;
+                let y = from.1 + (to.1 - from.1) * t;
+                let moved = CGEvent::new_mouse_event(
+                    source.clone(),
+                    CGEventType::MouseMoved,
+                    CGPoint::new(x, y),
+                    CGMouseButton::Left,
+                )
+                .map_err(|_| anyhow!("CGEvent MouseMoved 创建失败 (move_path 间帧)"))?;
+                moved.post(CGEventTapLocation::HID);
+            }
+            if per_seg_us > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(per_seg_us));
+            }
+        }
+        debug!(
+            segments,
+            frames_per_seg, "MovePath 完成 (MouseMoved posted)"
+        );
+        Ok(GuiResult {
+            ok: true,
+            ..Default::default()
+        })
+    }
+
+    /// #43: 显示器能力查询 — 枚举活跃显示器, 返 [{id, scale, bounds, primary}]。
+    /// trusted-independent (CGDisplay, 非 AX)。scale = pixels_wide / bounds.width (Retina=2.0)。
+    fn display_info(&self) -> Result<GuiResult> {
+        info!("DisplayInfo");
+        let ids = match CGDisplay::active_displays() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = ?e, "CGDisplay::active_displays 失败 — 降级");
+                return Ok(GuiResult {
+                    ok: false,
+                    error: Some(format!("display_info 失败: {e:?}")),
+                    ..Default::default()
+                });
+            }
+        };
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in ids {
+            let disp = CGDisplay::new(id);
+            let b = disp.bounds();
+            let logical_w = b.size.width;
+            let scale = if logical_w > 0.0 {
+                (disp.pixels_wide() as f32 / logical_w as f32).max(1.0)
+            } else {
+                1.0
+            };
+            entries.push(serde_json::json!({
+                "id": id,
+                "scale": scale,
+                "bounds": {
+                    "x": b.origin.x,
+                    "y": b.origin.y,
+                    "w": b.size.width,
+                    "h": b.size.height,
+                },
+                "primary": disp.is_main(),
+            }));
+        }
+        let displays =
+            serde_json::to_string(&entries).map_err(|e| anyhow!("display_info 序列化失败: {e}"))?;
+        info!(count = entries.len(), "DisplayInfo 完成");
+        Ok(GuiResult {
+            ok: true,
+            scale_factor: Self::compute_scale_factor(),
+            displays: Some(displays),
+            ..Default::default()
+        })
+    }
+
     /// 解析点击坐标 — 优先 ax_position; 否则 ax_label 匹配 AX 节点读 AXPosition。
     /// click/double_click/right_click 共用。无 label 无 position → 报错。
     fn resolve_click_position(
@@ -1647,6 +1790,15 @@ mod tests {
                 key: "Return".into(),
                 duration_ms: 100,
             },
+            GuiAction::MovePath {
+                points: vec![(0.0, 0.0), (10.0, 10.0), (20.0, 5.0)],
+                duration_ms: 120,
+            },
+            GuiAction::MovePath {
+                points: vec![(1.0, 1.0), (2.0, 2.0)],
+                duration_ms: 0,
+            },
+            GuiAction::DisplayInfo {},
         ];
         for a in cases {
             let s = serde_json::to_string(&a).unwrap();
@@ -1685,6 +1837,64 @@ mod tests {
         assert!(
             s.contains("\"kind\":\"hold_key\""),
             "hold_key tag snake_case: {s}"
+        );
+        let s = serde_json::to_string(&GuiAction::MovePath {
+            points: vec![(1.0, 2.0)],
+            duration_ms: 50,
+        })
+        .unwrap();
+        assert!(
+            s.contains("\"kind\":\"move_path\""),
+            "move_path tag snake_case: {s}"
+        );
+        assert!(
+            s.contains("\"duration_ms\":50"),
+            "move_path duration_ms 字段: {s}"
+        );
+        let s = serde_json::to_string(&GuiAction::DisplayInfo {}).unwrap();
+        assert!(
+            s.contains("\"kind\":\"display_info\""),
+            "display_info tag snake_case: {s}"
+        );
+    }
+
+    #[test]
+    fn move_path_empty_rejects() {
+        // <2 点拒绝 (ok=false) — 不需 trusted (focused_not_allowed 之前先查点数)
+        let g = GuiController::new();
+        let r = g.execute(GuiAction::MovePath {
+            points: vec![(1.0, 1.0)],
+            duration_ms: 10,
+        });
+        let r = r.unwrap();
+        assert!(!r.ok, "单点 move_path 应拒绝");
+        assert!(r.error.unwrap().contains("至少 2 个点"));
+        let r = g.execute(GuiAction::MovePath {
+            points: vec![],
+            duration_ms: 10,
+        });
+        let r = r.unwrap();
+        assert!(!r.ok, "空 move_path 应拒绝");
+    }
+
+    #[test]
+    fn display_info_trusted_independent_shape() {
+        // display_info 走 CGDisplay 非 AX — 无 trusted 亦有结果 (CI 路径可达)。
+        // CI 无显示器环境 active_displays 可能返空 Vec → ok=true displays="[]"; 有屏机 ok=true 非空。
+        // 不在此断言 displays 非空 (CI/无头差异), 仅断言 ok=true 且无 error (early-return 路径生效)。
+        let g = GuiController::new();
+        let r = g.execute(GuiAction::DisplayInfo {}).unwrap();
+        assert!(r.ok, "display_info 应 ok (CGDisplay, 非 AX gated): {r:?}");
+        assert!(r.error.is_none(), "display_info 不应有 error: {r:?}");
+        assert!(
+            r.displays.is_some(),
+            "displays 字段应填 (display_info 专属)"
+        );
+        // scale_factor 应来自 compute_scale_factor (非默认 1.0 占位 — 至少 >= 1.0)
+        assert!(
+            r.scale_factor >= 1.0,
+            "scale_factor 应 >= 1.0: {}",
+            r.scale_factor
         );
     }
 
