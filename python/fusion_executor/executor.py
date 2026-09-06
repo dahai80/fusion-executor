@@ -652,6 +652,7 @@ class FusionSandboxExecutor:
             screenshot_width=native.screenshot_width,
             screenshot_height=native.screenshot_height,
             scale_factor=native.scale_factor,
+            displays=native.displays,
             error=native.error,
         )
         logger.info(
@@ -686,6 +687,7 @@ class FusionSandboxExecutor:
                 screenshot_width=n.screenshot_width,
                 screenshot_height=n.screenshot_height,
                 scale_factor=n.scale_factor,
+                displays=n.displays,
                 error=n.error,
             )
             for n in natives

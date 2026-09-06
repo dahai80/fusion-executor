@@ -286,6 +286,7 @@ NEW_VARIANTS_CI = [
     {"kind": "window_resize", "width": 800.0, "height": 600.0},
     {"kind": "triple_click", "ax_position": [5.0, 5.0]},
     {"kind": "hold_key", "key": "Return", "duration_ms": 20},
+    {"kind": "move_path", "points": [[0.0, 0.0], [10.0, 10.0]]},
 ]
 
 
@@ -333,6 +334,46 @@ def test_gui_action_holdkey_when_trusted():
     assert isinstance(r, GuiResult)
     assert r.ok is True, f"HoldKey 应成功: {r.error}"
     assert r.error is None
+
+
+# ── v0.2.11 #43/#44 (display_info + move_path) ──
+
+
+def test_gui_action_display_info_trusted_independent():
+    # #43: DisplayInfo 走 CGDisplay API (trusted-independent) — 无需 TCC 授权, 任何机器 ok=True。
+    # 返回 displays JSON (活跃显示器清单 id/scale/bounds/primary) + scale_factor (主屏)。
+    ex = FusionSandboxExecutor()
+    r = ex.gui_action({"kind": "display_info"})
+    assert isinstance(r, GuiResult)
+    assert r.ok is True, f"DisplayInfo trusted-independent 应 ok=True: {r.error}"
+    assert r.error is None
+    assert r.displays is not None, "displays 应非 None"
+    entries = json.loads(r.displays)
+    assert isinstance(entries, list) and len(entries) >= 1, f"应至少 1 个显示器: {entries}"
+    main = entries[0]
+    assert {"id", "scale", "bounds", "primary"} <= set(main.keys()), f"字段缺失: {main}"
+    assert main["scale"] >= 1.0, f"scale 应 >= 1.0: {main['scale']}"
+    assert r.scale_factor >= 1.0, f"主屏 scale_factor 应 >= 1.0: {r.scale_factor}"
+
+
+def test_gui_action_move_path_pointer_when_trusted():
+    # #44: MovePath 单次 UDS 往返完成 N 点路径 — trusted 机 CGEvent MouseMoved 合成 ok=True。
+    if not _ax_access_trusted():
+        pytest.skip("AX Accessibility 未授权 — 跳过真实 move_path 合成测试 (CI 路径)")
+    ex = FusionSandboxExecutor(disable_bundle_allowlist=True)
+    r = ex.gui_action({"kind": "move_path", "points": [[0.0, 0.0], [10.0, 10.0], [20.0, 5.0]]})
+    assert isinstance(r, GuiResult)
+    assert r.ok is True, f"MovePath 带坐标应 ok=True: {r.error}"
+    assert r.error is None
+
+
+def test_gui_action_move_path_too_few_points_rejects():
+    # #44: MovePath <2 点 → ok=False (trusted-independent 拒绝, 无需 TCC)。
+    ex = FusionSandboxExecutor()
+    r = ex.gui_action({"kind": "move_path", "points": [[5.0, 5.0]]})
+    assert isinstance(r, GuiResult)
+    assert r.ok is False, "单点 move_path 应 ok=False"
+    assert r.error is not None
 
 
 # ── v1.5 #14 双向 server-push (subscribe/unsubscribe) ──
