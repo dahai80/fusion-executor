@@ -349,7 +349,10 @@ def test_gui_action_display_info_trusted_independent():
     assert r.error is None
     assert r.displays is not None, "displays 应非 None"
     entries = json.loads(r.displays)
-    assert isinstance(entries, list) and len(entries) >= 1, f"应至少 1 个显示器: {entries}"
+    assert isinstance(entries, list), f"displays 应 list: {entries}"
+    # headless/SSH 环境无活动显示器 — ok=True + 空 list 是正确行为, 跳过后续断言
+    if len(entries) == 0:
+        pytest.skip("无活动显示器 (headless/SSH 环境) — 跳过 display 字段断言 (CI 路径)")
     main = entries[0]
     assert {"id", "scale", "bounds", "primary"} <= set(main.keys()), f"字段缺失: {main}"
     assert main["scale"] >= 1.0, f"scale 应 >= 1.0: {main['scale']}"

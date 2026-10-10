@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .executor import FusionSandboxExecutor, Subscription
+from .laya_tool_selector import DEFAULT_TOOL_WHITELIST, LayaToolSelector
 from .models import (
     Diagnostics,
     EditResult,
@@ -20,9 +21,11 @@ from .models import (
     ShellStartResult,
     SnapshotInfo,
     TelemetrySample,
+    ToolDecision,
 )
 
 __all__ = [
+    "DEFAULT_TOOL_WHITELIST",
     "Diagnostics",
     "EditResult",
     "ExecutionRequest",
@@ -34,6 +37,7 @@ __all__ = [
     "GrepOptions",
     "GrepOutput",
     "GuiResult",
+    "LayaToolSelector",
     "MultiEditItem",
     "RollbackPolicy",
     "SandboxProfile",
@@ -43,6 +47,7 @@ __all__ = [
     "SnapshotInfo",
     "Subscription",
     "TelemetrySample",
+    "ToolDecision",
 ]
 # C-OPS-06: __version__ 读 build.rs 注入值 (经 fe-pyo3 version_info), 不再硬编码漂移
 # M-4: 导入失败 warn (Rule 12 fail-visible), 不静默吞 ABI/链接错误
@@ -55,7 +60,7 @@ try:
 except Exception as _e:  # native 扩展未构建/不可用 — 回退兜底但 warn 不静默
     import warnings
 
-    warnings.warn(f"native 扩展加载失败 ({_e!r}); 功能降级, __version__ 回退 0.2.11", RuntimeWarning, stacklevel=2)
-    __version__ = "0.2.11"
+    warnings.warn(f"native 扩展加载失败 ({_e!r}); 功能降级, __version__ 回退 0.2.12", RuntimeWarning, stacklevel=2)
+    __version__ = "0.2.12"
     __git_sha__ = "unknown"
     __build_time__ = "0"
