@@ -270,3 +270,23 @@ class SnapshotInfo(BaseModel):
     id: str = Field(description="快照 id (head:<SHA> / stash:<SHA>,base:<HEAD> / repo:<hash> 后缀)")
     created_ms: int = Field(description="快照创建时间戳 (毫秒纪元)")
     kind: str = Field(description="快照类型 (head 基线 / stash 含改动)")
+
+
+# Issue #46: laya-mlx 确定性工具调用 — ToolDecision 返回结构。
+# answer_confidence (max prob) 是门槛指标 — laya-mlx confidence.py 明确:
+# confidence (entropy) "not calibrated", 不跨 option 数迁移; answer_confidence 是
+# min_confidence gate 定义所用量。门槛比较永远用 answer_confidence。
+class ToolDecision(BaseModel):
+    model_config = _STRICT
+    tool_id: str = Field(description="选中工具 id; 低置信度降级时为 'llm_fallback'; 无需工具时 'none'")
+    confidence: float = Field(description="answer_confidence = max(probabilities) — 门槛比较用此值")
+    probabilities: dict[str, float] = Field(description="各选项概率分布 (tool_id -> prob)")
+    params: dict[str, str | int | None] = Field(
+        default_factory=dict, description="提取的参数槽位 (file_path/search_query/count 等); 无参数时空 dict"
+    )
+    fell_back: bool = Field(default=False, description="True=置信度低于门槛, 调用方应走 LLM 降级选工具")
+    latency_ms: float = Field(description="决策耗时 (毫秒, perf_counter)")
+    model: str = Field(description="laya 模型 id (如 convaiinnovations/laya)")
+    usage: dict[str, int | bool | list[str]] | None = Field(
+        default=None, description="laya usage (input_tokens/state_tokens/truncated 等); 诊断用"
+    )
