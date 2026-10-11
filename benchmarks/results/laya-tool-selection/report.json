@@ -1,20 +1,21 @@
 {
-  "timestamp": "2026-10-11T09:43:32Z",
+  "timestamp": "2026-10-11T11:45:51Z",
   "results": {
     "laya": {
       "accuracy": 0.9167,
       "structural_integrity": 1.0,
-      "avg_latency_ms": 5.41,
-      "p50_latency_ms": 5.46,
-      "p99_latency_ms": 6.04,
+      "avg_latency_ms": 6.76,
+      "p50_latency_ms": 6.21,
+      "p99_latency_ms": 9.08,
       "total": 12,
-      "fallback_cases": 1
+      "fallback_cases": 1,
+      "backend": "http"
     },
     "llm_baseline": {
-      "accuracy": 1.0,
-      "structural_integrity": 1.0,
-      "avg_latency_ms": 400.78,
-      "p50_latency_ms": 387.18,
+      "accuracy": 0.9167,
+      "structural_integrity": 0.9167,
+      "avg_latency_ms": 517.71,
+      "p50_latency_ms": 476.89,
       "total": 12,
       "model": "mlx-community/Qwen3.5-4B-MLX-4bit"
     }

@@ -62,6 +62,7 @@ def bench_laya(sel: LayaToolSelector, min_confidence: float) -> dict:
     it would fall back to LLM in production — listed separately, not counted as
     laya accuracy errors (LLM handles them).
     """
+    backend = getattr(sel, "backend", "python")
     for state, _ in BENCH_INPUTS[:2]:
         sel.select_tool(state)
 
@@ -121,6 +122,7 @@ def bench_laya(sel: LayaToolSelector, min_confidence: float) -> dict:
         "p99_latency_ms": round(p99, 2),
         "total": total,
         "fallback_cases": len(fallback_cases),
+        "backend": backend,
     }
 
 
@@ -217,14 +219,25 @@ def main() -> int:
     prod_min_conf = 0.7
     laya_result = bench_laya(sel, prod_min_conf)
 
-    # AC9: structural integrity 99.9% (per AC parenthetical "no malformed output — laya
-    # outputs structured data"). accuracy is a model-quality metric, NOT AC9-gated.
-    # low-confidence cases fall back to LLM in production (min_confidence=0.7).
+    # AC8: latency <15ms — 两 backend 均满足 (各自环境):
+    #   - HTTP backend: 服务端 warm 模型, p50~5-7ms (fusion-mlx 须运行)
+    #   - python backend: in-process MLX eval, p50~7ms (fusion-mlx 须停止, 否则
+    #     Metal device 多模型争用膨胀到 ~110-140ms — 非 laya 延迟, 是设备争用)
+    bk = laya_result["backend"]
     ok_latency = laya_result["p50_latency_ms"] < 15.0
     ok_struct = laya_result["structural_integrity"] >= 0.999
+    contention_note = ""
+    if bk == "python":
+        try:
+            import httpx
+
+            httpx.get("http://localhost:11434/v1/models", timeout=1.0)
+            contention_note = "  ⚠ fusion-mlx 运行中 — Metal 争用膨胀延迟, 停 fusion-mlx 后测真实 AC8"
+        except httpx.ConnectError:
+            pass
     print(
-        f"\nAC9 Acceptance: latency<15ms={'PASS' if ok_latency else 'FAIL'}  "
-        f"structural_integrity>=99.9%={'PASS' if ok_struct else 'FAIL'}"
+        f"\nAC8/AC9 Acceptance (backend={bk}): latency<15ms={'PASS' if ok_latency else 'FAIL'}  "
+        f"structural_integrity>=99.9%={'PASS' if ok_struct else 'FAIL'}{contention_note}"
     )
     print(
         f"  (raw accuracy={laya_result['accuracy']:.1%} — model-quality metric, NOT AC9-gated; "
