@@ -219,20 +219,25 @@ def main() -> int:
     prod_min_conf = 0.7
     laya_result = bench_laya(sel, prod_min_conf)
 
-    # AC8: latency <15ms — HTTP backend 满足 (服务端 warm 模型, p50~5ms)。
-    # python backend 本地 MLX eval ~100-200ms (per-call 前向 pass), 非 AC8 路径 —
-    # 生产默认 backend="http" (FusionSandboxExecutor.agent_run)。
+    # AC8: latency <15ms — 两 backend 均满足 (各自环境):
+    #   - HTTP backend: 服务端 warm 模型, p50~5-7ms (fusion-mlx 须运行)
+    #   - python backend: in-process MLX eval, p50~7ms (fusion-mlx 须停止, 否则
+    #     Metal device 多模型争用膨胀到 ~110-140ms — 非 laya 延迟, 是设备争用)
     bk = laya_result["backend"]
-    ok_latency = laya_result["p50_latency_ms"] < 15.0 if bk == "http" else None
+    ok_latency = laya_result["p50_latency_ms"] < 15.0
     ok_struct = laya_result["structural_integrity"] >= 0.999
-    lat_label = (
-        f"{'PASS' if ok_latency else 'FAIL'}"
-        if ok_latency is not None
-        else "N/A (python backend — AC8 由 HTTP 满足, p50~5ms)"
-    )
+    contention_note = ""
+    if bk == "python":
+        try:
+            import httpx
+
+            httpx.get("http://localhost:11434/v1/models", timeout=1.0)
+            contention_note = "  ⚠ fusion-mlx 运行中 — Metal 争用膨胀延迟, 停 fusion-mlx 后测真实 AC8"
+        except httpx.ConnectError:
+            pass
     print(
-        f"\nAC8/AC9 Acceptance (backend={bk}): latency<15ms={lat_label}  "
-        f"structural_integrity>=99.9%={'PASS' if ok_struct else 'FAIL'}"
+        f"\nAC8/AC9 Acceptance (backend={bk}): latency<15ms={'PASS' if ok_latency else 'FAIL'}  "
+        f"structural_integrity>=99.9%={'PASS' if ok_struct else 'FAIL'}{contention_note}"
     )
     print(
         f"  (raw accuracy={laya_result['accuracy']:.1%} — model-quality metric, NOT AC9-gated; "
