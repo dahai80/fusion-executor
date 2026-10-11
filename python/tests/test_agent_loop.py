@@ -146,12 +146,45 @@ class TestAgentLoopWiring:
         assert "web_fetch" in result["steps"][0]["error"]
 
     def test_max_steps_reached(self):
-        """持续选工具不停 → 达 max_steps 终止, completed=False."""
-        sel = FakeSelector([_make_decision("file_edit", params={"file_path": "a.py"})] * 10)
+        """持续选不同参数工具不停 → 达 max_steps 终止, completed=False."""
+        decisions = [_make_decision("file_edit", params={"file_path": f"a{i}.py"}) for i in range(10)]
+        sel = FakeSelector(decisions)
         loop = AgentLoop(sel, executor=None, max_steps=3)
         result = loop.run("edit many files")
         assert result["completed"] is False
         assert result["step_count"] == 3
+
+    def test_same_tool_same_params_terminates(self):
+        """同工具同参数重复 → 终止 (任务完成或无进展, 避免 laya 无 done 信号死循环)。
+
+        step1: file_edit(a.py) 执行 → step2: laya 再选 file_edit(a.py) 同参数 → 终止。
+        """
+        sel = FakeSelector(
+            [
+                _make_decision("file_edit", params={"file_path": "a.py"}),
+                _make_decision("file_edit", params={"file_path": "a.py"}),
+            ]
+        )
+        loop = AgentLoop(sel, executor=None, max_steps=8)
+        result = loop.run("edit a.py")
+        assert result["completed"] is True
+        assert result["step_count"] == 2
+        assert result["metrics"]["same_tool_terminate"] == 1
+
+    def test_same_tool_diff_params_continues(self):
+        """同工具不同参数 → 不终止 (多步同工具合法: edit a.py → edit b.py)。"""
+        sel = FakeSelector(
+            [
+                _make_decision("file_edit", params={"file_path": "a.py"}),
+                _make_decision("file_edit", params={"file_path": "b.py"}),
+                _make_decision("none"),
+            ]
+        )
+        loop = AgentLoop(sel, executor=None, max_steps=8)
+        result = loop.run("edit a.py then b.py")
+        assert result["completed"] is True
+        assert result["step_count"] == 3
+        assert "same_tool_terminate" not in result["metrics"]
 
     def test_invalid_max_steps(self):
         """max_steps < 1 → ValueError."""
@@ -253,3 +286,107 @@ class TestHTTPBackend:
         assert payload["prompt"] == "edit main.py"
         assert "questions" in payload
         assert payload["model"] == "convaiinnovations/laya"
+
+
+class TestAgentRunOnExecutor:
+    """AC7 接线验收: FusionSandboxExecutor.agent_run — AgentLoop 经 executor 管线执行。
+
+    不依赖真实 laya 模型 (mock LayaToolSelector 经 patch)。验证 agent_run 方法存在、
+    构造 AgentLoop、用 self 作 executor 执行工具、返回步骤记录。
+    """
+
+    def test_agent_run_method_exists(self):
+        """FusionSandboxExecutor 暴露 agent_run 方法 (接线, 非死类)。"""
+        from fusion_executor import FusionSandboxExecutor
+
+        assert callable(getattr(FusionSandboxExecutor, "agent_run", None)), (
+            "agent_run 未接线到 FusionSandboxExecutor — AgentLoop 是死类 (违反 #46 AC7)"
+        )
+
+    def test_agent_run_none_terminates(self):
+        """agent_run: laya 选 none → 单步完成, completed=True."""
+        from fusion_executor import FusionSandboxExecutor
+
+        with (
+            patch("fusion_executor.laya_tool_selector.LayaToolSelector") as mock_sel_cls,
+            patch("fusion_executor.agent_loop.AgentLoop") as mock_loop_cls,
+        ):
+            mock_sel = MagicMock()
+            mock_sel_cls.return_value = mock_sel
+            mock_loop = MagicMock()
+            mock_loop_cls.return_value = mock_loop
+            mock_loop.run.return_value = {
+                "steps": [{"step": 1, "tool_id": "none"}],
+                "completed": True,
+                "final_tool": "none",
+                "step_count": 1,
+                "metrics": {"steps": 1, "none": 1},
+            }
+
+            ex = FusionSandboxExecutor()
+            result = ex.agent_run("hello there", max_steps=4)
+
+            assert result["completed"] is True
+            assert result["final_tool"] == "none"
+            mock_sel_cls.assert_called_once()
+            mock_loop_cls.assert_called_once_with(
+                mock_sel, executor=ex, max_steps=4, whitelist=None, extra_handlers=None
+            )
+            mock_loop.run.assert_called_once_with("hello there", context="")
+
+    def test_agent_run_invalid_max_steps(self):
+        """agent_run: max_steps < 1 → ValueError."""
+        from fusion_executor import FusionSandboxExecutor
+
+        ex = FusionSandboxExecutor()
+        with pytest.raises(ValueError, match="max_steps"):
+            ex.agent_run("hi", max_steps=0)
+
+    def test_agent_run_invalid_request_type(self):
+        """agent_run: user_request 非 str → TypeError."""
+        from fusion_executor import FusionSandboxExecutor
+
+        ex = FusionSandboxExecutor()
+        with pytest.raises(TypeError, match="user_request"):
+            ex.agent_run(123)
+
+    def test_agent_run_passes_backend_and_confidence(self):
+        """agent_run: backend/min_confidence/whitelist 透传给 LayaToolSelector + AgentLoop."""
+        from fusion_executor import FusionSandboxExecutor
+
+        with (
+            patch("fusion_executor.laya_tool_selector.LayaToolSelector") as mock_sel_cls,
+            patch("fusion_executor.agent_loop.AgentLoop") as mock_loop_cls,
+        ):
+            mock_loop_cls.return_value = MagicMock(
+                run=MagicMock(
+                    return_value={
+                        "completed": True,
+                        "final_tool": "shell_exec",
+                        "step_count": 2,
+                        "metrics": {"steps": 2},
+                    }
+                )
+            )
+            ex = FusionSandboxExecutor()
+            wl = {"shell_exec": "run cmd", "none": "no tool"}
+            ex.agent_run(
+                "run ls",
+                max_steps=3,
+                backend="http",
+                mlx_url="http://localhost:11434/v1",
+                api_key="test-key",
+                min_confidence=0.8,
+                whitelist=wl,
+                context="prior state",
+            )
+            mock_sel_cls.assert_called_once_with(
+                min_confidence=0.8,
+                backend="http",
+                mlx_url="http://localhost:11434/v1",
+                api_key="test-key",
+            )
+            _, kwargs = mock_loop_cls.call_args
+            assert kwargs["whitelist"] == wl
+            assert kwargs["max_steps"] == 3
+            mock_loop_cls.return_value.run.assert_called_once_with("run ls", context="prior state")

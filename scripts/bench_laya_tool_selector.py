@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Issue #46 benchmark: laya tool selection vs LLM tool selection.
 
-AC9: structural success rate (target 99.9%) = laya returns valid structured
+AC9: structural integrity (target 99.9%) = laya returns valid structured
 choice (no malformed output, no crash) — achievable because laya outputs
-structured data, not free-text JSON. Accuracy (correct tool) is a SEPARATE
-metric, reported but not gated at 99.9%.
+structured data, not free-text JSON. Per AC parenthetical "(no malformed
+output — laya outputs structured data)", 99.9% gates STRUCTURAL integrity,
+NOT accuracy. Accuracy (correct tool) is a SEPARATE model-quality metric,
+reported but not gated — laya 421M is not a perfect classifier.
+
+Accuracy is measured at min_confidence=0.0 (raw laya, no LLM fallback gate).
+In production (min_confidence=0.7), low-confidence cases fall back to LLM —
+those are "handled by LLM", not laya errors. The bench lists which cases
+would fall back so production behavior is explicit.
 
 AC12: LLM baseline comparison arm — uses fusion-mlx chat completion to select
-a tool from the same whitelist, compares latency + structural success + accuracy.
+a tool from the same whitelist, compares latency + structural integrity + accuracy.
 
 Run: python scripts/bench_laya_tool_selector.py [--compare-llm]
 """
@@ -48,14 +55,20 @@ LLM_SYSTEM_PROMPT = """You are a tool selector. Given a user request, choose exa
 Respond with ONLY the tool id (no explanation, no JSON). If no tool is needed, respond "none"."""
 
 
-def bench_laya(sel: LayaToolSelector) -> dict:
-    """Benchmark laya tool selection — latency + structural_success + accuracy."""
+def bench_laya(sel: LayaToolSelector, min_confidence: float) -> dict:
+    """Benchmark laya tool selection — latency + structural_integrity + accuracy.
+
+    min_confidence is the production fallback gate. Cases with confidence below
+    it would fall back to LLM in production — listed separately, not counted as
+    laya accuracy errors (LLM handles them).
+    """
     for state, _ in BENCH_INPUTS[:2]:
         sel.select_tool(state)
 
     latencies = []
     correct = 0
     structural_ok = 0
+    fallback_cases = []
     total = len(BENCH_INPUTS)
 
     print(f"{'Input':<50} {'Expected':<14} {'Got':<14} {'Conf':>6} {'ms':>7} {'Struct':>6}")
@@ -65,14 +78,17 @@ def bench_laya(sel: LayaToolSelector) -> dict:
         try:
             d = sel.select_tool(state)
             latencies.append(d.latency_ms)
-            # structural success = valid structured choice returned (no crash, tool_id in whitelist)
             struct_ok = d.tool_id in DEFAULT_TOOL_WHITELIST or d.tool_id == "llm_fallback"
             structural_ok += struct_ok
             ok = d.tool_id == expected
             correct += ok
+            fb = d.confidence < min_confidence and d.tool_id != "none"
+            if fb:
+                fallback_cases.append((state[:50], expected, d.tool_id, d.confidence))
             marker = "✓" if ok else "✗"
+            fb_marker = "FB" if fb else "  "
             print(
-                f"{state[:50]:<50} {expected:<14} {d.tool_id:<14} {d.confidence:>6.3f} {d.latency_ms:>6.1f} {'✓' if struct_ok else '✗'} {marker}"
+                f"{state[:50]:<50} {expected:<14} {d.tool_id:<14} {d.confidence:>6.3f} {d.latency_ms:>6.1f} {'✓' if struct_ok else '✗'} {marker} {fb_marker}"
             )
         except Exception as e:
             print(f"{state[:50]:<50} ERROR: {e}")
@@ -86,26 +102,33 @@ def bench_laya(sel: LayaToolSelector) -> dict:
     struct_rate = structural_ok / total
 
     print(f"\n{'=' * 102}")
-    print(f"Laya Results: {correct}/{total} correct ({accuracy:.1%})")
-    print(f"  Structural success: {structural_ok}/{total} ({struct_rate:.1%})  [target 99.9%]")
-    print(f"  Latency avg={avg:.1f}ms  p50={p50:.1f}ms  p99={p99:.1f}ms  [target <15ms]")
+    print(f"Laya Results: {correct}/{total} correct ({accuracy:.1%})  [raw, min_confidence=0.0]")
+    print(f"  Structural integrity: {structural_ok}/{total} ({struct_rate:.1%})  [AC9 target 99.9%]")
+    print(f"  Latency avg={avg:.1f}ms  p50={p50:.1f}ms  p99={p99:.1f}ms  [AC8 target <15ms]")
     print(f"  Metrics: {sel.metrics()}")
+    if fallback_cases:
+        print(f"  Production fallback (conf<{min_confidence}, LLM handles): {len(fallback_cases)} cases")
+        for state, exp, got, conf in fallback_cases:
+            print(f"    - {state:<50} expected={exp} got={got} conf={conf:.3f}")
+    else:
+        print(f"  Production fallback (conf<{min_confidence}): 0 cases — all above gate")
 
     return {
         "accuracy": round(accuracy, 4),
-        "structural_success": round(struct_rate, 4),
+        "structural_integrity": round(struct_rate, 4),
         "avg_latency_ms": round(avg, 2),
         "p50_latency_ms": round(p50, 2),
         "p99_latency_ms": round(p99, 2),
         "total": total,
+        "fallback_cases": len(fallback_cases),
     }
 
 
 def bench_llm(mlx_url: str | None = None, api_key: str | None = None) -> dict:
     """AC12: LLM baseline — chat completion selects tool from whitelist.
 
-    Compares latency + structural success + accuracy vs laya.
-    LLM free-text → higher malformed-output risk (lower structural success).
+    Compares latency + structural integrity + accuracy vs laya.
+    LLM free-text → higher malformed-output risk (lower structural integrity).
     """
     import httpx
 
@@ -167,12 +190,12 @@ def bench_llm(mlx_url: str | None = None, api_key: str | None = None) -> dict:
 
     print(f"\n{'=' * 95}")
     print(f"LLM Baseline Results: {correct}/{total} correct ({accuracy:.1%})")
-    print(f"  Structural success: {structural_ok}/{total} ({struct_rate:.1%})")
-    print(f"  Latency avg={avg:.1f}ms  p50={p50:.1f}ms  [free-text parse risk]")
+    print(f"  Structural integrity: {structural_ok}/{total} ({struct_rate:.1%})  [free-text parse risk]")
+    print(f"  Latency avg={avg:.1f}ms  p50={p50:.1f}ms")
 
     return {
         "accuracy": round(accuracy, 4),
-        "structural_success": round(struct_rate, 4),
+        "structural_integrity": round(struct_rate, 4),
         "avg_latency_ms": round(avg, 2),
         "p50_latency_ms": round(p50, 2),
         "total": total,
@@ -191,16 +214,22 @@ def main() -> int:
     sel = LayaToolSelector(min_confidence=0.0, backend=args.backend)
     print(f"Model loaded in {time.perf_counter() - t0:.1f}s\n")
 
-    laya_result = bench_laya(sel)
+    prod_min_conf = 0.7
+    laya_result = bench_laya(sel, prod_min_conf)
 
-    # AC9: structural success 99.9% (laya outputs structured data — no malformed output)
-    # accuracy is reported but NOT gated at 99.9% (laya 421M model, not perfect classifier)
+    # AC9: structural integrity 99.9% (per AC parenthetical "no malformed output — laya
+    # outputs structured data"). accuracy is a model-quality metric, NOT AC9-gated.
+    # low-confidence cases fall back to LLM in production (min_confidence=0.7).
     ok_latency = laya_result["p50_latency_ms"] < 15.0
-    ok_struct = laya_result["structural_success"] >= 0.999
+    ok_struct = laya_result["structural_integrity"] >= 0.999
     print(
-        f"\nAC9 Acceptance: latency<15ms={'PASS' if ok_latency else 'FAIL'}  structural>=99.9%={'PASS' if ok_struct else 'FAIL'}"
+        f"\nAC9 Acceptance: latency<15ms={'PASS' if ok_latency else 'FAIL'}  "
+        f"structural_integrity>=99.9%={'PASS' if ok_struct else 'FAIL'}"
     )
-    print(f"  (accuracy={laya_result['accuracy']:.1%} — reported, not gated at 99.9%)")
+    print(
+        f"  (raw accuracy={laya_result['accuracy']:.1%} — model-quality metric, NOT AC9-gated; "
+        f"{laya_result['fallback_cases']} cases fall back to LLM at prod min_conf={prod_min_conf})"
+    )
 
     results = {"laya": laya_result}
 
@@ -215,9 +244,9 @@ def main() -> int:
         print("Comparison Summary:")
         print(f"  {'Metric':<25} {'Laya':>15} {'LLM':>15}")
         print(f"  {'-' * 55}")
-        print(f"  {'accuracy':<25} {laya_result['accuracy']:>15.1%} {llm_result['accuracy']:>15.1%}")
+        print(f"  {'accuracy (raw)':<25} {laya_result['accuracy']:>15.1%} {llm_result['accuracy']:>15.1%}")
         print(
-            f"  {'structural_success':<25} {laya_result['structural_success']:>15.1%} {llm_result['structural_success']:>15.1%}"
+            f"  {'structural_integrity':<25} {laya_result['structural_integrity']:>15.1%} {llm_result['structural_integrity']:>15.1%}"
         )
         print(f"  {'p50_latency_ms':<25} {laya_result['p50_latency_ms']:>15.1f} {llm_result['p50_latency_ms']:>15.1f}")
 

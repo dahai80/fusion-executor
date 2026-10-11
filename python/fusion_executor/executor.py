@@ -7,7 +7,8 @@ import logging
 import os
 import signal
 import socket
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import Any
 
 from .models import (
     Diagnostics,
@@ -843,6 +844,66 @@ class FusionSandboxExecutor:
             return ok
         finally:
             sock.close()
+
+    def agent_run(
+        self,
+        user_request: str,
+        *,
+        max_steps: int = 8,
+        backend: str = "http",
+        mlx_url: str | None = None,
+        api_key: str | None = None,
+        min_confidence: float = 0.7,
+        whitelist: dict[str, str] | None = None,
+        extra_handlers: dict[str, Callable[[dict], Any]] | None = None,
+        context: str = "",
+    ) -> dict[str, Any]:
+        # Issue #46 AC7: AgentLoop 接进 executor 管线 — LayaToolSelector 选工具 →
+        # 本 executor 执行 (self.run/self.grep/...) → 结果回灌 → 重复。
+        # 替代 "LLM 生成 tool call JSON" 步骤 (确定性 laya choice 原语, 非 LLM 自由文本)。
+        #
+        # 默认 backend="http" — executor 是 L4 OS 工具, 不加载本地 laya 模型;
+        # HTTP backend 调 fusion-mlx /v1/laya/decide (生产推理路径, 无 laya_mlx 依赖)。
+        # backend="python" 直调 laya_mlx.Agent.system_one (更低延迟, 需本地模型缓存)。
+        #
+        # UDS 暴露暂缓 — fe-ipc 是纯 Rust UDS 服务器 (无 Python callback), laya 是 Python 依赖;
+        # 跨进程调用方 (fusion-code) 可经 Python API 直接调 agent_run, 或后续单独提 UDS agent.run issue。
+        from .agent_loop import AgentLoop
+        from .laya_tool_selector import LayaToolSelector
+
+        if not isinstance(user_request, str):
+            raise TypeError(f"user_request 必须为 str, 得 {type(user_request).__name__}")
+        if max_steps < 1:
+            raise ValueError(f"max_steps 须 >= 1, got {max_steps}")
+        logger.info(
+            "agent_run request=%r backend=%s max_steps=%s min_confidence=%s — 接线 AgentLoop",
+            user_request[:80],
+            backend,
+            max_steps,
+            min_confidence,
+        )
+        selector = LayaToolSelector(
+            min_confidence=min_confidence,
+            backend=backend,
+            mlx_url=mlx_url,
+            api_key=api_key,
+        )
+        loop = AgentLoop(
+            selector,
+            executor=self,
+            max_steps=max_steps,
+            whitelist=whitelist,
+            extra_handlers=extra_handlers,
+        )
+        result = loop.run(user_request, context=context)
+        logger.info(
+            "agent_run done: completed=%s final_tool=%s step_count=%s metrics=%s",
+            result["completed"],
+            result["final_tool"],
+            result["step_count"],
+            result["metrics"],
+        )
+        return result
 
     def serve(self, sock_path: str | None = None) -> None:
         # C-PYO3-02: 旧版裸 self._native.serve() — fe-pyo3 serve_blocking 无 shutdown

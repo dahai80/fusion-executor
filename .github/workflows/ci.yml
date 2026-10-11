@@ -78,7 +78,7 @@ jobs:
           python -m venv .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip
-          pip install maturin pytest pytest-asyncio pytest-cov ruff
+          pip install maturin pytest pytest-asyncio pytest-cov ruff httpx
 
       - name: Build native extension (editable)
         run: |

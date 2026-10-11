@@ -20,14 +20,14 @@ _DEFAULT_API_KEY = os.environ.get("FUSION_MLX_API_KEY", "fg-admin-key")
 # Issue #46: 默认工具白名单 — 覆盖 fusion-executor 自有工具 + 常见 agent 工具。
 # 调用方可传 whitelist dict 覆盖 (不同 workflow 不同工具集)。
 DEFAULT_TOOL_WHITELIST: dict[str, str] = {
-    "code_search": "search codebase for relevant files/functions/symbols",
+    "code_search": "search the codebase for text, functions, variables, or symbols (grep/find/locate)",
     "file_edit": "modify existing file content (edit, patch, replace function)",
-    "shell_exec": "execute shell command (build, test, run, install)",
+    "shell_exec": "execute a shell command, run tests or build tools (pytest, make, cargo, npm, bash)",
     "write_file": "create or overwrite a whole file",
     "web_fetch": "fetch URL content from the web",
     "rag_query": "query knowledge base / documentation for answers",
     "gui_action": "interact with macOS GUI (click, type, screenshot, window control)",
-    "none": "no tool needed, direct LLM response",
+    "none": "no tool needed, direct LLM response (greeting, question, conversation)",
 }
 
 # 参数槽位定义: tool_id -> list of (slot_name, question_type, instructions, criteria)
