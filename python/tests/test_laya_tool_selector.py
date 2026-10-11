@@ -141,11 +141,11 @@ def test_warm_latency_under_15ms(selector: LayaToolSelector):
 
     mlx_url = os.environ.get("FUSION_MLX_URL", "http://localhost:11434/v1").rstrip("/")
     try:
-        httpx.get(mlx_url + "/models", timeout=1.0)
+        httpx.get(mlx_url + "/models", timeout=3.0)
         pytest.skip(
             "fusion-mlx 运行中 — MLX Metal device 多模型争用膨胀延迟 (~110ms), 非 laya 本身。停 fusion-mlx 后测真实 AC8"
         )
-    except httpx.ConnectError:
+    except httpx.RequestError:
         pass
 
     selector.select_tool("warmup edit a.py")
@@ -174,7 +174,7 @@ def test_http_backend_latency_under_15ms():
     api_key = os.environ.get("FUSION_MLX_API_KEY", "fg-admin-key")
     url = os.environ.get("FUSION_MLX_URL", "http://localhost:11434/v1").rstrip("/") + "/laya/decide"
     try:
-        httpx.post(
+        resp = httpx.post(
             url,
             json={"prompt": "ping", "questions": {"t": {"type": "choice", "criteria": {"a": "x", "b": "y"}}}},
             headers={"Authorization": f"Bearer {api_key}"},
@@ -182,6 +182,8 @@ def test_http_backend_latency_under_15ms():
         )
     except httpx.ConnectError:
         pytest.skip("fusion-mlx 未运行 — 跳过 HTTP backend AC8 延迟测试 (本地需 start.sh start)")
+    if resp.status_code != 200:
+        pytest.skip(f"fusion-mlx laya/decide 探活非 200 (status={resp.status_code}) — 跳过 HTTP backend AC8 延迟测试")
 
     sel = LayaToolSelector(min_confidence=0.0, backend="http")
     warmup_lats = []
