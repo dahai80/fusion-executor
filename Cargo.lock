@@ -192,7 +192,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 3.0.7",
+ "syn 3.0.8",
 ]
 
 [[package]]
@@ -225,9 +225,9 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
-version = "1.7.0"
+version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50a649af8a827553c29fb0cb4bd4a6f1a0dd695bd3232b9bc98bd9c8a3ffbb8b"
+checksum = "6651c9ed80effdc7db0ff72512157f901af5e3549e341e24b1dd4887d836d838"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "fe-core"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "chrono",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "fe-diagnostics"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "fe-security",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "fe-guard"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "regex",
  "serde",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "fe-gui"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "accessibility",
  "accessibility-sys",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "fe-ipc"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "fe-pyo3"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "fe-core",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "fe-rollback"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "fe-security",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "fe-sandbox"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "criterion",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "fe-security"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "fe-shell"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "fe-sandbox",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "fe-telemetry"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "serde",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "fe-tools"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "diffy",
@@ -818,6 +818,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -835,7 +841,7 @@ checksum = "ea5190182e6915eb873ddbc16e23b711b6eb1f9c00a0d0a3a91b5f6228475225"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.7",
+ "syn 3.0.8",
 ]
 
 [[package]]
@@ -916,7 +922,7 @@ checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.7",
+ "syn 3.0.8",
 ]
 
 [[package]]
@@ -1970,15 +1976,16 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.7",
+ "syn 3.0.8",
 ]
 
 [[package]]
 name = "serde_json"
-version = "1.0.152"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1741ab7a6cc54a03a89b5d563ed60075c277d9e3cfa73ad0c1f23f23974703c6"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash",
  "indexmap",
  "itoa",
  "memchr",
@@ -2135,9 +2142,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.7"
+version = "3.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d62a2e0561533f2ca2561d0cf27fd9fedb640a1bf2616ff5d5c80d99017faadc"
+checksum = "01016da373cd8f7ef12624f796309f5c31ba8d646dd08856c02cd741d823c622"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2223,7 +2230,7 @@ checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.7",
+ "syn 3.0.8",
 ]
 
 [[package]]
@@ -2299,7 +2306,7 @@ checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.7",
+ "syn 3.0.8",
 ]
 
 [[package]]
@@ -2623,7 +2630,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 3.0.7",
+ "syn 3.0.8",
  "wasm-bindgen-shared",
 ]
 
