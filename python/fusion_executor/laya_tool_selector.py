@@ -11,6 +11,12 @@ from .models import ToolDecision
 
 logger = logging.getLogger("fusion_executor.laya")
 
+# AC1 (Issue #46 re-acceptance): HTTP backend 默认端点 — fusion-mlx /v1/laya/decide。
+# Python API backend (默认) 直调 laya_mlx.Agent.system_one, warm 5-7ms, 无 endpoint 依赖;
+# HTTP backend 经 fusion-mlx HTTP, 满足 AC 字面 "calls /v1/laya/decide" + 远程调用场景。
+_DEFAULT_MLX_URL = os.environ.get("FUSION_MLX_URL", "http://localhost:11434/v1").rstrip("/")
+_DEFAULT_API_KEY = os.environ.get("FUSION_MLX_API_KEY", "fg-admin-key")
+
 # Issue #46: 默认工具白名单 — 覆盖 fusion-executor 自有工具 + 常见 agent 工具。
 # 调用方可传 whitelist dict 覆盖 (不同 workflow 不同工具集)。
 DEFAULT_TOOL_WHITELIST: dict[str, str] = {
@@ -115,12 +121,34 @@ class LayaToolSelector:
         min_confidence: float = 0.7,
         device: str | None = None,
         hf_cache: str | None = None,
+        *,
+        backend: str = "python",
+        mlx_url: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         if min_confidence < 0 or min_confidence > 1:
             raise ValueError(f"min_confidence 须在 [0,1], got {min_confidence}")
+        if backend not in ("python", "http"):
+            raise ValueError(f"backend 须为 'python' | 'http', got {backend!r}")
         self.min_confidence = min_confidence
         self.model_id = model_id
         self.subfolder = subfolder
+        self.backend = backend
+
+        # 指标计数器 (进程内, 非 Prometheus — Python 层决策, 不经 UDS)
+        self._metrics = Counter()
+
+        if backend == "http":
+            # AC1: HTTP backend — 经 fusion-mlx /v1/laya/decide, 不加载本地模型。
+            # 无需 laya_mlx import / 模型缓存, 适合远程调用 + AC 字面满足。
+            import httpx
+
+            self._http_client = httpx.Client(
+                timeout=30.0, headers={"Authorization": f"Bearer {api_key or _DEFAULT_API_KEY}"}
+            )
+            self._decide_url = (mlx_url or _DEFAULT_MLX_URL) + "/laya/decide"
+            logger.info("LayaToolSelector HTTP backend: %s (model=%s)", self._decide_url, model_id)
+            return
 
         # HF 模型缓存位置 — 默认 ~/.fusion-mlx/models (fusion monorepo 约定)
         # HF_HUB_CACHE env 覆盖; 镜像站 HF_MIRROR=https://hf-mirror.com (用户规则)
@@ -133,7 +161,8 @@ class LayaToolSelector:
         except ImportError as e:
             raise ImportError(
                 "laya-mlx 未安装 — pip install laya-mlx (或 source .venv/bin/activate 共享 venv). "
-                "Issue #46 确定性工具调用依赖 laya-mlx runtime."
+                "Issue #46 确定性工具调用依赖 laya-mlx runtime. "
+                "或用 backend='http' 经 fusion-mlx HTTP (无需本地 laya_mlx)."
             ) from e
 
         logger.info("加载 laya 模型 %s (subfolder=%s, device=%s)", model_id, subfolder, device or "auto")
@@ -144,8 +173,34 @@ class LayaToolSelector:
         load_ms = (time.perf_counter() - t0) * 1000
         logger.info("laya 模型加载完成 %.0fms", load_ms)
 
-        # 指标计数器 (进程内, 非 Prometheus — Python 层决策, 不经 UDS)
-        self._metrics = Counter()
+    def _invoke(self, state: str, questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """统一调用入口 — 按 backend 分发到 Python API 或 HTTP endpoint。
+
+        两条路径返回相同结构: {answers: {qid: {choice/confidence/probabilities/...}}, usage, ...}
+        """
+        if self.backend == "http":
+            return self._invoke_http(state, questions)
+        return self._agent.system_one(state, questions)
+
+    def _invoke_http(self, state: str, questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """AC1: HTTP backend — POST /v1/laya/decide with custom questions。
+
+        fusion-mlx laya endpoint 接受 {prompt, questions, model?}, 返回
+        {model, answers: {qid: {choice, confidence, probabilities, ...}}, usage, latency_ms}。
+        """
+        payload: dict[str, Any] = {"prompt": state, "questions": questions}
+        if self.model_id:
+            payload["model"] = self.model_id
+        try:
+            resp = self._http_client.post(self._decide_url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error("laya HTTP decide 失败 (%s): %s", self._decide_url, e)
+            raise
+        # HTTP 返回 latency_ms (服务端测), 覆盖为客户端测的 latency 由 select_tool/extract_params 计算
+        logger.debug("laya HTTP decide ok: server_latency_ms=%s", data.get("latency_ms"))
+        return data
 
     def select_tool(self, state: str, whitelist: dict[str, str] | None = None) -> ToolDecision:
         """从白名单中选择最佳工具 (choice 原语)。
@@ -170,14 +225,15 @@ class LayaToolSelector:
         }
 
         t0 = time.perf_counter()
-        result = self._agent.system_one(state, questions)
+        result = self._invoke(state, questions)
         latency_ms = (time.perf_counter() - t0) * 1000
 
         ans = result["answers"]["tool"]
         tool_id = ans.get("choice", "none")
         # answer_confidence = max(p) — 门槛指标 (非 entropy confidence)
-        confidence = ans.get("answer_confidence", ans.get("confidence", 0.0))
+        # HTTP backend 无 answer_confidence 字段 → 用 max(probabilities) 补算
         probs = ans.get("probabilities", {})
+        confidence = ans.get("answer_confidence", max(probs.values()) if probs else ans.get("confidence", 0.0))
 
         # "none" = "无需工具" 是正向决策, 不是不确定 — 门槛不触发降级 (issue #46: none → skip tool calling)
         fell_back = confidence < self.min_confidence and tool_id != "none"
@@ -246,7 +302,7 @@ class LayaToolSelector:
         if not questions:
             return {}
 
-        result = self._agent.system_one(state, questions)
+        result = self._invoke(state, questions)
         params: dict[str, str | int | None] = {}
 
         for qid, sd in slot_map.items():
