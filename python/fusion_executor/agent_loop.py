@@ -93,6 +93,7 @@ class AgentLoop:
         steps: list[AgentStep] = []
         completed = False
         final_tool = "none"
+        prev_decision: ToolDecision | None = None
 
         for step_num in range(1, self.max_steps + 1):
             self._metrics["steps"] += 1
@@ -119,11 +120,31 @@ class AgentLoop:
                 completed = True
                 break
 
+            # 同工具同参数重复 → 任务已完成或无进展, 终止 (避免 laya 无 done 信号死循环)
+            # laya 421M 无显式 "task complete" 原语, 同决策重复是近似完成信号。
+            # 多步同工具不同参数 (run pytest → edit → run pytest) 不触发, 因 params 不同。
+            if (
+                prev_decision is not None
+                and prev_decision.tool_id == decision.tool_id
+                and prev_decision.params == decision.params
+            ):
+                self._metrics["same_tool_terminate"] += 1
+                logger.info(
+                    "agent step %d: 同工具同参数重复 (%s) → 终止 (任务完成或无进展)",
+                    step_num,
+                    decision.tool_id,
+                )
+                steps.append(AgentStep(step_num, decision, None, None))
+                final_tool = decision.tool_id
+                completed = True
+                break
+
             # 执行选中工具
             tool_result, error = self._execute_tool(decision.tool_id, decision.params)
             steps.append(AgentStep(step_num, decision, tool_result, error))
             final_tool = decision.tool_id
             self._metrics[f"exec:{decision.tool_id}"] += 1
+            prev_decision = decision
 
             if error:
                 self._metrics["exec_errors"] += 1
