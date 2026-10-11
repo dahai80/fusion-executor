@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**v0.2.12 released** (tag `v0.2.12`, GitHub release live). Rust+PyO3 core via maturin — the first maturin/PyO3 project in the Fusion monorepo (deliberate divergence from setuptools; the other Python projects use setuptools). 12-crate Cargo workspace (resolver 2). **Issue #46 (laya-mlx deterministic tool selection) landed** — `LayaToolSelector` (pure-Python, calls `laya_mlx.Agent.system_one()` directly) replaces LLM-generated tool-call JSON with the `choice` primitive; `answer_confidence` (max prob) gates LLM fallback, `decide()` adds `extract_params()` (noul/score + regex, Rule 5 deterministic). No Rust changes — laya-mlx is a Python dependency.
+**v0.2.14 released** (tag `v0.2.14`, GitHub release live). Rust+PyO3 core via maturin — the first maturin/PyO3 project in the Fusion monorepo (deliberate divergence from setuptools; the other Python projects use setuptools). 12-crate Cargo workspace (resolver 2). **Issue #46 (laya-mlx deterministic tool selection) fully landed** — `LayaToolSelector` (pure-Python) with **two backends**: `backend="python"` (default, direct `laya_mlx.Agent.system_one()`) and `backend="http"` (calls fusion-mlx `POST /v1/laya/decide`, AC1). Confidence gate uses max probability (`answer_confidence` or `max(probabilities)` — NOT entropy). `AgentLoop` (AC7) wires selector into executor pipeline. No Rust changes — laya-mlx is a Python dependency.
 
 - `fe-core` — orchestrator: `Executor` pipeline, `BLOCKING_RT` (LazyLock multi-thread tokio runtime). **Stateless per-task** (M-ARCH-1 — registries live in IPC/PyO3 layer, not `Executor`).
 - `fe-security` — Security Guard: regex blocklist + shlex tokenizer + whitelist + resolved-path guard (ARCH-2, trusted-bin-dirs) + inline-interpreter gateway (D3-1, blocks `python -c`/`node -e` default). `ArcSwap` whitelist for SIGHUP reload.
@@ -19,7 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `fe-guard` — fusion-guard wire mirror (Phase 3, default OFF).
 - `fe-pyo3` — PyO3 bindings → `fusion_executor._native`.
 
-**Current state**: 528 Rust + 238 Python (8 skip) tests green; clippy `--all-targets -D warnings` clean (only upstream `block v0.1.6` future-incompat); fmt/ruff clean; maturin builds. Four audit passes (0824/0825/0826/0827 + product-0827) — all defects fixed. `GuiAction` = 20 variants. `LayaToolSelector` (Issue #46) = pure-Python, optional `laya-mlx` dep.
+**Current state**: 528 Rust + 260 Python (1 skip) tests green; clippy `--all-targets -D warnings` clean (only upstream `block v0.1.6` future-incompat); fmt/ruff clean; maturin builds. Four audit passes (0824/0825/0826/0827 + product-0827) — all defects fixed. `GuiAction` = 20 variants. `LayaToolSelector` (Issue #46) = pure-Python, dual Python/HTTP backends + `AgentLoop`; optional `laya-mlx` dep (HTTP backend needs only fusion-mlx).
 
 **Per-version history**: `git log`, `.remember/` (recent.md / archive.md), and `docs/INDEX.md`. Do not rely on commit-message-level narrative for code structure — verify against real files before trusting any layout claim.
 
