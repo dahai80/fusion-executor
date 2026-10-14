@@ -14,6 +14,7 @@ if not os.path.isdir(_model_dir):
     pytest.skip(f"laya 模型未缓存 ({_model_dir}) — 跳过真实模型测试 (CI 路径)", allow_module_level=True)
 
 from fusion_executor import DEFAULT_TOOL_WHITELIST, LayaToolSelector, ToolDecision  # noqa: E402
+from fusion_executor.laya_tool_selector import PARAM_SLOTS  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -213,6 +214,37 @@ def test_invalid_min_confidence():
         LayaToolSelector(min_confidence=1.5)
     with pytest.raises(ValueError):
         LayaToolSelector(min_confidence=-0.1)
+
+
+def test_strip_filler_prefix_issue54():
+    """issue #54: shell_exec command 前导填充词确定性剥除 — security guard 不再拒 'the'."""
+    strip = LayaToolSelector._strip_filler_prefix
+    assert strip("the command echo hello world") == "echo hello world"
+    assert strip("command: ls -la") == "ls -la"
+    assert strip("cmd echo x") == "echo x"
+    assert strip("the a command x y") == "x y"  # 嵌套填充 (最多剥 3 层)
+    assert strip("echo the quick brown fox") == "echo the quick brown fox"  # 真实命令不剥
+    assert strip("pytest tests/") == "pytest tests/"
+    assert strip("") == ""
+    assert strip(None) is None
+
+
+def test_regex_extract_multiline_anchor_issue54():
+    """issue #54: $ 锚行尾 (re.MULTILINE) — 回灌 feedback 文本不污染提取."""
+    ex = LayaToolSelector._regex_extract
+    # 请求行后跟 feedback 行 — 提取止于请求行行尾
+    polluted = "run the command echo hi\n[tool shell_exec result: exit_code=0 stdout='hi']"
+    assert ex(polluted, PARAM_SLOTS["shell_exec"][0]["extract"]) == "echo hi"
+
+
+def test_decide_shell_exec_command_no_filler(selector: LayaToolSelector):
+    """issue #54 E2E: 'run the command X' → command=X (无填充词, security guard 可执行)."""
+    d = selector.decide("run the command echo hello world")
+    assert d.tool_id == "shell_exec"
+    cmd = d.params.get("command")
+    assert cmd is not None
+    assert not cmd.startswith(("the ", "command", "result:")), f"command 残留填充词: {cmd!r}"
+    assert "echo" in cmd
 
 
 def test_missing_laya_mlx_error(monkeypatch):

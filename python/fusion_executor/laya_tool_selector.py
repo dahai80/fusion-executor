@@ -71,7 +71,7 @@ PARAM_SLOTS: dict[str, list[dict[str, Any]]] = {
             "slot": "command",
             "type": "noul",
             "instructions": "Does the request specify a shell command to run?",
-            "extract": r'(?:run|execute|exec)\s+(?:command\s+)?["\']?(.+?)["\']?(?:\s+in\s+|$)',
+            "extract": r'(?:run|execute|exec)\s+(?:(?:the|a|an|this|that|following)\s+)*(?:(?:command|cmd)\s*[:：]?\s+)?["\']?(.+?)["\']?(?:\s+in\s+|$)',
         },
     ],
     "web_fetch": [
@@ -312,6 +312,10 @@ class LayaToolSelector:
                 yes_prob = ans.get("noul", 0.0)
                 if yes_prob > 0.5:
                     extracted = self._regex_extract(state, sd.get("extract", ""))
+                    # issue #54: shell_exec command 残留填充词 ("the command echo hi")
+                    # → security guard 拒 "the" — 确定性剥除
+                    if sd["slot"] == "command":
+                        extracted = self._strip_filler_prefix(extracted)
                     params[sd["slot"]] = extracted
                     logger.debug("param %s: noul=%.3f → 提取 %r", sd["slot"], yes_prob, extracted)
                 else:
@@ -363,10 +367,35 @@ class LayaToolSelector:
 
     @staticmethod
     def _regex_extract(text: str, pattern: str) -> str | None:
-        """从 text 中用 pattern 提取第一个匹配组 (无组则全匹配)。"""
+        """从 text 中用 pattern 提取第一个匹配组 (无组则全匹配)。
+
+        re.MULTILINE: `$` 锚到行尾而非串尾 — issue #54 步骤 2+ 回灌的
+        result feedback 文本会污染提取 (command 膨胀成整个 feedback),
+        行尾锚定让提取止于请求行。
+        """
         if not pattern:
             return None
-        m = re.search(pattern, text, re.IGNORECASE)
+        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if not m:
             return None
         return m.group(1) if m.groups() else m.group(0)
+
+    # Issue #54: shell_exec 提取结果残留自然语言填充词 → security guard 把 "the" 当
+    # binary 拒 (白名单外)。确定性清洗 (Rule 5: 能用 regex 不用模型) — 只剥前导
+    # 冠词/指代/命令引导词, 不碰真实命令 (首 token 是 white-listed binary 如 echo/ls)。
+    _FILLER_PREFIX_RE = re.compile(
+        r"^(?:the|a|an|this|that|these|those|command|cmd|following)\s*[:：]?\s+", re.IGNORECASE
+    )
+
+    @classmethod
+    def _strip_filler_prefix(cls, value: str | None) -> str | None:
+        """剥掉提取值的前导填充词 (issue #54) — 'the command echo hi' → 'echo hi'。"""
+        if not value:
+            return value
+        out = value.strip()
+        for _ in range(3):  # 最多剥 3 层 ('the a command x' 极端嵌套)
+            stripped = cls._FILLER_PREFIX_RE.sub("", out, count=1)
+            if stripped == out:
+                break
+            out = stripped
+        return out
