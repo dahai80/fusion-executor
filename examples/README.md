@@ -31,6 +31,9 @@ The TypeScript example additionally needs `bun` (`brew install oven-sh/bun/bun`)
 | 06 | `06_telemetry.py` | `telemetry_stream()` yields `TelemetrySample` at 10Hz (CPU%, mem MB, wall-clock `ts_ms`). |
 | 07 | `07_subscribe.py` | Starts the UDS server, `subscribe(["telemetry"])`, prints server-push frames, `unsubscribe()`, stops server. |
 | 08 | `08_integrate_fusion_code.py` | **Integration skeleton (ARCH-3)** — the self-healing loop an upstream agent (fusion-code) should run: parse `result.diagnostics`, own the consecutive-failure count as a circuit breaker (`RollbackPolicy.max_consecutive_failures`), optional `auto_rollback`. One-way reference; does not import fusion-code. |
+| 09 | `09_laya_tool_selector.py` | Deterministic tool selection (Issue #46) — `LayaToolSelector` picks a tool from the whitelist via laya-mlx `choice` in ~5-7ms warm, `decide()` extracts params, low-confidence falls back to LLM. |
+| 10 | `10_agent_loop.py` | `executor.agent_run()` (AgentLoop, AC7) — laya select tool → execute via the sandboxed executor → feed result back → repeat until done/fallback/max_steps. |
+| 11 | `11_task_service.py` | **Shared batch-task service (Issue #57)** — `TaskManager`: submit shell/async batch jobs, poll `status()`, retry with backoff, `TASK_PROGRESS:` live progress, `export_report()`. For any business app under ~/fusion/business. |
 
 Run any one:
 
