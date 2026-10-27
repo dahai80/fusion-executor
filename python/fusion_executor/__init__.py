@@ -24,6 +24,7 @@ from .models import (
     TelemetrySample,
     ToolDecision,
 )
+from .task_service import RetryPolicy, TaskManager, TaskState, TaskStatus
 
 __all__ = [
     "DEFAULT_TOOL_WHITELIST",
@@ -42,6 +43,7 @@ __all__ = [
     "GuiResult",
     "LayaToolSelector",
     "MultiEditItem",
+    "RetryPolicy",
     "RollbackPolicy",
     "SandboxProfile",
     "ShellInfo",
@@ -49,6 +51,9 @@ __all__ = [
     "ShellStartResult",
     "SnapshotInfo",
     "Subscription",
+    "TaskManager",
+    "TaskState",
+    "TaskStatus",
     "TelemetrySample",
     "ToolDecision",
 ]

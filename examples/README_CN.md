@@ -29,6 +29,9 @@ TypeScript 示例另需 `bun` (`brew install oven-sh/bun/bun`)。
 | 06 | `06_telemetry.py` | `telemetry_stream()` 以 10Hz 产出 `TelemetrySample` (CPU%、内存 MB、墙钟 `ts_ms`)。 |
 | 07 | `07_subscribe.py` | 启动 UDS 服务, `subscribe(["telemetry"])`, 打印服务端推送帧, `unsubscribe()`, 停服务。 |
 | 08 | `08_integrate_fusion_code.py` | **集成骨架 (ARCH-3)** —— 上游 agent (fusion-code) 应跑的自愈循环: 解析 `result.diagnostics`、自持连续失败计数作熔断 (`RollbackPolicy.max_consecutive_failures`)、可选 `auto_rollback`。单向参考, 不 import fusion-code。 |
+| 09 | `09_laya_tool_selector.py` | 确定性工具选择 (Issue #46) —— `LayaToolSelector` 用 laya-mlx `choice` 从白名单选工具 (~5-7ms warm), `decide()` 提取参数, 低置信度降级 LLM。 |
+| 10 | `10_agent_loop.py` | `executor.agent_run()` (AgentLoop, AC7) —— laya 选工具 → 经沙箱 executor 执行 → 结果回灌 → 重复, 直至完成/降级/max_steps。 |
+| 11 | `11_task_service.py` | **共享批量任务服务 (Issue #57)** —— `TaskManager`: 提交 shell/async 批量任务, 轮询 `status()`, 退避重试, `TASK_PROGRESS:` 实时进度, `export_report()`。供 ~/fusion/business 任意业务应用使用。 |
 
 运行单个:
 
