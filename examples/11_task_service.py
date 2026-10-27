@@ -11,6 +11,7 @@ task_id-polling workflow without building its own SQLite queue + worker:
 Shell tasks run through the executor's background-shell path, so the
 security guard, seatbelt and kill-tree semantics all apply.
 """
+
 from __future__ import annotations
 
 import asyncio

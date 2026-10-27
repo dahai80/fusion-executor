@@ -485,12 +485,12 @@ task_id = tm.submit_shell(
     timeout_sec=600,
     retry=RetryPolicy(max_retries=2, backoff_initial_sec=1.0),
 )
-st = tm.status(task_id)          # TaskStatus: state, progress, attempts, failure_reason, result
+st = tm.status(task_id)  # TaskStatus: state, progress, attempts, failure_reason, result
 while st.state in (TaskState.QUEUED, TaskState.RUNNING):
     await asyncio.sleep(0.5)
     st = tm.status(task_id)
 if st.state == TaskState.DONE:
-    print(tm.result(task_id))    # {"exit_code": 0, "output": "..."}
+    print(tm.result(task_id))  # {"exit_code": 0, "output": "..."}
 await tm.stop()
 tm.close()
 ```
