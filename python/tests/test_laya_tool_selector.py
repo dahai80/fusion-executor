@@ -172,8 +172,11 @@ def test_http_backend_latency_under_15ms():
     """
     import httpx
 
-    api_key = os.environ.get("FUSION_MLX_API_KEY", "fg-admin-key")
-    url = os.environ.get("FUSION_MLX_URL", "http://localhost:11434/v1").rstrip("/") + "/laya/decide"
+    # Issue #60: 单点解析 — 显式 key 优先, 无 secret 默认值字面量
+    from fusion_core.config import client_key, default_mlx_base_url
+
+    api_key = client_key()
+    url = default_mlx_base_url().rstrip("/") + "/laya/decide"
     try:
         resp = httpx.post(
             url,
