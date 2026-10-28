@@ -78,6 +78,9 @@ jobs:
           python -m venv .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip
+          # Issue #60: fusion_core.config 单点解析依赖 — pyproject 声明 bare fusion-core>=0.7.0,
+          # CI 显式装 git pin (dahai80/fusion-core 公开仓, 无 token) 满足之。
+          pip install "fusion-core @ git+https://github.com/dahai80/fusion-core.git@v0.7.0"
           pip install maturin pytest pytest-asyncio pytest-cov ruff httpx
 
       - name: Build native extension (editable)

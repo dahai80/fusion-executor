@@ -32,6 +32,9 @@ _cache = os.environ.get("HF_HUB_CACHE") or os.path.expanduser("~/.fusion-mlx/mod
 if os.path.isdir(_cache) and not os.environ.get("HF_HUB_CACHE"):
     os.environ["HF_HUB_CACHE"] = _cache
 
+# Issue #60: key/URL 解析单点化 — fusion_core.config, 无 secret 默认值字面量
+from fusion_core.config import client_key, default_mlx_base_url  # noqa: E402
+
 from fusion_executor import DEFAULT_TOOL_WHITELIST, LayaToolSelector  # noqa: E402
 
 BENCH_INPUTS = [
@@ -134,8 +137,8 @@ def bench_llm(mlx_url: str | None = None, api_key: str | None = None) -> dict:
     """
     import httpx
 
-    base = (mlx_url or os.environ.get("FUSION_MLX_URL", "http://localhost:11434/v1")).rstrip("/")
-    key = api_key or os.environ.get("FUSION_MLX_API_KEY", "fg-admin-key")
+    base = (mlx_url or default_mlx_base_url()).rstrip("/")
+    key = api_key or client_key()
     model = os.environ.get("FUSION_MLX_MODEL", "mlx-community/Qwen3.5-4B-MLX-4bit")
     client = httpx.Client(timeout=60.0, headers={"Authorization": f"Bearer {key}"})
 

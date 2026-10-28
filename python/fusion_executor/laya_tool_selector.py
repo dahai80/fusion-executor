@@ -7,15 +7,17 @@ import time
 from collections import Counter
 from typing import Any
 
+from fusion_core.config import client_key, default_mlx_base_url
+
 from .models import ToolDecision
 
 logger = logging.getLogger("fusion_executor.laya")
 
-# AC1 (Issue #46 re-acceptance): HTTP backend 默认端点 — fusion-mlx /v1/laya/decide。
-# Python API backend (默认) 直调 laya_mlx.Agent.system_one, warm 5-7ms, 无 endpoint 依赖;
-# HTTP backend 经 fusion-mlx HTTP, 满足 AC 字面 "calls /v1/laya/decide" + 远程调用场景。
-_DEFAULT_MLX_URL = os.environ.get("FUSION_MLX_URL", "http://localhost:11434/v1").rstrip("/")
-_DEFAULT_API_KEY = os.environ.get("FUSION_MLX_API_KEY", "fg-admin-key")
+# Issue #60 (config Phase 2.2): key/URL 解析单点化 — fusion_core.config, 本仓不自抄
+# _resolve 函数, 不留 secret 默认值字面量 (config-conventions §3 prod 非法)。
+# client_key: 新名 + 迁移期旧名别名链 (fusion_core 内收敛, 本仓不引用旧名);
+# dev 缺省 "" + warning, prod 缺省 RuntimeError。
+# default_mlx_base_url: 默认 http://localhost:11434/v1。
 
 # Issue #46: 默认工具白名单 — 覆盖 fusion-executor 自有工具 + 常见 agent 工具。
 # 调用方可传 whitelist dict 覆盖 (不同 workflow 不同工具集)。
@@ -143,10 +145,12 @@ class LayaToolSelector:
             # 无需 laya_mlx import / 模型缓存, 适合远程调用 + AC 字面满足。
             import httpx
 
-            self._http_client = httpx.Client(
-                timeout=30.0, headers={"Authorization": f"Bearer {api_key or _DEFAULT_API_KEY}"}
-            )
-            self._decide_url = (mlx_url or _DEFAULT_MLX_URL) + "/laya/decide"
+            # Issue #60: 显式 api_key 优先; 缺省走 fusion_core client_key() 单点解析
+            # (dev 缺 key = "" + warning / prod 缺 key = RuntimeError, 无默认值字面量)。
+            key = api_key or client_key()
+            base_url = (mlx_url or default_mlx_base_url()).rstrip("/")
+            self._http_client = httpx.Client(timeout=30.0, headers={"Authorization": f"Bearer {key}"})
+            self._decide_url = base_url + "/laya/decide"
             logger.info("LayaToolSelector HTTP backend: %s (model=%s)", self._decide_url, model_id)
             return
 
