@@ -1,3 +1,18 @@
+---
+doc_id: fusion-executor/readme-cn
+product: fusion-executor
+class: platform
+entry: service
+doc_type: readme
+title: {zh: "fusion-executor 中文说明", en: "fusion-executor README (Chinese)"}
+audience: engineer
+status: draft
+version: 0.2.20
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - README_CN.md
+---
 # fusion-executor
 
 > **语言 / Language**: [English](README.md) | **中文**
@@ -340,7 +355,7 @@ selector.metrics()  # {total, fell_back, fallback_rate, avg_latency_ms, per_tool
 - **HF 模型缓存** — `~/.fusion-mlx/models` (fusion monorepo 约定); `HF_HUB_CACHE` env 覆盖; 镜像站 `HF_MIRROR=https://hf-mirror.com` (Python 后端需模型; HTTP 后端不需)。
 - **可选依赖** — `laya_mlx` 未安装 → `ImportError` 带清晰提示 (非静默); 测试 `pytest.importorskip("laya_mlx")` + 模型缓存检查优雅跳过 (CI 路径); HTTP 后端测试 mock httpx, 不加载模型。
 
-Issue #46 验收 (12 ACs, 诚实标注): AC1 HTTP `/v1/laya/decide` ✓, AC7 AgentLoop 接进 `FusionSandboxExecutor.agent_run()` ✓ (生产路径, 非 v0.2.14 死类), AC8 延迟 <15ms ✓ (HTTP 后端 p50=6.2ms 服务端 warm; python 后端 p50=7.2ms fusion-mlx 停止时; fusion-mlx 运行时 Metal device 多模型争用膨胀到 ~110ms — 并发负载下优先 `backend="http"`, 测试检测到 fusion-mlx 运行则 skip), AC9 结构完整性 100% ✓ (12/12, 按 AC 括注 "no malformed output" 99.9% 门槛=结构完整性, 非准确率; PRD "99.9% 工具执行成功" 指标定义 = 结构完整性), AC12 `--compare-llm` 基准 ✓ (laya 91.7%/p50=6.2ms vs LLM 91.7%/p50=477ms, LLM 结构完整性 91.7% free-text 风险 vs laya 100%, 提交证据 `benchmarks/results/laya-tool-selection/report.json` backend 字段标注)。**准确率 91.7% 是模型质量指标, 非 AC9 门槛** — laya 421M 非完美分类器; 1 miss (conf 0.45<0.7) 生产中降级到 LLM。基准脚本 `scripts/bench_laya_tool_selector.py --backend http --compare-llm`, 示例 `examples/09_laya_tool_selector.py` + `examples/10_agent_loop.py`。
+Issue #46 验收 (12 ACs, 诚实标注): AC1 HTTP `/v1/laya/decide` ✓, AC7 AgentLoop 接进 `FusionSandboxExecutor.agent_run()` ✓ (生产路径, 非 v0.2.14 死类), AC8 延迟 <15ms ✓ (HTTP 后端 p50=6.2ms 服务端 warm; python 后端 p50=7.2ms fusion-mlx 停止时; fusion-mlx 运行时 Metal device 多模型争用膨胀到 ~110ms — 并发负载下优先 `backend="http"`, 测试检测到 fusion-mlx 运行则 skip), AC9 结构完整性 100% ✓ (12/12, 按 AC 括注 "no malformed output" 99.9% 门槛=结构完整性, 非准确率; PRD "99.9% 工具执行成功" 指标定义 = 结构完整性), AC12 `--compare-llm` 基准 ✓ (laya 91.7%/p50=6.2ms vs LLM 91.7%/p50=477ms, LLM 结构完整性 91.7% free-text 风险 vs laya 100%, 提交证据 `benchmarks/results/laya-tool-selection/report.json` backend 字段标注)。**准确率 91.7% 是模型质量指标, 非 AC9 门槛** — laya 421M 分类器存在 miss（生产降级到 LLM 兜底）; 1 miss (conf 0.45<0.7) 生产中降级到 LLM。基准脚本 `scripts/bench_laya_tool_selector.py --backend http --compare-llm`, 示例 `examples/09_laya_tool_selector.py` + `examples/10_agent_loop.py`。
 
 ## 共享异步批量任务服务 (v0.2.19 — Issue #57)
 

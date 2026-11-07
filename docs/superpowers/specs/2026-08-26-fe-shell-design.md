@@ -1,3 +1,18 @@
+---
+doc_id: fusion-executor/fe-shell-design
+product: fusion-executor
+class: platform
+entry: service
+doc_type: guide
+title: {zh: "fe-shell 背景 Shell 设计稿", en: "fe-shell Background Shell Design Spec"}
+audience: engineer
+status: draft
+version: 0.2.20
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - docs/superpowers/specs/2026-08-26-fe-shell-design.md
+---
 # fe-shell — Background Task Execution API (Issue #1)
 
 Date: 2026-08-26

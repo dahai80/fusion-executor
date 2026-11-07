@@ -1,3 +1,18 @@
+---
+doc_id: fusion-executor/production-runbook
+product: fusion-executor
+class: platform
+entry: service
+doc_type: guide
+title: {zh: "fusion-executor 生产运维手册", en: "fusion-executor Production Runbook"}
+audience: engineer
+status: draft
+version: 0.2.20
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - docs/PRODUCTION_RUNBOOK.md
+---
 # Production Runbook — fusion-executor
 
 > Enterprise deployment, operations, incident, and API-stability guide.

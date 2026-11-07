@@ -1,3 +1,18 @@
+---
+doc_id: fusion-executor/ipc-client-typescript
+product: fusion-executor
+class: platform
+entry: service
+doc_type: guide
+title: {zh: "fusion-executor TypeScript IPC 客户端参考", en: "fusion-executor TypeScript IPC Client Sketch"}
+audience: engineer
+status: draft
+version: 0.2.20
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - docs/ipc-client-typescript.md
+---
 # fusion-executor IPC — TypeScript Client Sketch (P3)
 
 > fusion-code (TypeScript) 消费 fusion-executor 的 UDS JSON-RPC 2.0 接口的 sketch。

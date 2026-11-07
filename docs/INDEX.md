@@ -1,3 +1,18 @@
+---
+doc_id: fusion-executor/docs-index
+product: fusion-executor
+class: platform
+entry: service
+doc_type: readme
+title: {zh: "fusion-executor 文档索引", en: "fusion-executor Documentation Index"}
+audience: engineer
+status: draft
+version: 0.2.20
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - docs/INDEX.md
+---
 # Documentation Index
 
 > **Language / 语言**: **English** | [中文](INDEX_CN.md)
@@ -18,6 +33,7 @@ execution sandbox + macOS OS-level control hub for the Fusion ecosystem.
 | Document | What it covers |
 |----------|----------------|
 | [docs/architecture.md](architecture.md) | In-repo architecture: 10-crate layout, 4-layer wiring (fe-core → fe-ipc → fe-pyo3 → Python), pipeline diagram, per-crate responsibilities. |
+| [docs/api-protocol-reference.md](api-protocol-reference.md) | Deep-dive reference split out of the old architecture doc: Python API surface, IPC protocol spec (UDS JSON-RPC 2.0), data schemas, per-subsystem details (Security Guard, slicer, GUI, rollback, telemetry, push). |
 | PRD (monorepo) | Full PRD at `../../architecture/fusion-executor-prd.md` (monorepo root `architecture/` dir): §4 data schema (ExecutionRequest/ExecutionResult fields), §4.2 Diagnostics Slicer algorithm, fusion-code refactor plan, Claude-SDK/DeepSeek-Harness capability comparison. |
 | Audit (monorepo) | `../../audit/fusion-executor-audit-report-0825.md` — commercial-grade integration audit (10 CRITICAL / 23 MAJOR / 4 MINOR); the audit-0825-pass memory documents all 11 Blockers + 13 MAJOR/MINOR landed. |
 
