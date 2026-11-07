@@ -1,3 +1,18 @@
+---
+doc_id: fusion-executor/examples-readme
+product: fusion-executor
+class: platform
+entry: service
+doc_type: readme
+title: {zh: "fusion-executor 示例索引", en: "fusion-executor Examples Index"}
+audience: engineer
+status: draft
+version: 0.2.20
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - examples/README.md
+---
 # Examples
 
 > **Language / 语言**: **English** | [中文](README_CN.md)

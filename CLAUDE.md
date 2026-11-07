@@ -1,3 +1,18 @@
+---
+doc_id: fusion-executor/claude
+product: fusion-executor
+class: platform
+entry: service
+doc_type: readme
+title: {zh: "fusion-executor 开发者指南", en: "fusion-executor Developer Guide"}
+audience: engineer
+status: draft
+version: 0.2.20
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - CLAUDE.md
+---
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.

@@ -214,6 +214,11 @@ const TRUSTED_BIN_DIRS: &[&str] = &[
     "/usr/local/bin",
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
+    // Homebrew rustup shim dir: GitHub macos-15 (macos-latest) runner images put
+    // cargo/rustc shims here ahead of /opt/homebrew/bin in PATH, so a bare
+    // `cargo` resolves to /opt/homebrew/opt/rustup/bin/cargo. Same trust class
+    // as the Homebrew prefix above (package-manager-managed, root-owned).
+    "/opt/homebrew/opt/rustup/bin",
     "/bin",
     "/sbin",
 ];

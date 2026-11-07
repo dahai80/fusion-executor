@@ -1,3 +1,18 @@
+---
+doc_id: fusion-executor/docs-index-cn
+product: fusion-executor
+class: platform
+entry: service
+doc_type: readme
+title: {zh: "fusion-executor 文档索引（中文）", en: "fusion-executor Documentation Index (Chinese)"}
+audience: engineer
+status: draft
+version: 0.2.20
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - docs/INDEX_CN.md
+---
 # 文档索引
 
 > **语言 / Language**: [English](INDEX.md) | **中文**
@@ -17,6 +32,7 @@ fusion-executor 全部文档导航。v0.1.0 —— Fusion 生态的受控执行�
 | 文档 | 覆盖内容 |
 |------|----------|
 | [docs/architecture.md](architecture.md) | 仓内架构: 10 crate 布局、4 层 wiring (fe-core → fe-ipc → fe-pyo3 → Python)、管线图、各 crate 职责。 |
+| [docs/api-protocol-reference.md](api-protocol-reference.md) | 从原 architecture 文档拆出的深度参考：Python API 全表、IPC 协议规范（UDS JSON-RPC 2.0）、数据 schema、各子系统细节（Security Guard、切片器、GUI、回滚、遥测、双向推送）。 |
 | PRD (单仓级) | 完整 PRD 在 `../../architecture/fusion-executor-prd.md` (单仓根 `architecture/` 目录): §4 数据契约 (ExecutionRequest/ExecutionResult 字段)、§4.2 诊断切片算法、fusion-code 重构计划、Claude-SDK/DeepSeek-Harness 能力对比。 |
 | 审计 (单仓级) | `../../audit/fusion-executor-audit-report-0825.md` —— 商用级集成审计 (10 CRITICAL / 23 MAJOR / 4 MINOR); audit-0825-pass 记忆记录了全部 11 Blocker + 13 MAJOR/MINOR 已落地。 |
 
