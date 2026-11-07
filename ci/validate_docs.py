@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 fusion docs-system static validator (stdlib only, CI-ready)
 
@@ -25,7 +24,6 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------- constants
 
@@ -251,7 +249,7 @@ class Finding:
 @dataclass
 class Doc:
     path: str
-    meta: Dict[str, object] = field(default_factory=dict)
+    meta: dict[str, object] = field(default_factory=dict)
     body_start: int = 0
     body_lines: int = 0
 
@@ -262,7 +260,7 @@ KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$")
 ITEM_RE = re.compile(r"^\s*-\s+(.+)$")
 
 
-def parse_frontmatter(text: str) -> Tuple[Dict[str, object], int, int]:
+def parse_frontmatter(text: str) -> tuple[dict[str, object], int, int]:
     """Return (meta, 1-based line number where frontmatter ends, total lines). No frontmatter -> ({}, 0, N)."""
     lines = text.splitlines()
     total = len(lines)
@@ -276,8 +274,8 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, object], int, int]:
     if end is None:
         return {}, 0, total
 
-    meta: Dict[str, object] = {}
-    current: Optional[str] = None
+    meta: dict[str, object] = {}
+    current: str | None = None
     for raw in lines[1:end]:
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
@@ -301,7 +299,7 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, object], int, int]:
 
 
 def load_doc(path: str) -> Doc:
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(path, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
     meta, body_start, total = parse_frontmatter(text)
     return Doc(path=path, meta=meta, body_start=body_start, body_lines=total - body_start)
@@ -310,7 +308,7 @@ def load_doc(path: str) -> Doc:
 # ---------------------------------------------------------------- checks
 
 
-def check_frontmatter(doc: Doc, rel: str, out: List[Finding]) -> None:
+def check_frontmatter(doc: Doc, rel: str, out: list[Finding]) -> None:
     if not doc.meta:
         out.append(
             Finding(
@@ -327,7 +325,7 @@ def check_frontmatter(doc: Doc, rel: str, out: List[Finding]) -> None:
         if key not in doc.meta:
             out.append(Finding("ERROR", "FM-KEY", rel, 1, f"missing required key {key}"))
 
-    def val(k: str) -> Optional[str]:
+    def val(k: str) -> str | None:
         v = doc.meta.get(k)
         return v if isinstance(v, str) else None
 
@@ -346,15 +344,9 @@ def check_frontmatter(doc: Doc, rel: str, out: List[Finding]) -> None:
 
     owner = val("owner")
     if owner and not owner.startswith("@"):
-        out.append(
-            Finding(
-                "ERROR", "FM-OWNER", rel, 1, "owner must be an @handle (a single specific person)"
-            )
-        )
+        out.append(Finding("ERROR", "FM-OWNER", rel, 1, "owner must be an @handle (a single specific person)"))
     if owner and owner.startswith("@") and len(owner.strip("@")) > 39:
-        out.append(
-            Finding("WARN", "FM-OWNER", rel, 1, f"owner too long, looks like a team name: {owner}")
-        )
+        out.append(Finding("WARN", "FM-OWNER", rel, 1, f"owner too long, looks like a team name: {owner}"))
 
     up = val("updated")
     if up and not re.match(r"^\d{4}-\d{2}-\d{2}$", up):
@@ -362,21 +354,17 @@ def check_frontmatter(doc: Doc, rel: str, out: List[Finding]) -> None:
 
     doc_id = val("doc_id")
     if doc_id and not re.match(r"^[a-z0-9-]+/[a-z0-9-]+(/[a-z0-9-]+)?$", doc_id):
-        out.append(
-            Finding("ERROR", "FM-DOCID", rel, 1, f"doc_id must be <product>/<doc_type>: {doc_id}")
-        )
+        out.append(Finding("ERROR", "FM-DOCID", rel, 1, f"doc_id must be <product>/<doc_type>: {doc_id}"))
 
     if st == "deprecated" and not doc.meta.get("superseded_by"):
-        out.append(
-            Finding("ERROR", "FM-SUPERSEDE", rel, 1, "status=deprecated requires superseded_by")
-        )
+        out.append(Finding("ERROR", "FM-SUPERSEDE", rel, 1, "status=deprecated requires superseded_by"))
 
     sot = doc.meta.get("source_of_truth")
     if not isinstance(sot, list) or not sot:
         out.append(Finding("ERROR", "FM-SOT", rel, 1, "source_of_truth must be a non-empty list"))
 
 
-def check_sot_paths(doc: Doc, rel: str, repo_root: str, out: List[Finding]) -> None:
+def check_sot_paths(doc: Doc, rel: str, repo_root: str, out: list[Finding]) -> None:
     sot = doc.meta.get("source_of_truth")
     if not isinstance(sot, list):
         return
@@ -386,9 +374,7 @@ def check_sot_paths(doc: Doc, rel: str, repo_root: str, out: List[Finding]) -> N
             continue
         target = os.path.join(repo_root, p)
         if not os.path.exists(target):
-            out.append(
-                Finding("ERROR", "SOT-PATH", rel, 1, f"source_of_truth path does not exist: {p}")
-            )
+            out.append(Finding("ERROR", "SOT-PATH", rel, 1, f"source_of_truth path does not exist: {p}"))
             continue
         # line-range validation
         if "#L" in str(item) and os.path.isfile(target):
@@ -397,7 +383,7 @@ def check_sot_paths(doc: Doc, rel: str, repo_root: str, out: List[Finding]) -> N
                 start = int(m.group(1))
                 end = int(m.group(2) or start)
                 try:
-                    with open(target, "r", encoding="utf-8", errors="replace") as fh:
+                    with open(target, encoding="utf-8", errors="replace") as fh:
                         n = sum(1 for _ in fh)
                 except OSError:
                     continue
@@ -413,7 +399,7 @@ def check_sot_paths(doc: Doc, rel: str, repo_root: str, out: List[Finding]) -> N
                     )
 
 
-def check_redlines(text: str, rel: str, out: List[Finding]) -> None:
+def check_redlines(text: str, rel: str, out: list[Finding]) -> None:
     lines = text.splitlines()
     in_fence = False
     in_inline = False  # inline-code span state, carried across lines
@@ -485,7 +471,7 @@ def check_redlines(text: str, rel: str, out: List[Finding]) -> None:
             )
 
 
-def check_links(doc_path: str, text: str, rel: str, out: List[Finding]) -> None:
+def check_links(doc_path: str, text: str, rel: str, out: list[Finding]) -> None:
     base = os.path.dirname(doc_path)
     # Strip fenced + inline code first: `layers[i](hidden)` is a call, not a link.
     # Inline-code state carries across lines; resets on blank lines.
@@ -520,14 +506,10 @@ def check_links(doc_path: str, text: str, rel: str, out: List[Finding]) -> None:
             continue
         cand = os.path.normpath(os.path.join(base, frag))
         if not os.path.exists(cand):
-            out.append(
-                Finding(
-                    "ERROR", "LINK-BROKEN", rel, 0, f"relative link target does not exist: {target}"
-                )
-            )
+            out.append(Finding("ERROR", "LINK-BROKEN", rel, 0, f"relative link target does not exist: {target}"))
 
 
-def check_budget(doc: Doc, rel: str, out: List[Finding]) -> None:
+def check_budget(doc: Doc, rel: str, out: list[Finding]) -> None:
     dt = doc.meta.get("doc_type")
     entry = doc.meta.get("entry")
     if not isinstance(dt, str):
@@ -536,9 +518,7 @@ def check_budget(doc: Doc, rel: str, out: List[Finding]) -> None:
     if dt == "get-started" and entry == "guided-ui":
         limit = GUIDED_UI_BUDGET
     if limit is None:
-        out.append(
-            Finding("INFO", "BUDGET", rel, 0, f"body {doc.body_lines} lines ({dt} has no hard cap)")
-        )
+        out.append(Finding("INFO", "BUDGET", rel, 0, f"body {doc.body_lines} lines ({dt} has no hard cap)"))
         return
     if doc.body_lines > limit:
         over = doc.body_lines - limit
@@ -565,21 +545,17 @@ def check_budget(doc: Doc, rel: str, out: List[Finding]) -> None:
         out.append(Finding("INFO", "BUDGET", rel, 0, f"body {doc.body_lines} lines / cap {limit}"))
 
 
-def check_bi_lingual(doc: Doc, rel: str, out: List[Finding]) -> None:
+def check_bi_lingual(doc: Doc, rel: str, out: list[Finding]) -> None:
     # Only the frontmatter zh/en pairing is checked: title must exist in both languages
     title = doc.meta.get("title")
     if isinstance(title, str):
         if "zh" not in title or "en" not in title:
-            out.append(
-                Finding("WARN", "I18N-TITLE", rel, 1, "title should be { zh: ..., en: ... }")
-            )
+            out.append(Finding("WARN", "I18N-TITLE", rel, 1, "title should be { zh: ..., en: ... }"))
     elif isinstance(title, list):
-        out.append(
-            Finding("WARN", "I18N-TITLE", rel, 1, "title failed to parse, check indentation")
-        )
+        out.append(Finding("WARN", "I18N-TITLE", rel, 1, "title failed to parse, check indentation"))
 
 
-def check_inventory(root: str, cls: str, entry: str, out: List[Finding]) -> None:
+def check_inventory(root: str, cls: str, entry: str, out: list[Finding]) -> None:
     key = (cls, entry)
     if key not in TIER1:
         out.append(
@@ -598,11 +574,7 @@ def check_inventory(root: str, cls: str, entry: str, out: List[Finding]) -> None
     for rel in TIER1[key]:
         p = os.path.join(root, rel)
         if not os.path.exists(p):
-            out.append(
-                Finding(
-                    "ERROR", "INV-T1", rel, 0, f"Tier 1 doc missing (grid position {cls}x{entry})"
-                )
-            )
+            out.append(Finding("ERROR", "INV-T1", rel, 0, f"Tier 1 doc missing (grid position {cls}x{entry})"))
         elif os.path.isdir(p) and not os.listdir(p):
             out.append(Finding("ERROR", "INV-T1", rel, 0, "Tier 1 directory is empty"))
     for rel, need in TIER1_MIN_COUNT.get(key, []):
@@ -610,15 +582,13 @@ def check_inventory(root: str, cls: str, entry: str, out: List[Finding]) -> None
         if os.path.isdir(d):
             n = len([f for f in os.listdir(d) if f.endswith(".md") and not f.startswith("_")])
             if n < need:
-                out.append(
-                    Finding("ERROR", "INV-COUNT", rel, 0, f"need at least {need} docs, found {n}")
-                )
+                out.append(Finding("ERROR", "INV-COUNT", rel, 0, f"need at least {need} docs, found {n}"))
 
 
 # ---------------------------------------------------------------- main
 
 
-def iter_docs(root: str, skip_dirs: Tuple[str, ...]) -> List[str]:
+def iter_docs(root: str, skip_dirs: tuple[str, ...]) -> list[str]:
     found = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
@@ -628,22 +598,18 @@ def iter_docs(root: str, skip_dirs: Tuple[str, ...]) -> List[str]:
     return sorted(found)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="fusion docs-system validator")
     ap.add_argument("--root", default=".", help="repository root directory")
     ap.add_argument("--product", help="e.g. fusion-mlx, used for the doc-set check")
-    ap.add_argument(
-        "--class", dest="cls", choices=sorted(VALID_CLASS), help="product class core/platform/app"
-    )
+    ap.add_argument("--class", dest="cls", choices=sorted(VALID_CLASS), help="product class core/platform/app")
     ap.add_argument(
         "--entry",
         choices=sorted(VALID_ENTRY),
         help="integration form developer/service/guided-ui/none",
     )
     ap.add_argument("--strict", action="store_true", help="treat WARN as failure too")
-    ap.add_argument(
-        "--skip-inventory", action="store_true", help="skip doc-set completeness checks"
-    )
+    ap.add_argument("--skip-inventory", action="store_true", help="skip doc-set completeness checks")
     ap.add_argument(
         "--skip-placeholder",
         action="store_true",
@@ -662,13 +628,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     skip = tuple(x.strip() for x in args.skip_dirs.split(",") if x.strip())
-    findings: List[Finding] = []
+    findings: list[Finding] = []
 
     if args.product:
         if not args.cls or not args.entry:
-            print(
-                "[ERROR] --class and --entry are required together with --product", file=sys.stderr
-            )
+            print("[ERROR] --class and --entry are required together with --product", file=sys.stderr)
             return 2
         if not args.skip_inventory:
             check_inventory(root, args.cls, args.entry, findings)
@@ -681,7 +645,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     for path in docs_paths:
         rel = os.path.relpath(path, root)
         doc = load_doc(path)
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
 
         check_frontmatter(doc, rel, findings)
@@ -710,9 +674,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f)
 
     print()
-    print(
-        f"scanned {len(docs_paths)} docs | ERROR {len(errs)} | WARN {len(warns)} | INFO {len(infos)}"
-    )
+    print(f"scanned {len(docs_paths)} docs | ERROR {len(errs)} | WARN {len(warns)} | INFO {len(infos)}")
 
     if errs:
         return 1

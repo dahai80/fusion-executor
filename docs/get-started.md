@@ -57,7 +57,7 @@ r = ex.run("python3 -c 'while True: pass'", timeout=1.0)
 assert r.timed_out and r.exit_code == -124
 
 r = ex.run("python3 -c \"raise ValueError('boom')\"")
-assert r.diagnostics.error_type == "ValueError"   # structured diagnostics slicer
+assert r.diagnostics.error_type == "ValueError"  # structured diagnostics slicer
 ```
 
 ## 4. Start the UDS JSON-RPC service / 启动 UDS 服务

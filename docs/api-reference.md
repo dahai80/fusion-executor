@@ -73,7 +73,7 @@ Exit-code contract: `0` success; `-124` timeout; `-1` blocked by Security Guard 
 ```python
 ex.serve()  # UDS JSON-RPC 2.0; default ~/.fusion-executor/fe.sock
 sub = ex.subscribe(["telemetry", "stdio"], interval_ms=100, screenshot_interval_ms=1000)
-for params in sub:          # yields params (dict) of executor.event frames
+for params in sub:  # yields params (dict) of executor.event frames
     print(params["channel"], params["data"])
 sub.unsubscribe()
 ```

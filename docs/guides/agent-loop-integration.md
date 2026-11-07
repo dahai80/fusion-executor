@@ -41,7 +41,7 @@ The executor does NOT count consecutive failures. The caller keeps the count and
 ```python
 from fusion_executor import RollbackPolicy
 
-policy = RollbackPolicy(max_consecutive_failures=5)   # threshold read by the caller
+policy = RollbackPolicy(max_consecutive_failures=5)  # threshold read by the caller
 failures = 0
 for attempt in range(max_attempts):
     result = ex.run(command, cwd=repo, auto_rollback=policy)
