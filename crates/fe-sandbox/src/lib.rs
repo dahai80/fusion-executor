@@ -53,17 +53,35 @@ static PTY_OPEN_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 /// 开 PTY — 持 PTY_OPEN_LOCK 防 ENXIO 竞态。仅设备分配临界区, 返回 pair 后释放。
+/// 高并发下 openpty 偶发瞬时失败 (ENXIO/EBUSY, 设备分配压力) — 有界退避重试,
+/// 耗尽后仍失败才上抛 (真实 PTY 耗尽不受隐藏)。
 fn open_pty_pair() -> Result<portable_pty::PtyPair> {
     let _guard = PTY_OPEN_LOCK.lock().unwrap();
     let pty_system = NativePtySystem::default();
-    pty_system
-        .openpty(PtySize {
+    const RETRY_BACKOFF_MS: [u64; 4] = [25, 50, 100, 200];
+    let mut attempt = 0;
+    loop {
+        match pty_system.openpty(PtySize {
             rows: 24,
             cols: 80,
             pixel_width: 0,
             pixel_height: 0,
-        })
-        .context("openpty 失败")
+        }) {
+            Ok(pair) => return Ok(pair),
+            Err(e) if attempt < RETRY_BACKOFF_MS.len() => {
+                let backoff = RETRY_BACKOFF_MS[attempt];
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    backoff_ms = backoff,
+                    error = %e,
+                    "openpty transient failure, retrying"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(backoff));
+                attempt += 1;
+            }
+            Err(e) => return Err(e).context("openpty 失败"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
