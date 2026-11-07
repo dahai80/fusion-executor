@@ -7,7 +7,7 @@ doc_type: readme
 title: {zh: "fusion-executor 开发者指南", en: "fusion-executor Developer Guide"}
 audience: engineer
 status: draft
-version: 0.2.20
+version: 0.2.21
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -18,6 +18,8 @@ source_of_truth:
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Status
+
+**v0.2.21 released** (tag `v0.2.21`, GitHub release live). fusion docs-system v1.1 adoption + CI unblock: new `docs/` grid (product-page/get-started/api-reference/config-reference/troubleshooting/guides/api-protocol-reference) + contract frontmatter on existing markdown docs + `AGENTS.md` + `ci/validate_docs.py` (frontmatter/link validator, stdlib only) + `.github/workflows/docs.yml`; CI runner label `macos-14` → `macos-latest` (macos-15) both jobs; fe-security resolved-path check trusts `/opt/homebrew/opt/rustup/bin` (Homebrew rustup shim dir — macos-15 runner PATH resolves bare `cargo` there; same trust class as Homebrew prefix). No API changes, no Python behavior change.
 
 **v0.2.20 released** (tag `v0.2.20`, GitHub release live). **Issue #60 (fusion_core.config single-point config resolution, config Phase 2.2)**: `LayaToolSelector` HTTP backend + bench script + AC8 test resolve key/URL via `from fusion_core.config import client_key, default_mlx_base_url` (explicit `api_key`/`mlx_url` kwargs win); deleted hand-rolled module-level env reads + the hardcoded `"fg-admin-key"` fallback literal (spec §3 illegal; fusion-mlx allows anonymous localhost when no server key, alias chain preserves configured-key behavior). dev missing key = `""` + one-time warning; `FUSION_PROFILE=prod` missing key = `RuntimeError`. pyproject adds `fusion-core>=0.7.0` (bare, fusion-rag pattern; CI installs git pin `dahai80/fusion-core@v0.7.0` before maturin). Scope guard: executor.py `FUSION_GUARD_SOCK` read NOT migrated to `default_guard_sock()` — would flip guard default ON. Acceptance: workspace `scripts/check-env.py` 0 findings for this repo; `grep 'def _resolve.*key'` empty; no Rust changes. +8 Python tests (`python/tests/test_config_resolution.py`, no model dep).
 

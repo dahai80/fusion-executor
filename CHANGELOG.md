@@ -7,7 +7,7 @@ doc_type: changelog
 title: {zh: "fusion-executor 变更日志", en: "fusion-executor Changelog"}
 audience: engineer
 status: draft
-version: 0.2.20
+version: 0.2.21
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -21,8 +21,14 @@ All notable changes to fusion-executor are documented here. Format follows [Keep
 
 ## [Unreleased]
 
-### Changed
-- Adopted the fusion docs-system v1.1 contract: added `docs/product-page.md`, `docs/get-started.md`, `docs/api-reference.md`, `docs/config-reference.md`, `docs/troubleshooting.md`, `docs/guides/`, `ci/validate_docs.py`, and `.github/workflows/docs.yml`; added contract frontmatter to existing markdown docs. Grid classification: platform x service. No functional code changes.
+## [0.2.21] — 2026-11
+
+### Added
+- fusion docs-system v1.1 adoption: `docs/product-page.md`, `docs/get-started.md`, `docs/api-reference.md`, `docs/config-reference.md`, `docs/troubleshooting.md`, `docs/guides/`, `ci/validate_docs.py` (frontmatter + link validator, stdlib only), `.github/workflows/docs.yml`; contract frontmatter on existing markdown docs. Grid classification: platform x service.
+
+### Fixed
+- CI runner label `macos-14` → `macos-latest` (macos-15) — unblocks queued jobs on retired-runner label.
+- fe-security resolved-path check: trust `/opt/homebrew/opt/rustup/bin` (Homebrew rustup shim dir) — macos-15 runner PATH resolves bare `cargo` there; same trust class as the Homebrew prefix (package-manager-managed, root-owned).
 
 ## [0.2.20] — 2026-11
 
