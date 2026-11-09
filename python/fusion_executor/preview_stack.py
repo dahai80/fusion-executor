@@ -193,11 +193,18 @@ class PreviewStackRunner:
         if st and st.get("healthy"):
             logger.info("preview already up, idempotent return name=%s", proj.name)
             return st
+        try:
+            self._probe_port_free(proj.host_port)
+        except PreviewError:
+            if st is None:
+                raise
+            logger.info("port busy, tearing down stale preview first name=%s", proj.name)
+            self.teardown(proj.name)
+            self._probe_port_free(proj.host_port)
         self._ensure_docker()
         if st:
             logger.info("stale preview state found, re-uping name=%s", proj.name)
             self.teardown(proj.name)
-        self._probe_port_free(proj.host_port)
         repo_dir = self.apps_dir / proj.name
         self._provision(proj.repo_url, proj.name, repo_dir)
         cmd = [*self._compose_base(proj, repo_dir), "up", "-d", "--build"]
