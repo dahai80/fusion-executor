@@ -7,7 +7,7 @@ doc_type: changelog
 title: {zh: "fusion-executor 变更日志", en: "fusion-executor Changelog"}
 audience: engineer
 status: draft
-version: 0.2.21
+version: 0.2.22
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -20,6 +20,12 @@ source_of_truth:
 All notable changes to fusion-executor are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.22] — 2026-11
+
+### Added
+- Demo/test environment sandbox runner (issue #64): `DemoEnvRunner` (`python/fusion_executor/demo_env.py`) — guest runs ONE ai-* app, heavy deps consumed from the host. Provision (clone https w/ ssh fallback, shared venv, `pip install -e` when `pyproject.toml` present), start via the app's own `start.sh` (missing → visible error + manual hint, never silently skipped), `up`/`status`/`stop` idempotent actions, single-app-per-guest policy, host gateway probe (`/healthz` then `/v1/models`) informational only. App process runs via `shell_start` with `SandboxProfile(network=allow)` + env wiring `FUSION_LLM_BASE_URL`/`FUSION_MLX_URL` → host gateway. CLI: `--demo-up REPO_URL` / `--demo-status` / `--demo-stop` (+ `--demo-workspace` / `--demo-llm-url` / `--demo-env`).
+- `shell_start` gains optional per-shell `sandbox: SandboxProfile` (4-layer additive plumb: fe-shell `ShellStartParams.sandbox_profile` → `SandboxConfig`, fe-ipc serde param, fe-pyo3 PyAny bridge, Python kwarg; `None` = byte-identical prior behavior).
 
 ## [0.2.21] — 2026-11
 

@@ -1182,6 +1182,7 @@ impl PyExecutor {
         max_nofile=1024,
         max_idle_sec=fe_core::shell::DEFAULT_MAX_IDLE_SEC,
         kill_grace_ms=500,
+        sandbox=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn shell_start(
@@ -1199,6 +1200,7 @@ impl PyExecutor {
         max_nofile: u32,
         max_idle_sec: u64,
         kill_grace_ms: u64,
+        sandbox: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyShellStartResult>> {
         let env: std::collections::HashMap<String, String> = match env_vars {
             Some(obj) => {
@@ -1217,6 +1219,23 @@ impl PyExecutor {
             }
             None => std::collections::HashMap::new(),
         };
+        let sandbox_profile: Option<fe_sandbox::seatbelt::SandboxProfile> = match sandbox {
+            Some(obj) => {
+                let json_mod = py.import("json")?;
+                let s: String = json_mod
+                    .call_method1("dumps", (obj,))?
+                    .extract()
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "sandbox 序列化失败: {e}"
+                        ))
+                    })?;
+                Some(serde_json::from_str(&s).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("sandbox 解析失败: {e}"))
+                })?)
+            }
+            None => None,
+        };
         let sp = ShellStartParams {
             command,
             cwd,
@@ -1230,6 +1249,7 @@ impl PyExecutor {
             max_nofile,
             max_idle_sec,
             kill_grace_ms,
+            sandbox_profile,
         };
         let r: RsShellStartResult = self.inner.shell_start(&self.shells, sp);
         let raw = serde_json::to_string(&r)

@@ -437,6 +437,7 @@ class FusionSandboxExecutor:
         max_nofile: int = 1024,
         max_idle_sec: int = 3600,
         kill_grace_ms: int = 500,
+        sandbox: SandboxProfile | None = None,
     ) -> ShellStartResult:
         if not isinstance(max_idle_sec, int) or max_idle_sec < 0:
             raise ValueError(f"max_idle_sec 必须为非负 int, 得 {max_idle_sec!r}")
@@ -444,8 +445,11 @@ class FusionSandboxExecutor:
             raise ValueError(f"kill_grace_ms 必须为非负 int, 得 {kill_grace_ms!r}")
         if not isinstance(max_nofile, int) or max_nofile < 0:
             raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
+        if sandbox is not None and not isinstance(sandbox, SandboxProfile):
+            raise TypeError(f"sandbox 必须为 SandboxProfile | None, 得 {type(sandbox).__name__}")
+        sandbox_payload = sandbox.model_dump() if sandbox is not None else None
         logger.debug(
-            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s kill_grace_ms=%s max_nofile=%s",
+            "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s kill_grace_ms=%s max_nofile=%s sandbox=%s",
             command,
             cwd,
             task_id,
@@ -454,6 +458,7 @@ class FusionSandboxExecutor:
             max_idle_sec,
             kill_grace_ms,
             max_nofile,
+            sandbox_payload is not None,
         )
         native = self._native.shell_start(
             command,
@@ -468,6 +473,7 @@ class FusionSandboxExecutor:
             max_nofile,
             max_idle_sec,
             kill_grace_ms,
+            sandbox_payload,
         )
         result = ShellStartResult.model_validate(native.to_dict())
         logger.info(

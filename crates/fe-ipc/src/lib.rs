@@ -2274,6 +2274,15 @@ async fn handle_method(
                 .get("kill_grace_ms")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(500);
+            // Issue #64: 可选 per-shell seatbelt profile — serde 反序列化 (deny_unknown_fields 校验)。
+            let sandbox_profile: Option<fe_sandbox::seatbelt::SandboxProfile> =
+                match params.get("sandbox") {
+                    Some(v) if !v.is_null() => Some(
+                        serde_json::from_value(v.clone())
+                            .map_err(|e| (ERR_INVALID_REQ, format!("sandbox 解析失败: {}", e)))?,
+                    ),
+                    _ => None,
+                };
             let sp = fe_core::shell::ShellStartParams {
                 command,
                 cwd,
@@ -2287,6 +2296,7 @@ async fn handle_method(
                 max_nofile,
                 max_idle_sec,
                 kill_grace_ms,
+                sandbox_profile,
             };
             let r = executor.shell_start(shells, sp);
             // M-OPS-02: fe_shell_active gauge — list_shells 已 reap finished, running 计数即活跃。
