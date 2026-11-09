@@ -7,7 +7,7 @@ doc_type: changelog
 title: {zh: "fusion-executor 变更日志", en: "fusion-executor Changelog"}
 audience: engineer
 status: draft
-version: 0.2.22
+version: 0.2.23
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -20,6 +20,12 @@ source_of_truth:
 All notable changes to fusion-executor are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.23] — 2026-11
+
+### Added
+- Automated sandbox preview stack runner (issue #65, companion to fusion-cowork#422): `PreviewStackRunner` + `PreviewProject` (`python/fusion_executor/preview_stack.py`) — per-project docker compose overlay (ordered `compose_files` base→overlay + `profile`), synthetic demo data injection via project-provided `seed_cmd` (`docker compose exec`, never real customer data), health-check gate before URL issuance (`/healthz` poll; unhealthy stack auto-torn-down, no URL issued), preview URL `http://127.0.0.1:<host_port>/` with `PREVIEW_HOST_PORT`/`PREVIEW_SERVICE_PORT` env injection into compose, TTL auto-teardown (daemon timer) + explicit `teardown`/`teardown_all`, port-in-use pre-flight probe (fail visibly), state persisted `<workspace>/<name>.json`, idempotent `up` (healthy re-up returns same URL), `notify` hook for readiness notification (email channel owned by consumer, e.g. cowork cow#404). Provision = clone (https with ssh fallback) / `git pull --ff-only`. No CLI by design (library API for cowork pipeline consumption). Port-registry note: preview binds 127.0.0.1 ephemeral/unregistered test ports only — no new business ports in this repo (check-ports unchanged).
+- Live E2E verified: fixture repo (nginx:alpine + overlay profile) → clone/compose up → health 200 → synthetic seed file served → idempotent re-up → teardown clean (0 leftover containers); unhealthy-stack auto-teardown verified. +8 Python tests (`test_preview_stack.py`, live class skipped when docker daemon unavailable).
 
 ## [0.2.22] — 2026-11
 
