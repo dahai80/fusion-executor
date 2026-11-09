@@ -92,6 +92,9 @@ pub struct ShellStartParams {
     /// M-9: kill 宽限期 (毫秒) — kill_shell/expire_idle/Drop 用此值作 SIGINT→grace→SIGKILL 间隔。
     /// 0 = 立即 SIGKILL; 默认 DEFAULT_KILL_GRACE_MS (500)。
     pub kill_grace_ms: u64,
+    /// Issue #64: 可选 per-shell seatbelt profile (透传 SandboxConfig.sandbox_profile)。
+    /// None = 沿用 seatbelt bool 固定 profile (向后兼容, 字节级不变); Some = 参数化 profile。
+    pub sandbox_profile: Option<fe_sandbox::seatbelt::SandboxProfile>,
 }
 
 struct ShellHandle {
@@ -151,7 +154,7 @@ impl ShellRegistry {
             max_cpu_sec: p.max_cpu_sec,
             max_nofile: p.max_nofile,
             rss_limit_mb: 0, // D3-4: 后台 shell 不加 RSS 上限 — poll-model 长驻任务, 调用方自管 kill_shell
-            sandbox_profile: None,
+            sandbox_profile: p.sandbox_profile,
         };
         let spawned: SpawnedPty = match spawn_pty(&sb_cfg) {
             Ok(s) => s,
@@ -595,6 +598,7 @@ mod tests {
             max_nofile: 0,
             max_idle_sec: 0,
             kill_grace_ms: DEFAULT_KILL_GRACE_MS,
+            sandbox_profile: None,
         }
     }
 
@@ -607,6 +611,25 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         let out = reg.shell_output(&id).unwrap();
         assert!(out.output.contains("hi"), "output: {}", out.output);
+    }
+
+    /// Issue #64: Some(sandbox_profile) 透传 SandboxConfig — 参数化 profile (excluded_commands
+    /// 拒一个未被调用的 binary) 下命令仍正常执行; seatbelt 不可用 (非 macOS / CI 无 sandbox-exec)
+    /// 时静默降级 (fail_if_unavailable=false 默认), 断言仅 ok。
+    #[test]
+    fn shell_start_with_sandbox_profile() {
+        let reg = ShellRegistry::new();
+        let mut p = params("echo profiled", None);
+        p.sandbox_profile = Some(fe_sandbox::seatbelt::SandboxProfile {
+            excluded_commands: vec!["definitely-not-invoked-bin".to_string()],
+            ..Default::default()
+        });
+        let r = reg.shell_start(p);
+        assert!(r.ok, "error: {:?}", r.error);
+        let id = r.shell_id.unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let out = reg.shell_output(&id).unwrap();
+        assert!(out.output.contains("profiled"), "output: {}", out.output);
     }
 
     #[test]

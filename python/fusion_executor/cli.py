@@ -55,6 +55,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="允许内联解释器 (python -c / node -e / ruby -e / perl -e; 企业硬化默认拒)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="调试日志")
+    # Issue #64: demo/test 环境沙箱 runner (guest 单 ai-* app, LLM 走宿主网关)
+    parser.add_argument(
+        "--demo-up",
+        default=None,
+        metavar="REPO_URL",
+        help="demo 环境: provision + 启动一个 ai-* app (单 app per guest, 幂等)",
+    )
+    parser.add_argument("--demo-status", action="store_true", help="demo 环境: 查询运行状态")
+    parser.add_argument("--demo-stop", action="store_true", help="demo 环境: 停止运行中的 app")
+    parser.add_argument("--demo-workspace", default=None, help="demo 工作区 (默认 ~/.fusion-executor/demo)")
+    parser.add_argument(
+        "--demo-llm-url",
+        default=None,
+        help="宿主 LLM 网关 (默认 http://127.0.0.1:11432; 注入 FUSION_LLM_BASE_URL/FUSION_MLX_URL)",
+    )
+    parser.add_argument(
+        "--demo-env", action="append", default=None, metavar="K=V", help="demo app 附加环境变量 (可多次)"
+    )
     return parser
 
 
@@ -68,6 +86,36 @@ def _parse_env(pairs: list[str] | None) -> dict[str, str] | None:
         k, v = p.split("=", 1)
         out[k] = v
     return out
+
+
+def _run_demo(args: argparse.Namespace, log: logging.Logger) -> int:
+    # Issue #64: demo 环境子模式 — up/status/stop 幂等动作, JSON 输出供演示脚本消费
+    from .demo_env import DemoEnvError, DemoEnvRunner
+
+    try:
+        runner = DemoEnvRunner(
+            host_llm_base_url=args.demo_llm_url or "http://127.0.0.1:11432",
+            workspace_dir=args.demo_workspace,
+            extra_env=_parse_env(args.demo_env),
+            executor=FusionSandboxExecutor(allow_inline_interpreter=args.allow_inline_interpreter),
+        )
+        if args.demo_up:
+            info = runner.up(args.demo_up)
+        elif args.demo_status:
+            info = runner.status()
+        else:
+            info = runner.stop()
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0
+    except DemoEnvError as e:
+        log.error("demo 环境失败: %s", e)
+        return 1
+    except (TypeError, ValueError) as e:
+        log.error("参数错误: %s", e)
+        return 2
+    except Exception:
+        log.exception("demo 环境异常")
+        return 2
 
 
 def main() -> int:
@@ -90,6 +138,10 @@ def main() -> int:
             log.info("serve interrupted (KeyboardInterrupt)")
             return 1
         return 0
+
+    # Issue #64: demo 环境模式 — flag 驱动 (同 --serve, 避免 subcommand + bare positional 歧义)
+    if args.demo_up or args.demo_status or args.demo_stop:
+        return _run_demo(args, log)
 
     if not args.command:
         parser.print_help()
