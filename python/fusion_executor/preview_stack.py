@@ -188,12 +188,12 @@ class PreviewStackRunner:
             self._timers[name] = t
 
     def up(self, proj: PreviewProject) -> dict:
-        self._ensure_docker()
         proj.model_validate_name()
         st = self._load_state(proj.name)
         if st and st.get("healthy"):
             logger.info("preview already up, idempotent return name=%s", proj.name)
             return st
+        self._ensure_docker()
         if st:
             logger.info("stale preview state found, re-uping name=%s", proj.name)
             self.teardown(proj.name)
