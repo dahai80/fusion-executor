@@ -7,7 +7,7 @@ doc_type: changelog
 title: {zh: "fusion-executor 变更日志", en: "fusion-executor Changelog"}
 audience: engineer
 status: draft
-version: 0.2.24
+version: 0.2.25
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -20,6 +20,17 @@ source_of_truth:
 All notable changes to fusion-executor are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.25] — 2026-11
+
+### Added
+- Demo session screen streaming (issue #69, partial): `open_stream(session_id)` — iOS kind serves an MJPEG stream over HTTP (stdlib `ThreadingHTTPServer`, `simctl io screenshot` snapshot loop to a temp file, bind-wait before URL issuance, idempotent re-open returns same URL); web kind verifies and returns the demo-app-provided stream page URL (`stream_path` config opt-in, e.g. noVNC `vnc.html`). Explicitly NOT the ~120ms WebRTC acceptance target: iOS touch injection has no public simctl API (needs XCTest stack) and MJPEG latency is ~0.5-1s — blocked upstream, documented in issue #69.
+- Android demo session kind (issue #69, code path): `kind="android"` in `DemoSessionConfig` — Linux demo host + `/dev/kvm` pre-flight (visible `DemoSessionError` on non-Linux, never silent), docker `--privileged` emulator container (configurable `android_image`), `adb connect` + boot-completed poll (600s) + optional APK install + launch via monkey; capacity knob `max_android`; teardown = `docker rm -f` (data burned). Live verification blocked on a Linux+KVM host — code path + unit/preflight tests only.
+- Per-session LLM metering readback (issue #69, verified): `session_cost(session_id)` — reads the session's own fk- key from state (workspace now `0o700`; key stored at rest) and queries gateway `GET /v1/cost` (own-key scope, gateway-owned metering). Live E2E verified end-to-end: demo session → scenario injection → in-container curl through gateway (stream mode) → `POST /api/v1/keys` fk- key → `/v1/cost` shows `by_key` entry + `total_tokens` > 0 → key revoked. NOTE gateway gap found during verification: non-stream `/v1/chat/completions` does not record cost (stream does) — upstream issue dahai80/fusion-gateway#639.
+- `llm_api_key` now persisted in session state (0o700 workspace) so metering readback survives across processes.
+
+### Fixed
+- iOS live test in CI: headless GitHub runners boot simulators but app launch hangs (no GUI session) — test gated off CI via `GITHUB_ACTIONS`; simulator device discovery tolerant of slow cold-start simctl (120s + skip on failure); UDS shell-output roundtrip poll replaces fixed sleep (load-flake root cause).
 
 ## [0.2.24] — 2026-11
 

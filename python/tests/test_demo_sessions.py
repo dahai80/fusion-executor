@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -41,11 +42,16 @@ def _available_device_names() -> list[str]:
     return names
 
 
-def _make_demo_repo(repo_dir: Path) -> str:
+def _make_demo_repo(repo_dir: Path, *, stream: bool = False, llm_env: bool = False) -> str:
     site = repo_dir / "site"
     site.mkdir(parents=True, exist_ok=True)
     (site / "index.html").write_text("<html>DEMO-SESSION-OK</html>\n")
     (site / "healthz").write_text("ok\n")
+    if stream:
+        (site / "vnc.html").write_text("<html>NOVNC-PLACEHOLDER</html>\n")
+    env_block = ""
+    if llm_env:
+        env_block = "    environment:\n      - FUSION_LLM_API_KEY=${FUSION_LLM_API_KEY:-}\n"
     compose = repo_dir / "docker-compose.demo.yml"
     compose.write_text(
         "services:\n"
@@ -54,7 +60,7 @@ def _make_demo_repo(repo_dir: Path) -> str:
         "    ports:\n"
         '      - "127.0.0.1:${PREVIEW_HOST_PORT:-11600}:80"\n'
         "    volumes:\n"
-        "      - ./site:/usr/share/nginx/html:rw\n"
+        "      - ./site:/usr/share/nginx/html:rw\n" + env_block
     )
     subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
     subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
@@ -67,13 +73,13 @@ def _make_demo_repo(repo_dir: Path) -> str:
 
 
 def _web_cfg(repo_url: str, slug: str = "tiny-todo", **kw) -> DemoSessionConfig:
+    kw.setdefault("llm_api_key", "fk-test-session-key")
+    kw.setdefault("scenarios", {"invoice-created": "echo INVOICE-STUB-EVENT > /usr/share/nginx/html/demo-data.txt"})
     return DemoSessionConfig(
         sample_slug=slug,
         kind="web",
         repo_url=repo_url,
         exec_service="web",
-        scenarios={"invoice-created": "echo INVOICE-STUB-EVENT > /usr/share/nginx/html/demo-data.txt"},
-        llm_api_key="fk-test-session-key",
         ttl_min=5,
         **kw,
     )
@@ -82,7 +88,7 @@ def _web_cfg(repo_url: str, slug: str = "tiny-todo", **kw) -> DemoSessionConfig:
 def test_validate_config_slug_and_kind():
     with pytest.raises(DemoSessionError, match="invalid sample_slug"):
         DemoSessionConfig(sample_slug="Bad Slug").validate_config()
-    with pytest.raises(DemoSessionError, match="unsupported kind"):
+    with pytest.raises(DemoSessionError, match="bundle_id"):
         DemoSessionConfig(sample_slug="ok", kind="android").validate_config()
     with pytest.raises(DemoSessionError, match="repo_url"):
         DemoSessionConfig(sample_slug="ok", kind="web").validate_config()
@@ -209,6 +215,36 @@ class TestLiveIosSessions:
             m.shutdown_all()
         assert m.rollup("ios-demo-a")["active"] == 0
 
+    def test_ios_mjpeg_stream_serves_frames(self, tmp_path):
+        import urllib.error
+        import urllib.request
+
+        devices = _available_device_names()
+        if not devices:
+            pytest.skip("no available iPhone simulator")
+        m = DemoSessionManager(workspace_dir=tmp_path / "ws", max_ios=1)
+        cfg = DemoSessionConfig(
+            sample_slug="ios-stream", kind="ios", bundle_id="com.apple.mobilesafari", device_name=devices[0]
+        )
+        try:
+            st = m.start_session(cfg)
+            sid = st["session_id"]
+            opened = m.open_stream(sid)
+            assert opened["mode"] == "mjpeg"
+            url = opened["stream_url"]
+            again = m.open_stream(sid)
+            assert again["stream_url"] == url
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                ctype = resp.headers.get("Content-Type", "")
+                assert "multipart/x-mixed-replace" in ctype
+                chunk = resp.read(4096)
+                assert b"image/jpeg" in chunk
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                urllib.request.urlopen(url.replace("stream.mjpeg", "nope"), timeout=5)
+            assert ei.value.code == 404
+        finally:
+            m.shutdown_all()
+
 
 def test_preview_up_extra_env_passthrough(tmp_path):
     PreviewStackRunner(workspace_dir=tmp_path / "ws")
@@ -216,3 +252,157 @@ def test_preview_up_extra_env_passthrough(tmp_path):
 
     sig = inspect.signature(PreviewStackRunner.up)
     assert "extra_env" in sig.parameters
+
+
+def test_android_preflight_visible_error(tmp_path):
+    import platform
+
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    cfg = DemoSessionConfig(sample_slug="android-demo", kind="android", bundle_id="com.example.app")
+    if platform.system() == "Linux" and Path("/dev/kvm").exists():
+        pytest.skip("real Linux+KVM host — preflight would pass")
+    with pytest.raises(DemoSessionError, match="Linux demo host with /dev/kvm"):
+        m.start_session(cfg)
+
+
+def test_android_capacity_queue(tmp_path):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws", max_android=0)
+    cfg = DemoSessionConfig(sample_slug="android-demo", kind="android", bundle_id="com.example.app")
+    st = m.start_session(cfg)
+    assert st["queued"] is True and st["position"] == 1
+    m._save_queue([])
+
+
+def test_session_cost_no_key_visible_error(tmp_path):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    sid = "tiny-todo-00000000"
+    m._save(sid, {"session_id": sid, "sample_slug": "tiny-todo", "kind": "web", "llm_api_key": ""})
+    with pytest.raises(DemoSessionError, match="no llm_api_key wired"):
+        m.session_cost(sid)
+
+
+def test_session_cost_bad_key_visible_error(tmp_path):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    sid = "tiny-todo-00000000"
+    m._save(sid, {"session_id": sid, "sample_slug": "tiny-todo", "kind": "web", "llm_api_key": "fk-definitely-invalid"})
+    with pytest.raises(DemoSessionError, match="/v1/cost readback failed"):
+        m.session_cost(sid)
+
+
+def test_web_stream_not_configured_visible_error(tmp_path):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    sid = "tiny-todo-00000000"
+    m._save(sid, {"session_id": sid, "sample_slug": "tiny-todo", "kind": "web"})
+    with pytest.raises(DemoSessionError, match="no stream configured"):
+        m.open_stream(sid)
+
+
+def test_open_stream_no_session(tmp_path):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    with pytest.raises(DemoSessionError, match="no such session"):
+        m.open_stream("ghost-000")
+
+
+@pytest.mark.skipif(not DOCKER_AVAILABLE, reason="docker daemon not available")
+class TestLiveWebStreamAndMetering:
+    def test_stream_url_issued_and_reachable(self, tmp_path):
+        repo = _make_demo_repo(tmp_path / "repo", stream=True)
+        m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+        st = m.start_session(_web_cfg(repo, slug="stream-demo", stream_path="vnc.html"))
+        try:
+            assert st["stream_url"].endswith("/vnc.html")
+            got = m.open_stream(st["session_id"])
+            assert got["ok"] is True and got["mode"] == "demo-app"
+            with urllib.request.urlopen(got["stream_url"], timeout=5) as resp:
+                assert b"NOVNC-PLACEHOLDER" in resp.read()
+        finally:
+            m.end_session(st["session_id"])
+
+    def test_web_llm_env_reaches_container(self, tmp_path, caplog):
+        repo = _make_demo_repo(tmp_path / "repo", llm_env=True)
+        m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+        cfg = _web_cfg(
+            repo,
+            slug="llm-env-demo",
+            llm_api_key="fk-container-env-probe",
+            scenarios={"key-echo": 'echo -n "$FUSION_LLM_API_KEY" > /usr/share/nginx/html/key.txt'},
+        )
+        st = m.start_session(cfg)
+        sid = st["session_id"]
+        try:
+            m.inject_scenario(sid, "key-echo")
+            with urllib.request.urlopen(st["url"] + "key.txt", timeout=5) as resp:
+                assert resp.read() == b"fk-container-env-probe"
+        finally:
+            m.end_session(sid)
+
+
+def _gateway_up() -> bool:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11432/healthz", timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _gateway_master_key() -> str:
+    key = os.environ.get("FUSION_GATEWAY_MASTER_KEY", "")
+    if not key:
+        p = Path("/tmp/fusion-gw-master.key")
+        if p.exists():
+            key = p.read_text(encoding="utf-8").strip()
+    return key
+
+
+GATEWAY_MASTER_KEY = _gateway_master_key()
+
+
+@pytest.mark.skipif(
+    not (_gateway_up() and GATEWAY_MASTER_KEY), reason="gateway down or FUSION_GATEWAY_MASTER_KEY unset"
+)
+class TestLiveMeteringE2E:
+    def test_fk_key_usage_shows_in_v1_cost(self, tmp_path):
+        import uuid as _uuid
+
+        gw = "http://127.0.0.1:11432"
+        key_name = f"demo-metering-test-{_uuid.uuid4().hex[:8]}"
+        req = urllib.request.Request(
+            gw + "/api/v1/keys",
+            data=json.dumps({"name": key_name, "scopes": ["chat"]}).encode(),
+            headers={"Authorization": f"Bearer {GATEWAY_MASTER_KEY}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw_key = json.loads(resp.read().decode())["raw_key"]
+        assert raw_key.startswith("fk-")
+        repo = _make_demo_repo(tmp_path / "repo", llm_env=True)
+        m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+        llm_cmd = (
+            "curl -s -m 90 -X POST http://host.docker.internal:11432/v1/chat/completions "
+            '-H "Content-Type: application/json" -H "Authorization: Bearer $FUSION_LLM_API_KEY" '
+            '-d \'{"model":"mlx-community--Qwen3-0.6B-4bit","messages":[{"role":"user","content":"say ok"}],'
+            '"max_tokens":8,"stream":true}\' > /usr/share/nginx/html/llm.txt; head -c 60 /usr/share/nginx/html/llm.txt'
+        )
+        cfg = _web_cfg(repo, slug="metering-demo", llm_api_key=raw_key, scenarios={"llm-call": llm_cmd})
+        st = m.start_session(cfg)
+        sid = st["session_id"]
+        try:
+            m.inject_scenario(sid, "llm-call")
+            got = m.get_session(sid)
+            assert got["healthy"] is True
+            cost = m.session_cost(sid)
+            summary = cost["cost_summary"]
+            assert summary.get("total_requests", 0) >= 1, f"fk- key usage not metered: {summary}"
+            assert summary.get("total_tokens", 0) > 0
+            assert any("demo-metering-test" in k for k in summary.get("by_key", {}))
+        finally:
+            m.end_session(sid)
+            revoke = urllib.request.Request(
+                gw + f"/api/v1/keys/{key_name}",
+                headers={"Authorization": f"Bearer {GATEWAY_MASTER_KEY}"},
+                method="DELETE",
+            )
+            try:
+                urllib.request.urlopen(revoke, timeout=10)
+            except Exception as e:
+                logging.warning("metering test key revoke failed name=%s err=%s", key_name, e)

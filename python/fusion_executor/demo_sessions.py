@@ -7,6 +7,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -24,6 +25,8 @@ DEMO_LLM_BASE_URL = "http://127.0.0.1:11432"
 IOS_TTL_MIN = 15
 DISPATCH_INTERVAL_SEC = 5.0
 SIMCTL_TIMEOUT_SEC = 300.0
+ANDROID_BOOT_TIMEOUT_SEC = 600.0
+KIND_CAP_ATTR = {"web": "max_web", "ios": "max_ios", "android": "max_android"}
 
 
 class DemoSessionError(RuntimeError):
@@ -47,18 +50,20 @@ class DemoSessionConfig(BaseModel):
     device_name: str = "iPhone 18 Pro"
     app_path: str = ""
     bundle_id: str = ""
+    android_image: str = "redroid/redroid:14.0.0-latest"
+    stream_path: str = ""
 
     def validate_config(self) -> None:
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", self.sample_slug):
             raise DemoSessionError(f"invalid sample_slug: {self.sample_slug!r}")
-        if self.kind not in ("web", "ios"):
-            raise DemoSessionError(
-                f"unsupported kind: {self.kind!r} (web|ios; android emulator container deferred, see follow-up issue)"
-            )
+        if self.kind not in ("web", "ios", "android"):
+            raise DemoSessionError(f"unsupported kind: {self.kind!r} (web|ios|android)")
         if self.kind == "web" and not self.repo_url:
             raise DemoSessionError("web session requires repo_url")
         if self.kind == "ios" and not self.bundle_id:
             raise DemoSessionError("ios session requires bundle_id")
+        if self.kind == "android" and not self.bundle_id:
+            raise DemoSessionError("android session requires bundle_id (app package to launch)")
 
 
 class DemoSessionManager:
@@ -67,11 +72,16 @@ class DemoSessionManager:
         workspace_dir: str | Path = DEFAULT_SESSIONS_WORKSPACE,
         max_web: int = 8,
         max_ios: int = 2,
+        max_android: int = 1,
     ) -> None:
         self.workspace = Path(workspace_dir).expanduser()
-        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.workspace, 0o700)
         self.max_web = max_web
         self.max_ios = max_ios
+        self.max_android = max_android
+        self._streams: dict[str, threading.Thread] = {}
+        self._stop_flags: dict[str, threading.Event] = {}
         self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.RLock()
         self._stacks = PreviewStackRunner(workspace_dir=self.workspace / "stacks")
@@ -123,7 +133,7 @@ class DemoSessionManager:
 
     def start_session(self, cfg: DemoSessionConfig) -> dict:
         cfg.validate_config()
-        cap = self.max_web if cfg.kind == "web" else self.max_ios
+        cap = getattr(self, KIND_CAP_ATTR[cfg.kind])
         with self._lock:
             active = self._count_kind(cfg.kind)
             if active >= cap:
@@ -137,6 +147,8 @@ class DemoSessionManager:
         session_id = f"{cfg.sample_slug}-{uuid.uuid4().hex[:8]}"
         if cfg.kind == "web":
             return self._start_web(session_id, cfg)
+        if cfg.kind == "android":
+            return self._start_android(session_id, cfg)
         return self._start_ios(session_id, cfg)
 
     def _start_web(self, session_id: str, cfg: DemoSessionConfig) -> dict:
@@ -176,10 +188,14 @@ class DemoSessionManager:
             "exec_service": cfg.exec_service,
             "scenarios": cfg.scenarios,
             "llm_base_url": DEMO_LLM_BASE_URL,
+            "llm_api_key": cfg.llm_api_key,
             "llm_key_wired": bool(cfg.llm_api_key),
+            "stream_path": cfg.stream_path,
             "ttl_min": cfg.ttl_min,
             "started_at": st["started_at"],
         }
+        if cfg.stream_path:
+            state["stream_url"] = st["url"].rstrip("/") + "/" + cfg.stream_path.lstrip("/")
         self._save(session_id, state)
         self._arm_ttl(session_id, cfg.ttl_min)
         logger.info("demo web session up id=%s url=%s ttl=%dmin", session_id, st["url"], cfg.ttl_min)
@@ -230,6 +246,7 @@ class DemoSessionManager:
             "bundle_id": cfg.bundle_id,
             "healthy": True,
             "llm_base_url": DEMO_LLM_BASE_URL,
+            "llm_api_key": cfg.llm_api_key,
             "llm_key_wired": bool(cfg.llm_api_key),
             "ttl_min": IOS_TTL_MIN,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -239,6 +256,224 @@ class DemoSessionManager:
         logger.info("demo ios session up id=%s device=%s ttl=%dmin", session_id, cfg.device_name, IOS_TTL_MIN)
         return {**state, "queued": False}
 
+    def _adb(self, args: list[str], what: str, timeout: float = 60.0) -> str:
+        logger.info("adb what=%s args=%s", what, " ".join(args))
+        try:
+            r = subprocess.run(["adb", *args], capture_output=True, text=True, timeout=timeout)
+        except FileNotFoundError as e:
+            raise DemoSessionError("android sessions require adb (android platform-tools) on PATH") from e
+        except subprocess.TimeoutExpired as e:
+            raise DemoSessionError(f"{what} timed out after {timeout}s") from e
+        if r.returncode != 0:
+            raise DemoSessionError(f"{what} failed (exit {r.returncode}): {(r.stderr or r.stdout).strip()[-500:]}")
+        return r.stdout
+
+    def _start_android(self, session_id: str, cfg: DemoSessionConfig) -> dict:
+        import platform
+
+        if platform.system() != "Linux" or not Path("/dev/kvm").exists():
+            # Visible failure, never a silent skip: the emulator container needs
+            # Linux + KVM (redroid binderfs). Live verification is blocked on a
+            # Linux demo host — see issue #69 acceptance notes.
+            raise DemoSessionError(
+                "android sessions require a Linux demo host with /dev/kvm "
+                f"(got platform={platform.system()}, /dev/kvm={Path('/dev/kvm').exists()})"
+            )
+        if shutil.which("adb") is None:
+            raise DemoSessionError("android sessions require adb (android platform-tools) on PATH")
+        host_port = self._free_port()
+        container = f"{session_id}-emu"
+        try:
+            self._stacks._run(
+                [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--rm",
+                    "--name",
+                    container,
+                    "--privileged",
+                    "-p",
+                    f"127.0.0.1:{host_port}:5555",
+                    cfg.android_image,
+                ],
+                cwd=self.workspace,
+                timeout=180.0,
+                what="android emulator container start",
+            )
+        except PreviewError as e:
+            raise DemoSessionError(f"android emulator container start failed: {e}") from e
+        serial = f"127.0.0.1:{host_port}"
+        try:
+            self._adb(["connect", serial], "adb connect")
+            deadline = time.monotonic() + ANDROID_BOOT_TIMEOUT_SEC
+            booted = False
+            while time.monotonic() < deadline:
+                out = self._adb(["-s", serial, "shell", "getprop", "sys.boot_completed"], "wait boot", timeout=30.0)
+                if out.strip() == "1":
+                    booted = True
+                    break
+                time.sleep(5.0)
+            if not booted:
+                raise DemoSessionError(f"android emulator {serial} failed to boot within {ANDROID_BOOT_TIMEOUT_SEC}s")
+            if cfg.app_path:
+                self._adb(["-s", serial, "install", "-r", "-t", cfg.app_path], "install apk", timeout=300.0)
+            self._adb(
+                ["-s", serial, "shell", "monkey", "-p", cfg.bundle_id, "-c", "android.intent.category.LAUNCHER", "1"],
+                "launch app",
+            )
+        except DemoSessionError:
+            try:
+                self._stacks._run(
+                    ["docker", "rm", "-f", container],
+                    cwd=self.workspace,
+                    timeout=30.0,
+                    what="android emulator cleanup after failed start",
+                )
+            except PreviewError as e:
+                logger.warning("android cleanup failed id=%s err=%s", session_id, e)
+            raise
+        state = {
+            "session_id": session_id,
+            "sample_slug": cfg.sample_slug,
+            "kind": "android",
+            "container": container,
+            "adb_serial": serial,
+            "host_port": host_port,
+            "bundle_id": cfg.bundle_id,
+            "healthy": True,
+            "llm_base_url": DEMO_LLM_BASE_URL,
+            "llm_api_key": cfg.llm_api_key,
+            "llm_key_wired": bool(cfg.llm_api_key),
+            "ttl_min": cfg.ttl_min,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        self._save(session_id, state)
+        self._arm_ttl(session_id, cfg.ttl_min)
+        logger.info("demo android session up id=%s serial=%s ttl=%dmin", session_id, serial, cfg.ttl_min)
+        return {**state, "queued": False}
+
+    def open_stream(self, session_id: str) -> dict:
+        """Best-effort screen stream. iOS: MJPEG over HTTP (simctl screenshot loop).
+        Web: demo-app-provided stream page (noVNC etc.) — URL probed and returned.
+        NOTE: this is NOT the ~120ms WebRTC acceptance target from issue #69 —
+        iOS touch injection has no public simctl API (needs XCTest stack); MJPEG
+        latency is ~0.5-1s. Verified honestly as best-effort preview."""
+        st = self._load(session_id)
+        if st is None:
+            raise DemoSessionError(f"no such session: {session_id}")
+        if st["kind"] == "ios":
+            if st.get("stream_port"):
+                return {"ok": True, "stream_url": f"http://127.0.0.1:{st['stream_port']}/stream.mjpeg", "mode": "mjpeg"}
+            port = self._free_port()
+            stop = threading.Event()
+            t = threading.Thread(target=self._mjpeg_loop, args=(st["udid"], port, stop), daemon=True)
+            t.start()
+            self._streams[session_id] = t
+            self._stop_flags[session_id] = stop
+            # Wait for the listener to bind before handing out the URL (the
+            # server thread owns binding; a fast client would otherwise hit
+            # connection-refused).
+            ready = False
+            for _ in range(50):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        ready = True
+                        break
+                except OSError:
+                    time.sleep(0.1)
+            if not ready:
+                stop.set()
+                raise DemoSessionError(f"mjpeg stream server failed to bind port {port}")
+            st["stream_port"] = port
+            self._save(session_id, st)
+            url = f"http://127.0.0.1:{port}/stream.mjpeg"
+            logger.info("demo ios stream open id=%s url=%s (mjpeg best-effort, not WebRTC)", session_id, url)
+            return {"ok": True, "stream_url": url, "mode": "mjpeg"}
+        url = st.get("stream_url")
+        if not url:
+            raise DemoSessionError(
+                "session has no stream configured (web demos opt in via stream_path; "
+                "the demo app must provide the stream page, e.g. noVNC)"
+            )
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                code = resp.status
+        except Exception as e:
+            raise DemoSessionError(f"stream endpoint unreachable: {url} ({e})") from e
+        logger.info("demo web stream verified id=%s url=%s status=%d", session_id, url, code)
+        return {"ok": True, "stream_url": url, "mode": "demo-app"}
+
+    def _mjpeg_loop(self, udid: str, port: int, stop: threading.Event) -> None:
+        import http.server
+
+        frames = {"jpg": b""}
+
+        def snap() -> bytes:
+            # simctl screenshot only writes to a file path (stdout "-" is
+            # treated as a literal filename) — snapshot via temp file.
+            tmp = Path(tempfile.gettempdir()) / f"fe-mjpeg-{udid[:8]}.jpg"
+            try:
+                r = subprocess.run(
+                    ["xcrun", "simctl", "io", udid, "screenshot", "--type=jpeg", "--display", "1", str(tmp)],
+                    capture_output=True,
+                    timeout=30.0,
+                )
+            except subprocess.TimeoutExpired:
+                return b""
+            if r.returncode != 0:
+                return b""
+            try:
+                return tmp.read_bytes()
+            except OSError:
+                return b""
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/stream.mjpeg":
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+                while not stop.is_set():
+                    jpg = frames["jpg"]
+                    if not jpg:
+                        time.sleep(0.2)
+                        continue
+                    try:
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                            + str(len(jpg)).encode()
+                            + b"\r\n\r\n"
+                            + jpg
+                            + b"\r\n"
+                        )
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    time.sleep(0.5)
+
+            def log_message(self, fmt, *args):
+                logger.debug("mjpeg " + fmt, *args)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        server.daemon_threads = True
+
+        def capture():
+            while not stop.is_set():
+                frames["jpg"] = snap()
+                time.sleep(0.5)
+            server.shutdown()
+
+        threading.Thread(target=capture, daemon=True).start()
+        logger.info("mjpeg stream server listening port=%d udid=%s", port, udid)
+        server.serve_forever(poll_interval=0.2)
+        server.server_close()
+        logger.info("mjpeg stream server stopped port=%d", port)
+
     def get_session(self, session_id: str) -> dict | None:
         st = self._load(session_id)
         if st is None:
@@ -247,10 +482,44 @@ class DemoSessionManager:
             ok, detail = self._stacks._wait_healthy_quick(st["host_port"], st.get("health_path", "/healthz"))
             st["healthy"] = ok
             st["health_detail"] = detail
+        elif st["kind"] == "android":
+            try:
+                out = self._adb(["-s", st["adb_serial"], "get-state"], "check emulator", timeout=15.0)
+                st["healthy"] = out.strip() == "device"
+            except DemoSessionError:
+                st["healthy"] = False
         else:
             out = self._run_simctl(["list", "devices"], what="check device")
             st["healthy"] = st.get("udid", "") in out and "(Booted)" in out
         return st
+
+    def session_cost(self, session_id: str) -> dict:
+        """Read back per-session LLM metering from the gateway /v1/cost surface
+        using the session's own fk- key (own-key scope — gateway-owned metering)."""
+        st = self._load(session_id)
+        if st is None:
+            raise DemoSessionError(f"no such session: {session_id}")
+        key = st.get("llm_api_key")
+        if not key:
+            raise DemoSessionError(f"session {session_id} has no llm_api_key wired; metering readback unavailable")
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(
+            DEMO_LLM_BASE_URL.rstrip("/") + "/v1/cost",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                summary = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise DemoSessionError(
+                f"/v1/cost readback failed (HTTP {e.code}): {e.read().decode('utf-8', 'replace')[-300:]}"
+            ) from e
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            raise DemoSessionError(f"/v1/cost readback failed: {e}") from e
+        logger.info("session cost readback id=%s ok=%s", session_id, bool(summary))
+        return {"session_id": session_id, "cost_summary": summary}
 
     def inject_scenario(self, session_id: str, scenario_id: str) -> dict:
         st = self._load(session_id)
@@ -284,11 +553,25 @@ class DemoSessionManager:
         st = self._load(session_id)
         if st is None:
             return {"ok": True, "ended": None}
+        stop = self._stop_flags.pop(session_id, None)
+        if stop:
+            stop.set()
+        self._streams.pop(session_id, None)
         if st["kind"] == "web":
             try:
                 self._stacks.teardown(session_id)
             except PreviewError as e:
                 raise DemoSessionError(f"teardown failed: {e}") from e
+        elif st["kind"] == "android":
+            try:
+                self._stacks._run(
+                    ["docker", "rm", "-f", st["container"]],
+                    cwd=self.workspace,
+                    timeout=60.0,
+                    what="android emulator teardown (burn data)",
+                )
+            except (PreviewError, KeyError) as e:
+                logger.warning("android teardown failed id=%s err=%s", session_id, e)
         else:
             udid = st.get("udid")
             if udid:
@@ -364,7 +647,7 @@ class DemoSessionManager:
                 if not q:
                     continue
                 head = DemoSessionConfig(**q[0])
-                cap = self.max_web if head.kind == "web" else self.max_ios
+                cap = getattr(self, KIND_CAP_ATTR[head.kind])
                 if self._count_kind(head.kind) < cap:
                     self._save_queue(q[1:])
                     self._start_now(head)
