@@ -7,7 +7,7 @@ doc_type: readme
 title: {zh: "fusion-executor 开发者指南", en: "fusion-executor Developer Guide"}
 audience: engineer
 status: draft
-version: 0.2.23
+version: 0.2.24
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -18,6 +18,8 @@ source_of_truth:
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Status
+
+**v0.2.24 released** (tag `v0.2.24`, GitHub release live). **Issue #68 (session-scoped demo host orchestration — web compose + iOS Simulator + stub scenario injection; executor owns session-level demo workload lifecycle, supervisor stays out)**: `DemoSessionManager` + `DemoSessionConfig` (`python/fusion_executor/demo_sessions.py`). Web kind: per-session isolated docker compose stack (unique project name + port from registered demo range 11600-11669 + healthcheck gate; reuses `PreviewStackRunner.up`, which gains `extra_env` passthrough), TTL countdown → teardown + data burned. Scenario/stub layer: `inject_scenario` replays recorded fixtures via `docker compose exec`, logged `[stub] <event> -> fixture` (demo path never calls real third-party APIs). iOS kind: `xcrun simctl` boot + optional install + launch + shutdown; concurrency cap 2 + persisted queue (position + ETA, daemon dispatcher); TTL 15 min. Per-session LLM attribution: `FUSION_LLM_API_KEY` (fk-) + `FUSION_LLM_BASE_URL` → gateway :11432. `get_session`/`end_session`/`rollup` badges. Library API (HTTP surface owned by consumer). NOTE: `_lock` must stay an `RLock` (TTL arm inside capacity-held lock). Live E2E: web lifecycle + scenario + cross-session burn; iOS 2 sims concurrent + queue position. +9 Python tests. Deferred upstream: WebRTC/noVNC streaming, Android emulator container, gateway /v1/cost metering verify (follow-up issue).
 
 **v0.2.23 released** (tag `v0.2.23`, GitHub release live). **Issue #65 (automated sandbox preview stack, companion to fusion-cowork#422; owner-routed to executor)**: `PreviewStackRunner` + `PreviewProject` (`python/fusion_executor/preview_stack.py`). Per-project compose overlay (ordered `compose_files` base→overlay + `profile`); provision = clone (https w/ ssh fallback) / `git pull --ff-only`; `docker compose up -d --build` with `PREVIEW_HOST_PORT`/`PREVIEW_SERVICE_PORT` env injection; synthetic demo data injection via project-provided `seed_cmd` through `docker compose exec` (never real customer data — business rule 6 red line); health-check gate before URL issuance (urllib poll, unhealthy stack auto-torn-down); TTL auto-teardown (daemon timer) + explicit `teardown`/`teardown_all`; port-in-use pre-flight probe; state `<workspace>/<name>.json`; idempotent `up`; `notify` hook (email channel owned by consumer — cowork cow#404). Library API only, no CLI (cowork pipeline consumes). Port isolation: 127.0.0.1 unregistered test ports only, no new business ports. Live E2E verified (fixture nginx:alpine + overlay: up → health 200 → seed file served → idempotent re-up → teardown clean; unhealthy auto-teardown). +8 Python tests (live class skips when docker daemon unavailable). No Rust changes.
 
@@ -42,7 +44,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `fe-guard` — fusion-guard wire mirror (Phase 3, default OFF).
 - `fe-pyo3` — PyO3 bindings → `fusion_executor._native`.
 
-**Current state**: 529 Rust + 300 Python (2 skip) tests green; clippy `--all-targets -D warnings` clean (only upstream `block v0.1.6` future-incompat); fmt/ruff clean; maturin builds. Four audit passes (0824/0825/0826/0827 + product-0827) — all defects fixed. `GuiAction` = 20 variants. `TaskManager` (Issue #57) = shared batch-task service at the Python layer (SQLite persistence + retry backoff + progress protocol; first consumer ai-speech-exam G5). `LayaToolSelector` (Issue #46) = pure-Python, dual Python/HTTP backends + `AgentLoop` wired into `FusionSandboxExecutor.agent_run()`; optional `laya-mlx` dep (HTTP backend needs only fusion-mlx).
+**Current state**: 529 Rust + 309 Python (2 skip) tests green; clippy `--all-targets -D warnings` clean (only upstream `block v0.1.6` future-incompat); fmt/ruff clean; maturin builds. Four audit passes (0824/0825/0826/0827 + product-0827) — all defects fixed. `GuiAction` = 20 variants. `TaskManager` (Issue #57) = shared batch-task service at the Python layer (SQLite persistence + retry backoff + progress protocol; first consumer ai-speech-exam G5). `LayaToolSelector` (Issue #46) = pure-Python, dual Python/HTTP backends + `AgentLoop` wired into `FusionSandboxExecutor.agent_run()`; optional `laya-mlx` dep (HTTP backend needs only fusion-mlx).
 
 **Per-version history**: `git log`, `.remember/` (recent.md / archive.md), and `docs/INDEX.md`. Do not rely on commit-message-level narrative for code structure — verify against real files before trusting any layout claim.
 
