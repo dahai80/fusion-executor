@@ -1631,20 +1631,26 @@ def test_shell_output_over_uds_roundtrip(uds_server: str):
         },
     )
     sid = start["result"]["shell_id"]
-    time.sleep(0.8)
-    out = _rpc_once(
-        uds_server,
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "executor.shell_output",
-            "params": {"shell_id": sid},
-        },
-    )
-    assert out["result"]["shell_id"] == sid
-    assert "poll-me" in out["result"]["output"]
-    assert out["result"]["running"] is False
-    assert out["result"]["exit_code"] == 0
+    out = None
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        out = _rpc_once(
+            uds_server,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "executor.shell_output",
+                "params": {"shell_id": sid},
+            },
+        )["result"]
+        if out["running"] is False and "poll-me" in out["output"]:
+            break
+        time.sleep(0.2)
+    assert out is not None
+    assert out["shell_id"] == sid
+    assert "poll-me" in out["output"]
+    assert out["running"] is False
+    assert out["exit_code"] == 0
 
 
 def test_kill_shell_over_uds_roundtrip(uds_server: str):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import urllib.request
@@ -175,6 +176,10 @@ class TestLiveWebSessions:
 
 
 @pytest.mark.skipif(not SIMCTL_AVAILABLE, reason="xcrun simctl not available")
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="headless CI runners boot simulators but app launch hangs without a GUI session",
+)
 class TestLiveIosSessions:
     def test_ios_boot_launch_shutdown_and_queue(self, tmp_path):
         devices = _available_device_names()
