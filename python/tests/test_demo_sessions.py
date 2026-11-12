@@ -19,6 +19,17 @@ DOCKER_AVAILABLE = (
 SIMCTL_AVAILABLE = shutil.which("xcrun") is not None
 
 
+def _available_device_names() -> list[str]:
+    r = subprocess.run(["xcrun", "simctl", "list", "devices", "available"], capture_output=True, text=True, timeout=30)
+    names: list[str] = []
+    for line in r.stdout.splitlines():
+        if "(Shutdown)" in line and "iPhone" in line:
+            name = line.split("(")[0].strip()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
 def _make_demo_repo(repo_dir: Path) -> str:
     site = repo_dir / "site"
     site.mkdir(parents=True, exist_ok=True)
@@ -156,12 +167,15 @@ class TestLiveWebSessions:
 @pytest.mark.skipif(not SIMCTL_AVAILABLE, reason="xcrun simctl not available")
 class TestLiveIosSessions:
     def test_ios_boot_launch_shutdown_and_queue(self, tmp_path):
+        devices = _available_device_names()
+        if len(devices) < 3:
+            pytest.skip(f"need 3 available iPhone simulators, found {len(devices)}: {devices}")
         m = DemoSessionManager(workspace_dir=tmp_path / "ws", max_ios=2)
         cfg_a = DemoSessionConfig(
-            sample_slug="ios-demo-a", kind="ios", bundle_id="com.apple.mobilesafari", device_name="iPhone 18 Pro"
+            sample_slug="ios-demo-a", kind="ios", bundle_id="com.apple.mobilesafari", device_name=devices[0]
         )
         cfg_b = DemoSessionConfig(
-            sample_slug="ios-demo-b", kind="ios", bundle_id="com.apple.mobilesafari", device_name="iPhone 18 Pro Max"
+            sample_slug="ios-demo-b", kind="ios", bundle_id="com.apple.mobilesafari", device_name=devices[1]
         )
         try:
             st_a = m.start_session(cfg_a)
@@ -169,7 +183,7 @@ class TestLiveIosSessions:
             st_b = m.start_session(cfg_b)
             assert st_b["queued"] is False and st_b["healthy"] is True
             cfg_c = DemoSessionConfig(
-                sample_slug="ios-demo-c", kind="ios", bundle_id="com.apple.mobilesafari", device_name="iPhone 17e"
+                sample_slug="ios-demo-c", kind="ios", bundle_id="com.apple.mobilesafari", device_name=devices[2]
             )
             st_c = m.start_session(cfg_c)
             assert st_c["queued"] is True and st_c["position"] == 1
