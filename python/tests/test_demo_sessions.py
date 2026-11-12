@@ -20,7 +20,17 @@ SIMCTL_AVAILABLE = shutil.which("xcrun") is not None
 
 
 def _available_device_names() -> list[str]:
-    r = subprocess.run(["xcrun", "simctl", "list", "devices", "available"], capture_output=True, text=True, timeout=30)
+    try:
+        # First simctl call on a fresh runner cold-starts daemons and can be slow.
+        r = subprocess.run(
+            ["xcrun", "simctl", "list", "devices", "available"], capture_output=True, text=True, timeout=120
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logging.warning("simctl device discovery failed, skipping iOS live test: %s", e)
+        return []
+    if r.returncode != 0:
+        logging.warning("simctl device discovery exited %d, skipping iOS live test", r.returncode)
+        return []
     names: list[str] = []
     for line in r.stdout.splitlines():
         if "(Shutdown)" in line and "iPhone" in line:
