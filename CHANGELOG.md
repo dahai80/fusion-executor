@@ -7,7 +7,7 @@ doc_type: changelog
 title: {zh: "fusion-executor 变更日志", en: "fusion-executor Changelog"}
 audience: engineer
 status: draft
-version: 0.2.23
+version: 0.2.24
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -20,6 +20,13 @@ source_of_truth:
 All notable changes to fusion-executor are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.24] — 2026-11
+
+### Added
+- Session-scoped demo host orchestration (issue #68): `DemoSessionManager` + `DemoSessionConfig` (`python/fusion_executor/demo_sessions.py`) — per-customer-click ephemeral demo stacks. Web kind: docker compose per-session project name + port from the registered demo range 11600-11669 (free-port probe) + healthcheck-gated readiness (reuses `PreviewStackRunner.up`, now with `extra_env` passthrough); TTL countdown → teardown, data burned (`compose down -v`); scenario/stub injection `inject_scenario(session_id, scenario_id)` runs the sample's recorded fixture via `docker compose exec`, every injection logged `[stub] <scenario> -> <cmd>` (hard rule: demo path never calls real third-party APIs); iOS kind: `xcrun simctl` boot + (optional) app install + launch + shutdown on Mac host, concurrency cap 2 with persisted queue (position + ETA, daemon dispatcher starts next when a slot frees), shorter TTL (15 min); per-session LLM attribution: `FUSION_LLM_API_KEY` (fk- key) + `FUSION_LLM_BASE_URL` (:11432 gateway, single metering point) injected into compose env; `get_session`/`end_session`/`rollup(slug)` health badges (healthy/maintenance/unknown); library API (HTTP surface owned by consumer). Deadlock fix in the making: `_lock` is an `RLock` (TTL arm inside capacity-held lock).
+- Live E2E verified: web session up → healthy → scenario injection (stub file served, `[stub]` log emitted) → TTL teardown → cross-session burn check (session B sees no session A data); iOS: 2 simulators booted concurrently + queue position reported + shutdown_all clean; ports verified inside 11600-11669. +9 Python tests (`test_demo_sessions.py`, live classes skip when docker daemon / xcrun unavailable).
+- Deferred (out of scope, tracked upstream): WebRTC/noVNC screen streaming (web container + simulator), Android emulator container (Linux demo host), gateway `/v1/cost` metering verification — follow-up issue filed.
 
 ## [0.2.23] — 2026-11
 

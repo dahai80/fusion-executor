@@ -187,7 +187,7 @@ class PreviewStackRunner:
             t.start()
             self._timers[name] = t
 
-    def up(self, proj: PreviewProject) -> dict:
+    def up(self, proj: PreviewProject, extra_env: dict[str, str] | None = None) -> dict:
         proj.model_validate_name()
         st = self._load_state(proj.name)
         if st and st.get("healthy"):
@@ -213,7 +213,11 @@ class PreviewStackRunner:
             cwd=repo_dir,
             timeout=COMPOSE_TIMEOUT_SEC,
             what="docker compose up",
-            extra_env={"PREVIEW_HOST_PORT": str(proj.host_port), "PREVIEW_SERVICE_PORT": str(proj.service_port)},
+            extra_env={
+                "PREVIEW_HOST_PORT": str(proj.host_port),
+                "PREVIEW_SERVICE_PORT": str(proj.service_port),
+                **(extra_env or {}),
+            },
         )
         healthy, detail = self._wait_healthy(proj)
         seed_detail = "skipped (unhealthy stack)"
