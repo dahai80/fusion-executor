@@ -303,6 +303,107 @@ def test_open_stream_no_session(tmp_path):
         m.open_stream("ghost-000")
 
 
+def test_touch_no_session(tmp_path):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    with pytest.raises(DemoSessionError, match="no such session"):
+        m.inject_touch("ghost-000", 10, 20)
+
+
+def _ios_state(sid: str) -> dict:
+    return {
+        "session_id": sid,
+        "sample_slug": "ios-demo",
+        "kind": "ios",
+        "udid": "00000000-0000-0000-0000-000000000000",
+        "device_name": "iPhone",
+        "bundle_id": "com.apple.mobilesafari",
+        "healthy": True,
+    }
+
+
+def test_touch_action_and_coord_validation(tmp_path):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    sid = "ios-demo-00000000"
+    m._save(sid, _ios_state(sid))
+    with pytest.raises(DemoSessionError, match="unsupported touch action"):
+        m.inject_touch(sid, 10, 20, action="pinch")
+    with pytest.raises(DemoSessionError, match="non-negative"):
+        m.inject_touch(sid, -1, 20)
+    with pytest.raises(DemoSessionError, match="swipe requires x2/y2"):
+        m.inject_touch(sid, 10, 20, action="swipe")
+
+
+def test_touch_idb_missing_visible_error(tmp_path, monkeypatch):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    sid = "ios-demo-00000000"
+    m._save(sid, _ios_state(sid))
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    with pytest.raises(DemoSessionError, match="requires idb_companion"):
+        m.inject_touch(sid, 100, 200)
+
+
+def test_touch_web_session_rejected(tmp_path):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    sid = "web-demo-00000000"
+    m._save(sid, {"session_id": sid, "sample_slug": "web-demo", "kind": "web"})
+    with pytest.raises(DemoSessionError, match="ios and android sessions only"):
+        m.inject_touch(sid, 10, 20)
+
+
+def test_touch_android_uses_adb_input(tmp_path):
+    m = DemoSessionManager(workspace_dir=tmp_path / "ws")
+    sid = "android-demo-0000000"
+    st = {
+        "session_id": sid,
+        "sample_slug": "android-demo",
+        "kind": "android",
+        "adb_serial": "127.0.0.1:11600",
+        "bundle_id": "com.example.app",
+        "healthy": True,
+    }
+    m._save(sid, st)
+    calls: list[list[str]] = []
+
+    def fake_adb(args, what, timeout=60.0):
+        calls.append(args)
+        return ""
+
+    m._adb = fake_adb
+    r = m.inject_touch(sid, 55, 66)
+    assert r["ok"] is True and r["action"] == "tap"
+    assert calls == [["-s", "127.0.0.1:11600", "shell", "input", "tap", "55", "66"]]
+    calls.clear()
+    r = m.inject_touch(sid, 10, 20, action="swipe", x2=300, y2=400, duration_ms=250)
+    assert r["action"] == "swipe"
+    assert calls == [["-s", "127.0.0.1:11600", "shell", "input", "swipe", "10", "20", "300", "400", "250"]]
+
+
+@pytest.mark.skipif(not SIMCTL_AVAILABLE, reason="xcrun simctl not available")
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="headless CI runners boot simulators but app launch hangs without a GUI session",
+)
+class TestLiveIosTouch:
+    def test_touch_tap_and_swipe_roundtrip(self, tmp_path):
+        shutil.which("idb") or pytest.skip("idb (fb-idb) not installed")
+        devices = _available_device_names()
+        if not devices:
+            pytest.skip("no available iPhone simulator")
+        m = DemoSessionManager(workspace_dir=tmp_path / "ws", max_ios=1)
+        cfg = DemoSessionConfig(
+            sample_slug="ios-touch", kind="ios", bundle_id="com.apple.mobilesafari", device_name=devices[0]
+        )
+        try:
+            st = m.start_session(cfg)
+            sid = st["session_id"]
+            r = m.inject_touch(sid, 150, 300)
+            assert r["ok"] is True and r["latency_ms"] > 0
+            r2 = m.inject_touch(sid, 100, 500, action="swipe", x2=100, y2=100)
+            assert r2["ok"] is True
+        finally:
+            m.shutdown_all()
+
+
 @pytest.mark.skipif(not DOCKER_AVAILABLE, reason="docker daemon not available")
 class TestLiveWebStreamAndMetering:
     def test_stream_url_issued_and_reachable(self, tmp_path):

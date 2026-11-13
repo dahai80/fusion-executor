@@ -7,7 +7,7 @@ doc_type: changelog
 title: {zh: "fusion-executor 变更日志", en: "fusion-executor Changelog"}
 audience: engineer
 status: draft
-version: 0.2.25
+version: 0.2.26
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -20,6 +20,16 @@ source_of_truth:
 All notable changes to fusion-executor are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.26] — 2026-11
+
+### Added
+- Demo session touch injection (issue #69, iOS acceptance item resolved): `inject_touch(session_id, x, y, action="tap"|"swipe", x2, y2, duration_ms)` — iOS goes through idb (the XCTest-based UI automation stack), Android via `adb shell input tap/swipe`. Executor owns the idb companion lifecycle (`_ensure_companion`/`_stop_companion`): spawns `idb_companion --udid <udid> --only simulator`, parses the grpc port from its log, `idb connect`s the CLI, tears the companion down in `end_session`. Without owned-companion lifecycle the idb CLI either reuses a stale companion with an invalidated HID connection (`dtuhidd connection invalidated`) or fails with "Failed to connect to companion" — both observed and fixed. Live E2E verified on a booted iPhone simulator: tap round-trip ~327ms steady state (first tap ~5.3s HID handshake), swipe verified. Not the <30ms fe-gui native target — this is the demo-session remote-injection path via XCTest.
+- Missing-tool failures stay visible: idb CLI / idb_companion absent → explicit `DemoSessionError` with install commands, never a silent skip.
+- Dependencies are external tools, not package deps: `brew install facebook/fb/idb-companion` + `pip install fb-idb` (iOS touch only).
+
+### Fixed
+- Companion log handle now opened in a context manager (fd leak on early-exit path).
 
 ## [0.2.25] — 2026-11
 
