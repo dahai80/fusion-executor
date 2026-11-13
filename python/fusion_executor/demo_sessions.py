@@ -83,6 +83,7 @@ class DemoSessionManager:
         self._streams: dict[str, threading.Thread] = {}
         self._stop_flags: dict[str, threading.Event] = {}
         self._timers: dict[str, threading.Timer] = {}
+        self._companions: dict[str, subprocess.Popen] = {}
         self._lock = threading.RLock()
         self._stacks = PreviewStackRunner(workspace_dir=self.workspace / "stacks")
         self._dispatcher = threading.Thread(target=self._dispatch_loop, daemon=True)
@@ -474,6 +475,136 @@ class DemoSessionManager:
         server.server_close()
         logger.info("mjpeg stream server stopped port=%d", port)
 
+    def inject_touch(
+        self,
+        session_id: str,
+        x: int,
+        y: int,
+        action: str = "tap",
+        x2: int = 0,
+        y2: int = 0,
+        duration_ms: int = 300,
+    ) -> dict:
+        """Touch injection into a live demo session. iOS: idb (XCTest-based UI
+        automation — the stack issue #69 acceptance calls for). Android: adb
+        shell input. Coordinates are points in the device screen space."""
+        st = self._load(session_id)
+        if st is None:
+            raise DemoSessionError(f"no such session: {session_id}")
+        if action not in ("tap", "swipe"):
+            raise DemoSessionError(f"unsupported touch action: {action!r} (tap|swipe)")
+        if x < 0 or y < 0 or x2 < 0 or y2 < 0:
+            raise DemoSessionError("touch coordinates must be non-negative")
+        if action == "swipe" and (x2 == 0 and y2 == 0):
+            raise DemoSessionError("swipe requires x2/y2")
+        started = time.monotonic()
+        if st["kind"] == "ios":
+            self._ensure_companion(st["udid"])
+            if action == "tap":
+                self._run_idb_cli(["ui", "tap", str(x), str(y), "--udid", st["udid"]], what="idb ui tap")
+            else:
+                self._run_idb_cli(
+                    [
+                        "ui",
+                        "swipe",
+                        str(x),
+                        str(y),
+                        str(x2),
+                        str(y2),
+                        "--duration",
+                        str(duration_ms / 1000.0),
+                        "--udid",
+                        st["udid"],
+                    ],
+                    what="idb ui swipe",
+                )
+        elif st["kind"] == "android":
+            serial = st["adb_serial"]
+            if action == "tap":
+                self._adb(["-s", serial, "shell", "input", "tap", str(x), str(y)], "adb input tap")
+            else:
+                self._adb(
+                    ["-s", serial, "shell", "input", "swipe", str(x), str(y), str(x2), str(y2), str(duration_ms)],
+                    "adb input swipe",
+                )
+        else:
+            raise DemoSessionError("touch injection currently supported for ios and android sessions only")
+        latency_ms = round((time.monotonic() - started) * 1000.0, 1)
+        logger.info("[touch] %s (%d,%d) session=%s latency_ms=%.1f", action, x, y, session_id, latency_ms)
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "action": action,
+            "x": x,
+            "y": y,
+            "latency_ms": latency_ms,
+        }
+
+    def _ensure_companion(self, udid: str) -> None:
+        """Spawn + register an idb companion for the simulator if we don't own a
+        healthy one yet. The idb CLI never spawns a companion itself — without
+        this, taps either hit a stale companion with an invalidated HID
+        connection or fail with 'Failed to connect to companion'."""
+        proc = self._companions.get(udid)
+        if proc is not None and proc.poll() is None:
+            return
+        comp = shutil.which("idb_companion")
+        if comp is None:
+            raise DemoSessionError(
+                "ios touch injection requires idb_companion (XCTest-based UI automation): "
+                "brew install facebook/fb/idb-companion (plus pip install fb-idb for the idb CLI)"
+            )
+        log_path = Path(tempfile.gettempdir()) / f"fe-idb-companion-{udid[:8]}.log"
+        with open(log_path, "w") as log_f:
+            p = subprocess.Popen([comp, "--udid", udid, "--only", "simulator"], stdout=log_f, stderr=subprocess.STDOUT)
+            deadline = time.monotonic() + 30.0
+            port = ""
+            while time.monotonic() < deadline:
+                if p.poll() is not None:
+                    raise DemoSessionError(
+                        f"idb_companion exited early (code {p.returncode}): {log_path.read_text()[-400:]}"
+                    )
+                try:
+                    m = re.search(r'"grpc_port":(\d+)', log_path.read_text())
+                except OSError:
+                    m = None
+                if m:
+                    port = m.group(1)
+                    break
+                time.sleep(0.3)
+        if not port:
+            p.terminate()
+            raise DemoSessionError(f"idb_companion did not report a grpc port within 30s (log: {log_path})")
+        self._run_idb_cli(["connect", "localhost", port], what="idb connect")
+        self._companions[udid] = p
+        logger.info("idb companion up udid=%s port=%s pid=%d", udid, port, p.pid)
+
+    def _run_idb_cli(self, args: list[str], what: str) -> str:
+        if shutil.which("idb") is None:
+            raise DemoSessionError(
+                "ios touch injection requires the idb CLI (XCTest-based UI automation): "
+                "pip install fb-idb (plus brew install facebook/fb/idb-companion)"
+            )
+        logger.info("idb what=%s args=%s", what, " ".join(args))
+        try:
+            r = subprocess.run(["idb", *args], capture_output=True, text=True, timeout=60.0)
+        except subprocess.TimeoutExpired as e:
+            raise DemoSessionError(f"{what} timed out after 60s") from e
+        if r.returncode != 0:
+            raise DemoSessionError(f"{what} failed (exit {r.returncode}): {(r.stderr or r.stdout).strip()[-500:]}")
+        return r.stdout
+
+    def _stop_companion(self, udid: str) -> None:
+        proc = self._companions.pop(udid, None)
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=5.0)
+            logger.info("idb companion stopped udid=%s", udid)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logger.warning("idb companion stop failed udid=%s err=%s", udid, e)
+
     def get_session(self, session_id: str) -> dict | None:
         st = self._load(session_id)
         if st is None:
@@ -583,6 +714,7 @@ class DemoSessionManager:
                     self._run_simctl(["shutdown", udid], what="shutdown simulator")
                 except DemoSessionError as e:
                     logger.warning("simulator shutdown failed id=%s err=%s", session_id, e)
+                self._stop_companion(udid)
         with self._lock:
             t = self._timers.pop(session_id, None)
             if t:
