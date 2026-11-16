@@ -7,7 +7,7 @@ doc_type: readme
 title: {zh: "fusion-executor 开发者指南", en: "fusion-executor Developer Guide"}
 audience: engineer
 status: draft
-version: 0.2.26
+version: 0.2.27
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -18,6 +18,8 @@ source_of_truth:
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Status
+
+**v0.2.27 released** (tag `v0.2.27`, GitHub release live). **Issue #73 (CI efficiency retrofit per meta dahai80/fusion#2)**: `concurrency` group by ref + `cancel-in-progress: true` on both `ci.yml` and `docs.yml` (rapid push/PR-update no longer queues stale macos runs — macos-latest capacity was the observed 2026-11-13 bottleneck); `paths-ignore: ["**.md"]` on ci.yml push+PR (docs-only commits skip test jobs); `cache: pip` on the python job's setup-python (keyed on `pyproject.toml`) on top of existing rust-cache. Assessed and NOT implemented, rationale in PR #74: test sharding via matrix (release build dominates each shard — net runner-minutes rise) and tiered fast-PR + nightly gate (single full per-PR gate ~8 min uncontended; per-PR CI stays authoritative). Timing: python job 5:20-6:00 → 3:58; rust 6:00-10:51 → 5:29 (PR run 43793707039). Workflows-only diff — no product code, no test changes.
 
 **v0.2.26 released** (tag `v0.2.26`, GitHub release live). **Issue #69 acceptance item (iOS touch injection) resolved**: `inject_touch(session_id, x, y, action="tap"|"swipe", x2, y2, duration_ms)` in `DemoSessionManager` — iOS via idb (the XCTest-based UI automation stack), Android via `adb shell input`. Executor owns the full idb_companion lifecycle (`_ensure_companion`: spawn `idb_companion --udid <udid> --only simulator`, parse grpc port from its log, `idb connect localhost <port>`; `_stop_companion` in `end_session`) — without owned lifecycle the idb CLI reuses a stale companion with invalidated HID connection (`dtuhidd connection invalidated`) or fails `Failed to connect to companion`; both observed live and fixed. Live E2E: tap round-trip ~327ms steady state (first tap ~5.3s HID handshake), swipe verified on a booted simulator; NOT the <30ms fe-gui native target — this is the demo-session remote-injection path. Validation up front (action whitelist, non-negative coords, swipe requires x2/y2), `[touch]` latency log, missing idb CLI / idb_companion fail visibly with install commands. External tools (not package deps): `brew install facebook/fb/idb-companion` + `pip install fb-idb`. +6 Python tests (companion lifecycle covered by live class, gated off CI). No Rust changes.
 

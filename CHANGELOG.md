@@ -7,8 +7,8 @@ doc_type: changelog
 title: {zh: "fusion-executor 变更日志", en: "fusion-executor Changelog"}
 audience: engineer
 status: draft
-version: 0.2.26
-updated: 2026-11-07
+version: 0.2.27
+updated: 2026-11-16
 owner: "@dahai"
 source_of_truth:
   - CHANGELOG.md
@@ -20,6 +20,11 @@ source_of_truth:
 All notable changes to fusion-executor are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.27] — 2026-11
+
+### Changed
+- CI retrofit per the fusion#2 efficiency checklist (issue #73): `concurrency` group by ref + `cancel-in-progress: true` on both `ci.yml` and `docs.yml` (rapid push/PR-update no longer queues stale macos runs — macos-latest capacity was the observed bottleneck); `paths-ignore: ["**.md"]` on ci.yml push+PR (docs-only commits skip test jobs); `cache: pip` added to the python job's setup-python (keyed on `pyproject.toml`) on top of the existing rust-cache. Assessed and deliberately not implemented (rationale in PR #74): test sharding via matrix (release build dominates each shard, net runner-minutes would rise) and a tiered fast-PR + nightly gate (single full per-PR gate already runs ~8 min uncontended; per-PR CI stays authoritative). Timing: python job 5:20-6:00 → 3:58; rust 6:00-10:51 → 5:29 (PR run 43793707039). Workflows-only diff, no product code.
 
 ## [0.2.26] — 2026-11
 
