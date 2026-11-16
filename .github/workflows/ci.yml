@@ -3,7 +3,18 @@ name: CI
 on:
   push:
     branches: [main, master]
+    paths-ignore:
+      - "**.md"
   pull_request:
+    paths-ignore:
+      - "**.md"
+
+# fusion#2 CI retrofit: superseded runs on the same ref are cancelled so a
+# rapid push/PR-update sequence does not queue a pile of stale macos runs
+# (macos-latest capacity is the queue bottleneck we observed on 2026-11-13).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -72,6 +83,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Create venv + install deps
         run: |
