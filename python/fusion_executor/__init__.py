@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .agent_loop import AgentLoop, AgentStep
+from .code_executor import CodeExecutionError, CodeSandboxProfile, SandboxedCodeExecutor
 from .executor import FusionSandboxExecutor, Subscription
 from .laya_tool_selector import DEFAULT_TOOL_WHITELIST, LayaToolSelector
 from .models import (
@@ -30,6 +31,8 @@ __all__ = [
     "DEFAULT_TOOL_WHITELIST",
     "AgentLoop",
     "AgentStep",
+    "CodeExecutionError",
+    "CodeSandboxProfile",
     "Diagnostics",
     "EditResult",
     "ExecutionRequest",
@@ -46,6 +49,7 @@ __all__ = [
     "RetryPolicy",
     "RollbackPolicy",
     "SandboxProfile",
+    "SandboxedCodeExecutor",
     "ShellInfo",
     "ShellOutput",
     "ShellStartResult",
