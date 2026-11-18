@@ -97,6 +97,16 @@ from fusion_executor import TaskManager, RetryPolicy, TaskState
 
 `TaskManager` — shared async batch-task service for business apps: `task_id` polling, `queued → running → done | failed | cancelled` state machine, retry with backoff, SQLite persistence across restarts, `TASK_PROGRESS:` live progress protocol, result export/report.
 
+## Code-mode execution backend (v0.2.28, issue #75)
+
+```python
+from fusion_executor import SandboxedCodeExecutor, CodeSandboxProfile
+```
+
+`SandboxedCodeExecutor` — implements the harness `CodeExecutor` protocol (fusion-harness#50): `execute(script, namespace) -> Any`. Model-written Python runs in a sandboxed child process spawned through `FusionSandboxExecutor.run` (security guard + seatbelt + rlimits + RSS watchdog + timeout cover the whole script run). `namespace` maps stub names to real tool callables; stub calls round-trip through an atomic-rename JSON file bridge serviced by the parent. On failure the pre-exec git snapshot is rolled back plus a `git clean -fd` sweep (workspace should be a dedicated scratch checkout). `CodeExecutionError` carries the child's full traceback in `str(exc)` — the harness error loop feeds `CodeExecutionError: <traceback>` back as the next model message.
+
+`CodeSandboxProfile` — per-execution limits: `timeout_sec` (30), `rss_limit_mb` (2048), `max_cpu_sec` (0), `network` ("deny"), `filesystem` ("deny_write"), `fail_if_unavailable` (False), `rollback_on_failure` (True).
+
 ## CLI
 
 ```bash

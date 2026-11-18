@@ -7,7 +7,7 @@ doc_type: changelog
 title: {zh: "fusion-executor 变更日志", en: "fusion-executor Changelog"}
 audience: engineer
 status: draft
-version: 0.2.27
+version: 0.2.28
 updated: 2026-11-16
 owner: "@dahai"
 source_of_truth:
@@ -20,6 +20,11 @@ source_of_truth:
 All notable changes to fusion-executor are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.28] — 2026-11
+
+### Added
+- Sandboxed code-mode execution backend implementing the harness `CodeExecutor` protocol (issue #75, protocol locked in fusion-harness#50): `SandboxedCodeExecutor` + `CodeSandboxProfile` (`python/fusion_executor/code_executor.py`). Model-written Python runs in a child process spawned through `FusionSandboxExecutor.run` — security guard, seatbelt (network deny by default), rlimits, RSS watchdog, and timeout all apply to the whole script run. Stub-call bridge: `namespace` maps stub names to real tool callables; the child rounds stub calls through an atomic-rename JSON file bridge and the parent services them against the real callables. Rollback on failure: pre-exec git snapshot (fe-core `auto_rollback` + manual fallback) **plus `git clean -fd` sweep** — `reset --hard` alone leaves untracked files a hallucinated script created (workspace documented as a dedicated scratch checkout). Error traceback payload: `CodeExecutionError` carries the child's full traceback in `str(exc)` so the harness error loop feeds `CodeExecutionError: <traceback>` back as the next model message. Weak-model blast radius: hallucinated code is caught by sandbox + rollback, never escapes (network deny verified live). Live E2E against the real `fusion_harness.code_mode.CodeModeTurn`: happy path, error-loop payload contract, outer-loop self-repair, rollback sweep, seatbelt network deny. +15 Python tests (CI stays hermetic with in-process fakes per the issue).
 
 ## [0.2.27] — 2026-11
 
