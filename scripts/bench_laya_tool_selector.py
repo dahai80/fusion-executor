@@ -235,7 +235,9 @@ def main() -> int:
             import httpx
 
             httpx.get("http://localhost:11434/v1/models", timeout=1.0)
-            contention_note = "  WARNING fusion-mlx running — Metal contention inflates latency, stop fusion-mlx to measure true AC8"
+            contention_note = (
+                "  WARNING fusion-mlx running — Metal contention inflates latency, stop fusion-mlx to measure true AC8"
+            )
         except httpx.ConnectError:
             pass
     print(
