@@ -1,7 +1,7 @@
 // fe-core — Executor orchestrator (P1 minimal pipeline)
 //
 // Pipeline: validate → spawn → return
-// 重型组件 (tree-sitter / git handle) 懒加载，new() <5ms (NFR)
+// Heavy components (tree-sitter / git handles) lazily loaded, new() <5ms (NFR)
 
 use std::panic::AssertUnwindSafe;
 use std::sync::LazyLock;
@@ -52,50 +52,33 @@ pub use fe_tools::{
     NotebookEditMode as ToolsNotebookEditMode,
 };
 
-// BLOCKING_RT — 多线程 N worker (CPU 核心数, 下限 2), 并发执行 sandbox/telemetry/IPC 任务
-// 审计 Blocker 5 / 1.2: 原 worker_threads(1) 全局串行 → execute + telemetry + IPC 请求互相阻塞
-// 解法: worker_threads(N) 提升并行度。仍是单一全局 runtime (LazyLock), 不会嵌套 runtime panic
-// (asyncio 调用方在 Python 侧, 此 runtime 独立; N 提升只增线程池大小, 无嵌套问题)
-// 模式源自 fusion-design/crates/fd-ai-adapter/src/lib.rs
+// BLOCKING_RT — multi-threaded N workers (CPU core count, floor 2), concurrently running
+// sandbox/telemetry/IPC tasks
+// Audit Blocker 5 / 1.2: the old worker_threads(1) was globally serial → execute + telemetry
+// + IPC requests blocked each other
+// Fix: worker_threads(N) raises parallelism. Still a single global runtime (LazyLock), no
+// nested-runtime panic
+// (asyncio callers live on the Python side, this runtime is independent; raising N only grows
+// the thread pool, no nesting issue)
+// Pattern taken from fusion-design/crates/fd-ai-adapter/src/lib.rs
 //
-// A-5: LazyLock init panic 不可恢复 (OnceLock 中毒, 该进程此后任何 Runtime 访问都 panic)。
-// 构造失败 = 进程永久不可用, 无重试。故 panic 信息须含构建原因, 让调用方日志能定位根因;
-// 文档化约定: 首次 run() panic = 进程需重启, 无 Result 可捕获无降级 (sandbox/telemetry 全 async)。
+// A-5: a LazyLock init panic is unrecoverable (poisoned OnceLock — any later Runtime access
+// in this process panics). Construction failure = process permanently unusable, no retry.
+// So the panic message must include the build failure reason so caller logs can locate the
+// root cause; documented convention: first run() panic = process needs a restart, no Result
+// to catch and no fallback (sandbox/telemetry are all async).
 pub static BLOCKING_RT: LazyLock<Runtime> = LazyLock::new(|| {
-    // D4-12: cap workers at 8 — CLI/OS-tool 无需 32 核全开 (32 核机 spawn 32 worker 纯浪费线程栈)。
-    // 下限 2 保 execute/telemetry/IPC 并行; 上限 8 覆盖高并发 UDS, 余量靠 exec_sem 信号量节流。
+    // D4-12: cap workers at 8 — a CLI/OS-tool does not need all 32 cores open (spawning 32
+    // workers on a 32-core machine purely wastes thread stacks).
+    // Floor 2 keeps execute/telemetry/IPC parallel; cap 8 covers high-concurrency UDS, the
+    // rest is throttled by the exec_sem semaphore.
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
     let workers = workers.clamp(2, 8);
-    info!(workers, "BLOCKING_RT 初始化多线程 runtime (D4-12 上限 8)");
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .enable_all()
-        .build()
-        .unwrap_or_else(|e| {
-            panic!(
-                "BLOCKING_RT init failed: tokio runtime 构建失败 — {e}. \
-                 此 panic 不可恢复 (LazyLock 中毒), 进程需重启。worker_threads={workers}"
-            )
-        })
-});
-
-// IPC_RT — IPC 服务器扇出专属多线程 runtime (serve_blocking 入口)。
-// 审计 gap #5 (soak_stress.py 死锁): 旧版 serve_blocking 跑在共享 BLOCKING_RT (上限 8 worker),
-// 64 连接 = ~128 长任务 (push_task + read_loop) + 64 dispatch task 全挤 8 worker → dispatch 饥饿,
-// 响应帧写不出 → client recv 30s 超时。解法: 专属 IPC_RT 按 IPC 扇出放宽 worker (clamp 4-16),
-// 与 BLOCKING_RT (in-process execute_sync 路径) 隔离。fe-core execute_async/execute_streaming 用裸
-// tokio::spawn (落 caller runtime = IPC_RT), 故 IPC 任务图干净隔离, BLOCKING_RT 仅留 run() 路径。
-// spawn_blocking 落 per-runtime 阻塞池 (512 线程), 远超 MAX_CONCURRENT_EXECS=16, 不饱和。
-pub static IPC_RT: LazyLock<Runtime> = LazyLock::new(|| {
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let workers = workers.clamp(4, 16);
     info!(
         workers,
-        "IPC_RT 初始化多线程 runtime (IPC 扇出专属, 4-16 worker)"
+        "BLOCKING_RT initializing multi-thread runtime (D4-12 cap 8)"
     );
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
@@ -103,45 +86,84 @@ pub static IPC_RT: LazyLock<Runtime> = LazyLock::new(|| {
         .build()
         .unwrap_or_else(|e| {
             panic!(
-                "IPC_RT init failed: tokio runtime 构建失败 — {e}. \
-                 此 panic 不可恢复 (LazyLock 中毒), 进程需重启。worker_threads={workers}"
+                "BLOCKING_RT init failed: tokio runtime build failed — {e}. \
+                 This panic is unrecoverable (poisoned LazyLock), the process must be restarted. worker_threads={workers}"
             )
         })
 });
 
-/// 退出码约定: 0=成功, -124=超时, -1=拦截/内部异常
+// IPC_RT — dedicated multi-thread runtime for IPC server fan-out (serve_blocking entry).
+// Audit gap #5 (soak_stress.py deadlock): the old serve_blocking ran on the shared
+// BLOCKING_RT (cap 8 workers); 64 connections = ~128 long tasks (push_task + read_loop) +
+// 64 dispatch tasks all squeezed into 8 workers → dispatch starvation, response frames
+// could not be written → client recv 30s timeout. Fix: a dedicated IPC_RT with workers
+// widened for IPC fan-out (clamp 4-16), isolated from BLOCKING_RT (the in-process
+// execute_sync path). fe-core execute_async/execute_streaming use bare tokio::spawn
+// (landing on the caller runtime = IPC_RT), so the IPC task graph is cleanly isolated and
+// BLOCKING_RT keeps only the run() path.
+// spawn_blocking lands on the per-runtime blocking pool (512 threads), far above
+// MAX_CONCURRENT_EXECS=16, never saturated.
+pub static IPC_RT: LazyLock<Runtime> = LazyLock::new(|| {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let workers = workers.clamp(4, 16);
+    info!(
+        workers,
+        "IPC_RT initializing multi-thread runtime (dedicated to IPC fan-out, 4-16 workers)"
+    );
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            panic!(
+                "IPC_RT init failed: tokio runtime build failed — {e}. \
+                 This panic is unrecoverable (poisoned LazyLock), the process must be restarted. worker_threads={workers}"
+            )
+        })
+});
+
+/// Exit code convention: 0=success, -124=timeout, -1=blocked/internal error
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_TIMEOUT: i32 = -124;
 pub const EXIT_BLOCKED: i32 = -1;
 
-/// D3-5/D3-10 (审计 0827 product): 命令日志脱敏 — command 字段直入 tracing JSON 日志
-/// (~/.fusion-executor/logs/fe.log), agent-driven 场景模型可生成含 secret 的内联命令
-/// (curl -H "Authorization: Bearer sk-ant-xxx" / export API_KEY=... / -u user:pass)。
-/// 无脱敏 → token 明文落盘, 同 UID 进程可读, 企业合规违规 (PCI-DSS/HIPAA)。
+/// D3-5/D3-10 (audit 0827 product): command log redaction — the command field goes straight
+/// into tracing JSON logs (~/.fusion-executor/logs/fe.log); in agent-driven scenarios the
+/// model may generate inline commands containing secrets
+/// (curl -H "Authorization: Bearer sk-ant-xxx" / export API_KEY=... / -u user:pass).
+/// Without redaction → tokens written to disk in plaintext, readable by same-UID processes,
+/// an enterprise-compliance violation (PCI-DSS/HIPAA).
 ///
-/// 纯日志侧过滤 (不改 ExecutionResult.command — 调用方需原始命令做回放/审计);
-/// 非 token 提取 (非金库) — 仅掩码疑似 secret 片段, 保守多掩少漏。
-/// 红线: 脱敏仅作用于日志 span/info, 不破坏 validate 校验 (validate 吃原始 req.command)。
+/// Log-side filtering only (does not modify ExecutionResult.command — the caller needs the
+/// original command for replay/audit);
+/// not token extraction (not a vault) — only masks suspected secret fragments, conservatively
+/// masking more rather than leaking.
+/// Red line: redaction applies only to log spans/info, never breaks validate (validate sees
+/// the raw req.command).
 fn redact_command(cmd: &str) -> String {
     use regex::Regex;
     use std::sync::LazyLock;
-    // (?:...) 非捕获组避免影响 replace 回引用编号。case-insensitive (?i)。
+    // (?:...) non-capturing groups avoid shifting replace backreference numbering.
+    // case-insensitive (?i).
     static RE_BEARER: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+\S+").unwrap());
     static RE_SK: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)\bsk-[A-Za-z0-9_-]+").unwrap());
-    // KEY=VAL 形: key 命中敏感集 → 掩 VAL (VAL 不含空白, 含引号则到引号内整体)
-    // 形如 export PASSWORD=hunter2 / API_KEY="abc def" / --password=secret
+    // KEY=VAL form: key hits the sensitive set → mask VAL (VAL holds no whitespace; if
+    // quoted, mask the whole quoted span)
+    // e.g. export PASSWORD=hunter2 / API_KEY="abc def" / --password=secret
     static RE_KV: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r#"(?i)((?:password|passwd|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credential|authorization)\s*=\s*)("[^"]*"|\S+)"#,
         )
         .unwrap()
     });
-    // curl basic auth: -u user:pass / --user user:pass (pass 为冒号后整段)
+    // curl basic auth: -u user:pass / --user user:pass (pass is the whole segment after the colon)
     static RE_BASIC: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)(\B-u\b|--user)\s+(\S+):(\S+)").unwrap());
-    // -H/--header "Name: val" 中 Name 命中敏感集 → 掩整段引号内容
+    // -H/--header "Name: val" where Name hits the sensitive set → mask the whole quoted value
     static RE_HEADER: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r#"(?i)(-H|--header)\s+"((?:authorization|x-api-key|api-key|cookie|set-cookie)[^"]*)""#,
@@ -175,51 +197,65 @@ pub struct ExecutionRequest {
     pub timeout_sec: f64,
     #[serde(default)]
     pub env_vars: Option<std::collections::HashMap<String, String>>,
-    /// D5-2: 默认 false — 快照创建是 opt-in (每次 execute 跑 2 次 git spawn, 热路径成本
-    /// D4-11)。auto_rollback_policy.is_some() 时 fe-core 内部强制开快照 (回滚须快照, 调用方
-    /// 不应设两标志)。默认关 = 裸 run("echo") 不触发 git, 无意外延迟。
+    /// D5-2: default false — snapshot creation is opt-in (each execute costs 2 git spawns on
+    /// the hot path, D4-11). When auto_rollback_policy.is_some(), fe-core force-enables the
+    /// snapshot internally (rollback needs a snapshot; the caller should not set both flags).
+    /// Default off = bare run("echo") never triggers git, no surprise latency.
     #[serde(default = "default_false")]
     pub enable_rollback_snapshot: bool,
     #[serde(default)]
     pub auto_rollback_policy: Option<RollbackPolicy>,
-    /// Blocker 1 / 1.1: macOS seatbelt 运行时隔离 — sandbox-exec 包装子进程 (禁网 + 危险二进制 execve deny)。
-    /// 默认 true — 商用安全默认 (audit ARCH-1); 透传 SandboxConfig.seatbelt。
-    /// 调用方显式传 false 关闭隔离 (受信本地 opt-out, 须文档化逃逸风险)。
+    /// Blocker 1 / 1.1: macOS seatbelt runtime isolation — sandbox-exec wraps the child
+    /// process (network deny + execve deny for dangerous binaries).
+    /// Default true — commercially safe default (audit ARCH-1); passes through to
+    /// SandboxConfig.seatbelt. Callers may explicitly pass false to disable isolation
+    /// (trusted local opt-out, escape risk must be documented).
     #[serde(default = "default_true")]
     pub seatbelt: bool,
-    /// Issue #9: 环境隔离。默认 false → 子进程 env_clear + 仅最小基线 (PATH/TMPDIR/SHELL) + env_vars,
-    /// 不泄漏宿主密钥 (AWS_SECRET_ACCESS_KEY/ANTHROPIC_API_KEY 等)。
-    /// true → 继承宿主全量 env (受信本地场景显式 opt-in, 文档化泄漏风险)。
+    /// Issue #9: environment isolation. Default false → child gets env_clear + a minimal
+    /// baseline (PATH/TMPDIR/SHELL) + env_vars, never leaking host secrets
+    /// (AWS_SECRET_ACCESS_KEY/ANTHROPIC_API_KEY etc.).
+    /// true → inherit the full host env (explicit opt-in for trusted local scenarios,
+    /// leak risk documented).
     #[serde(default)]
     pub inherit_env: bool,
-    /// Issue #4: 捕获后端。true(默认)=PTY (ANSI/Traceback 保真, stdout+stderr 合并);
-    /// false=stdio 独立管道 (FR-03 双工 stdout/stderr 分离, Slicer 吃 stderr)。PTY 合并时 stderr 恒空。
+    /// Issue #4: capture backend. true (default)=PTY (ANSI/Traceback fidelity, stdout+stderr
+    /// merged); false=stdio separate pipes (FR-03 duplex stdout/stderr split, Slicer eats
+    /// stderr). With PTY merging, stderr is always empty.
     #[serde(default = "default_use_pty")]
     pub use_pty: bool,
-    /// Issue #3: 进程数上限 (RLIMIT_NPROC, 经 ulimit -u 注入)。默认 1024 — 拦 fork bomb 并发扩散,
-    /// 够工具链链式 spawn。0=不限 (受信 opt-out)。Darwin 实测生效。
+    /// Issue #3: process count cap (RLIMIT_NPROC, injected via ulimit -u). Default 1024 —
+    /// blocks fork-bomb concurrent spread, enough for toolchain chained spawns. 0=unlimited
+    /// (trusted opt-out). Verified effective on Darwin.
     #[serde(default = "default_nproc")]
     pub max_nproc: u32,
-    /// Issue #3: CPU 秒上限 (RLIMIT_CPU, 经 ulimit -t 注入)。默认 0=不限 (依赖 timeout_sec watchdog)。
-    /// >0 到顶 SIGXCPU (CPU 死循环防御)。Darwin 实测生效。
+    /// Issue #3: CPU seconds cap (RLIMIT_CPU, injected via ulimit -t). Default 0=unlimited
+    /// (relies on the timeout_sec watchdog). >0 hits SIGXCPU at the cap (CPU death-loop
+    /// defense). Verified effective on Darwin.
     #[serde(default)]
     pub max_cpu_sec: u32,
-    /// RUN-10 (审计 0827): 文件描述符上限 (RLIMIT_NOFILE, 经 ulimit -n 注入)。默认 1024 —
-    /// 拦 FD 耗尽攻击 (海量打开 fd 击杀宿主)。0=不限 (受信场景 opt-out)。Darwin 实测生效 (errno 24 EMFILE)。
+    /// RUN-10 (audit 0827): file descriptor cap (RLIMIT_NOFILE, injected via ulimit -n).
+    /// Default 1024 — blocks FD-exhaustion attacks (mass-opened fds killing the host).
+    /// 0=unlimited (trusted opt-out). Verified effective on Darwin (errno 24 EMFILE).
     #[serde(default = "default_nofile")]
     pub max_nofile: u32,
-    /// D3-4 (审计 0827 product): per-task RSS 上限 (MB)。Darwin RLIMIT_AS/RLIMIT_DATA 平台无效,
-    /// 改 sysinfo 轮询子进程树 RSS, 超限 kill 进程树 (exit_code -124, oom_killed=true)。
-    /// 默认 2048 — 拦内存炸弹击杀宿主。0=禁用 watchdog (受信 opt-out)。
+    /// D3-4 (audit 0827 product): per-task RSS cap (MB). Darwin RLIMIT_AS/RLIMIT_DATA are
+    /// ineffective on this platform, so sysinfo polls the child process tree RSS instead and
+    /// kills the tree over the limit (exit_code -124, oom_killed=true).
+    /// Default 2048 — blocks memory bombs from killing the host. 0=watchdog disabled
+    /// (trusted opt-out).
     #[serde(default = "default_rss_limit")]
     pub rss_limit_mb: u32,
-    /// M-OPS-06: 跨层关联 id。None 时 execute 入口自动生成 uuid v4, 贯穿日志/IPC/结果。
+    /// M-OPS-06: cross-layer correlation id. When None, the execute entry auto-generates a
+    /// uuid v4 that flows through logs/IPC/result.
     #[serde(default)]
     pub trace_id: Option<String>,
-    /// Issue #34: 每命令可配置 seatbelt/sandbox profile (网络/文件系统/排除命令)。
-    /// None → 现有固定 profile (默认禁网 + 敏感路径 file-write deny), 行为同 v0.2.7 (默认关, opt-in)。
-    /// Some → build_profile_from 按 profile 生成 seatbelt policy; fail_if_unavailable=true 且
-    /// sandbox-exec 不可用时 fail-closed 拦截 (exit -1, 不 spawn)。匹配 fusion-code SandboxSettings。
+    /// Issue #34: per-command configurable seatbelt/sandbox profile (network/filesystem/
+    /// excluded commands). None → existing fixed profile (default network deny + sensitive-path
+    /// file-write deny), behavior identical to v0.2.7 (default off, opt-in).
+    /// Some → build_profile_from generates the seatbelt policy from the profile; with
+    /// fail_if_unavailable=true and sandbox-exec unavailable → fail-closed block (exit -1,
+    /// no spawn). Matches fusion-code SandboxSettings.
     #[serde(default)]
     pub sandbox: Option<fe_sandbox::seatbelt::SandboxProfile>,
 }
@@ -262,15 +298,20 @@ pub struct Diagnostics {
     pub raw_trace: Option<String>,
 }
 
-/// 自动回滚策略 (FR-04 — caller-driven 锁定决策的扩展: 调用方可选启用自动策略)。
-/// Executor 保持无状态 — guard 在单次 execute_async 内构造, 不跨请求累积计数。
-/// max_consecutive_failures: 连续失败上限 (达此值触发回滚); file_damage_check: 检测文件毁损触发回滚。
+/// Auto-rollback policy (FR-04 — extension of the caller-driven locked decision: the caller
+/// may optionally enable the automatic policy). The Executor stays stateless — the guard is
+/// constructed within a single execute_async, never accumulating counts across requests.
+/// max_consecutive_failures: consecutive-failure cap (triggers rollback at this value);
+/// file_damage_check: detect file damage to trigger rollback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RollbackPolicy {
-    /// Issue #12.3 / A4: 此字段在 wire 上接受 (调用方表达策略意图), 但 Rust 永不读 —
-    /// 连续失败计数归 caller 自愈循环 (Executor 无状态, PRD §重构 明确; 接入需跨请求状态违反 NFR)。
-    /// DEFERRED-BY-DESIGN: 保留供未来 stateful 扩展, 勿当生效字段。Python 侧标 deprecated=True。
+    /// Issue #12.3 / A4: this field is accepted on the wire (the caller expresses policy
+    /// intent) but Rust never reads it — consecutive-failure counting belongs to the caller's
+    /// self-healing loop (Executor is stateless, per PRD §refactor; wiring it up would need
+    /// cross-request state, violating the NFR).
+    /// DEFERRED-BY-DESIGN: kept for a future stateful extension, do not treat it as effective.
+    /// Python side marks deprecated=True.
     #[serde(default = "default_max_failures")]
     pub max_consecutive_failures: u32,
     #[serde(default = "default_true")]
@@ -302,7 +343,8 @@ impl From<fe_diagnostics::Diagnostics> for Diagnostics {
     }
 }
 
-/// L-2: serde skip_serializing_if 辅助 — false 时不序列化 rollback_unavailable (wire 省位)。
+/// L-2: serde skip_serializing_if helper — do not serialize rollback_unavailable when false
+/// (saves wire space).
 fn is_false(b: &bool) -> bool {
     !b
 }
@@ -326,37 +368,49 @@ pub struct ExecutionResult {
     pub diagnostics: Option<Diagnostics>,
     #[serde(default)]
     pub auto_rolled_back: bool,
-    /// L-2: 回滚保障失效标记 — guard 构造/快照/检测出错时置 true, 调用方可见 (fail-loud, 不静默)。
-    /// 与 auto_rolled_back 互补: 后者表 "已回滚", 此字段表 "本应回滚但保障不可用"。
+    /// L-2: rollback-safety-lost marker — set true when guard construction/snapshot/detection
+    /// errors occur, visible to the caller (fail-loud, never silent).
+    /// Complementary to auto_rolled_back: the latter means "rolled back", this field means
+    /// "should have rolled back but the safety net was unavailable".
     #[serde(default, skip_serializing_if = "is_false")]
     pub rollback_unavailable: bool,
-    /// L-1 (审计 0827): 回滚跳过原因 — rollback() 尝试过但跳过 (快照失效/解析失败/非 git 仓库/
-    /// repo 标识不匹配) 时填充, 调用方可 fail-loud 区分 "未回滚 (无需)" 与 "未回滚 (快照失效)"。
-    /// 与 auto_rolled_back/rollback_unavailable 互补, 三轴独立:
-    ///   auto_rolled_back=true        已回滚
-    ///   rollback_unavailable=true    回滚保障不可用 (guard 出错)
-    ///   rollback_skipped_reason=Some 回滚尝试过但跳过 (rollback 内部判定)
+    /// L-1 (audit 0827): rollback skip reason — filled when rollback() was attempted but
+    /// skipped (stale snapshot/parse failure/non-git repo/repo identity mismatch), so the
+    /// caller can fail-loud distinguish "not rolled back (not needed)" from "not rolled back
+    /// (stale snapshot)".
+    /// Complementary to auto_rolled_back/rollback_unavailable, three independent axes:
+    ///   auto_rolled_back=true        rolled back
+    ///   rollback_unavailable=true    rollback safety net unavailable (guard error)
+    ///   rollback_skipped_reason=Some rollback attempted but skipped (rollback's internal judgment)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_skipped_reason: Option<String>,
-    /// M-OPS-06: 跨层关联 id — 回填请求侧 trace_id (None 时入口自动生成)。
+    /// M-OPS-06: cross-layer correlation id — echoes the request-side trace_id (auto-generated
+    /// at entry when None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
-    /// D3-4 (审计 0827 product): RSS watchdog 触发标记 — 子进程树 RSS 超 rss_limit_mb 被 kill。
-    /// 默认 false 省略 (skip_serializing_if is_false); exit_code 伴随 -124 (kill 约定)。
+    /// D3-4 (audit 0827 product): RSS watchdog trigger marker — child process tree RSS exceeded
+    /// rss_limit_mb and was killed. Default false omitted (skip_serializing_if is_false);
+    /// exit_code accompanies -124 (kill convention).
     #[serde(default, skip_serializing_if = "is_false")]
     pub oom_killed: bool,
-    /// RUN-11: 沙箱子进程 PID — 从 SandboxResult.pid 回填, 调用方据此传给 telemetry_stream
-    /// 采样真实任务进程 (非 executor 自身)。stdio 路径有 pid; 拦截/超时路径无 → None。
+    /// RUN-11: sandbox child PID — backfilled from SandboxResult.pid; the caller passes it to
+    /// telemetry_stream to sample the real task process (not the executor itself). The stdio
+    /// path has a pid; blocked/timeout paths have none → None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
-    /// Issue #23 (guard Phase 3): guard 判 block 的裁决 action_id — 调用方据此向 guard 发 confirm 审批回路
-    /// (executor 本身不发 confirm, 仅透传)。仅 guard 介入且判 block/preview 时填充; guard OFF 或 allow → None。
-    /// additive wire 字段 (skip_serializing_if None), 4 层 auto-flow (fe-pyo3 From + Pydantic + fe-ipc done serde-flatten)。
+    /// Issue #23 (guard Phase 3): verdict action_id when guard blocks — the caller uses it to
+    /// send a confirm approval round to guard
+    /// (the executor itself never sends confirm, pass-through only). Filled only when guard is
+    /// engaged and rules block/preview; guard OFF or allow → None.
+    /// Additive wire field (skip_serializing_if None), 4-layer auto-flow (fe-pyo3 From +
+    /// Pydantic + fe-ipc done serde-flatten).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_action_id: Option<String>,
-    /// Issue #32: server-side cancel 触发确定性进程树 kill。true → 调用方发 executor.cancel,
-    /// fe-sandbox 收 oneshot 后 kill_process_group (SIGINT→grace→SIGKILL + ppid 树), exit_code=-1。
-    /// false → 正常完成/超时/OOM/消费者断开/安全拦截。additive wire (skip_serializing_if is_false)。
+    /// Issue #32: server-side cancel triggers a deterministic process-tree kill. true → the
+    /// caller sent executor.cancel, fe-sandbox received the oneshot and ran kill_process_group
+    /// (SIGINT→grace→SIGKILL + ppid tree), exit_code=-1.
+    /// false → normal completion/timeout/OOM/consumer disconnect/security block. Additive wire
+    /// (skip_serializing_if is_false).
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancelled: bool,
 }
@@ -371,7 +425,8 @@ impl ExecutionResult {
         }
     }
 
-    /// 带 task_id/command/trace_id 的拦截结果 (PRD §4.1 — result 回填请求侧标识; M-OPS-06 trace_id)
+    /// Blocked result with task_id/command/trace_id (PRD §4.1 — result echoes request-side
+    /// identifiers; M-OPS-06 trace_id)
     pub fn blocked_with(
         reason: impl Into<String>,
         task_id: Option<String>,
@@ -389,8 +444,10 @@ impl ExecutionResult {
         }
     }
 
-    /// Issue #23 (guard Phase 3): guard 判 block 的拦截结果 — 携带 guard action_id 供调用方 confirm 回路。
-    /// 签名与 blocked_with 一致 + action_id (fix #5: 不扩展 blocked_with 调用点, 独立构造器)。
+    /// Issue #23 (guard Phase 3): blocked result when guard rules block — carries the guard
+    /// action_id for the caller's confirm round.
+    /// Signature matches blocked_with plus action_id (fix #5: no blocked_with call-site
+    /// changes, separate constructor).
     pub fn blocked_by_guard(
         reason: impl Into<String>,
         action_id: Option<String>,
@@ -411,10 +468,13 @@ impl ExecutionResult {
     }
 }
 
-/// ARCH-4: 进程内执行路径 (fe-pyo3 execute_sync 直调 fe-core, 绕过 fe-ipc) 的可观测性补齐。
-/// 镜像 fe-ipc BroadcastHub::record_exec 的 metrics::counter 分支, 仅记 Prometheus 全局计数器
-/// (AtomicU64 快照归 fe-ipc hub, 此处不碰 — 进程内路径无 hub, 只补 Prometheus 侧)。
-/// fe-ipc record_exec 保留自有 AtomicU64 + 调此 helper (去重, 避免双计); fe-pyo3 execute_sync 调此 helper。
+/// ARCH-4: observability for the in-process execution path (fe-pyo3 execute_sync calls fe-core
+/// directly, bypassing fe-ipc). Mirrors the metrics::counter branch of fe-ipc
+/// BroadcastHub::record_exec, recording only the Prometheus global counters
+/// (AtomicU64 snapshots belong to the fe-ipc hub, untouched here — the in-process path has no
+/// hub, only the Prometheus side is filled in).
+/// fe-ipc record_exec keeps its own AtomicU64 + calls this helper (deduplicated, avoiding double
+/// counting); fe-pyo3 execute_sync calls this helper.
 pub fn record_exec_outcome(r: &ExecutionResult) {
     metrics::counter!("fe_exec_total").increment(1);
     if r.blocked_by_security {
@@ -428,8 +488,9 @@ pub fn record_exec_outcome(r: &ExecutionResult) {
     }
 }
 
-/// 流式事件 — Chunk (实时 stdio 分块) / Done (最终 ExecutionResult, 含 diagnostics)
-/// 镜像 fe-sandbox::StreamEvent, 但 Done 携带完整 ExecutionResult (经诊断切片 + 快照 id)
+/// Stream events — Chunk (real-time stdio chunks) / Done (final ExecutionResult, with
+/// diagnostics). Mirrors fe-sandbox::StreamEvent, but Done carries the full ExecutionResult
+/// (post diagnostics slicing + snapshot id)
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecutionStreamEvent {
@@ -437,17 +498,22 @@ pub enum ExecutionStreamEvent {
     Done(Box<ExecutionResult>),
 }
 
-/// 自动回滚守卫 (FR-04) — 单次执行内检测文件毁损, 达阈值触发 rollback。
-/// 生命周期限定单次 execute_async: 不跨请求累积 (Executor 无状态锁定决策)。
-/// 真正的连续失败计数归 caller (fusion-code 自愈循环 owns retry count, PRD §重构 明确)。
-/// C-2: 判 porcelain 行码是否为跟踪文件突变 (计为 damage)。
-/// `git status --porcelain` 每行 = 2 字符 XY 状态码 + 空格 + 路径。
-/// - X = 暂存区状态, Y = 工作区状态。
-/// - `??` = 未跟踪 (命令有意创建, 非 damage) → false。
-/// - `A`/` ` + `A` = 仅新增 (暂存/工作区新增, 无旧跟踪基线) → 不计 damage → false。
-/// - `M`/`D`/`R`/`C`/`T` 在 X 或 Y 任一位置 = 跟踪文件被修改/删除/重命名/复制/类型变 → damage → true。
+/// Auto-rollback guard (FR-04) — detects file damage within a single execution, triggers
+/// rollback at the threshold. Lifecycle is bounded to a single execute_async: nothing
+/// accumulates across requests (Executor's stateless locked decision).
+/// The real consecutive-failure count belongs to the caller (fusion-code's self-healing loop
+/// owns the retry count, per PRD §refactor).
+/// C-2: decides whether a porcelain status code is a tracked-file mutation (counted as damage).
+/// Each `git status --porcelain` line = 2-char XY status code + space + path.
+/// - X = staged status, Y = worktree status.
+/// - `??` = untracked (intentionally created by the command, not damage) → false.
+/// - `A`/` ` + `A` = additions only (staged/worktree adds, no old tracked baseline) → not
+///   damage → false.
+/// - `M`/`D`/`R`/`C`/`T` in either X or Y = tracked file modified/deleted/renamed/copied/
+///   type-changed → damage → true.
 ///
-/// 短于 2 字符的行 (异常) → 保守计 false (不算 damage, 避误回滚)。
+/// Lines shorter than 2 chars (anomaly) → conservatively false (not damage, avoids false
+/// rollbacks).
 fn is_tracked_mutation(entry: &str) -> bool {
     let bytes = entry.as_bytes();
     if bytes.len() < 2 {
@@ -456,55 +522,65 @@ fn is_tracked_mutation(entry: &str) -> bool {
     let x = bytes[0] as char;
     let y = bytes[1] as char;
     const MUTATION_CODES: &[char] = &['M', 'D', 'R', 'C', 'T'];
-    // `??` 整行未跟踪 → 绝非跟踪文件突变。
+    // `??` means the whole entry is untracked → never a tracked-file mutation.
     if x == '?' && y == '?' {
         return false;
     }
-    // X 或 Y 是突变码即计 (含 ` M` 工作区改、`M ` 暂存改、`MM` 两区都改、`R ` 重命名等)。
+    // Count when X or Y is a mutation code (covers ` M` worktree modify, `M ` staged modify,
+    // `MM` both, `R ` rename, etc.).
     MUTATION_CODES.contains(&x) || MUTATION_CODES.contains(&y)
 }
 
-/// max_consecutive_failures 保留字段, 供未来 stateful 扩展 (A4: 当前死字段, 文档标注非删除)。
+/// max_consecutive_failures is a reserved field for a future stateful extension (A4: currently
+/// a dead field, documented rather than deleted).
 ///
-/// C-CORE-01: 旧版 `git status --porcelain` 非空即判毁损 — 未跟踪 `__pycache__`/WIP/并发编辑
-/// 全算 → 误触发回滚丢无关改动。修: 命令前 capture `pre_status` (porcelain 快照), 命令后
-/// 再 capture `post_status`, diff 出**命令新增**的改动条目才判毁损。pre 已记录的未跟踪文件
-/// 不算 (命令前就脏)。这样 WIP/`__pycache__` 等命令前已存在的脏状态不误触发。
+/// C-CORE-01: the old version treated any non-empty `git status --porcelain` as damage —
+/// untracked `__pycache__`/WIP/concurrent edits all counted → falsely triggered rollback,
+/// losing unrelated changes. Fix: capture `pre_status` (porcelain snapshot) before the command,
+/// capture `post_status` after, and only diff out entries **added by the command** before
+/// judging damage. Untracked files already in pre don't count (dirty before the command).
+/// This way WIP/`__pycache__` and other pre-existing dirty state no longer falsely trigger.
 ///
-/// C-2: C-CORE-01 仅排除预存脏, 仍把命令**有意创建** (未跟踪/暂存新增) 误算 damage。
-/// `detect_damage` 进一步用 `is_tracked_mutation` 只计跟踪文件突变 (`M`/`D`/`R`/`C`/`T`),
-/// `??`/`A` (未跟踪/暂存新增) 不计 — `mkdir -p build && pytest` 失败不再误回滚合法产物。
+/// C-2: C-CORE-01 only excludes pre-existing dirt, but still miscounts entries **intentionally
+/// created** by the command (untracked/staged adds) as damage. `detect_damage` further uses
+/// `is_tracked_mutation` to count only tracked-file mutations (`M`/`D`/`R`/`C`/`T`), excluding
+/// `??`/`A` (untracked/staged adds) — a failed `mkdir -p build && pytest` no longer falsely
+/// rolls back legitimate artifacts.
 pub struct AutoRollbackGuard {
     policy: RollbackPolicy,
     snapshot_id: String,
     cwd: String,
     rollback: RollbackManager,
     pre_status: std::collections::HashSet<String>,
-    // D5-1: record_result 是否已被调用。Drop 时若未调 → 执行中途 panic/abort 提早 drop,
-    // warn! 显式暴露 snapshot_id 供调用方手动恢复 (Drop 不能 .await, 真回滚须调用方发起)。
-    // AtomicBool (非 Cell<bool>) — guard 跨 tokio::spawn move 须 Send, Cell 不 impl Sync。
+    // D5-1: whether record_result has been called. If not called by Drop time → a mid-execution
+    // panic/abort dropped the guard early; warn! explicitly surfaces the snapshot_id so the
+    // caller can recover manually (Drop cannot .await; a real rollback must be caller-initiated).
+    // AtomicBool (not Cell<bool>) — the guard is moved across tokio::spawn and must be Send;
+    // Cell does not impl Sync.
     recorded: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for AutoRollbackGuard {
     fn drop(&mut self) {
-        // D5-1: 守卫未正常 record_result 就 drop = 执行中途 panic/abort/提前返回。
-        // 不能在 Drop 里 .await 做回滚 (async-in-Drop 不健全); 仅 loud warn + 暴露 snapshot_id,
-        // 让调用方见日志后手动 rollback(snapshot_id, cwd) 恢复 (Rule 12 fail-visible, honest path)。
+        // D5-1: guard dropped without a normal record_result = mid-execution panic/abort/early
+        // return. Cannot .await a rollback inside Drop (async-in-Drop is unsound); only a loud
+        // warn + exposing the snapshot_id, so the caller can manually rollback(snapshot_id, cwd)
+        // after seeing the log (Rule 12 fail-visible, honest path).
         if !self.recorded.load(std::sync::atomic::Ordering::Acquire) {
             warn!(
                 snapshot = %self.snapshot_id,
                 cwd = %self.cwd,
-                "AutoRollbackGuard dropped 未调 record_result — 执行中途 panic/提前 drop; \
-                 调用方须手动 rollback(snapshot_id) 恢复 (Drop 无法 async 回滚)"
+                "AutoRollbackGuard dropped without record_result — mid-execution panic/early drop; \
+                 caller must manually rollback(snapshot_id) to recover (Drop cannot rollback async)"
             );
         }
     }
 }
 
 impl AutoRollbackGuard {
-    /// 构造 — 持有本次执行前创建的快照 id + cwd + 命令前 git status 快照。
-    /// `pre_status` 由 `capture_status` 在命令前采集, 捕获失败则空集 (detect 时 fail-loud)。
+    /// Construct — holds the snapshot id created before this execution + cwd + the pre-command
+    /// git status snapshot. `pre_status` is captured by `capture_status` before the command;
+    /// on capture failure it is an empty set (fail-loud at detect time).
     pub fn new(
         policy: RollbackPolicy,
         snapshot_id: String,
@@ -521,10 +597,13 @@ impl AutoRollbackGuard {
         }
     }
 
-    /// 采集 git status --porcelain 行集 (去空白行)。命令前后各采一次, diff 出命令新增改动。
-    /// L-CORE-02: git 失败 fail-loud (返 Err), 不再 `.unwrap_or(0)` 静默跳回滚。
-    /// D5-4: git status 包 tokio::time::timeout(10s) — NFS/挂死 git 不会无限阻塞执行; 超时
-    /// 返 Err (status 未知), detect_damage/调用方 fail-loud 处理 (回滚可能不精确, 但不挂死)。
+    /// Collect the git status --porcelain line set (drop blank lines). Captured once before and
+    /// once after the command, diffed to find command-added changes.
+    /// L-CORE-02: git failure is fail-loud (returns Err), no longer `.unwrap_or(0)` silently
+    /// skipping rollback.
+    /// D5-4: git status wrapped in tokio::time::timeout(10s) — an NFS/hung git cannot block
+    /// execution indefinitely; timeout returns Err (status unknown), detect_damage/caller
+    /// handle fail-loud (rollback may be imprecise, but never hangs).
     async fn capture_status(cwd: &str) -> Result<std::collections::HashSet<String>> {
         let fut = tokio::process::Command::new("git")
             .arg("-C")
@@ -532,14 +611,14 @@ impl AutoRollbackGuard {
             .args(["status", "--porcelain"])
             .output();
         let out = match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
-            Ok(o) => o.map_err(|e| anyhow::anyhow!("git status 启动失败: {e}"))?,
+            Ok(o) => o.map_err(|e| anyhow::anyhow!("git status failed to start: {e}"))?,
             Err(_) => {
-                anyhow::bail!("git status 超时 (>10s) — cwd={cwd}, status 未知 (D5-4)")
+                anyhow::bail!("git status timed out (>10s) — cwd={cwd}, status unknown (D5-4)")
             }
         };
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            anyhow::bail!("git status 失败 (exit {}): {}", out.status, stderr);
+            anyhow::bail!("git status failed (exit {}): {}", out.status, stderr);
         }
         let s = String::from_utf8_lossy(&out.stdout);
         Ok(s.lines()
@@ -548,14 +627,17 @@ impl AutoRollbackGuard {
             .collect())
     }
 
-    /// 检测命令导致的文件毁损 — diff 命令后状态与命令前快照, 只算**命令新增**且为
-    /// **跟踪文件突变**的条目。返回计数。
+    /// Detect file damage caused by the command — diff the post-command state against the
+    /// pre-command snapshot, counting only entries **added by the command** that are
+    /// **tracked-file mutations**. Returns the count.
     ///
-    /// C-2: C-CORE-01 仅排除预存脏文件, 不区分命令**有意创建** (未跟踪/暂存新增) 与**损坏**。
-    /// `mkdir -p build && pytest` 失败 → `build/`/`__pycache__`/`.pytest_cache` 在 post 不在 pre
-    /// → 误判 damage → 回滚丢合法产物。修: 只计 porcelain XY 行码表示跟踪文件删除/修改的条目
-    /// (`M`/`D`/`R`/`C`/`T` 在任一位置), `??` (未跟踪新增) 与 `A` (仅暂存新增, 无旧跟踪) 不计。
-    /// git 失败 fail-loud (L-CORE-02)。
+    /// C-2: C-CORE-01 only excludes pre-existing dirty files, without distinguishing entries
+    /// **intentionally created** by the command (untracked/staged adds) from **corruption**.
+    /// A failed `mkdir -p build && pytest` → `build/`/`__pycache__`/`.pytest_cache` present in
+    /// post but not pre → misjudged as damage → rollback loses legitimate artifacts. Fix: count
+    /// only porcelain XY codes representing tracked-file deletion/modification (`M`/`D`/`R`/`C`/`T`
+    /// in either position); `??` (untracked add) and `A` (staged add only, no old tracked
+    /// baseline) don't count. git failure is fail-loud (L-CORE-02).
     async fn detect_damage(&self) -> Result<usize> {
         let post = Self::capture_status(&self.cwd).await?;
         let new_entries: Vec<&String> = post
@@ -564,7 +646,7 @@ impl AutoRollbackGuard {
             .filter(|entry| is_tracked_mutation(entry))
             .collect();
         if !new_entries.is_empty() {
-            info!(new = ?new_entries, "命令新增跟踪文件突变条目 (命令导致, 计为 damage)");
+            info!(new = ?new_entries, "command added tracked-file mutation entries (command-caused, counted as damage)");
         } else {
             let skipped: Vec<&String> = post
                 .iter()
@@ -574,20 +656,23 @@ impl AutoRollbackGuard {
             if !skipped.is_empty() {
                 info!(
                     skipped = ?skipped,
-                    "命令新增条目但为未跟踪/暂存新增 (??/A), 不计 damage — 合法产物创建"
+                    "command-added entries are untracked/staged adds (??/A), not counted as damage — legitimate artifact creation"
                 );
             }
         }
         Ok(new_entries.len())
     }
 
-    /// 记录结果 — exit_code==0 无动作; !=0 且检测命令导致毁损 → rollback, 标记 auto_rolled_back。
-    /// 就地修改 result.auto_rolled_back。非 git repo → detect 失败 (fail-loud) 由调用方 log。
-    /// L-CORE-02: detect_damage 失败不再静默 (旧 .unwrap_or(0) 跳回滚); 现 propagate Err,
-    /// 调用方 (execute_async/execute_streaming) 已 warn! 记录。
+    /// Record the result — exit_code==0 does nothing; !=0 with detected command-caused damage →
+    /// rollback and set auto_rolled_back. Modifies result.auto_rolled_back in place. Non-git
+    /// repo → detect fails (fail-loud), logged by the caller.
+    /// L-CORE-02: detect_damage failure is no longer silent (the old .unwrap_or(0) skipped
+    /// rollback); now it propagates Err, already warn!-logged by the callers
+    /// (execute_async/execute_streaming).
     pub async fn record_result(&self, result: &mut ExecutionResult) -> Result<()> {
-        // D5-1: 进 record_result 即视守卫已被正常消费 (即便早期 return 也是合法 "无需回滚")。
-        // Drop 据此区分 "已消费" vs "中途 panic/提前 drop 未消费"。set 在入口, 覆盖所有 return 路径。
+        // D5-1: entering record_result means the guard has been normally consumed (even an early
+        // return is a legitimate "no rollback needed"). Drop uses this to distinguish "consumed"
+        // vs "mid-execution panic/early drop, unconsumed". Set at entry, covering all return paths.
         self.recorded
             .store(true, std::sync::atomic::Ordering::Release);
         if result.exit_code == 0 {
@@ -598,42 +683,47 @@ impl AutoRollbackGuard {
         }
         let damaged = self.detect_damage().await?;
         if damaged == 0 {
-            info!(exit_code = result.exit_code, "失败但无命令新增改动, 不回滚");
+            info!(
+                exit_code = result.exit_code,
+                "failed but no command-added changes, not rolling back"
+            );
             return Ok(());
         }
         info!(
             damaged,
             exit_code = result.exit_code,
-            "检测到命令导致文件改动, 触发自动回滚"
+            "command-caused file changes detected, triggering auto-rollback"
         );
-        // L-1 (审计 0827): rollback() 现返 RollbackOutcome{applied, skipped_reason, wip_sha}。
-        // applied=true → auto_rolled_back=true (已回滚); applied=false + skipped_reason=Some →
-        // 填 rollback_skipped_reason 让调用方 fail-loud 区分 "未回滚(无需)" 与 "未回滚(快照失效)"。
+        // L-1 (audit 0827): rollback() now returns RollbackOutcome{applied, skipped_reason, wip_sha}.
+        // applied=true → auto_rolled_back=true (rolled back); applied=false + skipped_reason=Some →
+        // fill rollback_skipped_reason so the caller can fail-loud distinguish "not rolled back
+        // (not needed)" from "not rolled back (stale snapshot)".
         let outcome = self.rollback.rollback(&self.snapshot_id, &self.cwd).await?;
         if outcome.applied {
             result.auto_rolled_back = true;
             if let Some(wip) = &outcome.wip_sha {
-                info!(snapshot = %self.snapshot_id, wip = %wip, "自动回滚成功 — 已捕获 tracked WIP (C-7)");
+                info!(snapshot = %self.snapshot_id, wip = %wip, "auto-rollback succeeded — tracked WIP captured (C-7)");
             } else {
-                info!(snapshot = %self.snapshot_id, "自动回滚成功");
+                info!(snapshot = %self.snapshot_id, "auto-rollback succeeded");
             }
         } else if let Some(reason) = &outcome.skipped_reason {
-            // L-1: 跳过有原因 — 暴露给调用方 (fail-loud), 不静默 false。
+            // L-1: a skip has a reason — surface it to the caller (fail-loud), never silent false.
             result.rollback_skipped_reason = Some(reason.clone());
             warn!(
                 snapshot = %self.snapshot_id,
                 reason = %reason,
-                "自动回滚跳过 (rollback 判定) — rollback_skipped_reason 已置位 (L-1)"
+                "auto-rollback skipped (rollback's judgment) — rollback_skipped_reason set (L-1)"
             );
         } else {
-            // applied=false + 无原因 — 理论上不达 (skipped 必带原因), 防御性 warn。
-            warn!(snapshot = %self.snapshot_id, "自动回滚未生效 (rollback 返回 applied=false 无原因)");
+            // applied=false with no reason — theoretically unreachable (skipped always carries a
+            // reason), defensive warn.
+            warn!(snapshot = %self.snapshot_id, "auto-rollback did not take effect (rollback returned applied=false without a reason)");
         }
         Ok(())
     }
 }
 
-/// Executor — 校验 + 沙箱执行的编排器
+/// Executor — orchestrator for validation + sandboxed execution
 pub struct Executor {
     security: SecurityGuard,
     sandbox: Sandbox,
@@ -643,9 +733,11 @@ pub struct Executor {
     #[cfg(feature = "gui")]
     gui: GuiController,
     tools: Tools,
-    // M-ARCH-1: ShellRegistry 不再属 Executor — 移到 IpcServer/PyExecutor (与 BroadcastHub 并列)。
-    // Executor 保持 per-task 无状态: IPC 层重启 Executor 不丢后台 shell 句柄; serve-path 与
-    // in-process path 共享同一 registry。安在校验留此层 (self.security), registry 由调用方传引用。
+    // M-ARCH-1: ShellRegistry no longer belongs to the Executor — moved to IpcServer/PyExecutor
+    // (alongside BroadcastHub). The Executor stays per-task stateless: restarting the Executor at
+    // the IPC layer does not lose background shell handles; the serve-path and in-process path
+    // share the same registry. Security validation stays at this layer (self.security), the
+    // registry is passed in by the caller.
 }
 
 impl Default for Executor {
@@ -656,11 +748,13 @@ impl Default for Executor {
 
 impl Executor {
     pub fn new() -> Self {
-        info!("Executor::new() — 初始化 SecurityGuard + Sandbox + Slicer + Rollback + Gui + Tools");
-        // ARCH-2: SecurityGuard 基线 TRUSTED_BIN_DIRS 仅系统目录 (/usr/bin 等)。本地 venv
-        // 解释器 (/Users/.../.venv/bin/python3) 不在内 → basename 命中后 resolved-path 校验
-        // fail-closed 拒, 正常 python3 命令被拦。此处自动登记 venv bin (VIRTUAL_ENV env) +
-        // 当前可执行父目录 (PyO3 扩展所在), 使本地解释器路径落可信集。
+        info!("Executor::new() — initializing SecurityGuard + Sandbox + Slicer + Rollback + Gui + Tools");
+        // ARCH-2: the SecurityGuard baseline TRUSTED_BIN_DIRS only holds system dirs (/usr/bin
+        // etc.). A local venv interpreter (/Users/.../.venv/bin/python3) is not among them →
+        // after the basename hit, the resolved-path check fail-closed rejects it and normal
+        // python3 commands get blocked. Here we auto-register the venv bin (VIRTUAL_ENV env) +
+        // the current executable's parent dir (where the PyO3 extension lives), so local
+        // interpreter paths land in the trusted set.
         let mut trusted: Vec<String> = Vec::new();
         if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
             let venv_bin = std::path::Path::new(&venv).join("bin");
@@ -675,10 +769,12 @@ impl Executor {
                 }
             }
         }
-        // ARCH-2: rustup 标准安装位 ($HOME/.cargo/bin) — cargo/rustc 在此。非攻击者可控
-        // (home 目录, rustup 写入需已具机器执行权), 不违 ARCH-2 /tmp 投毒 + PATH 前置威胁模型。
-        // 登记使 rustup-only 机器 (CI macos-14 runner) 的 `cargo build/test` 通过 — homebrew
-        // 机器 cargo 在 /opt/homebrew/bin 已基线可信, 不受影响。与 VIRTUAL_ENV/bin 同级信任。
+        // ARCH-2: rustup's standard install location ($HOME/.cargo/bin) — cargo/rustc live here.
+        // Not attacker-controllable (home directory; writing via rustup already requires machine
+        // execution rights), does not violate the ARCH-2 /tmp poisoning + PATH-prefix threat
+        // model. Registering it lets rustup-only machines (CI macos-14 runner) pass
+        // `cargo build/test` — on homebrew machines cargo is already baseline-trusted in
+        // /opt/homebrew/bin, unaffected. Trusted at the same level as VIRTUAL_ENV/bin.
         if let Ok(home) = std::env::var("HOME") {
             let cargo_bin = std::path::Path::new(&home).join(".cargo").join("bin");
             if let Some(s) = cargo_bin.to_str() {
@@ -689,7 +785,7 @@ impl Executor {
         let security = if trusted_refs.is_empty() {
             SecurityGuard::new()
         } else {
-            info!(dirs = ?trusted_refs, "Executor 登记 venv/exe 可信二进制目录 (ARCH-2)");
+            info!(dirs = ?trusted_refs, "Executor registered venv/exe trusted binary dirs (ARCH-2)");
             SecurityGuard::new().with_trusted_bin_dirs(&trusted_refs)
         };
         Self {
@@ -704,77 +800,93 @@ impl Executor {
         }
     }
 
-    /// 扩展白名单 — Issue #10: 项目级二进制放行 (含危险解释器拒绝守卫)
+    /// Extend the allowlist — Issue #10: project-level binary pass-through (with the dangerous
+    /// interpreter rejection guard)
     pub fn with_extra_whitelist(mut self, extras: &[&str]) -> Self {
-        info!(count = extras.len(), "Executor 扩展白名单 (项目级放行)");
+        info!(
+            count = extras.len(),
+            "Executor extended allowlist (project-level pass-through)"
+        );
         self.security = self.security.with_extra_whitelist(extras);
         self
     }
 
-    /// ARCH-2 可信二进制目录透传 — 项目 bin 目录登记 (venv/exe 目录由 new() 自动登记;
-    /// 此 builder 供额外项目工具目录登记, 多用于测试与多 bin 路径部署)。透传 SecurityGuard。
+    /// ARCH-2 trusted binary dirs pass-through — register project bin dirs (venv/exe dirs are
+    /// auto-registered by new(); this builder registers additional project tool dirs, mostly for
+    /// tests and multi-bin-path deployments). Passes through to SecurityGuard.
     pub fn with_trusted_bin_dirs(mut self, dirs: &[&str]) -> Self {
         info!(
             count = dirs.len(),
-            "Executor 登记额外可信二进制目录 (ARCH-2)"
+            "Executor registered additional trusted binary dirs (ARCH-2)"
         );
         self.security = self.security.with_trusted_bin_dirs(dirs);
         self
     }
 
-    /// D3-1 (审计 0827 product): 内联解释器网关透传。true=允许 python -c / node -e /
-    /// ruby -e / perl -e (保留 trusted-caller 内联执行能力); 默认 false (企业硬化拒内联代码,
-    /// 防 agent-driven 任意 payload 绕白名单语义)。透传 SecurityGuard.with_allow_inline_interpreter。
+    /// D3-1 (audit 0827 product): inline interpreter gateway pass-through. true=allow python -c /
+    /// node -e / ruby -e / perl -e (preserving trusted-caller inline execution); default false
+    /// (enterprise hardening rejects inline code, preventing agent-driven arbitrary payloads from
+    /// bypassing allowlist semantics). Passes through to
+    /// SecurityGuard.with_allow_inline_interpreter.
     pub fn with_allow_inline_interpreter(mut self, allow: bool) -> Self {
         self.security = self.security.with_allow_inline_interpreter(allow);
         self
     }
 
-    /// Issue #23 (fusion-guard Phase 3): 启用 guard 授权编排。透传 SecurityGuard.with_guard
-    /// (建 GuardClient + RulesCache, 探活 + 种子缓存)。guard 默认 OFF (向后兼容); 调用方显式传
-    /// guard_sock/guard_tenant (或 env FUSION_GUARD_SOCK/FUSION_EXECUTOR_TENANT) 才开启。
-    /// 开启后 validate() 走 guard 编排: 本地校验放行后调 guard.evaluate, 映射 GuardVerdict,
-    /// 宕机降级 fail-closed (缓存 regex + 白名单栅栏, 永不 fail-open)。
+    /// Issue #23 (fusion-guard Phase 3): enable guard authorization orchestration. Passes through
+    /// to SecurityGuard.with_guard (builds GuardClient + RulesCache, liveness probe + seed
+    /// cache). Guard is OFF by default (back-compat); the caller must explicitly pass
+    /// guard_sock/guard_tenant (or env FUSION_GUARD_SOCK/FUSION_EXECUTOR_TENANT) to enable it.
+    /// Once on, validate() goes through guard orchestration: after local validation passes, call
+    /// guard.evaluate, map GuardVerdict, degrade fail-closed when guard is down (cached regex +
+    /// allowlist fence, never fail-open).
     pub fn with_guard(mut self, sock: &str, tenant: &str) -> Self {
         info!(
             sock,
-            tenant, "Executor 启用 guard 授权编排 (Issue #23 Phase 3)"
+            tenant, "Executor enabled guard authorization orchestration (Issue #23 Phase 3)"
         );
         self.security = self.security.with_guard(sock, tenant);
         self
     }
 
-    /// m-OPS-02: SIGHUP 运行时白名单热重载 — 从基线 + extras 重建 (非累加)。
-    /// &self (Executor 无状态约定, 仅透传 SecurityGuard.reload_extras 的 ArcSwap store)。
-    /// fe-ipc SIGHUP 处理器读 FUSION_EXECUTOR_EXTRA_WHITELIST env → 逗号分割 → 调此。
+    /// m-OPS-02: SIGHUP runtime allowlist hot-reload — rebuilt from baseline + extras (not
+    /// additive). &self (Executor's stateless convention, only forwards to
+    /// SecurityGuard.reload_extras' ArcSwap store).
+    /// The fe-ipc SIGHUP handler reads the FUSION_EXECUTOR_EXTRA_WHITELIST env → splits on
+    /// commas → calls this.
     pub fn reload_whitelist(&self, extras: &[&str]) {
-        info!(count = extras.len(), "SIGHUP 白名单热重载 (基线重建)");
+        info!(
+            count = extras.len(),
+            "SIGHUP allowlist hot-reload (baseline rebuild)"
+        );
         self.security.reload_extras(extras);
     }
 
-    /// M-SEC-04: GUI 安全配置 (bundle allowlist + 密码框 type_text 守卫)。
-    /// 默认 Executor::new() 无配置 = 不限 (本地可信调用方, 仅审计日志);
-    /// 企业/多用户场景用此构造器设 allowlist + allow_type_into_secure opt-in。
+    /// M-SEC-04: GUI security config (bundle allowlist + secure text-field type_text guard).
+    /// Default Executor::new() with no config = unrestricted (trusted local caller, audit log
+    /// only); enterprise/multi-user scenarios use this constructor to set allowlist +
+    /// allow_type_into_secure opt-in.
     #[cfg(feature = "gui")]
     pub fn with_gui_config(mut self, config: GuiConfig) -> Self {
-        info!("Executor 设置 GUI 安全配置 (M-SEC-04)");
+        info!("Executor set GUI security config (M-SEC-04)");
         self.gui = GuiController::new_with_config(config);
         self
     }
 
-    /// GUI 动作 (P4 FR-05) — 同步入口, 供 fe-pyo3/fe-ipc 调用
+    /// GUI action (P4 FR-05) — sync entry point, called by fe-pyo3/fe-ipc
     #[cfg(feature = "gui")]
     pub fn gui_action(&self, action: GuiAction) -> Result<GuiResult> {
         self.gui.execute(action)
     }
 
-    /// #39: 批量 GUI 动作管线 — 顺序执行多动作, 收集每步结果。
+    /// #39: batch GUI action pipeline — executes multiple actions in order, collecting each
+    /// step's result.
     #[cfg(feature = "gui")]
     pub fn gui_action_batch(&self, actions: Vec<GuiAction>) -> Result<Vec<GuiResult>> {
         self.gui.gui_action_batch(actions)
     }
 
-    /// 原生文件工具 — file_edit (PRD FileEdit 本地化, #6 replace_all)
+    /// Native file tool — file_edit (PRD FileEdit localization, #6 replace_all)
     pub fn file_edit(
         &self,
         path: &str,
@@ -787,18 +899,21 @@ impl Executor {
             .file_edit(path, old_string, new_string, cwd, replace_all)
     }
 
-    /// 原生文件工具 — write_file 整文件创建/覆盖 + 建父目录 (#2, Claude Code Write parity)
+    /// Native file tool — write_file whole-file create/overwrite + parent dir creation (#2,
+    /// Claude Code Write parity)
     pub fn write_file(&self, path: &str, content: &str, cwd: Option<&str>) -> Result<EditResult> {
         self.tools.write_file(path, content, cwd)
     }
 
-    /// 后台 shell — 启动持久 shell (#1, Claude Code run_in_background parity)
-    /// 安全校验在此层 (fail-closed): blocked → ShellStartResult{ok:false, blocked_by_security:true}
-    /// M-ARCH-1: registry 由调用方传引用 (Executor 无状态; registry 归 IpcServer/PyExecutor)。
+    /// Background shell — start a persistent shell (#1, Claude Code run_in_background parity)
+    /// Security validation at this layer (fail-closed): blocked →
+    /// ShellStartResult{ok:false, blocked_by_security:true}
+    /// M-ARCH-1: the registry is passed in by the caller (Executor stateless; the registry
+    /// belongs to IpcServer/PyExecutor).
     pub fn shell_start(&self, registry: &ShellRegistry, p: ShellStartParams) -> ShellStartResult {
         let v = self.security.validate(&p.command);
         if !v.allowed {
-            warn!(command = %p.command, reason = ?v.reason, "shell_start 被安全守卫拦截");
+            warn!(command = %p.command, reason = ?v.reason, "shell_start blocked by security guard");
             return ShellStartResult {
                 ok: false,
                 shell_id: None,
@@ -810,25 +925,25 @@ impl Executor {
         registry.shell_start(p)
     }
 
-    /// 后台 shell — 轮询 tail 快照 + 运行/退出状态 (#1)
-    /// M-ARCH-1: registry 由调用方传引用。
+    /// Background shell — poll tail snapshot + run/exit status (#1)
+    /// M-ARCH-1: the registry is passed in by the caller.
     pub fn shell_output(registry: &ShellRegistry, shell_id: &str) -> Result<ShellOutput> {
         registry.shell_output(shell_id)
     }
 
-    /// 后台 shell — kill 进程树 (#1, Claude Code KillShell parity)
-    /// M-ARCH-1: registry 由调用方传引用。
+    /// Background shell — kill the process tree (#1, Claude Code KillShell parity)
+    /// M-ARCH-1: the registry is passed in by the caller.
     pub fn kill_shell(registry: &ShellRegistry, shell_id: &str) -> Result<bool> {
         registry.kill_shell(shell_id)
     }
 
-    /// 后台 shell — 列出全部 shell (#1)
-    /// M-ARCH-1: registry 由调用方传引用。
+    /// Background shell — list all shells (#1)
+    /// M-ARCH-1: the registry is passed in by the caller.
     pub fn list_shells(registry: &ShellRegistry) -> Vec<ShellInfo> {
         registry.list_shells()
     }
 
-    /// 原生文件工具 — multi_edit 同文件原子批量编辑 (#6)
+    /// Native file tool — multi_edit atomic batch edit of one file (#6)
     pub fn multi_edit(
         &self,
         path: &str,
@@ -838,7 +953,7 @@ impl Executor {
         self.tools.multi_edit(path, edits, cwd)
     }
 
-    /// 原生文件工具 — notebook_edit Jupyter .ipynb 单元格编辑 (#6)
+    /// Native file tool — notebook_edit Jupyter .ipynb cell editing (#6)
     pub fn notebook_edit(
         &self,
         path: &str,
@@ -852,12 +967,12 @@ impl Executor {
             .notebook_edit(path, cell_id, cell_number, new_source, edit_mode, cwd)
     }
 
-    /// 原生文件工具 — glob (PRD GlobTool 本地化)
+    /// Native file tool — glob (PRD GlobTool localization)
     pub fn glob(&self, pattern: &str, cwd: Option<&str>) -> Result<Vec<GlobEntry>> {
         self.tools.glob(pattern, cwd)
     }
 
-    /// 原生文件工具 — grep (PRD GrepTool 本地化)
+    /// Native file tool — grep (PRD GrepTool localization)
     pub fn grep(
         &self,
         pattern: &str,
@@ -867,7 +982,7 @@ impl Executor {
         self.tools.grep(pattern, paths, cwd)
     }
 
-    /// #7 ripgrep parity — grep 带选项: 输出模式 / 上下文 / 多行 / glob 过滤
+    /// #7 ripgrep parity — grep with options: output mode / context / multiline / glob filter
     pub fn grep_with_opts(
         &self,
         pattern: &str,
@@ -878,12 +993,13 @@ impl Executor {
         self.tools.grep_with_opts(pattern, paths, cwd, opts)
     }
 
-    /// 外科补丁引擎 — apply_patch (PRD §DeepSeek Unified Diff 应用)
+    /// Surgical patch engine — apply_patch (PRD §DeepSeek Unified Diff application)
     pub fn apply_patch(&self, diff: &str, cwd: Option<&str>) -> Result<EditResult> {
         self.tools.apply_patch(diff, cwd)
     }
 
-    /// 外科补丁引擎 — replace_function (PRD §DeepSeek 函数级替换, 禁全文件重写)
+    /// Surgical patch engine — replace_function (PRD §DeepSeek function-level replacement,
+    /// whole-file rewrite forbidden)
     pub fn replace_function(
         &self,
         path: &str,
@@ -894,20 +1010,22 @@ impl Executor {
         self.tools.replace_function(path, fn_name, new_body, cwd)
     }
 
-    /// 快照 — 公开供 fe-pyo3 直接调用
+    /// Snapshot — exposed for direct fe-pyo3 calls
     pub async fn snapshot_create_async(&self, cwd: &str) -> Result<String> {
         self.rollback.snapshot_create(cwd).await
     }
 
-    /// D6-03 (审计 0827 product): 快照清单 — 公开供 fe-pyo3/fe-ipc 直接调用。
-    /// 无状态 (M-ARCH-1): 仅读 cwd 对应 on-disk 索引, Executor 不持有快照状态。
+    /// D6-03 (audit 0827 product): snapshot inventory — exposed for direct fe-pyo3/fe-ipc calls.
+    /// Stateless (M-ARCH-1): reads only the on-disk index for the cwd; the Executor holds no
+    /// snapshot state.
     pub async fn list_snapshots_async(&self, cwd: &str) -> Result<Vec<fe_rollback::SnapshotInfo>> {
         fe_rollback::RollbackManager::list_snapshots(cwd)
     }
 
-    /// 回滚 — 公开供 fe-pyo3 直接调用。
-    /// L-1 (审计 0827): rollback() 内部返 RollbackOutcome; 此包装映射 .applied → bool
-    /// 保持 IPC/PyO3/Python 侧 bool 契约不变 (skipped_reason 细节经 ExecutionResult 4 层流通)。
+    /// Rollback — exposed for direct fe-pyo3 calls.
+    /// L-1 (audit 0827): rollback() internally returns RollbackOutcome; this wrapper maps
+    /// .applied → bool to keep the IPC/PyO3/Python-side bool contract unchanged
+    /// (skipped_reason detail flows through ExecutionResult across 4 layers).
     pub async fn rollback_async(&self, snapshot_id: &str, cwd: &str) -> Result<bool> {
         self.rollback
             .rollback(snapshot_id, cwd)
@@ -915,14 +1033,15 @@ impl Executor {
             .map(|o| o.applied)
     }
 
-    /// 校验命令 — 公开供 fe-ipc/fe-pyo3 直接调用
+    /// Validate a command — exposed for direct fe-ipc/fe-pyo3 calls
     pub fn validate(&self, command: &str) -> SecurityVerdict {
         self.security.validate(command)
     }
 
-    /// 异步执行 — 校验 → 沙箱执行 → return
+    /// Async execute — validate → sandbox run → return
     pub async fn execute_async(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
-        // M-OPS-06/m-OPS-03: 入口解析 trace_id (None 自动 uuid v4), span 包整条请求链 — 日志带 span 上下文
+        // M-OPS-06/m-OPS-03: resolve trace_id at entry (None auto uuid v4), the span wraps the
+        // whole request chain — logs carry span context
         let trace_id = req
             .trace_id
             .clone()
@@ -934,13 +1053,16 @@ impl Executor {
             command = %redact_command(&req.command)
         );
         let _enter = span.enter();
-        info!(command = %redact_command(&req.command), "execute_async — 校验中");
+        info!(command = %redact_command(&req.command), "execute_async — validating");
         let start = Instant::now();
         let verdict = self.security.validate(&req.command);
         if !verdict.allowed {
-            let reason = verdict.reason.unwrap_or_else(|| "未知原因".to_string());
-            info!(%reason, "安全校验拦截");
-            // Issue #23: guard 判 block 携带 action_id 透传 (调用方 confirm 回路); 非 guard 拦截 action_id=None 同 blocked_with。
+            let reason = verdict
+                .reason
+                .unwrap_or_else(|| "unknown reason".to_string());
+            info!(%reason, "blocked by security validation");
+            // Issue #23: guard blocks carry action_id passed through (caller confirm round);
+            // non-guard blocks have action_id=None, same as blocked_with.
             return Ok(ExecutionResult::blocked_by_guard(
                 reason,
                 verdict.action_id.clone(),
@@ -949,11 +1071,13 @@ impl Executor {
                 Some(trace_id),
             ));
         }
-        // Issue #23 验收 #3 (seatbelt 门控 E7): guard 判高风险要求 seatbelt, 但调用方未启用 → 拒绝执行
-        // (防降级到非沙箱执行高风险命令)。guard OFF 时 seatbelt_required=false, 不触发。
+        // Issue #23 acceptance #3 (seatbelt gating E7): guard flags high risk requiring seatbelt
+        // but the caller has not enabled it → refuse to execute
+        // (prevents degrading to non-sandboxed execution of high-risk commands). With guard OFF,
+        // seatbelt_required=false, never triggered.
         if verdict.seatbelt_required && !req.seatbelt {
-            let reason = "guard 要求 seatbelt 隔离但调用方未启用 (E7 seatbelt gating)";
-            warn!(%reason, action_id = ?verdict.action_id, "seatbelt 门控拦截");
+            let reason = "guard requires seatbelt isolation but the caller has not enabled it (E7 seatbelt gating)";
+            warn!(%reason, action_id = ?verdict.action_id, "blocked by seatbelt gating");
             return Ok(ExecutionResult::blocked_by_guard(
                 reason,
                 verdict.action_id.clone(),
@@ -962,14 +1086,16 @@ impl Executor {
                 Some(trace_id),
             ));
         }
-        // Issue #34: 每命令 sandbox profile fail-closed — 调用方请求定制 profile 且 fail_if_unavailable=true,
-        // 但 sandbox-exec 不在 PATH → 拒绝执行 (防静默降级到无 seatbelt)。req.seatbelt=false 时不触发
-        // (调用方显式 opt-out 沙箱, profile 字段对裸命令无意义, 仅 seatbelt 路径消费)。
+        // Issue #34: per-command sandbox profile fail-closed — the caller requested a custom
+        // profile with fail_if_unavailable=true, but sandbox-exec is not on PATH → refuse to
+        // execute (prevents silently degrading to no seatbelt). Not triggered when
+        // req.seatbelt=false (the caller explicitly opted out of the sandbox; the profile field
+        // is meaningless for a bare command, consumed only on the seatbelt path).
         if let Some(sp) = &req.sandbox {
             if sp.fail_if_unavailable && !fe_sandbox::seatbelt::seatbelt_available() {
                 let reason =
-                    "请求 sandbox profile 但 sandbox-exec 不可用 (fail_if_unavailable fail-closed)";
-                warn!(%reason, command = %redact_command(&req.command), "sandbox profile 门控拦截");
+                    "sandbox profile requested but sandbox-exec unavailable (fail_if_unavailable fail-closed)";
+                warn!(%reason, command = %redact_command(&req.command), "blocked by sandbox profile gating");
                 return Ok(ExecutionResult::blocked_with(
                     reason.to_string(),
                     req.task_id.clone(),
@@ -978,12 +1104,12 @@ impl Executor {
                 ));
             }
         }
-        // cwd 校验
+        // cwd validation
         if let Some(cwd) = &req.cwd {
             let cwd_v = self.security.validate_cwd(cwd);
             if !cwd_v.allowed {
-                let reason = cwd_v.reason.unwrap_or_else(|| "cwd 非法".to_string());
-                info!(%reason, "cwd 校验拦截");
+                let reason = cwd_v.reason.unwrap_or_else(|| "invalid cwd".to_string());
+                info!(%reason, "blocked by cwd validation");
                 return Ok(ExecutionResult::blocked_with(
                     reason,
                     req.task_id.clone(),
@@ -993,14 +1119,17 @@ impl Executor {
             }
         }
 
-        // Issue #23 验收 #4 (H4 TOCTOU 复检): validate 解析 binary 路径后, spawn 前复检 —
-        // 拒绝执行前窗口新现的 symlink (validate 时非 symlink, recheck 时变 symlink → 拒),
-        // 路径消失亦拒。safe Rust (symlink_metadata, 无 libc/unsafe)。homebrew Cellar symlink by-design 不拒
-        // (validate 期就是 symlink, 非执行前窗口新现)。仅白名单 binary 第一 token 可解析 → 非白名单已被前面拦。
+        // Issue #23 acceptance #4 (H4 TOCTOU recheck): after validate resolves the binary path,
+        // recheck before spawn — reject symlinks newly appearing in the pre-exec window
+        // (not a symlink at validate time, a symlink at recheck time → reject); a vanished path
+        // is also rejected. Safe Rust (symlink_metadata, no libc/unsafe). homebrew Cellar
+        // symlinks are by-design not rejected (they are symlinks at validate time, not
+        // newly-appeared in the pre-exec window). Only the allowlisted binary's first token can
+        // be resolved → non-allowlisted ones were already blocked above.
         let first_token = req.command.split_whitespace().next().unwrap_or("");
         if !first_token.is_empty() {
             if let Err(reason) = self.security.recheck_binary(first_token) {
-                warn!(%reason, first_token, "TOCTOU 复检拦截 — 执行前 binary 路径变更");
+                warn!(%reason, first_token, "blocked by TOCTOU recheck — binary path changed before execution");
                 return Ok(ExecutionResult::blocked_with(
                     reason,
                     req.task_id.clone(),
@@ -1010,13 +1139,19 @@ impl Executor {
             }
         }
 
-        // 快照 + 命令前 git status 快照。
-        // D5-2: 默认 opt-in — want_snapshot = 显式 enable_rollback_snapshot || auto_rollback_policy.is_some()
-        //   (回滚须快照, 调用方传 policy 即隐式要快照, 不应再设两标志)。裸 run("echo") 默认不跑 git。
-        // D5-2 fail-loud: snapshot_create 失败不再 "非致命" info! 继续吞 — 改 warn! 显式暴露;
-        //   且若 caller 传了 auto_rollback_policy 但快照建不出 → 回滚保障失效, 标 rollback_unavailable。
-        // C-CORE-01: pre_status 是命令前工作区状态, 供 guard diff 命令后状态找出命令新增改动
-        //   (旧版非空即判毁损, __pycache__/WIP 误触发)。pre_status 与 snapshot 同期采集 (命令前)。
+        // Snapshot + pre-command git status snapshot.
+        // D5-2: default opt-in — want_snapshot = explicit enable_rollback_snapshot ||
+        //   auto_rollback_policy.is_some() (rollback needs a snapshot; passing a policy implies
+        //   wanting a snapshot, the caller should not set both flags). Bare run("echo") does not
+        //   run git by default.
+        // D5-2 fail-loud: snapshot_create failure is no longer a "non-fatal" info! swallowed and
+        //   continued — now warn! explicitly surfaced; and if the caller passed
+        //   auto_rollback_policy but the snapshot cannot be created → rollback safety net lost,
+        //   marked rollback_unavailable.
+        // C-CORE-01: pre_status is the pre-command worktree state, used by the guard to diff the
+        //   post-command state and find command-added changes (the old version judged any
+        //   non-empty status as damage, falsely triggering on __pycache__/WIP). pre_status is
+        //   captured at the same time as the snapshot (pre-command).
         let want_snapshot = req.enable_rollback_snapshot || req.auto_rollback_policy.is_some();
         let mut snapshot_create_err: Option<anyhow::Error> = None;
         let (snapshot_id, pre_status) = if want_snapshot {
@@ -1026,34 +1161,38 @@ impl Executor {
                 match (snap, pre) {
                     (Ok(id), Ok(st)) => {
                         if id.is_empty() {
-                            // D5-6: want_snapshot=true 但快照 id 空 (非 git repo cwd) — 回滚无锚点,
-                            // 若 caller 传 policy 则保障失效, warn! 显式暴露 (非静默空 id)。
+                            // D5-6: want_snapshot=true but empty snapshot id (non-git repo cwd) —
+                            // rollback has no anchor; if the caller passed a policy the safety net
+                            // is lost, warn! surfaced explicitly (not a silent empty id).
                             if req.auto_rollback_policy.is_some() {
-                                warn!(cwd, "快照 id 空 (非 git repo) 但 caller 传 auto_rollback — 回滚无锚点, 保障失效");
+                                warn!(cwd, "empty snapshot id (non-git repo) but caller passed auto_rollback — rollback has no anchor, safety net lost");
                             } else {
                                 info!(
                                     cwd,
-                                    "快照 id 空 (非 git repo) — 无回滚锚点, 仅 pre_status 采集"
+                                    "empty snapshot id (non-git repo) — no rollback anchor, pre_status capture only"
                                 );
                             }
                         } else {
-                            info!(%id, "快照已创建");
+                            info!(%id, "snapshot created");
                         }
                         (Some(id), st)
                     }
                     (Ok(id), Err(e)) => {
-                        // 命令前 status 采集失败 — 非 git repo 或 git 异常 (D5-4 可能超时)。pre_status 空集,
-                        // guard detect 时 post 若非空则全部算命令新增 (保守: 当作全命令导致)。
-                        warn!(error = %e, cwd, "命令前 git status 采集失败, pre_status 置空");
+                        // Pre-command status capture failed — non-git repo or git anomaly (D5-4
+                        // may time out). pre_status empty set; at detect time, a non-empty post
+                        // counts entirely as command-added (conservative: attribute all to the
+                        // command).
+                        warn!(error = %e, cwd, "pre-command git status capture failed, pre_status set to empty");
                         if !id.is_empty() {
-                            info!(%id, "快照已创建");
+                            info!(%id, "snapshot created");
                         }
                         (Some(id), std::collections::HashSet::new())
                     }
                     (Err(e), _) => {
-                        // D5-2 fail-loud: 快照建不出 → warn! (升级 info!→warn!)。caller 传 policy 时
-                        // 标 rollback_unavailable (后续 result 构造后置位, 此处记 err 携带)。
-                        warn!(error = %e, cwd, "快照创建失败 — 回滚保障不可用 (D5-2 fail-loud)");
+                        // D5-2 fail-loud: snapshot cannot be created → warn! (upgraded info!→warn!).
+                        // When the caller passed a policy, mark rollback_unavailable (set after the
+                        // result is constructed; the err is recorded here to carry over).
+                        warn!(error = %e, cwd, "snapshot creation failed — rollback safety net unavailable (D5-2 fail-loud)");
                         snapshot_create_err = Some(e);
                         (None, std::collections::HashSet::new())
                     }
@@ -1084,13 +1223,13 @@ impl Executor {
         info!(
             seatbelt = req.seatbelt,
             use_pty = req.use_pty,
-            "execute_async — 沙箱执行"
+            "execute_async — sandbox execution"
         );
         let sb = self.sandbox.run(sb_cfg).await?;
 
-        // 诊断切片 — exit_code != 0 且非拦截/超时时填充 (PRD §4.2)
-        // Issue #4: use_pty=false 时 stderr 独立 → Slicer 优先吃 stderr (error channel);
-        // PTY 模式 stderr 恒空 → 退回 stdout (traceback 在 tail)
+        // Diagnostics slicing — filled when exit_code != 0 and not blocked/timeout (PRD §4.2)
+        // Issue #4: with use_pty=false, stderr is independent → Slicer prefers stderr (error
+        // channel); in PTY mode stderr is always empty → falls back to stdout (traceback in tail)
         #[cfg(feature = "diagnostics")]
         let diag = if sb.exit_code != 0 && !sb.timed_out {
             let cwd_ref = req.cwd.as_deref();
@@ -1118,19 +1257,21 @@ impl Executor {
             snapshot_id: sid_filtered.clone(),
             diagnostics: diag,
             trace_id: Some(trace_id),
-            oom_killed: sb.oom_killed, // D3-4: RSS watchdog 触发回填
-            pid: sb.pid,               // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
+            oom_killed: sb.oom_killed, // D3-4: RSS watchdog trigger backfill
+            pid: sb.pid, // RUN-11: backfill sandbox child PID for telemetry to sample the real task
             ..Default::default()
         };
 
-        // D5-2 fail-loud: 快照建不出且 caller 传了 policy → 回滚无锚点, guard 不会构造,
-        // 调用方无信号知保障失效。标 rollback_unavailable=true (snapshot_create_err 已在上方记 warn!)。
+        // D5-2 fail-loud: snapshot cannot be created and the caller passed a policy → rollback has
+        // no anchor, the guard is never constructed, and the caller has no signal that the safety
+        // net is lost. Mark rollback_unavailable=true (snapshot_create_err was warn!-logged above).
         if snapshot_create_err.is_some() && req.auto_rollback_policy.is_some() {
             result.rollback_unavailable = true;
         }
 
-        // 自动回滚 (FR-04) — 调用方传 policy 且有快照+cwd 时, 单次内 guard 判定
-        // pre_status 命令前已采集, 传入 guard 供 detect_damage diff (C-CORE-01)
+        // Auto-rollback (FR-04) — when the caller passed a policy and snapshot+cwd exist, the
+        // guard judges within the single execution. pre_status was captured pre-command and is
+        // passed to the guard for detect_damage diffing (C-CORE-01)
         if let (Some(policy), Some(cwd), Some(sid)) = (
             req.auto_rollback_policy.clone(),
             req.cwd.clone(),
@@ -1139,9 +1280,11 @@ impl Executor {
             if !sid.is_empty() {
                 let guard = AutoRollbackGuard::new(policy, sid.clone(), cwd, pre_status.clone());
                 if let Err(e) = guard.record_result(&mut result).await {
-                    // L-2: fail-loud — 旧版 warn!-降级后静默继续, 调用方无信号知回滚保障失效。
-                    // 标 rollback_unavailable=true 让调用方可见, 仍 warn! 记日志 (双通道可见)。
-                    warn!(error = %e, "自动回滚 guard 异常 — rollback_unavailable 已置位");
+                    // L-2: fail-loud — the old version warn!-degraded then silently continued, the
+                    // caller had no signal that the rollback safety net was lost.
+                    // Mark rollback_unavailable=true so the caller sees it, still warn!-logged
+                    // (dual-channel visibility).
+                    warn!(error = %e, "auto-rollback guard error — rollback_unavailable set");
                     result.rollback_unavailable = true;
                 }
             }
@@ -1150,20 +1293,22 @@ impl Executor {
         Ok(result)
     }
 
-    /// 同步执行 — 走 BLOCKING_RT，供 PyO3 sync 入口
+    /// Sync execute — via BLOCKING_RT, for the PyO3 sync entry
     pub fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
         BLOCKING_RT.block_on(self.execute_async(req))
     }
 
-    /// 流式执行 — 校验 → 快照 → sandbox.run_streaming → 转发 Chunk, Done 时填 diagnostics。
-    /// 被安全拦截 → 单帧 Done(blocked); 其余走 run_streaming 的实时分块。
-    /// 非破坏性: 与 execute_async 并存, Done 帧的 ExecutionResult 逻辑等价 (诊断切片在 Done 时填充)。
+    /// Streaming execute — validate → snapshot → sandbox.run_streaming → forward Chunks, fill
+    /// diagnostics at Done. Security-blocked → single Done(blocked) frame; everything else goes
+    /// through run_streaming's real-time chunking.
+    /// Non-breaking: coexists with execute_async; the Done frame's ExecutionResult is logically
+    /// equivalent (diagnostics slicing happens at Done time).
     pub async fn execute_streaming(
         &self,
         req: ExecutionRequest,
         cancel_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(mpsc::Receiver<ExecutionStreamEvent>, JoinHandle<()>)> {
-        // M-OPS-06/m-OPS-03: 入口解析 trace_id + span (同 execute_async)
+        // M-OPS-06/m-OPS-03: resolve trace_id + span at entry (same as execute_async)
         let trace_id = req
             .trace_id
             .clone()
@@ -1175,12 +1320,14 @@ impl Executor {
             command = %redact_command(&req.command)
         );
         let _enter = span.enter();
-        info!(command = %redact_command(&req.command), "execute_streaming — 校验中");
+        info!(command = %redact_command(&req.command), "execute_streaming — validating");
         let start = Instant::now();
         let verdict = self.security.validate(&req.command);
         if !verdict.allowed {
-            let reason = verdict.reason.unwrap_or_else(|| "未知原因".to_string());
-            info!(%reason, "安全校验拦截 (streaming)");
+            let reason = verdict
+                .reason
+                .unwrap_or_else(|| "unknown reason".to_string());
+            info!(%reason, "blocked by security validation (streaming)");
             let action_id = verdict.action_id.clone();
             let (tx, rx) = mpsc::channel(8);
             let handle = tokio::spawn(async move {
@@ -1198,10 +1345,11 @@ impl Executor {
             });
             return Ok((rx, handle));
         }
-        // Issue #23 验收 #3 (seatbelt 门控 E7, streaming 同步路径): guard 要求 seatbelt 但调用方未启用 → 拒。
+        // Issue #23 acceptance #3 (seatbelt gating E7, streaming sync path): guard requires
+        // seatbelt but the caller has not enabled it → refuse.
         if verdict.seatbelt_required && !req.seatbelt {
-            let reason = "guard 要求 seatbelt 隔离但调用方未启用 (E7 seatbelt gating, streaming)";
-            warn!(%reason, action_id = ?verdict.action_id, "seatbelt 门控拦截 (streaming)");
+            let reason = "guard requires seatbelt isolation but the caller has not enabled it (E7 seatbelt gating, streaming)";
+            warn!(%reason, action_id = ?verdict.action_id, "blocked by seatbelt gating (streaming)");
             let action_id = verdict.action_id.clone();
             let (tx, rx) = mpsc::channel(8);
             let handle = tokio::spawn(async move {
@@ -1219,11 +1367,11 @@ impl Executor {
             });
             return Ok((rx, handle));
         }
-        // Issue #34: sandbox profile fail-closed (streaming 同步路径)。
+        // Issue #34: sandbox profile fail-closed (streaming sync path).
         if let Some(sp) = &req.sandbox {
             if sp.fail_if_unavailable && !fe_sandbox::seatbelt::seatbelt_available() {
-                let reason = "请求 sandbox profile 但 sandbox-exec 不可用 (fail_if_unavailable fail-closed, streaming)";
-                warn!(%reason, command = %redact_command(&req.command), "sandbox profile 门控拦截 (streaming)");
+                let reason = "sandbox profile requested but sandbox-exec unavailable (fail_if_unavailable fail-closed, streaming)";
+                warn!(%reason, command = %redact_command(&req.command), "blocked by sandbox profile gating (streaming)");
                 let (tx, rx) = mpsc::channel(8);
                 let handle = tokio::spawn(async move {
                     let _ = tx
@@ -1243,8 +1391,8 @@ impl Executor {
         if let Some(cwd) = &req.cwd {
             let cwd_v = self.security.validate_cwd(cwd);
             if !cwd_v.allowed {
-                let reason = cwd_v.reason.unwrap_or_else(|| "cwd 非法".to_string());
-                info!(%reason, "cwd 校验拦截 (streaming)");
+                let reason = cwd_v.reason.unwrap_or_else(|| "invalid cwd".to_string());
+                info!(%reason, "blocked by cwd validation (streaming)");
                 let (tx, rx) = mpsc::channel(8);
                 let handle = tokio::spawn(async move {
                     let _ = tx
@@ -1262,11 +1410,12 @@ impl Executor {
             }
         }
 
-        // Issue #23 验收 #4 (H4 TOCTOU 复检, streaming 同步路径): spawn 前复检 binary 路径非新现 symlink/消失。
+        // Issue #23 acceptance #4 (H4 TOCTOU recheck, streaming sync path): recheck before spawn
+        // that the binary path has no newly-appeared symlink / has not vanished.
         let first_token = req.command.split_whitespace().next().unwrap_or("");
         if !first_token.is_empty() {
             if let Err(reason) = self.security.recheck_binary(first_token) {
-                warn!(%reason, first_token, "TOCTOU 复检拦截 (streaming) — 执行前 binary 路径变更");
+                warn!(%reason, first_token, "blocked by TOCTOU recheck (streaming) — binary path changed before execution");
                 let (tx, rx) = mpsc::channel(8);
                 let handle = tokio::spawn(async move {
                     let _ = tx
@@ -1284,8 +1433,10 @@ impl Executor {
             }
         }
 
-        // 快照 + 命令前 git status 快照 (与 execute_async 同策略; C-CORE-01 pre_status diff)
-        // D5-2/D5-6: 同 execute_async — want_snapshot 含 auto_rollback_policy; fail-loud + empty warn。
+        // Snapshot + pre-command git status snapshot (same policy as execute_async; C-CORE-01
+        // pre_status diff)
+        // D5-2/D5-6: same as execute_async — want_snapshot includes auto_rollback_policy;
+        // fail-loud + empty warn.
         let want_snapshot = req.enable_rollback_snapshot || req.auto_rollback_policy.is_some();
         let mut snapshot_create_err: Option<anyhow::Error> = None;
         let (snapshot_id, pre_status) = if want_snapshot {
@@ -1296,24 +1447,24 @@ impl Executor {
                     (Ok(id), Ok(st)) => {
                         if id.is_empty() {
                             if req.auto_rollback_policy.is_some() {
-                                warn!(cwd, "快照 id 空 (非 git repo) 但 caller 传 auto_rollback — 回滚无锚点, 保障失效 (streaming)");
+                                warn!(cwd, "empty snapshot id (non-git repo) but caller passed auto_rollback — rollback has no anchor, safety net lost (streaming)");
                             } else {
-                                info!(cwd, "快照 id 空 (非 git repo) — 无回滚锚点 (streaming)");
+                                info!(cwd, "empty snapshot id (non-git repo) — no rollback anchor (streaming)");
                             }
                         } else {
-                            info!(%id, "快照已创建 (streaming)");
+                            info!(%id, "snapshot created (streaming)");
                         }
                         (Some(id), st)
                     }
                     (Ok(id), Err(e)) => {
-                        warn!(error = %e, cwd, "命令前 git status 采集失败 (streaming), pre_status 置空");
+                        warn!(error = %e, cwd, "pre-command git status capture failed (streaming), pre_status set to empty");
                         if !id.is_empty() {
-                            info!(%id, "快照已创建 (streaming)");
+                            info!(%id, "snapshot created (streaming)");
                         }
                         (Some(id), std::collections::HashSet::new())
                     }
                     (Err(e), _) => {
-                        warn!(error = %e, cwd, "快照创建失败 — 回滚保障不可用 (D5-2 fail-loud, streaming)");
+                        warn!(error = %e, cwd, "snapshot creation failed — rollback safety net unavailable (D5-2 fail-loud, streaming)");
                         snapshot_create_err = Some(e);
                         (None, std::collections::HashSet::new())
                     }
@@ -1341,7 +1492,10 @@ impl Executor {
             rss_limit_mb: req.rss_limit_mb,
             sandbox_profile: req.sandbox.clone(),
         };
-        info!(seatbelt = req.seatbelt, "execute_streaming — 沙箱流式执行");
+        info!(
+            seatbelt = req.seatbelt,
+            "execute_streaming — sandbox streaming execution"
+        );
         let (mut sb_rx, sb_handle) = self.sandbox.run_streaming(sb_cfg, cancel_rx)?;
 
         #[cfg(feature = "diagnostics")]
@@ -1353,14 +1507,18 @@ impl Executor {
         let policy_for_done = req.auto_rollback_policy.clone();
         let cwd_for_guard = req.cwd.clone();
         let pre_status_for_guard = pre_status.clone();
-        // D5-2: 快照建不出 + policy → 标 rollback_unavailable (closure 内应用)
+        // D5-2: snapshot cannot be created + policy → mark rollback_unavailable (applied inside
+        // the closure)
         let snapshot_err_for_done = snapshot_create_err.is_some();
         let policy_present = req.auto_rollback_policy.is_some();
 
         let (outer_tx, outer_rx) = mpsc::channel::<ExecutionStreamEvent>(64);
-        // C-4: spawn 任务体包 catch_unwind — 病态 slicer/guard/unwrap panic 不静默丢 Done 帧。
-        // outer_tx 克隆一份给 catch 内 async (move 入), 原始 outer_tx 留 catch 外供 panic 路径发
-        // 显式 Done{exit_code:-1, stderr:"internal panic: ..."} (而非让 outer_rx 收 None 当干净 EOF)。
+        // C-4: the spawn task body is wrapped in catch_unwind — a pathological
+        // slicer/guard/unwrap panic does not silently lose the Done frame.
+        // outer_tx is cloned for the async inside the catch (moved in); the original outer_tx
+        // stays outside the catch so the panic path can send an explicit
+        // Done{exit_code:-1, stderr:"internal panic: ..."} (rather than letting outer_rx receive
+        // None as a clean EOF).
         let panic_tx = outer_tx.clone();
         let trace_id_for_panic = trace_id.clone();
         let task_id_for_panic = req.task_id.clone();
@@ -1379,11 +1537,12 @@ impl Executor {
                             }
                         }
                         fe_sandbox::StreamEvent::Done(sb) => {
-                            // 诊断切片 — exit_code != 0 且非超时 (PRD §4.2, 同 execute_async)
+                            // Diagnostics slicing — exit_code != 0 and not timeout (PRD §4.2, same
+                            // as execute_async)
                             #[cfg(feature = "diagnostics")]
                             let diag = if sb.exit_code != 0 && !sb.timed_out {
                                 let cwd_ref = cwd_for_diag.as_deref();
-                                // Issue #4: stdio 模式 stderr 独立 → 优先吃 stderr
+                                // Issue #4: stdio mode has independent stderr → prefer stderr
                                 let diag_src = if !sb.stderr.is_empty() {
                                     &sb.stderr
                                 } else {
@@ -1408,16 +1567,17 @@ impl Executor {
                                 snapshot_id: sid_filtered.clone(),
                                 diagnostics: diag,
                                 trace_id: Some(trace_id_for_done.clone()),
-                                oom_killed: sb.oom_killed, // D3-4: RSS watchdog 触发回填
-                                pid: sb.pid, // RUN-11: 回填沙箱子进程 PID 供 telemetry 采样真实任务
-                                cancelled: sb.cancelled, // Issue #32: server-side cancel 透传
+                                oom_killed: sb.oom_killed, // D3-4: RSS watchdog trigger backfill
+                                pid: sb.pid, // RUN-11: backfill sandbox child PID for telemetry to sample the real task
+                                cancelled: sb.cancelled, // Issue #32: server-side cancel pass-through
                                 ..Default::default()
                             };
-                            // D5-2 fail-loud: 快照建不出且 caller 传 policy → guard 不构造, 标 rollback_unavailable (streaming)
+                            // D5-2 fail-loud: snapshot cannot be created and the caller passed a
+                            // policy → guard not constructed, mark rollback_unavailable (streaming)
                             if snapshot_err_for_done && policy_present {
                                 result.rollback_unavailable = true;
                             }
-                            // 自动回滚 (FR-04, 同 execute_async; pre_status diff C-CORE-01)
+                            // Auto-rollback (FR-04, same as execute_async; pre_status diff C-CORE-01)
                             if let (Some(policy), Some(cwd), Some(sid)) = (
                                 policy_for_done.as_ref(),
                                 cwd_for_guard.as_ref(),
@@ -1431,44 +1591,51 @@ impl Executor {
                                         pre_status_for_guard.clone(),
                                     );
                                     if let Err(e) = guard.record_result(&mut result).await {
-                                        // L-2: fail-loud — 旧版 warn!-降级静默吞, 调用方无信号。
-                                        // 标 rollback_unavailable=true 让调用方可见 (同 execute_async)。
+                                        // L-2: fail-loud — the old version warn!-degraded and
+                                        // silently swallowed, the caller had no signal.
+                                        // Mark rollback_unavailable=true so the caller sees it
+                                        // (same as execute_async).
                                         warn!(
                                             error = %e,
-                                            "自动回滚 guard 异常 (streaming) — rollback_unavailable 已置位"
+                                            "auto-rollback guard error (streaming) — rollback_unavailable set"
                                         );
                                         result.rollback_unavailable = true;
                                     }
                                 }
                             }
-                            // L-3: send 错误不再 let _ = 纯吞 — 消费者已 drop (提前 break/异常),
-                            // 显式 warn! 记 "Done frame dropped", 让通道关闭可见于日志。
+                            // L-3: send errors are no longer swallowed with let _ = — the consumer
+                            // already dropped (early break/exception); warn! explicitly logs "Done
+                            // frame dropped" so channel closure is visible in logs.
                             if outer_tx
                                 .send(ExecutionStreamEvent::Done(Box::new(result)))
                                 .await
                                 .is_err()
                             {
                                 warn!(
-                                    "execute_streaming Done 帧被丢弃 — 消费者已提前退出 (outer_tx.send Err)"
+                                    "execute_streaming Done frame dropped — consumer already exited early (outer_tx.send Err)"
                                 );
                             }
                             break;
                         }
                     }
                 }
-                // L-CORE-01: break 后 sb_handle.await 可能阻塞到子进程超时 (chunk 通道断后
-                // 沙箱协调任务仍驱动子进程)。abort 先停协调任务, 再 timeout 包 await 兜底 —
-                // 子进程由沙箱内部 timeout/supervisor 自管, fe-core 任务不无限挂起。
+                // L-CORE-01: after break, sb_handle.await may block until the child times out
+                // (after the chunk channel disconnects, the sandbox coordinator task still drives
+                // the child). abort stops the coordinator first, then a timeout wraps the await
+                // as a fallback — the child is managed by the sandbox's internal
+                // timeout/supervisor, so the fe-core task never hangs indefinitely.
                 sb_handle.abort();
                 match tokio::time::timeout(Duration::from_secs(5), sb_handle).await {
-                    Ok(_) => debug!("execute_streaming 协调任务已结束"),
+                    Ok(_) => debug!("execute_streaming coordinator task finished"),
                     Err(_) => warn!(
-                        "execute_streaming 协调任务 abort 后 5s 仍在运行 (子进程可能仍在超时回收中)"
+                        "execute_streaming coordinator task still running 5s after abort (child may still be reaping its timeout)"
                     ),
                 }
             });
-            // C-4: catch_unwind 捕获任务体内 panic。Err(payload) → 发显式 Done{exit_code:-1,
-            // stderr:"internal panic: ..."} 而非让 outer_rx 收 None (旧版静默吞结果, 看似成功无结果)。
+            // C-4: catch_unwind captures panics in the task body. Err(payload) → send an explicit
+            // Done{exit_code:-1, stderr:"internal panic: ..."} rather than letting outer_rx
+            // receive None (the old version silently swallowed the result, appearing successful
+            // with no result).
             if let Err(payload) = inner.catch_unwind().await {
                 let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
                     s.to_string()
@@ -1477,7 +1644,7 @@ impl Executor {
                 } else {
                     "unknown panic payload".to_string()
                 };
-                error!(panic = %msg, "execute_streaming 任务体 panic — 发显式错误 Done 帧");
+                error!(panic = %msg, "execute_streaming task body panicked — sending explicit error Done frame");
                 let panic_result = ExecutionResult {
                     exit_code: EXIT_BLOCKED,
                     stderr: format!("internal panic: {msg}"),
@@ -1493,7 +1660,7 @@ impl Executor {
                     .is_err()
                 {
                     warn!(
-                        "execute_streaming panic Done 帧也被丢弃 — 消费者已提前退出 (panic_tx.send Err)"
+                        "execute_streaming panic Done frame also dropped — consumer already exited early (panic_tx.send Err)"
                     );
                 }
             }
@@ -1501,14 +1668,18 @@ impl Executor {
         Ok((outer_rx, handle))
     }
 
-    /// 实时遥测流 — 10Hz CPU/内存采样, GPU 由调用方注入 (executor 不跑模型)。
-    /// 返回 (Receiver<TelemetrySample>, JoinHandle)。调用方迭代 rx 收帧,
-    /// 丢弃 rx 则采样任务自动停止 (通道关闭)。Executor 无状态: 每次调用独立流。
+    /// Real-time telemetry stream — 10Hz CPU/memory sampling, GPU injected by the caller (the
+    /// executor runs no models). Returns (Receiver<TelemetrySample>, JoinHandle). The caller
+    /// iterates rx to receive frames; dropping rx automatically stops the sampling task (channel
+    /// closed). Executor is stateless: each call yields an independent stream.
     pub fn telemetry_stream(
         &self,
         cfg: TelemetryConfig,
     ) -> (mpsc::Receiver<TelemetrySample>, JoinHandle<()>) {
-        info!(interval_ms = cfg.interval_ms, "telemetry_stream — 启动采样");
+        info!(
+            interval_ms = cfg.interval_ms,
+            "telemetry_stream — starting sampling"
+        );
         start_telemetry(cfg, BLOCKING_RT.handle().clone())
     }
 }
@@ -1524,43 +1695,67 @@ mod tests {
             .unwrap()
     }
 
-    // D3-5/D3-10: 命令日志脱敏 — secret 模式掩码, 非 secret 保留
+    // D3-5/D3-10: command log redaction — secret patterns masked, non-secrets preserved
     #[test]
     fn redact_command_bearer_token() {
         let r = redact_command("curl -H 'Authorization: Bearer sk-ant-abc123' https://api");
-        assert!(!r.contains("sk-ant-abc123"), "Bearer token 应脱敏: {r}");
-        assert!(r.contains("[REDACTED]"), "应含 [REDACTED] 占位: {r}");
+        assert!(
+            !r.contains("sk-ant-abc123"),
+            "Bearer token should be redacted: {r}"
+        );
+        assert!(
+            r.contains("[REDACTED]"),
+            "should contain the [REDACTED] placeholder: {r}"
+        );
     }
 
     #[test]
     fn redact_command_sk_prefix() {
         let r = redact_command("echo sk-proj-xyz789");
-        assert!(!r.contains("sk-proj-xyz789"), "sk- key 应脱敏: {r}");
-        assert!(r.contains("sk-[REDACTED]"), "应含 sk-[REDACTED]: {r}");
+        assert!(
+            !r.contains("sk-proj-xyz789"),
+            "sk- key should be redacted: {r}"
+        );
+        assert!(
+            r.contains("sk-[REDACTED]"),
+            "should contain sk-[REDACTED]: {r}"
+        );
     }
 
     #[test]
     fn redact_command_key_equals_value() {
         let r = redact_command("export PASSWORD=hunter2 && curl https://api");
-        assert!(!r.contains("hunter2"), "PASSWORD 值应脱敏: {r}");
+        assert!(
+            !r.contains("hunter2"),
+            "PASSWORD value should be redacted: {r}"
+        );
         assert!(
             r.contains("PASSWORD=[REDACTED]"),
-            "应含 PASSWORD=[REDACTED]: {r}"
+            "should contain PASSWORD=[REDACTED]: {r}"
         );
     }
 
     #[test]
     fn redact_command_api_key_quoted() {
         let r = redact_command(r#"cli --api-key="abc def ghi""#);
-        assert!(!r.contains("abc def ghi"), "引号内 api_key 值应脱敏: {r}");
-        assert!(r.contains("[REDACTED]"), "应含 [REDACTED]: {r}");
+        assert!(
+            !r.contains("abc def ghi"),
+            "quoted api_key value should be redacted: {r}"
+        );
+        assert!(r.contains("[REDACTED]"), "should contain [REDACTED]: {r}");
     }
 
     #[test]
     fn redact_command_curl_basic_auth() {
         let r = redact_command("curl -u admin:s3cret https://api");
-        assert!(!r.contains("s3cret"), "basic auth 密码应脱敏: {r}");
-        assert!(r.contains("admin:[REDACTED]"), "应保留 user 掩 pass: {r}");
+        assert!(
+            !r.contains("s3cret"),
+            "basic auth password should be redacted: {r}"
+        );
+        assert!(
+            r.contains("admin:[REDACTED]"),
+            "should keep user and mask pass: {r}"
+        );
     }
 
     #[test]
@@ -1568,7 +1763,7 @@ mod tests {
         let r = redact_command(r#"curl -H "Authorization: Bearer xyz" https://api"#);
         assert!(
             !r.contains("Bearer xyz"),
-            "Authorization header 值应脱敏: {r}"
+            "Authorization header value should be redacted: {r}"
         );
     }
 
@@ -1577,14 +1772,17 @@ mod tests {
         let r = redact_command("pytest tests/ -v --tb=short");
         assert_eq!(
             r, "pytest tests/ -v --tb=short",
-            "无 secret 命令应原样保留: {r}"
+            "command without secrets should be preserved verbatim: {r}"
         );
     }
 
     #[test]
     fn redact_command_case_insensitive() {
         let r = redact_command("curl -H 'authorization: bearer tok' url");
-        assert!(!r.contains("tok"), "小写 authorization/bearer 应脱敏: {r}");
+        assert!(
+            !r.contains("tok"),
+            "lowercase authorization/bearer should be redacted: {r}"
+        );
     }
 
     #[test]
@@ -1619,7 +1817,7 @@ mod tests {
                 }
             }
             handle.await.unwrap();
-            let done = done.expect("应收到 Done");
+            let done = done.expect("should receive Done");
             assert_eq!(done.exit_code, 0);
             assert!(!done.timed_out);
             assert!(combined.contains("hi"), "chunks={:?}", combined);
@@ -1629,7 +1827,8 @@ mod tests {
 
     #[test]
     fn trace_id_auto_generated_on_none() {
-        // M-OPS-06: 请求不带 trace_id → 入口自动生成 uuid v4, 回填 result
+        // M-OPS-06: request without trace_id → entry auto-generates a uuid v4, backfilled into
+        // the result
         rt().block_on(async {
             let ex = Executor::new();
             let req = ExecutionRequest {
@@ -1652,16 +1851,20 @@ mod tests {
             };
             let r = ex.execute_async(req).await.unwrap();
             assert_eq!(r.exit_code, 0);
-            assert!(r.trace_id.is_some(), "trace_id 应自动生成");
+            assert!(r.trace_id.is_some(), "trace_id should be auto-generated");
             let tid = r.trace_id.as_ref().unwrap();
-            assert_eq!(tid.len(), 36, "uuid v4 长度 36, 得 {tid}");
-            assert_eq!(tid.matches('-').count(), 4, "uuid v4 含 4 段分隔, 得 {tid}");
+            assert_eq!(tid.len(), 36, "uuid v4 length 36, got {tid}");
+            assert_eq!(
+                tid.matches('-').count(),
+                4,
+                "uuid v4 has 4 separator segments, got {tid}"
+            );
         });
     }
 
     #[test]
     fn trace_id_forwarded_when_provided() {
-        // M-OPS-06: 调用方传 trace_id → 原样回填 result
+        // M-OPS-06: caller passes trace_id → echoed verbatim into the result
         rt().block_on(async {
             let ex = Executor::new();
             let req = ExecutionRequest {
@@ -1689,7 +1892,7 @@ mod tests {
 
     #[test]
     fn trace_id_present_on_blocked() {
-        // M-OPS-06: 拦截结果也带 trace_id (blocked_with 转发)
+        // M-OPS-06: blocked results also carry trace_id (forwarded via blocked_with)
         rt().block_on(async {
             let ex = Executor::new();
             let req = ExecutionRequest {
@@ -1718,7 +1921,7 @@ mod tests {
 
     #[test]
     fn trace_id_streaming_done_carries_it() {
-        // M-OPS-06: 流式 Done 帧带 trace_id
+        // M-OPS-06: streaming Done frame carries trace_id
         rt().block_on(async {
             let ex = Executor::new();
             let req = ExecutionRequest {
@@ -1747,7 +1950,7 @@ mod tests {
                 }
             }
             handle.await.unwrap();
-            let done = done.expect("应收到 Done");
+            let done = done.expect("should receive Done");
             assert_eq!(done.trace_id.as_deref(), Some("stream-tid"));
         });
     }
@@ -1786,7 +1989,7 @@ mod tests {
                 }
             }
             handle.await.unwrap();
-            assert_eq!(frames, 1, "拦截应只发单帧 Done");
+            assert_eq!(frames, 1, "a block should send exactly one Done frame");
             assert!(blocked);
         });
     }
@@ -1821,7 +2024,7 @@ mod tests {
                 }
             }
             handle.await.unwrap();
-            let done = done.expect("应收到 Done");
+            let done = done.expect("should receive Done");
             assert!(done.timed_out);
             assert_eq!(done.exit_code, EXIT_TIMEOUT);
         });
@@ -1859,15 +2062,18 @@ mod tests {
             handle.await.unwrap();
             let done = done.unwrap();
             assert_ne!(done.exit_code, 0);
-            let diag = done.diagnostics.expect("非零退出应填 diagnostics");
+            let diag = done
+                .diagnostics
+                .expect("non-zero exit should fill diagnostics");
             assert_eq!(diag.error_type.as_deref(), Some("ValueError"));
         });
     }
 
     #[test]
     fn execute_streaming_cancel_kills_process_tree_issue32() {
-        // Issue #32: server-side cancel → execute_streaming 收 cancel_rx → kill 进程树
-        // → Done 帧 exit_code -1, cancelled true, 非 timeout。在 cancel timeout 内退出。
+        // Issue #32: server-side cancel → execute_streaming receives cancel_rx → kills the
+        // process tree → Done frame with exit_code -1, cancelled true, not a timeout. Exits
+        // within the cancel timeout.
         rt().block_on(async {
             let ex = Executor::new().with_allow_inline_interpreter(true);
             let req = ExecutionRequest {
@@ -1891,7 +2097,7 @@ mod tests {
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
             let start = std::time::Instant::now();
             let (mut rx, handle) = ex.execute_streaming(req, Some(cancel_rx)).await.unwrap();
-            // 500ms 后发 cancel — 优于 timeout_sec 100s
+            // send cancel after 500ms — beats the 100s timeout_sec
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let _ = cancel_tx.send(());
             let mut done = None;
@@ -1901,19 +2107,22 @@ mod tests {
                 }
             }
             handle.await.unwrap();
-            let done = done.expect("应收到 Done 帧");
+            let done = done.expect("should receive a Done frame");
             assert_eq!(
                 done.exit_code, -1,
-                "Issue #32: cancel 应产 exit_code -1 (blocked/internal 约定)"
+                "Issue #32: cancel should produce exit_code -1 (blocked/internal convention)"
             );
-            assert!(done.cancelled, "Issue #32: cancelled 应透传 true");
+            assert!(
+                done.cancelled,
+                "Issue #32: cancelled should pass through as true"
+            );
             assert!(
                 !done.timed_out,
-                "Issue #32: cancel 非 timeout — 不应填 timed_out"
+                "Issue #32: cancel is not a timeout — timed_out should not be set"
             );
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(5),
-                "Issue #32: cancel 应在 cancel timeout 内完成, 实际 {:?}",
+                "Issue #32: cancel should complete within the cancel timeout, actual {:?}",
                 start.elapsed()
             );
         });
@@ -1926,7 +2135,7 @@ mod tests {
                 .arg(dir)
                 .args(args)
                 .output()
-                .expect("git 失败")
+                .expect("git failed")
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
@@ -1942,7 +2151,7 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let cwd = dir.path().to_str().unwrap().to_string();
             make_git_repo(dir.path());
-            // python3 白名单内 — 改写 app.py 后抛错 (失败 + 文件毁损)
+            // python3 is allowlisted — rewrite app.py then raise (failure + file damage)
             let cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\"";
             let req = ExecutionRequest {
                 command: cmd.to_string(),
@@ -1964,11 +2173,14 @@ mod tests {
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
-            assert_ne!(res.exit_code, 0, "应失败");
-            assert!(res.auto_rolled_back, "应自动回滚");
-            // 回滚后 app.py 恢复原始内容
+            assert_ne!(res.exit_code, 0, "should fail");
+            assert!(res.auto_rolled_back, "should auto-rollback");
+            // after rollback app.py is restored to its original content
             let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
-            assert_eq!(content, "print('ok')\n", "回滚后应恢复: {content}");
+            assert_eq!(
+                content, "print('ok')\n",
+                "should be restored after rollback: {content}"
+            );
         });
     }
 
@@ -1978,7 +2190,7 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let cwd = dir.path().to_str().unwrap().to_string();
             make_git_repo(dir.path());
-            // 成功命令: commit 后工作区干净, 不应回滚
+            // successful command: worktree clean after commit, should not roll back
             let req = ExecutionRequest {
                 command: "echo hi".to_string(),
                 task_id: None,
@@ -2000,7 +2212,7 @@ mod tests {
             let ex = Executor::new();
             let res = ex.execute_async(req).await.unwrap();
             assert_eq!(res.exit_code, 0);
-            assert!(!res.auto_rolled_back, "成功不应回滚");
+            assert!(!res.auto_rolled_back, "success should not roll back");
         });
     }
 
@@ -2010,7 +2222,7 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let cwd = dir.path().to_str().unwrap().to_string();
             make_git_repo(dir.path());
-            // 无 policy → 即使失败+文件改动也不回滚
+            // no policy → no rollback even with failure + file changes
             let cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\"";
             let req = ExecutionRequest {
                 command: cmd.to_string(),
@@ -2033,15 +2245,19 @@ mod tests {
             let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
             assert_ne!(res.exit_code, 0);
-            assert!(!res.auto_rolled_back, "无 policy 不应回滚");
-            // 文件保持损坏 (未回滚)
+            assert!(!res.auto_rolled_back, "no policy should not roll back");
+            // file stays damaged (not rolled back)
             let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
-            assert_eq!(content, "broken\n", "无 policy 文件应保持改动: {content}");
+            assert_eq!(
+                content, "broken\n",
+                "without policy the file should keep its changes: {content}"
+            );
         });
     }
 
-    // Issue #12.3 / A4: max_consecutive_failures 是 DEFERRED-BY-DESIGN 死字段 —
-    // Rust 永不读。设极高值 (99) 不应阻止单次执行的文件毁损回滚 (证字段被接受但忽略, 无状态)。
+    // Issue #12.3 / A4: max_consecutive_failures is a DEFERRED-BY-DESIGN dead field —
+    // Rust never reads it. Setting an extremely high value (99) should not block single-execution
+    // file-damage rollback (proves the field is accepted but ignored, stateless).
     #[test]
     fn max_consecutive_failures_ignored_stateless() {
         rt().block_on(async {
@@ -2072,29 +2288,35 @@ mod tests {
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
-            assert_ne!(res.exit_code, 0, "应失败");
-            // 即使 max_consecutive_failures=99 (远超单次), 文件毁损仍立即回滚 — 字段不限制单次执行
+            assert_ne!(res.exit_code, 0, "should fail");
+            // even with max_consecutive_failures=99 (far beyond a single execution), file damage
+            // still rolls back immediately — the field does not constrain a single execution
             assert!(
                 res.auto_rolled_back,
-                "max_consecutive_failures 不影响单次回滚 (死字段)"
+                "max_consecutive_failures does not affect single-execution rollback (dead field)"
             );
             let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
-            assert_eq!(content, "print('ok')\n", "回滚后应恢复: {content}");
+            assert_eq!(
+                content, "print('ok')\n",
+                "should be restored after rollback: {content}"
+            );
         });
     }
 
-    // C-CORE-01: 命令前已脏 (未跟踪 wip.txt) + 命令失败但不碰任何文件 → 不误触发回滚。
-    // 旧版 detect_damage 见 git status 非空 (wip.txt) 即判毁损 → 误回滚 (无谓 reset, 丢 wip.txt
-    // 若已 stash 则恢复). 新版 diff pre/post: wip.txt 在 pre_status, 非"命令新增" → 不回滚。
+    // C-CORE-01: dirty before the command (untracked wip.txt) + command fails but touches no
+    // files → no false rollback trigger. The old detect_damage saw a non-empty git status
+    // (wip.txt) and judged damage → false rollback (needless reset, losing wip.txt if stashed).
+    // New version diffs pre/post: wip.txt is in pre_status, not "command-added" → no rollback.
     #[test]
     fn auto_rollback_no_false_trigger_on_preexisting_dirty() {
         rt().block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let cwd = dir.path().to_str().unwrap().to_string();
             make_git_repo(dir.path());
-            // 命令前制造未跟踪文件 (WIP) — pre_status 记录它
+            // create an untracked file (WIP) before the command — pre_status records it
             std::fs::write(dir.path().join("wip.txt"), "work in progress\n").unwrap();
-            // 命令失败但不改任何文件 (纯 raise) — post_status 含 wip.txt 但 pre 也有 → 无新增
+            // command fails but changes no files (pure raise) — post_status contains wip.txt but
+            // pre does too → no additions
             let cmd = "python3 -c \"raise ValueError('boom')\"";
             let req = ExecutionRequest {
                 command: cmd.to_string(),
@@ -2116,17 +2338,20 @@ mod tests {
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
-            assert_ne!(res.exit_code, 0, "应失败");
+            assert_ne!(res.exit_code, 0, "should fail");
             assert!(
                 !res.auto_rolled_back,
-                "命令未新增改动 (wip.txt 命令前已脏) → 不应误回滚"
+                "command added no changes (wip.txt dirty before the command) → no false rollback"
             );
-            // app.py 未被命令触碰, 保持原样
+            // app.py untouched by the command, stays as-is
             let app = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
-            assert_eq!(app, "print('ok')\n", "app.py 未动");
-            // wip.txt 保留 (无回滚, 无丢失)
+            assert_eq!(app, "print('ok')\n", "app.py untouched");
+            // wip.txt preserved (no rollback, nothing lost)
             let wip = std::fs::read_to_string(dir.path().join("wip.txt")).unwrap();
-            assert_eq!(wip, "work in progress\n", "wip.txt 不应被回滚丢失");
+            assert_eq!(
+                wip, "work in progress\n",
+                "wip.txt should not be lost to rollback"
+            );
         });
     }
 
@@ -2145,64 +2370,85 @@ mod tests {
                 samples.push(s);
             }
             let _ = handle.await;
-            assert_eq!(samples.len(), 4, "应产出 4 帧");
+            assert_eq!(samples.len(), 4, "expected 4 frames");
             assert!(samples.iter().all(|s| s.mem_mb >= 0.0));
             assert!(
                 samples.iter().all(|s| s.gpu_pct.is_none()),
-                "GPU 默认不注入"
+                "GPU not injected by default"
             );
         });
     }
 
-    // ===== 0827 fe-core P0-P3 修复回归测试 =====
+    // ===== 0827 fe-core P0-P3 fix regression tests =====
 
-    /// C-2: is_tracked_mutation porcelain 行码判定 — 仅跟踪文件突变计 damage, ?? /A 不计。
+    /// C-2: is_tracked_mutation porcelain code classification — only tracked-file mutations count
+    /// as damage, ?? /A don't.
     #[test]
     fn c2_is_tracked_mutation_classifies_porcelain_codes() {
-        // 未跟踪新增 (命令有意创建) → 不计 damage
-        assert!(!is_tracked_mutation("?? build/"), "?? 未跟踪不算 damage");
+        // untracked addition (intentionally created by the command) → not damage
+        assert!(
+            !is_tracked_mutation("?? build/"),
+            "?? untracked is not damage"
+        );
         assert!(!is_tracked_mutation("?? __pycache__/"));
-        // 暂存新增 (无旧跟踪基线) → 不计 damage
+        // staged addition (no old tracked baseline) → not damage
         assert!(
             !is_tracked_mutation("A  new_file.py"),
-            "A 暂存新增不算 damage"
+            "A staged addition is not damage"
         );
-        // 工作区新增 (A 在 Y 位) → 不计
-        assert!(!is_tracked_mutation(" A new_file.py"), " Y=A 不算 damage");
-        // 跟踪文件修改 (任一位置 M) → 计 damage
-        assert!(is_tracked_mutation(" M app.py"), " Y=M 工作区改算 damage");
-        assert!(is_tracked_mutation("M  app.py"), "X=M 暂存改算 damage");
-        assert!(is_tracked_mutation("MM app.py"), "MM 双区改算 damage");
-        // 跟踪文件删除 (D) → 计 damage
-        assert!(is_tracked_mutation(" D app.py"), " Y=D 删除算 damage");
-        assert!(is_tracked_mutation("D  app.py"), "X=D 暂存删除算 damage");
-        // 重命名/复制 (R/C) → 计 damage
+        // worktree addition (A in Y position) → not counted
+        assert!(!is_tracked_mutation(" A new_file.py"), " Y=A is not damage");
+        // tracked file modified (M in either position) → damage
+        assert!(
+            is_tracked_mutation(" M app.py"),
+            " Y=M worktree modify is damage"
+        );
+        assert!(
+            is_tracked_mutation("M  app.py"),
+            "X=M staged modify is damage"
+        );
+        assert!(
+            is_tracked_mutation("MM app.py"),
+            "MM both-areas modify is damage"
+        );
+        // tracked file deleted (D) → damage
+        assert!(is_tracked_mutation(" D app.py"), " Y=D delete is damage");
+        assert!(
+            is_tracked_mutation("D  app.py"),
+            "X=D staged delete is damage"
+        );
+        // rename/copy (R/C) → damage
         assert!(
             is_tracked_mutation("R  old.py -> new.py"),
-            "R 重命名算 damage"
+            "R rename is damage"
         );
         assert!(
             is_tracked_mutation("C  src.py -> dst.py"),
-            "C 复制算 damage"
+            "C copy is damage"
         );
-        // 类型变 (T) → 计 damage
-        assert!(is_tracked_mutation(" T app.py"), " Y=T 类型变算 damage");
-        // 异常短行 → 保守 false (不误回滚)
-        assert!(!is_tracked_mutation(""), "空行不算 damage");
-        assert!(!is_tracked_mutation("A"), "单字符行不算 damage");
+        // type change (T) → damage
+        assert!(
+            is_tracked_mutation(" T app.py"),
+            " Y=T type change is damage"
+        );
+        // anomalous short lines → conservatively false (no false rollback)
+        assert!(!is_tracked_mutation(""), "empty line is not damage");
+        assert!(!is_tracked_mutation("A"), "single-char line is not damage");
     }
 
-    /// C-2: `mkdir -p build && <失败命令>` — 未跟踪 build/ 在 post 不在 pre,
-    /// 不应误判 damage 触发回滚 (C-CORE-01 漏的大问题, fusion-code 典型工作流)。
+    /// C-2: `mkdir -p build && <failing command>` — untracked build/ present in post but not in
+    /// pre, should not be misjudged as damage triggering rollback (a big hole C-CORE-01 missed,
+    /// typical fusion-code workflow).
     #[test]
     fn c2_untracked_build_dir_not_treated_as_damage() {
         rt().block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let cwd = dir.path().to_str().unwrap().to_string();
             make_git_repo(dir.path());
-            // mkdir 建未跟踪 build/ 目录, 然后 python3 抛错 (白名单内 + exit!=0)
-            // build/ 在 post (?? build/) 不在 pre → 旧版误判 damage → 误回滚。
-            // C-2 修后: ?? 不计 damage → damaged=0 → 不回滚, auto_rolled_back=false。
+            // mkdir creates an untracked build/ dir, then python3 raises (allowlisted + exit!=0)
+            // build/ is in post (?? build/) but not pre → old version misjudged damage → false
+            // rollback. After the C-2 fix: ?? is not counted as damage → damaged=0 → no rollback,
+            // auto_rolled_back=false.
             let cmd = "mkdir -p build && python3 -c \"raise ValueError(1)\"";
             let req = ExecutionRequest {
                 command: cmd.to_string(),
@@ -2224,28 +2470,29 @@ mod tests {
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
-            assert_ne!(res.exit_code, 0, "应失败 (python 抛错)");
+            assert_ne!(res.exit_code, 0, "should fail (python raise)");
             assert!(
                 !res.auto_rolled_back,
-                "C-2: 未跟踪 build/ 不应触发回滚, got auto_rolled_back={}",
+                "C-2: untracked build/ should not trigger rollback, got auto_rolled_back={}",
                 res.auto_rolled_back
             );
-            // build/ 应保留 (未被回滚清掉)
+            // build/ should be preserved (not wiped by rollback)
             assert!(
                 dir.path().join("build").exists(),
-                "C-2: build/ 目录应保留 (合法产物未误回滚)"
+                "C-2: build/ dir should be preserved (legitimate artifact not falsely rolled back)"
             );
         });
     }
 
-    /// C-2: 跟踪文件被命令改坏 (M) + exit!=0 → 仍应触发回滚 (C-2 不破坏真 damage 路径)。
+    /// C-2: tracked file broken by the command (M) + exit!=0 → rollback should still trigger
+    /// (C-2 does not break the real-damage path).
     #[test]
     fn c2_tracked_modify_still_triggers_rollback() {
         rt().block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let cwd = dir.path().to_str().unwrap().to_string();
             make_git_repo(dir.path());
-            // 改写跟踪文件 app.py ( M) 后抛错 → 真damage → 应回滚
+            // rewrite the tracked file app.py ( M) then raise → real damage → should roll back
             let cmd = "python3 -c \"open('app.py','w').write('broken\\n'); raise ValueError(1)\"";
             let req = ExecutionRequest {
                 command: cmd.to_string(),
@@ -2267,27 +2514,28 @@ mod tests {
             };
             let ex = Executor::new().with_allow_inline_interpreter(true);
             let res = ex.execute_async(req).await.unwrap();
-            assert_ne!(res.exit_code, 0, "应失败");
+            assert_ne!(res.exit_code, 0, "should fail");
             assert!(
                 res.auto_rolled_back,
-                "C-2: 跟踪文件 M 突变应触发回滚, got auto_rolled_back={}",
+                "C-2: tracked-file M mutation should trigger rollback, got auto_rolled_back={}",
                 res.auto_rolled_back
             );
         });
     }
 
-    /// L-2: rollback_unavailable 字段默认 false, 序列化省略 (skip_serializing_if is_false)。
+    /// L-2: rollback_unavailable field defaults to false, omitted on serialization
+    /// (skip_serializing_if is_false).
     #[test]
     fn l2_rollback_unavailable_default_and_skip_serialize() {
         let r = ExecutionResult::default();
-        assert!(!r.rollback_unavailable, "默认 false");
-        // false 时不序列化 (wire 省位)
+        assert!(!r.rollback_unavailable, "default false");
+        // false → not serialized (saves wire space)
         let json = serde_json::to_string(&r).unwrap();
         assert!(
             !json.contains("rollback_unavailable"),
-            "false 时应 skip: {json}"
+            "false should be skipped: {json}"
         );
-        // true 时序列化
+        // true → serialized
         let r2 = ExecutionResult {
             rollback_unavailable: true,
             ..Default::default()
@@ -2295,59 +2543,68 @@ mod tests {
         let json2 = serde_json::to_string(&r2).unwrap();
         assert!(
             json2.contains("rollback_unavailable"),
-            "true 时应序列化: {json2}"
+            "true should be serialized: {json2}"
         );
-        // 反序列化兼容 (缺字段 → default false)
+        // deserialization compatibility (missing field → default false)
         let back: ExecutionResult = serde_json::from_str(
             r#"{"exit_code":0,"stdout":"","stderr":"","timed_out":false,"blocked_by_security":false}"#,
         )
         .unwrap();
-        assert!(!back.rollback_unavailable, "缺字段反序列化应默认 false");
+        assert!(
+            !back.rollback_unavailable,
+            "missing field should deserialize to default false"
+        );
     }
 
-    /// L-1 (审计 0827): rollback_skipped_reason 字段默认 None, 序列化省略 (skip_serializing_if
-    /// Option::is_none)。区分 "未回滚(无需)" (None) 与 "未回滚(快照失效)" (Some) — fail-loud。
+    /// L-1 (audit 0827): rollback_skipped_reason field defaults to None, omitted on serialization
+    /// (skip_serializing_if Option::is_none). Distinguishes "not rolled back (not needed)" (None)
+    /// from "not rolled back (stale snapshot)" (Some) — fail-loud.
     #[test]
     fn l1_rollback_skipped_reason_default_and_skip_serialize() {
         let r = ExecutionResult::default();
-        assert!(r.rollback_skipped_reason.is_none(), "默认 None");
-        // None 时 skip (wire 省位)
+        assert!(r.rollback_skipped_reason.is_none(), "default None");
+        // None → skipped (saves wire space)
         let json = serde_json::to_string(&r).unwrap();
         assert!(
             !json.contains("rollback_skipped_reason"),
-            "None 时应 skip: {json}"
+            "None should be skipped: {json}"
         );
-        // Some 时序列化
+        // Some → serialized
         let r2 = ExecutionResult {
-            rollback_skipped_reason: Some("snapshot_id 解析失败".to_string()),
+            rollback_skipped_reason: Some("snapshot_id parse failure".to_string()),
             ..Default::default()
         };
         let json2 = serde_json::to_string(&r2).unwrap();
         assert!(
             json2.contains("rollback_skipped_reason"),
-            "Some 时应序列化: {json2}"
+            "Some should be serialized: {json2}"
         );
         assert!(
-            json2.contains("snapshot_id 解析失败"),
-            "原因值应在 wire: {json2}"
+            json2.contains("snapshot_id parse failure"),
+            "reason value should be on the wire: {json2}"
         );
-        // 反序列化兼容 (缺字段 → default None)
+        // deserialization compatibility (missing field → default None)
         let back: ExecutionResult = serde_json::from_str(
             r#"{"exit_code":0,"stdout":"","stderr":"","timed_out":false,"blocked_by_security":false}"#,
         )
         .unwrap();
         assert!(
             back.rollback_skipped_reason.is_none(),
-            "缺字段反序列化应默认 None"
+            "missing field should deserialize to default None"
         );
     }
 
-    /// A-5: BLOCKING_RT panic 信息含构建原因 + 不可恢复提示 (文档锚点, 不触发真 panic)。
-    /// 验证静态可访问 + runtime 活跃 (能跑任务)。
+    /// A-5: the BLOCKING_RT panic message includes the build failure reason + unrecoverable hint
+    /// (documentation anchor, does not trigger a real panic). Verifies the static is accessible +
+    /// the runtime is alive (can run tasks).
     #[test]
     fn a5_blocking_rt_symbol_accessible() {
-        // 访问触发 init (正常环境必成功); 验证符号可访问且 runtime 活跃 (能 spawn 任务)。
+        // Accessing triggers init (must succeed in a normal environment); verifies the symbol is
+        // accessible and the runtime is alive (can spawn tasks).
         let entered: bool = BLOCKING_RT.handle().block_on(async { true });
-        assert!(entered, "BLOCKING_RT 应可访问且能执行任务");
+        assert!(
+            entered,
+            "BLOCKING_RT should be accessible and able to execute tasks"
+        );
     }
 }

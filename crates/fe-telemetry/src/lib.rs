@@ -1,8 +1,10 @@
-// fe-telemetry — 实时遥测采样 (GPU/CPU/内存), UDS 广播给 fusion-studio 仪表盘
+// fe-telemetry — real-time telemetry sampling (GPU/CPU/memory), broadcast over UDS to the
+// fusion-studio dashboard
 //
-// 设计: CPU/内存本地采样 (sysinfo), GPU 数据由调用方注入 (executor 不跑模型,
-// 不持有 GPU 句柄)。10Hz 采样 → mpsc<telemetry::TelemetrySample> 流。
-// Executor 不跨请求累积状态: 每次 telemetry_stream() 返回独立流 + JoinHandle。
+// Design: CPU/memory sampled locally (sysinfo), GPU data injected by the caller (executor
+// does not run models and holds no GPU handles). 10Hz sampling → mpsc<telemetry::TelemetrySample>
+// stream. The executor accumulates no cross-request state: every telemetry_stream() returns
+// an independent stream + JoinHandle.
 
 use std::time::{Duration, SystemTime};
 
@@ -11,54 +13,63 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-/// 单帧遥测样本 — CPU/内存本机采样, GPU 可选 (调用方注入)
+/// One telemetry sample frame — local CPU/memory sampling, optional GPU (caller-injected)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetrySample {
-    /// 采样时间戳 (毫秒, 调用方纪元)
+    /// Sample timestamp (ms, caller epoch)
     pub ts_ms: u64,
-    /// 进程 CPU 占用百分比 (0-100, 单核倍数; sysinfo cpu_usage)
+    /// Process CPU usage percentage (0-100, multi-core multiples; sysinfo cpu_usage)
     pub cpu_pct: f32,
-    /// 进程常驻内存 (MB)
+    /// Process resident memory (MB)
     pub mem_mb: f64,
-    /// GPU 占用百分比 (调用方注入; None = 本机不采样)
+    /// GPU usage percentage (caller-injected; None = not sampled on this host)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_pct: Option<f32>,
-    /// GPU 显存占用 (MB, 调用方注入)
+    /// GPU VRAM usage (MB, caller-injected)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_mem_mb: Option<f64>,
-    /// 关联任务 id (透传请求侧)
+    /// Associated task id (passed through from the request side)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
 }
 
 impl TelemetrySample {
-    /// M-11: GPU 注入字段 sanitize — NaN/Inf/负数 (serde_json 渲染 NaN→null 丢信息, 负数语义错)
-    /// → None (告警系统读 null = "无 GPU 数据" 而非 "调用方传了脏数据", 宁静默丢坏值不留假信号)
+    /// M-11: sanitize GPU-injected fields — NaN/Inf/negative (serde_json renders NaN→null
+    /// losing information, negative values are semantically wrong) → None (the alerting
+    /// system reads null as "no GPU data" rather than "caller sent dirty data"; better to
+    /// silently drop bad values than leave a false signal)
     pub fn sanitize_gpu(&mut self) {
         if let Some(g) = self.gpu_pct {
             if !g.is_finite() || g < 0.0 {
-                warn!(gpu_pct = g, "GPU pct 异常值 (NaN/Inf/负数), 置 None");
+                warn!(
+                    gpu_pct = g,
+                    "GPU pct invalid value (NaN/Inf/negative), set to None"
+                );
                 self.gpu_pct = None;
             }
         }
         if let Some(g) = self.gpu_mem_mb {
             if !g.is_finite() || g < 0.0 {
-                warn!(gpu_mem_mb = g, "GPU mem 异常值 (NaN/Inf/负数), 置 None");
+                warn!(
+                    gpu_mem_mb = g,
+                    "GPU mem invalid value (NaN/Inf/negative), set to None"
+                );
                 self.gpu_mem_mb = None;
             }
         }
     }
 }
 
-/// 遥测采样参数
+/// Telemetry sampling configuration
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
-    /// 采样间隔 (默认 100ms = 10Hz)
+    /// Sampling interval (default 100ms = 10Hz)
     pub interval_ms: u64,
-    /// 最大帧数 (默认 0 = 无限, 直至调用方丢弃 rx)
+    /// Max frames (default 0 = unlimited, until the caller drops rx)
     pub max_samples: u64,
-    /// 采样目标进程 PID (L-15) — None 时采样 executor 自身 (当前行为, 文档化)。
-    /// 真实任务遥测: 调用方从 SandboxResult.pid 传入沙箱子进程 PID。
+    /// Target process PID to sample (L-15) — None samples the executor itself (current
+    /// behavior, documented). Real task telemetry: the caller passes the sandbox child PID
+    /// from SandboxResult.pid.
     pub pid: Option<u32>,
 }
 
@@ -72,47 +83,61 @@ impl Default for TelemetryConfig {
     }
 }
 
-/// 启动遥测采样流 — 在指定 runtime handle 上 spawn, 返回 (Receiver, JoinHandle)。
-/// spawn 任务按 interval 采样 CPU/内存 (sysinfo), GPU 字段由调用方在每次帧后
-/// 通过 inject 路径填入 (此处仅产出 None; 注入由 fe-core 包装层完成)。
+/// Start a telemetry sampling stream — spawn on the given runtime handle, return
+/// (Receiver, JoinHandle). The spawned task samples CPU/memory per interval (sysinfo);
+/// GPU fields are filled in by the caller after each frame via the inject path (this
+/// layer only emits None; injection is done by the fe-core wrapper).
 ///
-/// 停止契约 (A-9): 主导路径 = 调用方丢弃 receiver → send 失败 → 任务退出。
-/// max_samples>0 达此值也结束。JoinHandle drop = detach (tokio 约定), 非僵尸
-/// (receiver drop 即停)。缓冲 64 — 10Hz 下 6.4s stall 容忍。
+/// Stop contract (A-9): the dominant path = caller drops the receiver → send fails → task
+/// exits. max_samples>0 also ends at that count. Dropping the JoinHandle = detach (tokio
+/// convention), not a zombie (receiver drop stops it). Buffer 64 — tolerates a 6.4s
+/// consumer stall at 10Hz.
 ///
-/// PID 语义 (L-15): cfg.pid=None 采样 executor 自身 (默认, 当前行为);
-/// 传入沙箱子进程 PID (从 SandboxResult.pid) 采样真实任务进程。
-/// PID 消失 (子进程退出) → warn 跳帧, 不静默发 0 (P-7)。
+/// PID semantics (L-15): cfg.pid=None samples the executor itself (default, current
+/// behavior); pass the sandbox child PID (from SandboxResult.pid) to sample the real task
+/// process. PID gone (child exited) → warn and skip the frame, never silently emit 0 (P-7).
 pub fn start_stream(
     cfg: TelemetryConfig,
     rt: tokio::runtime::Handle,
 ) -> (mpsc::Receiver<TelemetrySample>, JoinHandle<()>) {
-    // A-9: 缓冲 64 — 10Hz 下 6.4s 消费者 stall 才阻塞 send, ts_ms 漂移容忍窗口宽于旧 16
+    // A-9: buffer 64 — at 10Hz a consumer stall of 6.4s is needed to block send; drift
+    // tolerance window for ts_ms is wider than the old 16
     let (tx, rx) = mpsc::channel(64);
     let handle = rt.spawn(async move {
-        // P-7: new_all 建全进程表基线 (单 PID refresh 在全新 System 上 mem 可能 0);
-        // 循环内再窄到单 PID refresh 省 CPU。macOS libproc 怪癖: 全表建内存基线稳。
+        // P-7: new_all builds a full process-table baseline (single-PID refresh on a fresh
+        // System may report mem 0); narrowing to a single-PID refresh inside the loop saves
+        // CPU. macOS libproc quirk: building the memory baseline from the full table is stable.
         let mut sys = sysinfo::System::new_all();
-        // L-15 + RUN-11: pid=None 采样 executor 自身 — 仅 ops 自监控场景合法, 非 sandbox 任务遥测。
-        // 审计 RUN-11: 默认采 executor 会让任务遥测读成空载 broker, 容量决策误导。
-        // 保留 None=采自身 (back-compat, ops 自监控合法), 但 warn fail-loud 让 "采的是 executor 非任务" 可见;
-        // sandbox 任务遥测调用方须从 ExecutionResult.pid 传入真实子进程 PID (4 层已暴露)。
+        // L-15 + RUN-11: pid=None samples the executor itself — legal only for the ops
+        // self-monitoring scenario, not sandbox task telemetry.
+        // Audit RUN-11: defaulting to the executor makes task telemetry read as an idle
+        // broker, misleading capacity decisions.
+        // Keep None=samples-self (back-compat, legal for ops self-monitoring), but warn
+        // fail-loud so "sampling the executor, not the task" is visible;
+        // sandbox task telemetry callers must pass the real child PID from
+        // ExecutionResult.pid (exposed across all 4 layers).
         let raw_pid = cfg.pid.unwrap_or_else(|| {
             warn!(
-                "telemetry pid=None — 采样 executor 自身 (非 sandbox 任务). \
-                 sandbox 任务遥测须从 ExecutionResult.pid 传入子进程 PID, 否则读空载 broker (RUN-11)"
+                "telemetry pid=None — sampling the executor itself (not a sandbox task). \
+                 sandbox task telemetry must pass the child PID from ExecutionResult.pid, \
+                 otherwise it reads an idle broker (RUN-11)"
             );
             std::process::id()
         });
         let pid = sysinfo::Pid::from_u32(raw_pid);
-        info!(interval_ms = cfg.interval_ms, pid = raw_pid, "遥测采样启动");
-        // L-TEL-03: 0 = 未指定用默认 100ms; <10 提至 10ms 防 CPU 霸占 (warn 显式, 非静默夹紧)
+        info!(
+            interval_ms = cfg.interval_ms,
+            pid = raw_pid,
+            "telemetry sampling started"
+        );
+        // L-TEL-03: 0 = unspecified, use default 100ms; <10 raised to 10ms to prevent CPU
+        // hogging (warn explicitly, not a silent clamp)
         let interval_ms = if cfg.interval_ms == 0 {
             100
         } else if cfg.interval_ms < 10 {
             warn!(
                 requested = cfg.interval_ms,
-                "interval_ms < 10, 提升至 10ms 防 CPU 霸占"
+                "interval_ms < 10, raised to 10ms to prevent CPU hogging"
             );
             10
         } else {
@@ -121,27 +146,34 @@ pub fn start_stream(
         let interval = Duration::from_millis(interval_ms);
         let mut count: u64 = 0;
         let kind = sysinfo::ProcessRefreshKind::new().with_memory().with_cpu();
-        // L-TEL-02: 命令前先刷新一次建基线, 首帧 sleep+刷新即得真实 delta
-        // (旧版无基线刷新, 首帧 cpu_usage 恒 0.0 — sysinfo 需两次刷新间隔才准)
+        // L-TEL-02: refresh once before the loop to build a baseline, so the first frame's
+        // sleep+refresh yields a real delta (the old version had no baseline refresh, so the
+        // first frame's cpu_usage was always 0.0 — sysinfo needs two refreshes spaced apart)
         sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), false, kind);
         loop {
             tokio::time::sleep(interval).await;
             sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), false, kind);
             let proc = sys.process(pid);
-            // P-7: 进程消失 (子进程已退出或 executor PID 异常) — 非静默发 0, warn fail-loud 后跳帧
+            // P-7: process gone (child exited or executor PID anomaly) — not a silent 0,
+            // warn fail-loud then skip the frame
             let (cpu_pct, mem_mb) = match proc {
                 Some(p) => (p.cpu_usage(), (p.memory() as f64) / (1024.0 * 1024.0)),
                 None => {
-                    // P-7: 进程消失 (子进程已退出或 executor PID 异常) — 非静默发 0, warn 后跳帧
-                    warn!(pid = raw_pid, "采样进程消失, 跳帧 (子进程已退出?)");
+                    // P-7: process gone (child exited or executor PID anomaly) — not a
+                    // silent 0, warn then skip the frame
+                    warn!(
+                        pid = raw_pid,
+                        "sampled process gone, skipping frame (child exited?)"
+                    );
                     if tx.is_closed() {
-                        info!("遥测通道关闭 (调用方丢弃), 停止采样");
+                        info!("telemetry channel closed (caller dropped it), stopping sampling");
                         break;
                     }
                     continue;
                 }
             };
-            // L-TEL-01: 墙钟时间戳 (旧版 interval_ms*count 假计数, 非真实时刻)
+            // L-TEL-01: wall-clock timestamp (the old version's interval_ms*count was a fake
+            // counter, not a real point in time)
             let ts_ms = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -154,15 +186,16 @@ pub fn start_stream(
                 gpu_mem_mb: None,
                 task_id: None,
             };
-            // M-11: GPU 注入字段 sanitize (此处恒 None, 留边界给 fe-core 注入路径)
+            // M-11: sanitize GPU-injected fields (always None here; boundary left for the
+            // fe-core injection path)
             sample.sanitize_gpu();
             count += 1;
             if tx.send(sample).await.is_err() {
-                info!("遥测通道关闭 (调用方丢弃), 停止采样");
+                info!("telemetry channel closed (caller dropped it), stopping sampling");
                 break;
             }
             if cfg.max_samples > 0 && count >= cfg.max_samples {
-                info!(count, "遥测达 max_samples, 结束");
+                info!(count, "telemetry reached max_samples, ending");
                 break;
             }
         }
@@ -187,16 +220,17 @@ mod tests {
             samples.push(s);
         }
         let _ = handle.await;
-        assert_eq!(samples.len(), 3, "应产出 3 帧");
+        assert_eq!(samples.len(), 3, "expected 3 frames");
         assert!(samples[0].cpu_pct >= 0.0);
-        assert!(samples[0].mem_mb > 0.0, "本进程内存非零");
-        // L-TEL-01: ts_ms 墙钟 (非假计数); 单调递增, 末帧 > 首帧 (≈2*20ms 间隔)
-        assert!(samples[0].ts_ms > 0, "墙钟时间戳非零");
+        assert!(samples[0].mem_mb > 0.0, "this process's memory is non-zero");
+        // L-TEL-01: ts_ms is wall clock (not a fake counter); monotonically increasing,
+        // last frame > first frame (≈2*20ms intervals)
+        assert!(samples[0].ts_ms > 0, "wall-clock timestamp is non-zero");
         assert!(
             samples[2].ts_ms > samples[0].ts_ms,
-            "末帧 ts > 首帧 (单调递增)"
+            "last frame ts > first frame (monotonically increasing)"
         );
-        assert!(samples[0].gpu_pct.is_none(), "默认 GPU 不注入");
+        assert!(samples[0].gpu_pct.is_none(), "GPU not injected by default");
     }
 
     #[tokio::test]
@@ -228,7 +262,7 @@ mod tests {
         assert_eq!(back.task_id, Some("t1".into()));
     }
 
-    // M-11: GPU sanitize — NaN/Inf/负数 → None, 正常值保留
+    // M-11: GPU sanitize — NaN/Inf/negative → None, valid values kept
     #[test]
     fn sanitize_gpu_drops_bad_values() {
         let mut s = TelemetrySample {
@@ -252,8 +286,8 @@ mod tests {
             task_id: None,
         };
         neg.sanitize_gpu();
-        assert!(neg.gpu_pct.is_none(), "负数 gpu_pct → None");
-        assert!(neg.gpu_mem_mb.is_none(), "负数 gpu_mem → None");
+        assert!(neg.gpu_pct.is_none(), "negative gpu_pct → None");
+        assert!(neg.gpu_mem_mb.is_none(), "negative gpu_mem → None");
 
         let mut ok = TelemetrySample {
             ts_ms: 1,
@@ -264,26 +298,27 @@ mod tests {
             task_id: None,
         };
         ok.sanitize_gpu();
-        assert_eq!(ok.gpu_pct, Some(50.0), "正常值保留");
-        assert_eq!(ok.gpu_mem_mb, Some(2048.0), "正常值保留");
+        assert_eq!(ok.gpu_pct, Some(50.0), "valid value kept");
+        assert_eq!(ok.gpu_mem_mb, Some(2048.0), "valid value kept");
     }
 
-    // L-15 + P-7: 指定不存在 PID — 进程消失跳帧, 不静默发 0, 通道空
+    // L-15 + P-7: non-existent PID — process gone skips frames, no silent 0, channel empty
     #[tokio::test]
     async fn pid_gone_skips_frames() {
         let cfg = TelemetryConfig {
             interval_ms: 10,
             max_samples: 5,
-            pid: Some(u32::MAX), // 几乎肯定无此 PID
+            pid: Some(u32::MAX), // almost certainly no such PID
         };
         let (mut rx, handle) = start_stream(cfg, tokio::runtime::Handle::current());
-        // 短超时: 应无帧 (进程消失跳帧), max_samples 永远不达 → 依赖超时证空
+        // Short timeout: expect no frames (process-gone frame skip), max_samples never
+        // reached → rely on the timeout to prove emptiness
         let got = tokio::time::timeout(Duration::from_millis(80), rx.recv()).await;
         drop(rx);
         let _ = handle.await;
         assert!(
             got.is_err() || got.unwrap().is_none(),
-            "不存在 PID 应跳帧, 通道空 (无 0 帧)"
+            "non-existent PID should skip frames, channel empty (no zero frames)"
         );
     }
 }

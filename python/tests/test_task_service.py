@@ -19,7 +19,7 @@ async def tm(tmp_path):
 
 @pytest.fixture
 def scripts(tmp_path):
-    # 白名单外 binary (sleep/false) 会被安全守卫拦截 — 用 python3 脚本代替
+    # binaries outside the whitelist (sleep/false) are blocked by the security guard — use python3 scripts instead
     d = tmp_path / "scripts"
     d.mkdir()
     (d / "sleep.py").write_text("import sys, time\ntime.sleep(float(sys.argv[1]))\n")
@@ -46,7 +46,7 @@ async def wait_state(m: TaskManager, task_id: str, *states: TaskState, timeout: 
             return st
         await asyncio.sleep(0.02)
     st = m.status(task_id)
-    pytest.fail(f"task {task_id} 未达 {states}, 当前 {st.state} reason={st.failure_reason}")
+    pytest.fail(f"task {task_id} did not reach {states}, now {st.state} reason={st.failure_reason}")
 
 
 def test_state_machine_constants():
@@ -96,7 +96,7 @@ async def test_shell_task_fail_no_retry(tm: TaskManager, scripts):
 
 
 async def test_shell_task_retry_then_done(tm: TaskManager, tmp_path, scripts):
-    # 第 1 次失败 (flag 文件不存在), 第 2 次成功 (自建 flag) — 验证重试 + 退避
+    # 1st run fails (flag file missing), 2nd succeeds (creates the flag) — verifies retry + backoff
     flag = tmp_path / "flag"
     task_id = tm.submit_shell(
         f"python3 {scripts / 'flag.py'} {flag}",
@@ -114,7 +114,7 @@ async def test_shell_task_retry_exhausted(tm: TaskManager, scripts):
         retry=RetryPolicy(max_retries=1, backoff_initial_sec=0.05),
     )
     st = await wait_state(tm, task_id, TaskState.FAILED)
-    assert st.attempts == 2  # 1 次原始 + 1 次重试
+    assert st.attempts == 2  # 1 original + 1 retry
     assert "exit_code=3" in (st.failure_reason or "")
 
 
@@ -122,13 +122,13 @@ async def test_shell_task_progress(tm: TaskManager, scripts):
     cmd = f"echo 'TASK_PROGRESS: 0.5' && python3 {scripts / 'sleep.py'} 0.3 && echo done-marker"
     task_id = tm.submit_shell(cmd, timeout_sec=30)
     st = await wait_state(tm, task_id, TaskState.DONE)
-    # 最终 progress=1.0 (done); 过程中应有 >=0.5 记录 — 靠轮询间隔 0.05s 覆盖 0.3s sleep
+    # final progress=1.0 (done); intermediate records should include >=0.5 — poll interval 0.05s covers the 0.3s sleep
     assert st.state == TaskState.DONE
     assert "done-marker" in (tm.result(task_id) or {}).get("output", "")
 
 
 async def test_shell_task_security_blocked(tm: TaskManager):
-    # 危险命令被安全守卫拦截 — 立即 failed 且带 blocked 原因
+    # dangerous command blocked by the security guard — immediate failed with a blocked reason
     task_id = tm.submit_shell("rm -rf /")
     st = await wait_state(tm, task_id, TaskState.FAILED)
     assert st.attempts == 1
@@ -180,12 +180,12 @@ async def test_async_task_failure_reason(tm: TaskManager):
 
 
 async def test_cancel_queued(tmp_path, scripts):
-    # max_workers=1 — blocker 占住唯一 worker, 第二任务停留 queued 可取消
+    # max_workers=1 — the blocker occupies the only worker, the second task stays queued and cancellable
     m = TaskManager(tmp_path / "q", max_workers=1, poll_interval_sec=0.05)
     await m.start()
     try:
         blocker = m.submit_shell(f"python3 {scripts / 'sleep.py'} 2", timeout_sec=10)
-        await asyncio.sleep(0.2)  # 让 worker 抢占 blocker
+        await asyncio.sleep(0.2)  # let the worker pick up the blocker
         assert m.status(blocker).state == TaskState.RUNNING
         task_id = m.submit_shell("echo late", timeout_sec=10)
         assert m.status(task_id).state == TaskState.QUEUED
@@ -224,18 +224,18 @@ async def test_cancel_running_async(tm: TaskManager):
 
 async def test_persistence_across_restart(tmp_path):
     data_dir = tmp_path / "tasks"
-    m1 = TaskManager(data_dir)  # 不 start — 任务停留 queued
+    m1 = TaskManager(data_dir)  # not started — task stays queued
     task_id = m1.submit_shell("echo persisted", name="p1")
     assert m1.status(task_id).state == TaskState.QUEUED
     m1.close()
 
     m2 = TaskManager(data_dir, poll_interval_sec=0.05)
-    st = m2.status(task_id)  # 跨重启读取
+    st = m2.status(task_id)  # read across restart
     assert st.state == TaskState.QUEUED
     assert st.name == "p1"
     await m2.start()
     st = await wait_state(m2, task_id, TaskState.DONE)
-    m2.close()  # 双 close 由 fixture 外手动
+    m2.close()  # double close handled manually outside the fixture
 
 
 async def test_async_factory_lost_after_restart(tmp_path):
@@ -246,7 +246,7 @@ async def test_async_factory_lost_after_restart(tmp_path):
         return 1
 
     task_id = m1.submit_async(factory)
-    m1.close()  # factory 闭包随进程消失
+    m1.close()  # the factory closure dies with the process
 
     m2 = TaskManager(data_dir, poll_interval_sec=0.05)
     await m2.start()

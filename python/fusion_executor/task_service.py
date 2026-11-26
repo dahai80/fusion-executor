@@ -20,15 +20,15 @@ from .executor import FusionSandboxExecutor
 
 logger = logging.getLogger("fusion_executor.task_service")
 
-# Issue #57: 共享异步批量任务服务 — 通用 task_id 轮询 / 状态机 / 重试退避 / 结果导出。
-# 各业务应用 (~/fusion/business/*) 不再各自造 SQLite 队列 + worker。
-# 设计: 纯 Python 层组件 (同 agent_loop/laya_tool_selector), Executor 保持 stateless (M-ARCH-1);
-#       shell 任务复用 executor 后台 shell (shell_start/shell_output/kill_shell) — 继承安全守卫/seatbelt,
-#       天然获得运行中取消 + 增量进度解析。
+# Issue #57: shared async batch-task service — generic task_id polling / state machine / retry backoff / result export.
+# Business apps (~/fusion/business/*) no longer build their own SQLite queue + worker.
+# Design: a pure-Python layer component (same as agent_loop/laya_tool_selector), the Executor stays stateless (M-ARCH-1);
+#       shell tasks reuse the executor's background shells (shell_start/shell_output/kill_shell) — inheriting the security
+#       guard/seatbelt, and naturally gaining running-cancel + incremental progress parsing.
 
 _STRICT = ConfigDict(extra="forbid")
 
-# shell 任务进度协议: 子进程输出一行 "TASK_PROGRESS: 0.42" (0..1) 即上报进度
+# shell task progress protocol: the child prints one line "TASK_PROGRESS: 0.42" (0..1) to report progress
 _PROGRESS_RE = re.compile(r"TASK_PROGRESS:\s*([0-9]*\.?[0-9]+)")
 
 _DEFAULT_TIMEOUT_SEC = 600.0
@@ -100,11 +100,11 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 
 class TaskManager:
-    """共享异步批量任务管理器 (Issue #57)。
+    """Shared async batch-task manager (Issue #57).
 
-    状态机: queued → running → done/failed; 失败且未耗尽重试 → queued (带退避 next_retry_at)。
-    持久化: SQLite (data_dir/tasks.db) — 跨进程重启存活 (async 任务闭包除外, 重启后标 failed)。
-    信任边界: 进程内组件 — 宿主应用自身做 fusion-identity 鉴权 (业务应用已持有 FUSION_CLIENT_KEY)。
+    State machine: queued → running → done/failed; on failure with retries left → queued (with backoff next_retry_at).
+    Persistence: SQLite (data_dir/tasks.db) — survives process restarts (except async task closures, marked failed after restart).
+    Trust boundary: in-process component — the host app performs fusion-identity auth itself (business apps already hold FUSION_CLIENT_KEY).
     """
 
     def __init__(
@@ -116,9 +116,9 @@ class TaskManager:
         poll_interval_sec: float = 0.1,
     ) -> None:
         if max_workers < 1:
-            raise ValueError(f"max_workers 须 >= 1, 得 {max_workers!r}")
+            raise ValueError(f"max_workers must be >= 1, got {max_workers!r}")
         if poll_interval_sec <= 0:
-            raise ValueError(f"poll_interval_sec 须为正数, 得 {poll_interval_sec!r}")
+            raise ValueError(f"poll_interval_sec must be positive, got {poll_interval_sec!r}")
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.executor = executor or FusionSandboxExecutor()
@@ -137,7 +137,7 @@ class TaskManager:
         self._async_factories: dict[str, Callable[..., Awaitable[Any]]] = {}
         logger.info("TaskManager init db=%s max_workers=%s poll=%.2fs", self._db, max_workers, poll_interval_sec)
 
-    # ---------- 生命周期 ----------
+    # ---------- lifecycle ----------
 
     async def start(self) -> None:
         if self._workers:
@@ -161,7 +161,7 @@ class TaskManager:
         self._conn.close()
         logger.info("TaskManager closed db=%s", self._db)
 
-    # ---------- 提交 ----------
+    # ---------- submit ----------
 
     def submit_shell(
         self,
@@ -173,9 +173,9 @@ class TaskManager:
         retry: RetryPolicy | None = None,
     ) -> str:
         if not isinstance(command, str) or not command.strip():
-            raise ValueError("command 必须为非空 str")
+            raise ValueError("command must be a non-empty str")
         if timeout_sec <= 0:
-            raise ValueError(f"timeout_sec 须为正数, 得 {timeout_sec!r}")
+            raise ValueError(f"timeout_sec must be positive, got {timeout_sec!r}")
         rp = retry or RetryPolicy()
         task_id = f"t-{uuid.uuid4().hex[:12]}"
         now = time.time()
@@ -217,7 +217,7 @@ class TaskManager:
         retry: RetryPolicy | None = None,
     ) -> str:
         if not callable(factory):
-            raise TypeError("factory 必须为 callable 返回 Awaitable")
+            raise TypeError("factory must be a callable returning an Awaitable")
         rp = retry or RetryPolicy()
         task_id = f"t-{uuid.uuid4().hex[:12]}"
         now = time.time()
@@ -242,7 +242,7 @@ class TaskManager:
         self._wake.set()
         return task_id
 
-    # ---------- 查询 / 导出 ----------
+    # ---------- query / export ----------
 
     def status(self, task_id: str) -> TaskStatus:
         row = self._get(task_id)
@@ -307,12 +307,12 @@ class TaskManager:
         logger.info("task cancel no-op id=%s state=%s", task_id, state)
         return False
 
-    # ---------- 内部 ----------
+    # ---------- internal ----------
 
     def _get(self, task_id: str) -> sqlite3.Row:
         row = self._conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         if row is None:
-            raise KeyError(f"task 不存在: {task_id}")
+            raise KeyError(f"task not found: {task_id}")
         return row
 
     def _to_status(self, row: sqlite3.Row) -> TaskStatus:
@@ -368,7 +368,7 @@ class TaskManager:
                     await self._run_shell(row)
                 else:
                     await self._run_async(row)
-            except Exception as e:  # worker 兜底 — 单任务异常不杀 worker (Rule 12 log)
+            except Exception as e:  # worker fallback — a single task's exception must not kill the worker (Rule 12 log)
                 logger.exception("task worker %d crash on id=%s", idx, row["task_id"])
                 self._handle_failure(row["task_id"], f"worker internal error: {e!r}")
 
@@ -400,7 +400,7 @@ class TaskManager:
                 return
             so = self.executor.shell_output(shell_id)
             out = so.output or ""
-            if len(out) < last_len:  # tail 截断回卷 — 重新解析
+            if len(out) < last_len:  # tail truncation wrapped around — re-parse
                 last_len = 0
             new = out[last_len:]
             last_len = len(out)
@@ -511,5 +511,7 @@ class TaskManager:
             ),
         )
         self._conn.commit()
-        self._async_factories.pop(task_id, None)  # 终态才释放 — 重试轮次间保留 factory
+        self._async_factories.pop(
+            task_id, None
+        )  # release only on a terminal state — keep the factory across retry rounds
         logger.info("task finish id=%s state=%s", task_id, state.value)

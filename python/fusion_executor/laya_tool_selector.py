@@ -13,14 +13,14 @@ from .models import ToolDecision
 
 logger = logging.getLogger("fusion_executor.laya")
 
-# Issue #60 (config Phase 2.2): key/URL 解析单点化 — fusion_core.config, 本仓不自抄
-# _resolve 函数, 不留 secret 默认值字面量 (config-conventions §3 prod 非法)。
-# client_key: 新名 + 迁移期旧名别名链 (fusion_core 内收敛, 本仓不引用旧名);
-# dev 缺省 "" + warning, prod 缺省 RuntimeError。
-# default_mlx_base_url: 默认 http://localhost:11434/v1。
+# Issue #60 (config Phase 2.2): single-point key/URL resolution — fusion_core.config; this repo does not
+# copy _resolve functions and keeps no secret default-value literals (config-conventions §3 illegal in prod).
+# client_key: new name + legacy-name alias chain during migration (converged inside fusion_core; this repo never references the old name);
+# dev missing key = "" + warning, prod missing key = RuntimeError.
+# default_mlx_base_url: default http://localhost:11434/v1.
 
-# Issue #46: 默认工具白名单 — 覆盖 fusion-executor 自有工具 + 常见 agent 工具。
-# 调用方可传 whitelist dict 覆盖 (不同 workflow 不同工具集)。
+# Issue #46: default tool whitelist — covers fusion-executor's own tools + common agent tools.
+# Callers can pass a whitelist dict to override (different workflows use different tool sets).
 DEFAULT_TOOL_WHITELIST: dict[str, str] = {
     "code_search": "search the codebase for text, functions, variables, or symbols (grep/find/locate)",
     "file_edit": "modify existing file content (edit, patch, replace function)",
@@ -32,10 +32,10 @@ DEFAULT_TOOL_WHITELIST: dict[str, str] = {
     "none": "no tool needed, direct LLM response (greeting, question, conversation)",
 }
 
-# 参数槽位定义: tool_id -> list of (slot_name, question_type, instructions, criteria)
-# noul: yes/no 判断 "请求是否指定了 X" → 是则 regex 提取值
-# score: 0-N 评分 → 映射整数 (如结果数量)
-# 保持简单 — laya 判断参数是否出现, regex 提取值 (Rule 5: 能确定性的不用模型)
+# Parameter slot definitions: tool_id -> list of (slot_name, question_type, instructions, criteria)
+# noul: yes/no judgment "does the request specify X" → if yes, regex-extract the value
+# score: 0-N rating → mapped to an integer (e.g. result count)
+# Keep it simple — laya judges whether a parameter appears, regex extracts the value (Rule 5: deterministic when possible, no model)
 PARAM_SLOTS: dict[str, list[dict[str, Any]]] = {
     "file_edit": [
         {
@@ -65,7 +65,7 @@ PARAM_SLOTS: dict[str, list[dict[str, Any]]] = {
             "type": "score",
             "instructions": "How many results should the search return? (0=few, 10=many)",
             "criteria": ["0 results", "1 result", "3 results", "5 results", "10 results", "20 results"],
-            "scale": 1,  # score 值 × scale = 近似数量
+            "scale": 1,  # score value × scale = approximate count
         },
     ],
     "shell_exec": [
@@ -73,6 +73,7 @@ PARAM_SLOTS: dict[str, list[dict[str, Any]]] = {
             "slot": "command",
             "type": "noul",
             "instructions": "Does the request specify a shell command to run?",
+            # i18n: user-facing - fullwidth colon inside the pattern is functional (matches CJK input)
             "extract": r'(?:run|execute|exec)\s+(?:(?:the|a|an|this|that|following)\s+)*(?:(?:command|cmd)\s*[:：]?\s+)?["\']?(.+?)["\']?(?:\s+in\s+|$)',
         },
     ],
@@ -104,16 +105,17 @@ PARAM_SLOTS: dict[str, list[dict[str, Any]]] = {
 
 
 class LayaToolSelector:
-    """Issue #46: 基于 laya-mlx choice 原语的确定性工具选择器。
+    """Issue #46: deterministic tool selector based on the laya-mlx choice primitive.
 
-    替代 LLM 自由生成 tool call JSON — laya 从白名单中确定性选择工具,
-    输出结构化 choice + 置信度, 消除 malformed JSON 和幻觉工具调用。
+    Replaces LLM free-form tool-call JSON generation — laya deterministically picks a tool
+    from the whitelist, emitting a structured choice + confidence, eliminating malformed
+    JSON and hallucinated tool calls.
 
-    直接调 laya_mlx.Agent.system_one (Python API), 不经 fusion-mlx HTTP —
-    更低延迟 (warm 5-7ms vs HTTP round-trip), 无上游 endpoint 依赖。
+    Calls laya_mlx.Agent.system_one directly (Python API), bypassing the fusion-mlx HTTP —
+    lower latency (warm 5-7ms vs HTTP round-trip), no upstream endpoint dependency.
 
-    置信度门槛用 answer_confidence (max prob), 非 entropy confidence —
-    laya-mlx confidence.py 明确 entropy "not calibrated" 不跨 option 数迁移。
+    The confidence gate uses answer_confidence (max prob), not entropy confidence —
+    laya-mlx confidence.py states entropy is "not calibrated" and does not transfer across option counts.
     """
 
     def __init__(
@@ -129,24 +131,24 @@ class LayaToolSelector:
         api_key: str | None = None,
     ) -> None:
         if min_confidence < 0 or min_confidence > 1:
-            raise ValueError(f"min_confidence 须在 [0,1], got {min_confidence}")
+            raise ValueError(f"min_confidence must be in [0,1], got {min_confidence}")
         if backend not in ("python", "http"):
-            raise ValueError(f"backend 须为 'python' | 'http', got {backend!r}")
+            raise ValueError(f"backend must be 'python' | 'http', got {backend!r}")
         self.min_confidence = min_confidence
         self.model_id = model_id
         self.subfolder = subfolder
         self.backend = backend
 
-        # 指标计数器 (进程内, 非 Prometheus — Python 层决策, 不经 UDS)
+        # Metric counters (in-process, not Prometheus — Python-layer decisions, not routed over UDS)
         self._metrics = Counter()
 
         if backend == "http":
-            # AC1: HTTP backend — 经 fusion-mlx /v1/laya/decide, 不加载本地模型。
-            # 无需 laya_mlx import / 模型缓存, 适合远程调用 + AC 字面满足。
+            # AC1: HTTP backend — goes through fusion-mlx /v1/laya/decide, no local model loaded.
+            # No laya_mlx import / model cache needed; fits remote calls + literal AC satisfaction.
             import httpx
 
-            # Issue #60: 显式 api_key 优先; 缺省走 fusion_core client_key() 单点解析
-            # (dev 缺 key = "" + warning / prod 缺 key = RuntimeError, 无默认值字面量)。
+            # Issue #60: explicit api_key wins; the default goes through the fusion_core client_key() single-point
+            # resolution (dev missing key = "" + warning / prod missing key = RuntimeError, no default-value literal).
             key = api_key or client_key()
             base_url = (mlx_url or default_mlx_base_url()).rstrip("/")
             self._http_client = httpx.Client(timeout=30.0, headers={"Authorization": f"Bearer {key}"})
@@ -154,8 +156,8 @@ class LayaToolSelector:
             logger.info("LayaToolSelector HTTP backend: %s (model=%s)", self._decide_url, model_id)
             return
 
-        # HF 模型缓存位置 — 默认 ~/.fusion-mlx/models (fusion monorepo 约定)
-        # HF_HUB_CACHE env 覆盖; 镜像站 HF_MIRROR=https://hf-mirror.com (用户规则)
+        # HF model cache location — default ~/.fusion-mlx/models (fusion monorepo convention)
+        # HF_HUB_CACHE env overrides; mirror site HF_MIRROR=https://hf-mirror.com (user rule)
         cache = hf_cache or os.environ.get("HF_HUB_CACHE") or os.path.expanduser("~/.fusion-mlx/models")
         if os.path.isdir(cache) and not os.environ.get("HF_HUB_CACHE"):
             os.environ["HF_HUB_CACHE"] = cache
@@ -164,33 +166,33 @@ class LayaToolSelector:
             from laya_mlx import Agent
         except ImportError as e:
             raise ImportError(
-                "laya-mlx 未安装 — pip install laya-mlx (或 source .venv/bin/activate 共享 venv). "
-                "Issue #46 确定性工具调用依赖 laya-mlx runtime. "
-                "或用 backend='http' 经 fusion-mlx HTTP (无需本地 laya_mlx)."
+                "laya-mlx is not installed — pip install laya-mlx (or source .venv/bin/activate for the shared venv). "
+                "Issue #46 deterministic tool calling depends on the laya-mlx runtime. "
+                "Alternatively use backend='http' via fusion-mlx HTTP (no local laya_mlx needed)."
             ) from e
 
-        logger.info("加载 laya 模型 %s (subfolder=%s, device=%s)", model_id, subfolder, device or "auto")
+        logger.info("loading laya model %s (subfolder=%s, device=%s)", model_id, subfolder, device or "auto")
         t0 = time.perf_counter()
         self._agent = (
             Agent(model_id, subfolder=subfolder, device=device) if subfolder else Agent(model_id, device=device)
         )
         load_ms = (time.perf_counter() - t0) * 1000
-        logger.info("laya 模型加载完成 %.0fms", load_ms)
+        logger.info("laya model loaded in %.0fms", load_ms)
 
     def _invoke(self, state: str, questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        """统一调用入口 — 按 backend 分发到 Python API 或 HTTP endpoint。
+        """Unified invoke entry — dispatches to the Python API or HTTP endpoint by backend.
 
-        两条路径返回相同结构: {answers: {qid: {choice/confidence/probabilities/...}}, usage, ...}
+        Both paths return the same shape: {answers: {qid: {choice/confidence/probabilities/...}}, usage, ...}
         """
         if self.backend == "http":
             return self._invoke_http(state, questions)
         return self._agent.system_one(state, questions)
 
     def _invoke_http(self, state: str, questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        """AC1: HTTP backend — POST /v1/laya/decide with custom questions。
+        """AC1: HTTP backend — POST /v1/laya/decide with custom questions.
 
-        fusion-mlx laya endpoint 接受 {prompt, questions, model?}, 返回
-        {model, answers: {qid: {choice, confidence, probabilities, ...}}, usage, latency_ms}。
+        The fusion-mlx laya endpoint accepts {prompt, questions, model?} and returns
+        {model, answers: {qid: {choice, confidence, probabilities, ...}}, usage, latency_ms}.
         """
         payload: dict[str, Any] = {"prompt": state, "questions": questions}
         if self.model_id:
@@ -200,24 +202,24 @@ class LayaToolSelector:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.error("laya HTTP decide 失败 (%s): %s", self._decide_url, e)
+            logger.error("laya HTTP decide failed (%s): %s", self._decide_url, e)
             raise
-        # HTTP 返回 latency_ms (服务端测), 覆盖为客户端测的 latency 由 select_tool/extract_params 计算
+        # HTTP returns latency_ms (server-measured); overriding it with client-measured latency is computed by select_tool/extract_params
         logger.debug("laya HTTP decide ok: server_latency_ms=%s", data.get("latency_ms"))
         return data
 
     def select_tool(self, state: str, whitelist: dict[str, str] | None = None) -> ToolDecision:
-        """从白名单中选择最佳工具 (choice 原语)。
+        """Pick the best tool from the whitelist (choice primitive).
 
         Args:
-            state: 当前上下文状态 (用户请求 / 会话状态)
-            whitelist: tool_id -> description; None 用 DEFAULT_TOOL_WHITELIST
+            state: current context state (user request / session state)
+            whitelist: tool_id -> description; None uses DEFAULT_TOOL_WHITELIST
 
         Returns:
-            ToolDecision (不含参数 — 用 extract_params 补参数, 或调 decide 一步到位)
+            ToolDecision (no params — use extract_params to fill parameters, or call decide for one shot)
         """
         if whitelist is not None and len(whitelist) == 0:
-            raise ValueError("whitelist 不能为空")
+            raise ValueError("whitelist must not be empty")
         wl = whitelist if whitelist is not None else DEFAULT_TOOL_WHITELIST
 
         questions = {
@@ -234,16 +236,16 @@ class LayaToolSelector:
 
         ans = result["answers"]["tool"]
         tool_id = ans.get("choice", "none")
-        # answer_confidence = max(p) — 门槛指标 (非 entropy confidence)
-        # HTTP backend 无 answer_confidence 字段 → 用 max(probabilities) 补算
+        # answer_confidence = max(p) — the gate metric (not entropy confidence)
+        # the HTTP backend has no answer_confidence field → recompute as max(probabilities)
         probs = ans.get("probabilities", {})
         confidence = ans.get("answer_confidence", max(probs.values()) if probs else ans.get("confidence", 0.0))
 
-        # "none" = "无需工具" 是正向决策, 不是不确定 — 门槛不触发降级 (issue #46: none → skip tool calling)
+        # "none" = "no tool needed" is a positive decision, not uncertainty — the gate does not trigger fallback (issue #46: none → skip tool calling)
         fell_back = confidence < self.min_confidence and tool_id != "none"
         if fell_back:
             logger.warning(
-                "laya 工具选择置信度 %.4f < 门槛 %.2f → LLM 降级 (state=%s, choice=%s)",
+                "laya tool selection confidence %.4f < gate %.2f → LLM fallback (state=%s, choice=%s)",
                 confidence,
                 self.min_confidence,
                 state[:80],
@@ -279,10 +281,10 @@ class LayaToolSelector:
         )
 
     def extract_params(self, state: str, tool_id: str) -> dict[str, str | int | None]:
-        """为选中工具提取参数槽位 (noul/score 原语 + regex)。
+        """Extract parameter slots for the selected tool (noul/score primitives + regex).
 
-        laya 判断参数是否出现 (noul yes/no) 或数量 (score 0-N),
-        regex 提取具体值 — 不用 LLM (Rule 5: 能确定性的不用模型)。
+        laya judges whether a parameter appears (noul yes/no) or a quantity (score 0-N);
+        regex extracts the concrete value — no LLM (Rule 5: deterministic when possible, no model).
         """
         slots_def = PARAM_SLOTS.get(tool_id, [])
         if not slots_def:
@@ -297,8 +299,8 @@ class LayaToolSelector:
                 "type": sd["type"],
                 "instructions": sd["instructions"],
             }
-            # noul: 默认 labels {"false","true"} — 不传 criteria/labels, 用默认
-            # score: criteria 是 list (各级别描述)
+            # noul: default labels {"false","true"} — don't pass criteria/labels, use defaults
+            # score: criteria is a list (per-level descriptions)
             if sd["type"] == "score":
                 q["criteria"] = sd["criteria"]
             questions[qid] = q
@@ -312,22 +314,22 @@ class LayaToolSelector:
         for qid, sd in slot_map.items():
             ans = result["answers"].get(qid, {})
             if sd["type"] == "noul":
-                # noul: p[1] = "yes" 概率; >0.5 则参数存在 → regex 提取值
+                # noul: p[1] = "yes" probability; >0.5 means the parameter exists → regex-extract the value
                 yes_prob = ans.get("noul", 0.0)
                 if yes_prob > 0.5:
                     extracted = self._regex_extract(state, sd.get("extract", ""))
-                    # issue #54: shell_exec command 残留填充词 ("the command echo hi")
-                    # → security guard 拒 "the" — 确定性剥除
+                    # issue #54: shell_exec command keeps filler words ("the command echo hi")
+                    # → the security guard rejects "the" — strip deterministically
                     if sd["slot"] == "command":
                         extracted = self._strip_filler_prefix(extracted)
                     params[sd["slot"]] = extracted
-                    logger.debug("param %s: noul=%.3f → 提取 %r", sd["slot"], yes_prob, extracted)
+                    logger.debug("param %s: noul=%.3f → extracted %r", sd["slot"], yes_prob, extracted)
                 else:
                     params[sd["slot"]] = None
-                    logger.debug("param %s: noul=%.3f → 无", sd["slot"], yes_prob)
+                    logger.debug("param %s: noul=%.3f → absent", sd["slot"], yes_prob)
             elif sd["type"] == "score":
                 score = ans.get("score", 0.0)
-                # score 映射整数 — scale 定义乘数
+                # score mapped to integer — scale defines the multiplier
                 scale = sd.get("scale", 1)
                 val = max(1, round(score * scale))
                 params[sd["slot"]] = val
@@ -336,10 +338,10 @@ class LayaToolSelector:
         return params
 
     def decide(self, state: str, whitelist: dict[str, str] | None = None) -> ToolDecision:
-        """一步到位: 选工具 + 提参数 (select_tool + extract_params)。
+        """One shot: pick the tool + extract params (select_tool + extract_params).
 
-        低置信度降级时不提参数 (调用方走 LLM 自行解析)。
-        tool_id="none" 时不提参数 (无需工具)。
+        No param extraction on low-confidence fallback (the caller parses via its own LLM path).
+        No param extraction when tool_id="none" (no tool needed).
         """
         decision = self.select_tool(state, whitelist)
 
@@ -352,11 +354,13 @@ class LayaToolSelector:
             updated = decision.model_copy(update={"params": params})
             return updated
         except Exception as e:
-            logger.warning("参数提取失败 (tool=%s): %s — 返回无参数决策", decision.tool_id, e)
+            logger.warning(
+                "param extraction failed (tool=%s): %s — returning a decision without params", decision.tool_id, e
+            )
             return decision
 
     def metrics(self) -> dict[str, int | float]:
-        """返回进程内指标快照 (total / fell_back / per-tool / avg_latency_ms)。"""
+        """Return the in-process metrics snapshot (total / fell_back / per-tool / avg_latency_ms)."""
         total = self._metrics.get("total", 0)
         fell_back = self._metrics.get("fell_back", 0)
         latency_sum = self._metrics.get("latency_ms_sum", 0.0)
@@ -371,11 +375,11 @@ class LayaToolSelector:
 
     @staticmethod
     def _regex_extract(text: str, pattern: str) -> str | None:
-        """从 text 中用 pattern 提取第一个匹配组 (无组则全匹配)。
+        """Extract the first match group from text using pattern (full match when no groups).
 
-        re.MULTILINE: `$` 锚到行尾而非串尾 — issue #54 步骤 2+ 回灌的
-        result feedback 文本会污染提取 (command 膨胀成整个 feedback),
-        行尾锚定让提取止于请求行。
+        re.MULTILINE: `$` anchors to end-of-line instead of end-of-string — issue #54 step 2+
+        result-feedback text fed back into the request pollutes extraction (command bloating into the whole
+        feedback); line-end anchoring makes extraction stop at the request line.
         """
         if not pattern:
             return None
@@ -384,20 +388,23 @@ class LayaToolSelector:
             return None
         return m.group(1) if m.groups() else m.group(0)
 
-    # Issue #54: shell_exec 提取结果残留自然语言填充词 → security guard 把 "the" 当
-    # binary 拒 (白名单外)。确定性清洗 (Rule 5: 能用 regex 不用模型) — 只剥前导
-    # 冠词/指代/命令引导词, 不碰真实命令 (首 token 是 white-listed binary 如 echo/ls)。
+    # Issue #54: shell_exec extraction results keep natural-language filler words → the security guard treats
+    # "the" as a binary and rejects it (outside the allowlist). Deterministic cleanup (Rule 5: regex over model) —
+    # only strips leading articles/determiners/command lead-ins, never touches real commands
+    # (first token is a white-listed binary like echo/ls).
     _FILLER_PREFIX_RE = re.compile(
-        r"^(?:the|a|an|this|that|these|those|command|cmd|following)\s*[:：]?\s+", re.IGNORECASE
+        # i18n: user-facing - fullwidth colon inside the pattern is functional (matches CJK input)
+        r"^(?:the|a|an|this|that|these|those|command|cmd|following)\s*[:：]?\s+",
+        re.IGNORECASE,
     )
 
     @classmethod
     def _strip_filler_prefix(cls, value: str | None) -> str | None:
-        """剥掉提取值的前导填充词 (issue #54) — 'the command echo hi' → 'echo hi'。"""
+        """Strip leading filler words from the extracted value (issue #54) — 'the command echo hi' → 'echo hi'."""
         if not value:
             return value
         out = value.strip()
-        for _ in range(3):  # 最多剥 3 层 ('the a command x' 极端嵌套)
+        for _ in range(3):  # strip at most 3 layers (extreme nesting like 'the a command x')
             stripped = cls._FILLER_PREFIX_RE.sub("", out, count=1)
             if stripped == out:
                 break

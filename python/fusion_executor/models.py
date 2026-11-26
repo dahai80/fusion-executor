@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# Blocker 11 (审计 schema 同步): 全模型 extra="forbid" — Rust serde struct ↔
-# Pydantic 字段失配时 fail-loud (旧 extra="ignore" 静默丢未知字段, Rust 改字段名/
-# serde bug 时 Pydantic 侧空字段假成功)。严格校验破 silent-schema-drift。
+# Blocker 11 (schema sync audit): extra="forbid" on all models — a mismatch between the Rust serde struct and
+# the Pydantic fields fails loudly (old extra="ignore" silently dropped unknown fields; when Rust renamed a field /
+# serde bug, the Pydantic side returned empty fields as fake success). Strict validation breaks silent schema drift.
 _STRICT = ConfigDict(extra="forbid")
 
-# ARCH-4 可观测性边界: 进程内路径 (run()/run_async()/run_streaming 直调 fe-core) 绕过 fe-ipc
-# 层, 故不经 UDS 的 metrics/telemetry/审计计数。execute_sync 已 mirror 关键计数器
-# (fe_exec_total 等) 进全局 metrics recorder, 但完整可观测性 (BroadcastHub 推送/连接计数/
-# Prometheus export) 仅 serve() UDS 路径具备。需完整指标时用 serve() + executor.execute over UDS,
-# 不要依赖进程内 run() 的指标覆盖。
+# ARCH-4 observability boundary: the in-process path (run()/run_async()/run_streaming calling fe-core directly) bypasses the fe-ipc
+# layer, so metrics/telemetry/audit counters routed over UDS are not triggered. execute_sync already mirrors key counters
+# (fe_exec_total etc.) into the global metrics recorder, but full observability (BroadcastHub pushes / connection counts /
+# Prometheus export) is only available on the serve() UDS path. When full metrics are needed, use serve() + executor.execute over UDS;
+# do not rely on in-process run() metric coverage.
 
 
 class Diagnostics(BaseModel):
@@ -25,36 +25,38 @@ class Diagnostics(BaseModel):
 
 class RollbackPolicy(BaseModel):
     model_config = _STRICT
-    # L-PY-03: max_consecutive_failures 死字段 (Rust 从不读, CLAUDE.md 明说 caller
-    # owns 连续失败计数)。A4 决策: 保留 (跨层级联 — 测试发送它, fe-rollback wire
-    # 含它), 但标记 deprecated 告诫调用方勿依赖。Rule 7: 单一真源, 不模糊。
+    # L-PY-03: max_consecutive_failures is a dead field (Rust never reads it; CLAUDE.md states the caller
+    # owns the consecutive-failure count). A4 decision: keep it (cross-layer cascade — tests send it, the fe-rollback wire
+    # includes it), but mark it deprecated to warn callers not to rely on it. Rule 7: single source of truth, no ambiguity.
     max_consecutive_failures: int = Field(
         default=3,
         deprecated=True,
-        description="连续失败上限 (DEPRECATED 保留字段, Rust 不读; 连续失败计数归调用方自愈循环)",
+        description="Consecutive-failure cap (DEPRECATED reserved field, never read by Rust; the caller's self-healing loop owns the count)",
     )
-    file_damage_check: bool = Field(default=True, description="失败时检测文件毁损 (git status) 触发回滚")
+    file_damage_check: bool = Field(
+        default=True, description="Check for file damage on failure (git status) to trigger rollback"
+    )
 
 
 class SandboxProfile(BaseModel):
     model_config = _STRICT
-    # Issue #34: 每命令 seatbelt/sandbox profile (匹配 fusion-code SandboxSettings)。
-    # None/默认关 → 现有固定 profile (默认禁网 + 敏感路径 file-write deny), 行为同 v0.2.7。
+    # Issue #34: per-command seatbelt/sandbox profile (matches fusion-code SandboxSettings).
+    # None/default off → the existing fixed profile (default network deny + sensitive-path file-write deny), same behavior as v0.2.7.
     network: str | None = Field(
         default=None,
-        description="网络策略: allow=放行出网; deny=禁网 (deny network-outbound, 现有默认). None=不覆盖默认",
+        description="Network policy: allow=permit outbound; deny=network deny (deny network-outbound, current default). None=do not override the default",
     )
     filesystem: str | None = Field(
         default=None,
-        description="文件系统策略: allow=不注 FS deny; deny_write=定向敏感路径 file-write deny (默认); deny=全局 file-write deny (Darwin 25 NO-OP). None=不覆盖默认",
+        description="Filesystem policy: allow=no FS deny injected; deny_write=targeted sensitive-path file-write deny (default); deny=global file-write deny (Darwin 25 NO-OP). None=do not override the default",
     )
     excluded_commands: list[str] = Field(
         default_factory=list,
-        description="seatbelt 内 deny process-exec 的命令名列表 (literal 路径匹配)",
+        description="Command names denied via deny process-exec inside the seatbelt profile (literal path matching)",
     )
     fail_if_unavailable: bool = Field(
         default=False,
-        description="sandbox-exec 不可用时 fail-closed 拦截 (exit -1, 不 spawn); False=静默降级到无 seatbelt",
+        description="Fail-closed block when sandbox-exec is unavailable (exit -1, no spawn); False=silently degrade to running without seatbelt",
     )
 
 
@@ -63,53 +65,53 @@ class ExecutionRequest(BaseModel):
     command: str
     task_id: str | None = None
     cwd: str | None = None
-    timeout_sec: float = Field(default=30.0, description="秒; 超时退出码 -124")
+    timeout_sec: float = Field(default=30.0, description="Seconds; timeout exit code -124")
     env_vars: dict[str, str] | None = None
     enable_rollback_snapshot: bool = False
     auto_rollback_policy: RollbackPolicy | None = None
     seatbelt: bool = Field(
         default=True,
-        description="macOS seatbelt 运行时隔离 (sandbox-exec 禁网 + 危险二进制 execve deny); 商用安全默认 True, 对齐 fe-core serde default_true + executor.run/run_async/shell_start 默认",
+        description="macOS seatbelt runtime isolation (sandbox-exec network deny + dangerous-binary execve deny); commercial security default True, aligns with fe-core serde default_true + executor.run/run_async/shell_start defaults",
     )
     inherit_env: bool = Field(
         default=False,
-        description="环境隔离: False(默认)=env_clear+最小基线 PATH/TMPDIR/SHELL+env_vars, 不泄漏宿主密钥; True=继承宿主全量 env (受信本地 opt-in)",
+        description="Environment isolation: False(default)=env_clear + minimal baseline PATH/TMPDIR/SHELL + env_vars, no host secret leakage; True=inherit the full host env (trusted local opt-in)",
     )
     use_pty: bool = Field(
         default=True,
-        description="I/O 后端: True(默认)=PTY (合流 stdout/stderr 保 ANSI/Traceback, stderr 恒空); False=stdio (stdout/stderr 独立捕获, 需分流的调用方 opt-in)",
+        description="I/O backend: True(default)=PTY (merged stdout/stderr preserving ANSI/Traceback, stderr always empty); False=stdio (stdout/stderr captured independently, opt-in for callers that need split streams)",
     )
     max_nproc: int = Field(
         default=1024,
-        description="进程数上限 (RLIMIT_NPROC, 经 ulimit -u 注入); 拦 fork bomb 并发扩散, 够工具链链式 spawn; 0=不限 (受信 opt-out); Darwin 实测生效",
+        description="Process count cap (RLIMIT_NPROC, injected via ulimit -u); blocks fork-bomb fan-out while leaving room for toolchain spawn chains; 0=unlimited (trusted opt-out); verified effective on Darwin",
     )
     max_cpu_sec: int = Field(
         default=0,
-        description="CPU 秒上限 (RLIMIT_CPU, 经 ulimit -t 注入); >0 到顶 SIGXCPU (CPU 死循环防御); 0=不限 (依赖 timeout_sec watchdog); Darwin 实测生效",
+        description="CPU seconds cap (RLIMIT_CPU, injected via ulimit -t); >0 raises SIGXCPU at the cap (CPU death-loop defense); 0=unlimited (relies on the timeout_sec watchdog); verified effective on Darwin",
     )
     max_nofile: int = Field(
         default=1024,
-        description="文件描述符上限 (RLIMIT_NOFILE, 经 ulimit -n 注入); 拦 FD 耗尽攻击; 0=不限 (受信 opt-out); Darwin 实测生效 (errno 24 EMFILE)",
+        description="File descriptor cap (RLIMIT_NOFILE, injected via ulimit -n); blocks FD-exhaustion attacks; 0=unlimited (trusted opt-out); verified effective on Darwin (errno 24 EMFILE)",
     )
     rss_limit_mb: int = Field(
         default=2048,
-        description="per-task RSS 上限 (MB); Darwin RLIMIT_AS/RLIMIT_DATA 平台无效, 改 sysinfo 轮询子进程树 RSS 超限 kill (exit_code -124, oom_killed=true); 拦内存炸弹; 0=禁用 watchdog (受信 opt-out) (D3-4)",
+        description="Per-task RSS cap (MB); Darwin RLIMIT_AS/RLIMIT_DATA are platform-invalid, so a sysinfo poll kills the child tree when RSS exceeds the cap (exit_code -124, oom_killed=true); blocks memory bombs; 0=disable the watchdog (trusted opt-out) (D3-4)",
     )
     trace_id: str | None = Field(
         default=None,
-        description="跨层关联 id; None 时执行入口自动生成 uuid v4, 贯穿日志/IPC/结果 (M-OPS-06)",
+        description="Cross-layer correlation id; auto-generated uuid v4 at the execution entry when None, threading logs/IPC/results (M-OPS-06)",
     )
     sandbox: SandboxProfile | None = Field(
         default=None,
-        description="Issue #34: 每命令 seatbelt/sandbox profile (网络/文件系统/排除命令); "
-        "None=现有固定 profile (默认禁网+敏感路径 file-write deny), 行为同 v0.2.7; "
-        "fail_if_unavailable=true 且 sandbox-exec 不可用时 fail-closed 拦截 (exit -1)",
+        description="Issue #34: per-command seatbelt/sandbox profile (network/filesystem/excluded commands); "
+        "None=existing fixed profile (default network deny + sensitive-path file-write deny), same behavior as v0.2.7; "
+        "fail_if_unavailable=true blocks fail-closed when sandbox-exec is unavailable (exit -1)",
     )
 
 
 class ExecutionResult(BaseModel):
     model_config = _STRICT
-    exit_code: int = Field(description="0=成功, -124=超时, -1=拦截/内部异常")
+    exit_code: int = Field(description="0=success, -124=timeout, -1=blocked/internal error")
     stdout: str = ""
     stderr: str = ""
     task_id: str | None = None
@@ -123,34 +125,35 @@ class ExecutionResult(BaseModel):
     auto_rolled_back: bool = False
     rollback_unavailable: bool = Field(
         default=False,
-        description="回滚保障失效标记 — guard 出错时置 true (fail-loud, 不静默); 与 auto_rolled_back 互补",
+        description="Rollback-assurance failure marker — set true when guard errors (fail-loud, not silent); complements auto_rolled_back",
     )
     rollback_skipped_reason: str | None = Field(
         default=None,
-        description="回滚跳过原因 — rollback 尝试过但跳过 (快照失效/解析失败/非 git/repo 不匹配); "
-        "区分 '未回滚(无需)' 与 '未回滚(快照失效)' (fail-loud); 与 auto_rolled_back/rollback_unavailable 互补",
+        description="Rollback skip reason — rollback was attempted but skipped (stale snapshot/parse failure/not a git repo/repo mismatch); "
+        "distinguishes 'not rolled back (not needed)' from 'not rolled back (stale snapshot)' (fail-loud); complements auto_rolled_back/rollback_unavailable",
     )
     trace_id: str | None = Field(
-        default=None, description="跨层关联 id — 回填请求侧 trace_id 或入口自动生成 (M-OPS-06)"
+        default=None,
+        description="Cross-layer correlation id — backfills the request-side trace_id or an entry-generated one (M-OPS-06)",
     )
     oom_killed: bool = Field(
         default=False,
-        description="RSS watchdog 触发标记 — 子进程树 RSS 超 rss_limit_mb 被 kill (D3-4); 伴随 exit_code -124",
+        description="RSS watchdog trigger marker — child tree killed for exceeding rss_limit_mb (D3-4); accompanied by exit_code -124",
     )
     pid: int | None = Field(
         default=None,
-        description="沙箱子进程 PID — 调用方据此传 telemetry_stream(pid=...) 采样真实任务进程 "
-        "(非 executor 自身, RUN-11); stdio 路径有, 拦截/超时路径无",
+        description="Sandbox child PID — the caller uses it to pass telemetry_stream(pid=...) and sample the real task process "
+        "(not the executor itself, RUN-11); present on the stdio path, absent on the blocked/timeout path",
     )
     guard_action_id: str | None = Field(
         default=None,
-        description="guard 授权裁决 action_id (Issue #23 Phase 3) — guard 判 Block/L3 时返, "
-        "供调用方审计/人工 confirm 回路; guard OFF 或 Allow/L1/L2 时 None",
+        description="Guard authorization verdict action_id (Issue #23 Phase 3) — returned when guard decides Block/L3, "
+        "for caller audit / manual-confirm loops; None when guard is OFF or Allow/L1/L2",
     )
     cancelled: bool = Field(
         default=False,
-        description="服务端确定性 cancel 标记 (Issue #32) — executor.cancel 下发后 fe-sandbox "
-        "SIGINT→SIGKILL 进程组, Done 帧 exit_code -1 + cancelled true; 非 cancel 路径 False",
+        description="Server-side deterministic cancel marker (Issue #32) — after executor.cancel, fe-sandbox "
+        "SIGINT→SIGKILLs the process group, Done frame exit_code -1 + cancelled true; False on non-cancel paths",
     )
 
 
@@ -161,12 +164,12 @@ class GuiResult(BaseModel):
     screenshot_png_b64: str | None = None
     screenshot_width: int | None = None
     screenshot_height: int | None = None
-    # #38: backing scale factor — 物理 PNG 像素 / 逻辑点 (Retina=2.0, 非 Retina=1.0)。
-    # 坐标契约: GuiAction x/y 输入 + inspect_tree AXPosition = 逻辑点;
-    #           screenshot_width/height = 物理像素。调用方据此换算 (pixel = point * scale)。
+    # #38: backing scale factor — physical PNG pixels / logical points (Retina=2.0, non-Retina=1.0).
+    # Coordinate contract: GuiAction x/y inputs + inspect_tree AXPosition = logical points;
+    #           screenshot_width/height = physical pixels. Callers convert (pixel = point * scale).
     scale_factor: float = 1.0
-    # #43: 显示器清单 JSON (display_info 动作填) — [{id, scale, bounds:{x,y,w,h}, primary}]。
-    # None=非 display_info 结果 (向后兼容)。fusion-osagent 据此取 scale, 移除硬编码 2.0。
+    # #43: display list JSON (filled by the display_info action) — [{id, scale, bounds:{x,y,w,h}, primary}].
+    # None=not a display_info result (backward compatible). fusion-osagent reads scale from it, removing the hardcoded 2.0.
     displays: str | None = None
     error: str | None = None
 
@@ -190,8 +193,8 @@ class GrepMatch(BaseModel):
     path: str
     line_number: int
     content: str
-    context_before: list[str] = Field(default_factory=list, description="命中行之前的上下文 (-B)")
-    context_after: list[str] = Field(default_factory=list, description="命中行之后的上下文 (-A)")
+    context_before: list[str] = Field(default_factory=list, description="Context lines before the match (-B)")
+    context_after: list[str] = Field(default_factory=list, description="Context lines after the match (-A)")
 
 
 class GrepFileCount(BaseModel):
@@ -203,90 +206,101 @@ class GrepFileCount(BaseModel):
 class GrepOptions(BaseModel):
     model_config = _STRICT
     output_mode: str = Field(default="content", description="content | files_with_matches | count")
-    after: int = Field(default=0, description="命中行后额外行数 (-A)")
-    before: int = Field(default=0, description="命中行前额外行数 (-B)")
-    context: int = Field(default=0, description="命中行前后均取 (-C, 等价 max(A,B))")
-    multiline: bool = Field(default=False, description="多行模式 (整文件 buffer 匹配)")
-    glob_include: list[str] = Field(default_factory=list, description="仅匹配这些 glob 的文件 (-g)")
-    glob_exclude: list[str] = Field(default_factory=list, description="排除匹配这些 glob 的文件 (-g '!...')")
+    after: int = Field(default=0, description="Extra lines after each match (-A)")
+    before: int = Field(default=0, description="Extra lines before each match (-B)")
+    context: int = Field(
+        default=0, description="Lines of context on both sides of each match (-C, equivalent to max(A,B))"
+    )
+    multiline: bool = Field(default=False, description="Multiline mode (whole-file buffer matching)")
+    glob_include: list[str] = Field(default_factory=list, description="Only match files matching these globs (-g)")
+    glob_exclude: list[str] = Field(default_factory=list, description="Exclude files matching these globs (-g '!...')")
 
 
 class GrepOutput(BaseModel):
     model_config = _STRICT
     output_mode: str = Field(default="content")
-    matches: list[GrepMatch] = Field(default_factory=list, description="content 模式命中")
-    files: list[str] = Field(default_factory=list, description="files_with_matches 模式命中文件")
-    counts: list[GrepFileCount] = Field(default_factory=list, description="count 模式每文件计数")
+    matches: list[GrepMatch] = Field(default_factory=list, description="Matches in content mode")
+    files: list[str] = Field(default_factory=list, description="Matched files in files_with_matches mode")
+    counts: list[GrepFileCount] = Field(default_factory=list, description="Per-file counts in count mode")
 
 
 class MultiEditItem(BaseModel):
     model_config = _STRICT
     old_string: str
     new_string: str
-    replace_all: bool = Field(default=False, description="True=替换全部匹配; False=唯一匹配 (默认)")
+    replace_all: bool = Field(
+        default=False, description="True=replace all matches; False=unique match required (default)"
+    )
 
 
 class TelemetrySample(BaseModel):
     model_config = _STRICT
-    ts_ms: int = Field(description="采样时间戳 (毫秒, 调用方纪元)")
-    cpu_pct: float = Field(description="进程 CPU 占用百分比 (单核倍数)")
-    mem_mb: float = Field(description="进程常驻内存 (MB)")
-    gpu_pct: float | None = Field(default=None, description="GPU 占用百分比 (调用方注入)")
-    gpu_mem_mb: float | None = Field(default=None, description="GPU 显存占用 (MB, 调用方注入)")
-    task_id: str | None = Field(default=None, description="关联任务 id")
+    ts_ms: int = Field(description="Sample timestamp (milliseconds, caller epoch)")
+    cpu_pct: float = Field(description="Process CPU percentage (single-core multiples)")
+    mem_mb: float = Field(description="Process resident memory (MB)")
+    gpu_pct: float | None = Field(default=None, description="GPU percentage (caller-injected)")
+    gpu_mem_mb: float | None = Field(default=None, description="GPU memory usage (MB, caller-injected)")
+    task_id: str | None = Field(default=None, description="Associated task id")
 
 
 class ShellStartResult(BaseModel):
     model_config = _STRICT
-    ok: bool = Field(description="是否启动成功")
-    shell_id: str | None = Field(default=None, description="后台 shell id (sh-N); 失败或被拦截时 None")
-    blocked_by_security: bool = Field(default=False, description="是否被安全守卫拦截")
-    security_reason: str | None = Field(default=None, description="拦截原因")
-    error: str | None = Field(default=None, description="启动错误")
+    ok: bool = Field(description="Whether the start succeeded")
+    shell_id: str | None = Field(
+        default=None, description="Background shell id (sh-N); None on failure or when blocked"
+    )
+    blocked_by_security: bool = Field(default=False, description="Whether blocked by the security guard")
+    security_reason: str | None = Field(default=None, description="Block reason")
+    error: str | None = Field(default=None, description="Start error")
 
 
 class ShellOutput(BaseModel):
     model_config = _STRICT
-    shell_id: str = Field(description="后台 shell id")
-    output: str = Field(description="累积 tail 快照 (非增量; 调用方自去重)")
-    running: bool = Field(description="是否仍在运行")
-    exit_code: int | None = Field(default=None, description="退出码 (运行中为 None)")
+    shell_id: str = Field(description="Background shell id")
+    output: str = Field(description="Accumulated tail snapshot (not incremental; callers dedupe themselves)")
+    running: bool = Field(description="Whether still running")
+    exit_code: int | None = Field(default=None, description="Exit code (None while running)")
 
 
 class ShellInfo(BaseModel):
     model_config = _STRICT
-    shell_id: str = Field(description="后台 shell id")
-    pid: int | None = Field(default=None, description="子进程 pid")
-    task_id: str | None = Field(default=None, description="关联任务 id")
-    command: str = Field(description="启动命令")
-    started_at_ms: int = Field(description="启动时间戳 (毫秒纪元)")
-    finished: bool = Field(description="是否已退出")
-    exit_code: int | None = Field(default=None, description="退出码 (运行中为 None)")
+    shell_id: str = Field(description="Background shell id")
+    pid: int | None = Field(default=None, description="Child process pid")
+    task_id: str | None = Field(default=None, description="Associated task id")
+    command: str = Field(description="Start command")
+    started_at_ms: int = Field(description="Start timestamp (millisecond epoch)")
+    finished: bool = Field(description="Whether already exited")
+    exit_code: int | None = Field(default=None, description="Exit code (None while running)")
 
 
-# D6-03 (审计 0827 product): 快照清单条目 — 镜像 fe_rollback::SnapshotInfo (on-disk 索引读回)。
+# D6-03 (audit 0827 product): snapshot listing entry — mirrors fe_rollback::SnapshotInfo (read back from the on-disk index).
 class SnapshotInfo(BaseModel):
     model_config = _STRICT
-    id: str = Field(description="快照 id (head:<SHA> / stash:<SHA>,base:<HEAD> / repo:<hash> 后缀)")
-    created_ms: int = Field(description="快照创建时间戳 (毫秒纪元)")
-    kind: str = Field(description="快照类型 (head 基线 / stash 含改动)")
+    id: str = Field(description="Snapshot id (head:<SHA> / stash:<SHA>,base:<HEAD> / repo:<hash> suffix)")
+    created_ms: int = Field(description="Snapshot creation timestamp (millisecond epoch)")
+    kind: str = Field(description="Snapshot kind (head baseline / stash with changes)")
 
 
-# Issue #46: laya-mlx 确定性工具调用 — ToolDecision 返回结构。
-# answer_confidence (max prob) 是门槛指标 — laya-mlx confidence.py 明确:
-# confidence (entropy) "not calibrated", 不跨 option 数迁移; answer_confidence 是
-# min_confidence gate 定义所用量。门槛比较永远用 answer_confidence。
+# Issue #46: laya-mlx deterministic tool calling — ToolDecision return shape.
+# answer_confidence (max prob) is the gate metric — laya-mlx confidence.py states explicitly:
+# confidence (entropy) is "not calibrated" and does not transfer across option counts; answer_confidence is
+# what the min_confidence gate definition uses. Gate comparisons always use answer_confidence.
 class ToolDecision(BaseModel):
     model_config = _STRICT
-    tool_id: str = Field(description="选中工具 id; 低置信度降级时为 'llm_fallback'; 无需工具时 'none'")
-    confidence: float = Field(description="answer_confidence = max(probabilities) — 门槛比较用此值")
-    probabilities: dict[str, float] = Field(description="各选项概率分布 (tool_id -> prob)")
-    params: dict[str, str | int | None] = Field(
-        default_factory=dict, description="提取的参数槽位 (file_path/search_query/count 等); 无参数时空 dict"
+    tool_id: str = Field(
+        description="Selected tool id; 'llm_fallback' on low-confidence degradation; 'none' when no tool is needed"
     )
-    fell_back: bool = Field(default=False, description="True=置信度低于门槛, 调用方应走 LLM 降级选工具")
-    latency_ms: float = Field(description="决策耗时 (毫秒, perf_counter)")
-    model: str = Field(description="laya 模型 id (如 convaiinnovations/laya)")
+    confidence: float = Field(description="answer_confidence = max(probabilities) — used for gate comparisons")
+    probabilities: dict[str, float] = Field(description="Probability distribution over options (tool_id -> prob)")
+    params: dict[str, str | int | None] = Field(
+        default_factory=dict,
+        description="Extracted parameter slots (file_path/search_query/count etc.); empty dict when no parameters",
+    )
+    fell_back: bool = Field(
+        default=False, description="True=confidence below the gate; the caller should fall back to LLM tool selection"
+    )
+    latency_ms: float = Field(description="Decision latency (milliseconds, perf_counter)")
+    model: str = Field(description="laya model id (e.g. convaiinnovations/laya)")
     usage: dict[str, int | bool | list[str]] | None = Field(
-        default=None, description="laya usage (input_tokens/state_tokens/truncated 等); 诊断用"
+        default=None, description="laya usage (input_tokens/state_tokens/truncated etc.); for diagnostics"
     )

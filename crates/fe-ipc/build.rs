@@ -1,5 +1,5 @@
-// C-OPS-06: 构建期注入 git_sha + build_time — IPC health 暴露 (运维可追溯)
-// 同 fe-pyo3/build.rs (env! 按 crate 编译, 各需各注)
+// C-OPS-06: inject git_sha + build_time at build time — exposed via IPC health (ops traceability)
+// Same as fe-pyo3/build.rs (env! is per-crate at compile time, each crate injects its own)
 use std::process::Command;
 
 fn main() {

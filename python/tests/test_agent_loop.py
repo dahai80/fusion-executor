@@ -4,9 +4,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# AC7 (Issue #46): AgentLoop tests — 不依赖 laya 真实模型 (mock LayaToolSelector)。
-# AC1: HTTP backend tests — 不加载本地 laya_mlx (backend=http 跳过模型加载)。
-# laya 真实模型测试在 test_laya_tool_selector.py (importorskip + 模型缓存跳过)。
+# AC7 (Issue #46): AgentLoop tests — no real laya model dependency (mock LayaToolSelector).
+# AC1: HTTP backend tests — never loads local laya_mlx (backend=http skips model loading).
+# real laya model tests live in test_laya_tool_selector.py (importorskip + model-cache skip).
 from fusion_executor import AgentLoop, AgentStep, LayaToolSelector, ToolDecision
 
 
@@ -26,7 +26,7 @@ def _make_decision(
 
 
 class FakeSelector:
-    """Mock LayaToolSelector — 返回预设决策序列。"""
+    """Mock LayaToolSelector — returns a preset decision sequence."""
 
     def __init__(self, decisions: list[ToolDecision]) -> None:
         self._decisions = list(decisions)
@@ -47,10 +47,10 @@ class FakeSelector:
 
 
 class TestAgentLoopWiring:
-    """AC7: LayaToolSelector 接进 executor 管线 (P0 gap)。"""
+    """AC7: LayaToolSelector wired into the executor pipeline (P0 gap)."""
 
     def test_none_terminates_immediately(self):
-        """tool_id='none' → 单步完成, completed=True."""
+        """tool_id='none' → single step done, completed=True."""
         sel = FakeSelector([_make_decision("none")])
         loop = AgentLoop(sel, executor=None)
         result = loop.run("hello there")
@@ -59,7 +59,7 @@ class TestAgentLoopWiring:
         assert result["step_count"] == 1
 
     def test_fallback_terminates(self):
-        """降级 (fell_back=True) → 终止, final_tool='llm_fallback'."""
+        """degraded (fell_back=True) → terminate, final_tool='llm_fallback'."""
         sel = FakeSelector([_make_decision("llm_fallback", fell_back=True)])
         loop = AgentLoop(sel, executor=None)
         result = loop.run("ambiguous request")
@@ -67,7 +67,7 @@ class TestAgentLoopWiring:
         assert result["final_tool"] == "llm_fallback"
 
     def test_tool_executed_then_none(self):
-        """选工具 → 执行 → 下一轮 none → 完成 (2步)."""
+        """pick tool → execute → next round none → done (2 steps)."""
         sel = FakeSelector(
             [
                 _make_decision("file_edit", params={"file_path": "src/main.py"}),
@@ -82,7 +82,7 @@ class TestAgentLoopWiring:
         assert result["steps"][1]["tool_id"] == "none"
 
     def test_shell_exec_with_mock_executor(self):
-        """shell_exec → 调 executor.run(command) → 结果回灌."""
+        """shell_exec → calls executor.run(command) → result fed back."""
         mock_executor = MagicMock()
         mock_executor.run.return_value = MagicMock(ok=True, stdout="all tests passed", exit_code=0)
         sel = FakeSelector(
@@ -98,7 +98,7 @@ class TestAgentLoopWiring:
         mock_executor.run.assert_called_once_with("pytest")
 
     def test_code_search_with_mock_executor(self):
-        """code_search → 调 executor.grep → 返回 matches."""
+        """code_search → calls executor.grep → returns matches."""
         mock_executor = MagicMock()
         mock_executor.grep.return_value = ["line1", "line2", "line3"]
         sel = FakeSelector(
@@ -113,7 +113,7 @@ class TestAgentLoopWiring:
         mock_executor.grep.assert_called_once_with("TODO", ["."], cwd=None)
 
     def test_extra_handler_injected(self):
-        """web_fetch 无原生 executor 方法 → 注入 extra_handler 执行."""
+        """web_fetch has no native executor method → injected extra_handler executes it."""
         sel = FakeSelector(
             [
                 _make_decision("web_fetch", params={"url": "https://example.com"}),
@@ -133,7 +133,7 @@ class TestAgentLoopWiring:
         assert len(handler_calls) == 1
 
     def test_tool_without_handler_errors(self):
-        """web_fetch 无 executor 无 handler → error 回灌, 继续."""
+        """web_fetch with no executor and no handler → error fed back, loop continues."""
         sel = FakeSelector(
             [
                 _make_decision("web_fetch", params={"url": "https://example.com"}),
@@ -146,7 +146,7 @@ class TestAgentLoopWiring:
         assert "web_fetch" in result["steps"][0]["error"]
 
     def test_max_steps_reached(self):
-        """持续选不同参数工具不停 → 达 max_steps 终止, completed=False."""
+        """keeps picking tools with different args → stops at max_steps, completed=False."""
         decisions = [_make_decision("file_edit", params={"file_path": f"a{i}.py"}) for i in range(10)]
         sel = FakeSelector(decisions)
         loop = AgentLoop(sel, executor=None, max_steps=3)
@@ -155,9 +155,9 @@ class TestAgentLoopWiring:
         assert result["step_count"] == 3
 
     def test_same_tool_same_params_terminates(self):
-        """同工具同参数重复 → 终止 (任务完成或无进展, 避免 laya 无 done 信号死循环)。
+        """same tool with same args repeated → terminate (task done or no progress, avoids an infinite loop when laya has no done signal).
 
-        step1: file_edit(a.py) 执行 → step2: laya 再选 file_edit(a.py) 同参数 → 终止。
+        step1: file_edit(a.py) executes → step2: laya picks file_edit(a.py) with the same args again → terminate.
         """
         sel = FakeSelector(
             [
@@ -172,7 +172,7 @@ class TestAgentLoopWiring:
         assert result["metrics"]["same_tool_terminate"] == 1
 
     def test_same_tool_diff_params_continues(self):
-        """同工具不同参数 → 不终止 (多步同工具合法: edit a.py → edit b.py)。"""
+        """same tool with different args → do not terminate (multi-step same tool is legal: edit a.py → edit b.py)."""
         sel = FakeSelector(
             [
                 _make_decision("file_edit", params={"file_path": "a.py"}),
@@ -192,7 +192,7 @@ class TestAgentLoopWiring:
             AgentLoop(FakeSelector([]), max_steps=0)
 
     def test_metrics_tracked(self):
-        """指标计数器: steps/none/exec/tool."""
+        """metric counters: steps/none/exec/tool."""
         mock_executor = MagicMock()
         mock_executor.run.return_value = MagicMock(ok=True)
         sel = FakeSelector(
@@ -209,7 +209,7 @@ class TestAgentLoopWiring:
         assert m["exec:shell_exec"] == 1
 
     def test_step_to_dict(self):
-        """AgentStep.to_dict 序列化正确."""
+        """AgentStep.to_dict serializes correctly."""
         d = _make_decision("file_edit", params={"file_path": "a.py"})
         step = AgentStep(1, d, {"ready": True}, None)
         sd = step.to_dict()
@@ -220,7 +220,7 @@ class TestAgentLoopWiring:
         assert sd["error"] is None
 
     def test_result_stringified_truncated(self):
-        """长结果截断 500 字符防 context 爆炸."""
+        """long results truncated to 500 chars to prevent context explosion."""
         long_result = "x" * 1000
         truncated = AgentLoop._stringify_result(long_result)
         assert len(truncated) == 503  # 500 + "..."
@@ -228,11 +228,11 @@ class TestAgentLoopWiring:
 
 
 class TestHTTPBackend:
-    """AC1: HTTP backend — LayaToolSelector 经 /v1/laya/decide (不加载本地模型)."""
+    """AC1: HTTP backend — LayaToolSelector via /v1/laya/decide (no local model loaded)."""
 
     def test_http_backend_no_laya_mlx_required(self):
-        """HTTP backend 不 import laya_mlx (无本地模型依赖)."""
-        # 不应触发 laya_mlx ImportError — backend=http 跳过模型加载
+        """HTTP backend does not import laya_mlx (no local model dependency)."""
+        # must not trigger a laya_mlx ImportError — backend=http skips model loading
         with patch("httpx.Client") as mock_client:
             mock_client.return_value = MagicMock()
             sel = LayaToolSelector(backend="http", mlx_url="http://localhost:11434/v1", api_key="test-key")
@@ -244,7 +244,7 @@ class TestHTTPBackend:
             LayaToolSelector(backend="invalid")
 
     def test_http_invoke_posts_questions(self):
-        """_invoke_http POST {prompt, questions, model} 到 /v1/laya/decide."""
+        """_invoke_http POSTs {prompt, questions, model} to /v1/laya/decide."""
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {
@@ -289,22 +289,22 @@ class TestHTTPBackend:
 
 
 class TestAgentRunOnExecutor:
-    """AC7 接线验收: FusionSandboxExecutor.agent_run — AgentLoop 经 executor 管线执行。
+    """AC7 wiring acceptance: FusionSandboxExecutor.agent_run — AgentLoop runs through the executor pipeline.
 
-    不依赖真实 laya 模型 (mock LayaToolSelector 经 patch)。验证 agent_run 方法存在、
-    构造 AgentLoop、用 self 作 executor 执行工具、返回步骤记录。
+    No real laya model dependency (mock LayaToolSelector via patch). Verifies the agent_run method exists,
+    constructs AgentLoop, executes tools with self as the executor, and returns step records.
     """
 
     def test_agent_run_method_exists(self):
-        """FusionSandboxExecutor 暴露 agent_run 方法 (接线, 非死类)。"""
+        """FusionSandboxExecutor exposes the agent_run method (wired, not a dead class)."""
         from fusion_executor import FusionSandboxExecutor
 
         assert callable(getattr(FusionSandboxExecutor, "agent_run", None)), (
-            "agent_run 未接线到 FusionSandboxExecutor — AgentLoop 是死类 (违反 #46 AC7)"
+            "agent_run not wired into FusionSandboxExecutor — AgentLoop is a dead class (violates #46 AC7)"
         )
 
     def test_agent_run_none_terminates(self):
-        """agent_run: laya 选 none → 单步完成, completed=True."""
+        """agent_run: laya picks none → single step done, completed=True."""
         from fusion_executor import FusionSandboxExecutor
 
         with (
@@ -343,7 +343,7 @@ class TestAgentRunOnExecutor:
             ex.agent_run("hi", max_steps=0)
 
     def test_agent_run_invalid_request_type(self):
-        """agent_run: user_request 非 str → TypeError."""
+        """agent_run: user_request not a str → TypeError."""
         from fusion_executor import FusionSandboxExecutor
 
         ex = FusionSandboxExecutor()
@@ -351,7 +351,7 @@ class TestAgentRunOnExecutor:
             ex.agent_run(123)
 
     def test_agent_run_passes_backend_and_confidence(self):
-        """agent_run: backend/min_confidence/whitelist 透传给 LayaToolSelector + AgentLoop."""
+        """agent_run: backend/min_confidence/whitelist passed through to LayaToolSelector + AgentLoop."""
         from fusion_executor import FusionSandboxExecutor
 
         with (

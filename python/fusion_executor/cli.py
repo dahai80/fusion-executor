@@ -12,66 +12,68 @@ from .models import RollbackPolicy
 
 
 def _validate_paths(cwd: str | None, sock: str | None, *, check_sock: bool = True) -> None:
-    # M-5: 启动期 fail-fast — cwd 不存在 / sock 父目录不可写推迟到首请求难定位
+    # M-5: startup fail-fast — a missing cwd / unwritable sock parent deferred to the first request is hard to locate
     if cwd is not None and not Path(cwd).is_dir():
-        print(f"错误: --cwd 目录不存在: {cwd}", file=sys.stderr)
+        print(f"error: --cwd directory does not exist: {cwd}", file=sys.stderr)
         sys.exit(2)
     if check_sock:
         sock_path = sock or DEFAULT_SOCK
-        # IMPL-1: 默认 socket 在 ~/.fusion-executor/ (HOME 私有 0o700), 该目录可能不存在。
-        # serve() 会 ensure_socket_dir 创建, 此处先建以让父目录可写校验通过 (避免误拦首次启动)。
+        # IMPL-1: the default socket lives in ~/.fusion-executor/ (HOME-private 0o700), which may not exist yet.
+        # serve() would ensure_socket_dir; create it here first so the parent-writability check passes (avoid a false block on first start).
         ensure_socket_dir(sock_path)
         parent = Path(sock_path).parent
         if not parent.is_dir() or not os.access(parent, os.W_OK):
-            print(f"错误: socket 父目录不可写: {parent}", file=sys.stderr)
+            print(f"error: socket parent directory is not writable: {parent}", file=sys.stderr)
             sys.exit(2)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fusion-executor",
-        description="fusion-executor — 受控执行沙箱 + macOS 控制中枢",
+        description="fusion-executor — controlled execution sandbox + macOS control hub",
     )
-    # M-CLI-01: serve 作为 flag (非 subcommand), 保持裸命令模式为主路径 (Rule 11
-    # 兼容旧用法 `fusion-executor echo hi`)。subcommand + bare positional argparse
-    # 歧义 (echo v 被当 subcommand choice), flag 无歧义。
-    parser.add_argument("--serve", action="store_true", help="启动 UDS JSON-RPC server (替代执行命令)")
+    # M-CLI-01: serve as a flag (not a subcommand), keeping bare-command mode the main path (Rule 11
+    # compatible with the old usage `fusion-executor echo hi`). subcommand + bare positional argparse
+    # is ambiguous (echo v parsed as a subcommand choice); a flag is unambiguous.
     parser.add_argument(
-        "--sock", default=None, help="serve 模式 socket 路径 (默认 ~/.fusion-executor/fe.sock, HOME 私有 0o700)"
+        "--serve", action="store_true", help="start the UDS JSON-RPC server (instead of executing a command)"
     )
-    parser.add_argument("command", nargs="?", help="要执行的命令 (serve 模式忽略)")
-    parser.add_argument("--cwd", default=None, help="工作目录")
-    parser.add_argument("--timeout-sec", type=float, default=30.0, help="超时秒 (超时退出码 -124)")
-    parser.add_argument("--task-id", default=None, help="任务 id (透传结果)")
-    parser.add_argument("--env", action="append", default=None, metavar="K=V", help="环境变量 (可多次)")
-    parser.add_argument("--no-snapshot", action="store_true", help="禁用回滚快照")
-    parser.add_argument("--auto-rollback", action="store_true", help="失败+文件毁损自动回滚")
-    # D3-1 (审计 0827 product): 内联解释器网关 opt-in。默认 False (企业硬化拒 python -c / node -e /
-    #   ruby -e / perl -e, 防 agent-driven 任意 payload 绕白名单语义); True 保留内联执行能力 (测试机/
-    #   本地交互依赖 python3 -c)。
+    parser.add_argument(
+        "--sock", default=None, help="serve-mode socket path (default ~/.fusion-executor/fe.sock, HOME-private 0o700)"
+    )
+    parser.add_argument("command", nargs="?", help="command to execute (ignored in serve mode)")
+    parser.add_argument("--cwd", default=None, help="working directory")
+    parser.add_argument("--timeout-sec", type=float, default=30.0, help="timeout seconds (timeout exit code -124)")
+    parser.add_argument("--task-id", default=None, help="task id (passed through to the result)")
+    parser.add_argument("--env", action="append", default=None, metavar="K=V", help="environment variable (repeatable)")
+    parser.add_argument("--no-snapshot", action="store_true", help="disable the rollback snapshot")
+    parser.add_argument("--auto-rollback", action="store_true", help="auto-rollback on failure + file damage")
+    # D3-1 (audit 0827 product): inline-interpreter gateway opt-in. Default False (enterprise hardening rejects python -c / node -e /
+    #   ruby -e / perl -e, preventing agent-driven arbitrary payloads from bypassing allowlist semantics); True keeps inline
+    #   execution (test machines / local interaction rely on python3 -c).
     parser.add_argument(
         "--allow-inline-interpreter",
         action="store_true",
-        help="允许内联解释器 (python -c / node -e / ruby -e / perl -e; 企业硬化默认拒)",
+        help="allow inline interpreters (python -c / node -e / ruby -e / perl -e; enterprise hardening rejects by default)",
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="调试日志")
-    # Issue #64: demo/test 环境沙箱 runner (guest 单 ai-* app, LLM 走宿主网关)
+    parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    # Issue #64: demo/test environment sandbox runner (one ai-* app per guest, LLM via the host gateway)
     parser.add_argument(
         "--demo-up",
         default=None,
         metavar="REPO_URL",
-        help="demo 环境: provision + 启动一个 ai-* app (单 app per guest, 幂等)",
+        help="demo environment: provision + start one ai-* app (single app per guest, idempotent)",
     )
-    parser.add_argument("--demo-status", action="store_true", help="demo 环境: 查询运行状态")
-    parser.add_argument("--demo-stop", action="store_true", help="demo 环境: 停止运行中的 app")
-    parser.add_argument("--demo-workspace", default=None, help="demo 工作区 (默认 ~/.fusion-executor/demo)")
+    parser.add_argument("--demo-status", action="store_true", help="demo environment: query running status")
+    parser.add_argument("--demo-stop", action="store_true", help="demo environment: stop the running app")
+    parser.add_argument("--demo-workspace", default=None, help="demo workspace (default ~/.fusion-executor/demo)")
     parser.add_argument(
         "--demo-llm-url",
         default=None,
-        help="宿主 LLM 网关 (默认 http://127.0.0.1:11432; 注入 FUSION_LLM_BASE_URL/FUSION_MLX_URL)",
+        help="host LLM gateway (default http://127.0.0.1:11432; injected as FUSION_LLM_BASE_URL/FUSION_MLX_URL)",
     )
     parser.add_argument(
-        "--demo-env", action="append", default=None, metavar="K=V", help="demo app 附加环境变量 (可多次)"
+        "--demo-env", action="append", default=None, metavar="K=V", help="extra env var for the demo app (repeatable)"
     )
     return parser
 
@@ -82,14 +84,14 @@ def _parse_env(pairs: list[str] | None) -> dict[str, str] | None:
     out: dict[str, str] = {}
     for p in pairs:
         if "=" not in p:
-            raise ValueError(f"--env 格式须 K=V, 得 {p!r}")
+            raise ValueError(f"--env format must be K=V, got {p!r}")
         k, v = p.split("=", 1)
         out[k] = v
     return out
 
 
 def _run_demo(args: argparse.Namespace, log: logging.Logger) -> int:
-    # Issue #64: demo 环境子模式 — up/status/stop 幂等动作, JSON 输出供演示脚本消费
+    # Issue #64: demo environment submode — idempotent up/status/stop actions, JSON output for demo scripts
     from .demo_env import DemoEnvError, DemoEnvRunner
 
     try:
@@ -108,13 +110,13 @@ def _run_demo(args: argparse.Namespace, log: logging.Logger) -> int:
         print(json.dumps(info, ensure_ascii=False, indent=2))
         return 0
     except DemoEnvError as e:
-        log.error("demo 环境失败: %s", e)
+        log.error("demo environment failed: %s", e)
         return 1
     except (TypeError, ValueError) as e:
-        log.error("参数错误: %s", e)
+        log.error("argument error: %s", e)
         return 2
     except Exception:
-        log.exception("demo 环境异常")
+        log.exception("demo environment exception")
         return 2
 
 
@@ -128,9 +130,9 @@ def main() -> int:
     )
     log = logging.getLogger("fusion_executor")
 
-    # M-CLI-01: serve 模式
+    # M-CLI-01: serve mode
     if args.serve:
-        # M-5: serve 校验 sock 父目录可写 (cwd 用 executor 默认, 不校验)
+        # M-5: serve validates the sock parent writability (cwd uses the executor default, not validated)
         _validate_paths(None, args.sock)
         try:
             FusionSandboxExecutor(allow_inline_interpreter=args.allow_inline_interpreter).serve(args.sock)
@@ -139,7 +141,7 @@ def main() -> int:
             return 1
         return 0
 
-    # Issue #64: demo 环境模式 — flag 驱动 (同 --serve, 避免 subcommand + bare positional 歧义)
+    # Issue #64: demo environment mode — flag-driven (same as --serve, avoiding subcommand + bare positional ambiguity)
     if args.demo_up or args.demo_status or args.demo_stop:
         return _run_demo(args, log)
 
@@ -147,10 +149,10 @@ def main() -> int:
         parser.print_help()
         return 0
 
-    # M-5: 执行模式校验 cwd 存在 (sock 非执行路径, 不校验)
+    # M-5: execute mode validates cwd exists (sock is not the execute path, not validated)
     _validate_paths(args.cwd, None, check_sock=False)
 
-    # M-CLI-01: 包 try/except 退 2 (旧版裸 traceback); -124→124 (旧版 -1/-124 全 → 1)
+    # M-CLI-01: wrap in try/except and exit 2 (old version dumped a bare traceback); -124→124 (old version mapped -1/-124 all → 1)
     try:
         env_vars = _parse_env(args.env)
         policy = RollbackPolicy() if args.auto_rollback else None
@@ -166,12 +168,12 @@ def main() -> int:
         )
         print(json.dumps(result.model_dump(), ensure_ascii=False, indent=2))
     except (TypeError, ValueError) as e:
-        log.error("参数错误: %s", e)
+        log.error("argument error: %s", e)
         return 2
     except Exception:
-        log.exception("执行异常")
+        log.exception("execution exception")
         return 2
-    # M-CLI-01: -124 超时映射 124 (旧版 -1/-124 全 → 1, 超时身份丢失); -1 blocked → 1
+    # M-CLI-01: -124 timeout maps to 124 (old version mapped -1/-124 all → 1, losing the timeout identity); -1 blocked → 1
     if result.exit_code == -124:
         return 124
     if result.exit_code < 0:

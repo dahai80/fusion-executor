@@ -1,14 +1,17 @@
 // fe-gui — macOS Computer Use (FR-05)
 //
-// P4 实装: AXUIElement (accessibility crate, safe wrapper) + CoreGraphics fallback
-// CI 跳过 GUI (TCC Accessibility + Screen Recording 权限); ax_trusted() 为 false 时优雅降级。
+// P4 implementation: AXUIElement (accessibility crate, safe wrapper) + CoreGraphics fallback
+// CI skips GUI (TCC Accessibility + Screen Recording permissions); graceful degradation when
+// ax_trusted() is false.
 //
-// crate 级 unsafe allow — 仅限本 crate。其余 7 个 crate 仍 workspace unsafe_code="deny"。
-// 原因: rustc 1.96 起 extern "C" {} 块内函数默认 unsafe-to-call (unsafe_extern_blocks 迁移),
-// accessibility-sys 0.2 用普通 extern "C" 且未导出 safe wrapper。AXIsProcessTrusted() 与
-// AXValueGetValue() (position/size) 只在 accessibility-sys 里, accessibility 0.2 safe crate 不覆盖。
-// 故这 3 个 FFI 调用需 unsafe block。其余 GUI 逻辑仍走 accessibility 0.2 safe wrapper (约 90%)。
-// 用户决策 (2026-08-20): scope allow to fe-gui only, 3 处审计过的 unsafe block。
+// Crate-level unsafe allow — scoped to this crate only. The other 7 crates keep
+// workspace unsafe_code="deny". Reason: since rustc 1.96, functions inside extern "C" {}
+// blocks default to unsafe-to-call (unsafe_extern_blocks migration); accessibility-sys 0.2
+// declares plain extern "C" and does not export safe wrappers. AXIsProcessTrusted() and
+// AXValueGetValue() (position/size) only exist in accessibility-sys; the accessibility 0.2
+// safe crate does not cover them. Hence these 3 FFI calls need unsafe blocks. The rest of
+// the GUI logic still goes through the accessibility 0.2 safe wrapper (~90%).
+// User decision (2026-08-20): scope allow to fe-gui only, 3 audited unsafe blocks.
 #![allow(unsafe_code)]
 
 use accessibility::AXAttribute;
@@ -41,7 +44,7 @@ use png::{BitDepth, ColorType, Encoder};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-/// 截图节点树上限 — 防 OOM + 递归爆炸
+/// Screenshot node-tree limits — OOM + recursion-explosion guards
 const MAX_TREE_DEPTH: usize = 8;
 const MAX_TREE_NODES: usize = 500;
 
@@ -68,9 +71,11 @@ pub enum GuiAction {
         duration_ms: u64,
     },
     Screenshot {
-        // #40: 敏感区遮罩 — true 时遍历 AX 树查 AXSecureTextField (密码框) 位置/尺寸,
-        // 对截图 PNG 对应像素区涂黑后编码, 防 VLM 泄露凭据。需 Accessibility TCC
-        // (AX 树遍历); 未授权时跳过遮罩并 warn (截图仍返回, 仅未遮罩)。
+        // #40: sensitive-area masking — when true, walk the AX tree for AXSecureTextField
+        // (password field) position/size, black out the matching pixel regions of the
+        // screenshot PNG before encoding, preventing VLM credential leakage. Requires
+        // Accessibility TCC (AX tree walk); when unauthorized, skip masking and warn
+        // (screenshot still returned, just unmasked).
         #[serde(default)]
         mask_sensitive: bool,
     },
@@ -117,15 +122,17 @@ pub enum GuiAction {
     Wait {
         seconds: f64,
     },
-    // #44: 批量鼠标移动 — 有序点序列, 单次 UDS 往返原子完成 (避免 N 次 hover round-trip)。
-    // CGEvent MouseMoved (无按键) 沿 waypoints 线性插值平滑; duration_ms 总时长分摊到每段。
+    // #44: batch mouse move — ordered point sequence, completed atomically in a single UDS
+    // round-trip (avoids N hover round-trips). CGEvent MouseMoved (no buttons) interpolates
+    // linearly along the waypoints; duration_ms is the total duration split across segments.
     MovePath {
         points: Vec<(f64, f64)>,
         #[serde(default)]
         duration_ms: u64,
     },
-    // #43: 显示器能力查询 — 列举所有活跃显示器 (id/scale/bounds/primary), trusted-independent
-    // (走 CGDisplay 非 AX)。fusion-osagent 据此取 scale_factor, 移除硬编码 2.0 假设。
+    // #43: display capability query — enumerate all active displays (id/scale/bounds/primary),
+    // trusted-independent (goes through CGDisplay, not AX). fusion-osagent reads scale_factor
+    // from this, removing the hardcoded 2.0 assumption.
     DisplayInfo {},
 }
 
@@ -136,14 +143,17 @@ pub struct GuiResult {
     pub screenshot_png_b64: Option<String>,
     pub screenshot_width: Option<u32>,
     pub screenshot_height: Option<u32>,
-    // #38: backing scale factor — 物理 PNG 像素 / 逻辑点 (Retina=2.0, 非 Retina=1.0)。
-    // 坐标契约: 所有 GuiAction x/y 输入 + inspect_tree AXPosition = 逻辑点;
-    //           screenshot_width/height = 物理像素。调用方据此双向换算 (pixel = point * scale)。
-    // 非 screenshot 结果默认 1.0 (无截图时无意义但向后兼容 absent=1.0)。
+    // #38: backing scale factor — physical PNG pixels / logical points (Retina=2.0, non-Retina=1.0).
+    // Coordinate contract: all GuiAction x/y inputs + inspect_tree AXPosition = logical points;
+    //           screenshot_width/height = physical pixels. Callers convert both ways with this
+    //           (pixel = point * scale).
+    // Non-screenshot results default to 1.0 (meaningless without a screenshot, but keeps
+    // backward compat with absent=1.0).
     #[serde(default = "default_scale_factor")]
     pub scale_factor: f32,
-    // #43: 显示器清单 JSON (display_info 动作填) — [{id, scale, bounds:{x,y,w,h}, primary}]。
-    // additive: 非 display_info 结果为 None, 向后兼容。
+    // #43: display inventory JSON (filled by the display_info action) —
+    // [{id, scale, bounds:{x,y,w,h}, primary}].
+    // additive: None on non-display_info results, backward compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub displays: Option<String>,
     pub error: Option<String>,
@@ -153,7 +163,7 @@ fn default_scale_factor() -> f32 {
     1.0
 }
 
-/// 单个 UI 节点 — InspectTree 输出的树节点
+/// Single UI node — tree node emitted by InspectTree
 #[derive(Debug, Clone, Serialize)]
 struct UiNode {
     role: String,
@@ -166,31 +176,36 @@ struct UiNode {
     children: Vec<UiNode>,
 }
 
-/// GUI 控制器 — P4 实装 (AXUIElement + CoreGraphics)
-/// 点击候选 — (节点, label, 位置)
+/// GUI controller — P4 implementation (AXUIElement + CoreGraphics)
+/// Click candidate — (node, label, position)
 type ClickCandidate = (AXUIElement, Option<String>, Option<(f64, f64)>);
 
-/// RUN-12: 默认 bundle 安全集 — 商用安全默认非空 allowlist, 防越权驱动任意 app。
-/// 本地可信调用方若需无限制, 显式传 GuiConfig { allowed_bundle_ids: None, .. } (向后兼容)。
+/// RUN-12: default bundle safe set — non-empty allowlist as the commercial-safe default,
+/// preventing unauthorized driving of arbitrary apps.
+/// Local trusted callers that need unrestricted access pass
+/// GuiConfig { allowed_bundle_ids: None, .. } explicitly (backward compatible).
 const DEFAULT_ALLOWED_BUNDLE_IDS: &[&str] = &[
     "com.apple.Terminal",
     "com.apple.TextEdit",
     "com.apple.finder",
 ];
 
-/// M-SEC-04: GUI 安全配置。
-/// - allowed_bundle_ids: None=不限 (显式 opt-in, 仅审计日志); Some=set=仅放行集合内 bundle。
-///   RUN-12: 默认非空安全集 (DEFAULT_ALLOWED_BUNDLE_IDS), 商用默认受限。
-/// - allow_type_into_secure: false (默认) 时拒绝向 AXSecureTextField (密码框) type_text;
-///   true 显式 opt-in (受控场景)。无论取值都记审计 WARN (bundle + 文本长度, 不记文本)。
+/// M-SEC-04: GUI security configuration.
+/// - allowed_bundle_ids: None=unrestricted (explicit opt-in, audit-logged only);
+///   Some=set=only bundles in the set are allowed.
+///   RUN-12: default is the non-empty safe set (DEFAULT_ALLOWED_BUNDLE_IDS), restricted by default.
+/// - allow_type_into_secure: false (default) rejects type_text into AXSecureTextField
+///   (password fields); true is an explicit opt-in (controlled scenarios). Either value is
+///   audit-logged as WARN (bundle + text length, never the text itself).
 #[derive(Debug, Clone)]
 pub struct GuiConfig {
     pub allowed_bundle_ids: Option<Vec<String>>,
     pub allow_type_into_secure: bool,
 }
 
-/// RUN-12: 默认非空 allowlist (商用安全默认), 非 None。
-/// 与 check_bundle_allowed None→Ok 契约不冲突: 显式传 None 仍 = 无限制 opt-in。
+/// RUN-12: default non-empty allowlist (commercial-safe default), not None.
+/// No conflict with the check_bundle_allowed None→Ok contract: an explicit None still means
+/// an unrestricted opt-in.
 impl Default for GuiConfig {
     fn default() -> Self {
         GuiConfig {
@@ -217,7 +232,8 @@ impl GuiController {
         }
     }
 
-    /// M-SEC-04: 带安全配置构造 (企业/多用户场景设 bundle allowlist + secure flag)。
+    /// M-SEC-04: construct with security config (enterprise/multi-user scenarios set a bundle
+    /// allowlist + the secure flag).
     pub fn new_with_config(config: GuiConfig) -> Self {
         info!(
             allowlist = ?config.allowed_bundle_ids.as_ref().map(|v| v.len()),
@@ -227,21 +243,25 @@ impl GuiController {
         Self { config }
     }
 
-    /// M-SEC-04: bundle 放行校验。allowlist=None 始终放行 (仅审计日志); Some=set 须命中。
+    /// M-SEC-04: bundle admission check. allowlist=None always allows (audit-logged only);
+    /// Some=set requires a hit.
     fn check_bundle_allowed(&self, bundle_id: &str) -> Result<()> {
         match &self.config.allowed_bundle_ids {
             None => {
-                debug!(bundle_id, "M-SEC-04 bundle 无 allowlist, 放行 (审计)");
+                debug!(
+                    bundle_id,
+                    "M-SEC-04 bundle has no allowlist, allowed (audit)"
+                );
                 Ok(())
             }
             Some(set) => {
                 if set.iter().any(|b| b == bundle_id) {
-                    debug!(bundle_id, "M-SEC-04 bundle 命中 allowlist");
+                    debug!(bundle_id, "M-SEC-04 bundle hit allowlist");
                     Ok(())
                 } else {
                     warn!(
                         bundle_id,
-                        "M-SEC-04 bundle 不在 allowlist — 拒绝 (防越权驱动任意 app)"
+                        "M-SEC-04 bundle not in allowlist — rejected (prevents driving arbitrary apps)"
                     );
                     Err(anyhow!("bundle-not-allowed: {bundle_id}"))
                 }
@@ -249,30 +269,35 @@ impl GuiController {
         }
     }
 
-    /// C-13: 解析当前 focused app 的 bundle id (best-effort)。
-    /// accessibility-sys 0.2 无 kAXBundleIdentifierAttribute 常量 — 用原始 CFString "AXBundleIdentifier"
-    /// 经 AXAttribute::<CFType> 读 + downcast CFString (同 focused_app 读 AXFocusedApplication 模式)。
-    /// 用于 HID-post 输入合成方法 (key_press/hold_key/scroll/drag/hover) 的 bundle allowlist 校验。
+    /// C-13: resolve the focused app's bundle id (best-effort).
+    /// accessibility-sys 0.2 has no kAXBundleIdentifierAttribute constant — use the raw
+    /// CFString "AXBundleIdentifier" via AXAttribute::<CFType> read + downcast to CFString
+    /// (same pattern as focused_app reading AXFocusedApplication).
+    /// Used for bundle allowlist checks of HID-post input synthesis methods
+    /// (key_press/hold_key/scroll/drag/hover).
     fn focused_app_bundle(&self) -> Result<String> {
         let app = Self::focused_app()?;
         let attr = AXAttribute::<CFType>::new(&CFString::from_static_string("AXBundleIdentifier"));
         let cf: CFType = app
             .attribute(&attr)
-            .map_err(|e| anyhow!("取 AXBundleIdentifier 失败: {e}"))?;
+            .map_err(|e| anyhow!("failed to read AXBundleIdentifier: {e}"))?;
         let s = cf
             .downcast::<CFString>()
-            .ok_or_else(|| anyhow!("AXBundleIdentifier 非 CFString"))?;
+            .ok_or_else(|| anyhow!("AXBundleIdentifier is not a CFString"))?;
         Ok(s.to_string())
     }
 
-    /// C-13: 输入合成方法顶上检查当前 focused app bundle 是否在 allowlist。
-    /// allowlist=None → 放行 (审计, 无 AX 调用 short-circuit); Some=set → 解析 focused bundle 后复用
-    /// check_bundle_allowed 纯校验 (无逻辑重复)。TOCTOU: check 与 HID-post 间聚焦可能切换 — HID 固有,
-    /// best-effort 非原子, 但堵当前 bypass (等非 allowlisted app 聚焦 → type_text 注入)。
+    /// C-13: check whether the focused app's bundle is allowlisted, at the top of every
+    /// input-synthesis method.
+    /// allowlist=None → allow (audit, short-circuits without any AX call); Some=set → resolve
+    /// the focused bundle then reuse the pure check_bundle_allowed validation (no duplicated
+    /// logic). TOCTOU: focus may switch between check and HID-post — inherent to HID,
+    /// best-effort not atomic, but it closes the current bypass (wait for a non-allowlisted
+    /// app to get focus → type_text injection).
     fn check_focused_allowed(&self) -> Result<()> {
         match &self.config.allowed_bundle_ids {
             None => {
-                debug!("C-13 输入合成: 无 allowlist, focused app 放行 (审计)");
+                debug!("C-13 input synthesis: no allowlist, focused app allowed (audit)");
                 Ok(())
             }
             Some(_) => {
@@ -282,13 +307,14 @@ impl GuiController {
         }
     }
 
-    /// C-13: 输入合成方法顶上调用 — allowlist 拦截返 Some(degraded GuiResult), 放行返 None。
-    /// 各方法 `if let Some(r) = self.focused_not_allowed() { return Ok(r); }` 一行 gate。
+    /// C-13: call at the top of input-synthesis methods — allowlist block returns
+    /// Some(degraded GuiResult), allow returns None.
+    /// Each method gates with one line: `if let Some(r) = self.focused_not_allowed() { return Ok(r); }`.
     fn focused_not_allowed(&self) -> Option<GuiResult> {
         match self.check_focused_allowed() {
             Ok(()) => None,
             Err(e) => {
-                warn!(error = %e, "C-13: focused app 不在 allowlist — 拒绝输入合成 (防越权注入)");
+                warn!(error = %e, "C-13: focused app not in allowlist — input synthesis rejected (prevents unauthorized injection)");
                 Some(GuiResult {
                     ok: false,
                     error: Some(format!("focused-app-not-allowed: {e}")),
@@ -298,30 +324,35 @@ impl GuiController {
         }
     }
 
-    /// AX 是否已授权 (TCC Accessibility)。未授权时所有 GUI 操作降级报错。
-    /// unsafe: AXIsProcessTrusted 是 accessibility-sys 的 extern "C" fn (rustc 1.96 默认 unsafe-to-call)。
-    /// 该 C 函数仅读 TCC 状态返回 bool, 无指针参数, 内存安全无风险。
+    /// Whether AX is authorized (TCC Accessibility). When unauthorized, all GUI operations
+    /// degrade to an error.
+    /// unsafe: AXIsProcessTrusted is an accessibility-sys extern "C" fn (unsafe-to-call by
+    /// default since rustc 1.96). That C function only reads TCC state and returns a bool,
+    /// no pointer parameters, no memory-safety risk.
     pub fn ax_trusted() -> bool {
         unsafe { AXIsProcessTrusted() }
     }
 
     pub fn execute(&self, action: GuiAction) -> Result<GuiResult> {
-        // Wait — 纯延时, trusted-independent, 不需 AX 授权, 先处理 (CI 可测)
+        // Wait — pure delay, trusted-independent, needs no AX authorization; handle first (CI-testable)
         if let GuiAction::Wait { seconds } = &action {
             return self.wait(*seconds);
         }
-        // IMPL-9: Screenshot 走 CoreGraphics (CGWindowListCreateImage) 需 Screen Recording TCC,
-        // 非 Accessibility TCC — 两权限独立。AX 未授权但 Screen Recording 授权时仍应可截图。
-        // 提到 ax_trusted 闸门前, 让 screenshot() 自探 Screen Recording (CGImage None → 降级)。
+        // IMPL-9: Screenshot goes through CoreGraphics (CGWindowListCreateImage) and needs
+        // Screen Recording TCC, not Accessibility TCC — the two permissions are independent.
+        // AX unauthorized but Screen Recording authorized should still allow screenshots.
+        // Hoisted before the ax_trusted gate so screenshot() probes Screen Recording itself
+        // (CGImage None → degrade).
         if let GuiAction::Screenshot { mask_sensitive } = &action {
             return self.screenshot(*mask_sensitive);
         }
-        // #43: DisplayInfo 走 CGDisplay (非 AX), trusted-independent — 提到 ax_trusted 闸门前。
+        // #43: DisplayInfo goes through CGDisplay (not AX), trusted-independent — hoisted
+        // before the ax_trusted gate.
         if let GuiAction::DisplayInfo {} = &action {
             return self.display_info();
         }
         if !Self::ax_trusted() {
-            warn!("AX 未授权 (TCC Accessibility) — GUI 操作降级");
+            warn!("AX not authorized (TCC Accessibility) — GUI operations degraded");
             return Ok(GuiResult {
                 ok: false,
                 error: Some("accessibility-permission-required".into()),
@@ -337,11 +368,14 @@ impl GuiController {
             GuiAction::TypeText { text } => self.type_text(&text),
             GuiAction::KeyPress { key, modifiers } => self.key_press(&key, &modifiers),
             GuiAction::HoldKey { key, duration_ms } => self.hold_key(&key, duration_ms),
-            // IMPL-9: Screenshot 已在 ax_trusted 闸门前 early-return (Screen Recording TCC 独立)。
-            // 走到此说明 early-return 被重构破 — fail-loud (非 crash), 同 Wait 兜底模式。
+            // IMPL-9: Screenshot early-returns before the ax_trusted gate (Screen Recording TCC
+            // is independent). Reaching here means the early-return was broken by a refactor —
+            // fail-loud (not crash), same fallback pattern as Wait.
             GuiAction::Screenshot { .. } => Ok(GuiResult {
                 ok: false,
-                error: Some("internal: Screenshot 未在 early-return 处理 (invariant 破坏)".into()),
+                error: Some(
+                    "internal: Screenshot not handled at early-return (invariant broken)".into(),
+                ),
                 ..Default::default()
             }),
             GuiAction::InspectTree {} => self.inspect_tree(),
@@ -368,47 +402,54 @@ impl GuiController {
                 width,
                 height,
             } => self.window_resize(bundle_id, width, height),
-            // m-FT-04: Wait 已在 ax_trusted 前早 return, 走到此说明 early-return 被重构破;
-            // 不 panic, fail-loud 返回错误 (调用方可见, 非 crash)
+            // m-FT-04: Wait early-returns before ax_trusted; reaching here means the
+            // early-return was broken by a refactor. No panic — fail-loud with an error
+            // (visible to the caller, not a crash).
             GuiAction::Wait { .. } => Ok(GuiResult {
                 ok: false,
-                error: Some("internal: Wait 未在 early-return 处理 (invariant 破坏)".into()),
+                error: Some("internal: Wait not handled at early-return (invariant broken)".into()),
                 ..Default::default()
             }),
-            // #44: move_path — N waypoints 鼠标移动, MouseMoved 插值, 单次往返原子完成。
+            // #44: move_path — N-waypoint mouse move, MouseMoved interpolation, atomic in one round-trip.
             GuiAction::MovePath {
                 points,
                 duration_ms,
             } => self.move_path(points, duration_ms),
-            // #43: DisplayInfo 已在 ax_trusted 前早 return; 走到此说明 early-return 被重构破。
+            // #43: DisplayInfo early-returns before ax_trusted; reaching here means the
+            // early-return was broken by a refactor.
             GuiAction::DisplayInfo {} => Ok(GuiResult {
                 ok: false,
-                error: Some("internal: DisplayInfo 未在 early-return 处理 (invariant 破坏)".into()),
+                error: Some(
+                    "internal: DisplayInfo not handled at early-return (invariant broken)".into(),
+                ),
                 ..Default::default()
             }),
         }
     }
 
-    /// #39: 批量原子动作管线 — 顺序执行多个 GuiAction, 收集每步 GuiResult。
-    /// 非事务 (单步失败不中止后续 — 调用方据每步 ok 自决重试/补偿); 中止语义由调用方
-    /// 读 results 断点实现 (executor 不可知意图)。空 actions 返空 Vec。顺序保证 (非并行),
-    /// 因 GUI 动作有隐含时序 (focus→click→type)。
+    /// #39: batch atomic action pipeline — execute multiple GuiActions in order, collecting
+    /// a GuiResult per step.
+    /// Non-transactional (a failed step does not abort the rest — the caller decides
+    /// retry/compensation from each step's ok); abort semantics are implemented by the caller
+    /// reading results and breaking (the executor is unaware of intent). Empty actions returns
+    /// an empty Vec. Ordered (not parallel), because GUI actions carry implicit sequencing
+    /// (focus→click→type).
     pub fn gui_action_batch(&self, actions: Vec<GuiAction>) -> Result<Vec<GuiResult>> {
-        info!(count = actions.len(), "gui_action_batch 开始");
+        info!(count = actions.len(), "gui_action_batch start");
         let mut results = Vec::with_capacity(actions.len());
         for (i, action) in actions.into_iter().enumerate() {
             let res = self.execute(action)?;
             let ok = res.ok;
             results.push(res);
-            info!(step = i, ok, "gui_action_batch 步完成");
+            info!(step = i, ok, "gui_action_batch step done");
         }
-        info!(count = results.len(), "gui_action_batch 结束");
+        info!(count = results.len(), "gui_action_batch end");
         Ok(results)
     }
 
     fn focus_app(&self, bundle_id: &str) -> Result<GuiResult> {
         info!(bundle_id, "FocusApp");
-        // M-SEC-04: bundle 放行校验 (防越权驱动任意 app)。
+        // M-SEC-04: bundle admission check (prevents driving arbitrary apps).
         if self.check_bundle_allowed(bundle_id).is_err() {
             return Ok(GuiResult {
                 ok: false,
@@ -417,9 +458,9 @@ impl GuiController {
             });
         }
         let app = AXUIElement::application_with_bundle(bundle_id)
-            .map_err(|e| anyhow!("定位 app 失败 {bundle_id}: {e}"))?;
+            .map_err(|e| anyhow!("failed to locate app {bundle_id}: {e}"))?;
         app.set_frontmost(CFBoolean::true_value())
-            .map_err(|e| anyhow!("set_frontmost 失败: {e}"))?;
+            .map_err(|e| anyhow!("set_frontmost failed: {e}"))?;
         if let Ok(win) = app.focused_window().or_else(|_| app.main_window()) {
             let _ = win.set_main(CFBoolean::true_value());
         }
@@ -436,9 +477,9 @@ impl GuiController {
         ));
         let cf: CFType = syswide
             .attribute(&attr)
-            .map_err(|e| anyhow!("取 focused app 失败: {e}"))?;
+            .map_err(|e| anyhow!("failed to get focused app: {e}"))?;
         cf.downcast::<AXUIElement>()
-            .ok_or_else(|| anyhow!("focused app 类型不匹配"))
+            .ok_or_else(|| anyhow!("focused app type mismatch"))
     }
 
     fn click(&self, ax_label: Option<&str>, ax_position: Option<(f64, f64)>) -> Result<GuiResult> {
@@ -450,7 +491,7 @@ impl GuiController {
         let win = app
             .focused_window()
             .or_else(|_| app.main_window())
-            .map_err(|e| anyhow!("取 focused window 失败: {e}"))?;
+            .map_err(|e| anyhow!("failed to get focused window: {e}"))?;
         let target = Self::find_click_target(&win, ax_label, ax_position)?;
         let actions = target
             .action_names()
@@ -461,7 +502,7 @@ impl GuiController {
         {
             target
                 .press()
-                .map_err(|e| anyhow!("press 失败: {e}"))
+                .map_err(|e| anyhow!("press failed: {e}"))
                 .map(|_| true)
         } else {
             Ok(false)
@@ -479,7 +520,7 @@ impl GuiController {
         })
     }
 
-    /// 在 window 子树中找点击目标 — 优先 label 精确匹配, 否则位置最近匹配
+    /// Find a click target in the window subtree — exact label match first, otherwise nearest by position
     fn find_click_target(
         root: &AXUIElement,
         ax_label: Option<&str>,
@@ -488,7 +529,7 @@ impl GuiController {
         let mut candidates: Vec<ClickCandidate> = Vec::new();
         Self::collect_clickable(root, 0, &mut candidates);
         if candidates.is_empty() {
-            return Err(anyhow!("无可点击节点 (子树为空)"));
+            return Err(anyhow!("no clickable nodes (empty subtree)"));
         }
         if let Some(label) = ax_label {
             if let Some(c) = candidates
@@ -505,10 +546,10 @@ impl GuiController {
                     p.map(|(x, y)| ((x - pos.0).abs() + (y - pos.1).abs()) as i64)
                         .unwrap_or(i64::MAX)
                 })
-                .ok_or_else(|| anyhow!("位置匹配无候选"))?;
+                .ok_or_else(|| anyhow!("no candidates for position match"))?;
             return Ok(best.0);
         }
-        Err(anyhow!("click 需 ax_label 或 ax_position"))
+        Err(anyhow!("click requires ax_label or ax_position"))
     }
 
     fn collect_clickable(elem: &AXUIElement, depth: usize, out: &mut Vec<ClickCandidate>) {
@@ -543,11 +584,12 @@ impl GuiController {
         let win = app
             .focused_window()
             .or_else(|_| app.main_window())
-            .map_err(|e| anyhow!("取 focused window 失败: {e}"))?;
+            .map_err(|e| anyhow!("failed to get focused window: {e}"))?;
         let target = Self::find_text_field(&win)?;
-        // M-SEC-04: 密码框保护 — AXSecureTextField 是 AXTextField 角色 + AXSecureTextField 子角色。
-        // 拒绝向密码框 type_text 除非显式 allow_type_into_secure (防凭据窃取注入)。
-        // 审计日志记文本长度 (不记文本本身, 防凭据落盘日志)。
+        // M-SEC-04: password field protection — AXSecureTextField is the AXTextField role with
+        // the AXSecureTextField subrole. Reject type_text into password fields unless
+        // allow_type_into_secure is explicitly set (prevents credential-stealing injection).
+        // Audit log records the text length (never the text itself, keeping credentials out of logs).
         let is_secure = target
             .subrole()
             .map(|s| s == kAXSecureTextFieldSubrole)
@@ -556,14 +598,14 @@ impl GuiController {
             warn!(
                 text_len = text.len(),
                 allow_secure = self.config.allow_type_into_secure,
-                "M-SEC-04: 目标为 AXSecureTextField (密码框) — type_text 审计"
+                "M-SEC-04: target is AXSecureTextField (password field) — type_text audited"
             );
             if !self.config.allow_type_into_secure {
-                warn!("M-SEC-04: 拒绝向密码框 type_text (未显式 allow_type_into_secure)");
+                warn!("M-SEC-04: type_text into password field rejected (allow_type_into_secure not set)");
                 return Ok(GuiResult {
                     ok: false,
                     error: Some(
-                        "secure-text-field-rejected: 目标为密码框, type_text 被拒 (M-SEC-04)"
+                        "secure-text-field-rejected: target is a password field, type_text rejected (M-SEC-04)"
                             .into(),
                     ),
                     ..Default::default()
@@ -572,18 +614,18 @@ impl GuiController {
         } else {
             debug!(
                 text_len = text.len(),
-                "M-SEC-04: type_text 目标非密码框, 审计文本长度"
+                "M-SEC-04: type_text target is not a password field, text length audited"
             );
         }
         let settable = target
             .is_settable(&accessibility::AXAttribute::value())
             .unwrap_or(false);
         if !settable {
-            debug!("value 不可 settable, 尝试直接 set_value (部分控件允许)");
+            debug!("value not settable, trying direct set_value anyway (some controls allow it)");
         }
         target
             .set_value(CFString::new(text).into_CFType())
-            .map_err(|e| anyhow!("set_value 失败: {e}"))?;
+            .map_err(|e| anyhow!("set_value failed: {e}"))?;
         let actions = target
             .action_names()
             .unwrap_or_else(|_| CFArray::from_CFTypes(&[]));
@@ -599,24 +641,28 @@ impl GuiController {
         })
     }
 
-    /// KeyPress — CGEvent 合成 keydown + keyup, post 到 HID tap。
-    /// 键名 → virtual keycode (layout-independent); 未识别返回 ok:false + 已知列表, 不 panic。
-    /// modifiers: 和弦修饰键 (Cmd/Shift/Option/Control), 合成顺序:
-    ///   keydown 各 modifier (set_flags 累加) → keydown key (带累加 flag) → keyup key → keyup modifier 逆序
-    /// core-graphics 0.24 safe wrapper: CGEventSource::new / CGEvent::new_keyboard_event / post / set_flags
-    /// 内部均为 unsafe FFI, 但已封进 safe API; 本函数无需手写 unsafe block。
+    /// KeyPress — CGEvent synthesizes keydown + keyup, posted to the HID tap.
+    /// Key name → virtual keycode (layout-independent); unknown names return ok:false + the
+    /// known list, no panic.
+    /// modifiers: chord modifiers (Cmd/Shift/Option/Control), synthesis order:
+    ///   keydown each modifier (set_flags accumulates) → keydown key (with accumulated flags) →
+    ///   keyup key → keyup modifiers in reverse order
+    /// core-graphics 0.24 safe wrapper: CGEventSource::new / CGEvent::new_keyboard_event / post /
+    /// set_flags are unsafe FFI internally but already wrapped in a safe API; this function needs
+    /// no handwritten unsafe block.
     fn key_press(&self, key: &str, modifiers: &[String]) -> Result<GuiResult> {
         info!(key, mods = ?modifiers, "KeyPress");
-        // RUN-12: trusted-independent 输入校验先行 — 未知键名/修饰键降级与焦点 app 无关,
-        // 放在 focused_not_allowed 闸门之前 (keycode/modifier 解析不触 AX 焦点读)。
+        // RUN-12: trusted-independent input validation first — unknown key/modifier degradation
+        // is independent of the focused app, placed before the focused_not_allowed gate
+        // (keycode/modifier resolution never touches AX focus reads).
         let code = match Self::resolve_keycode(key) {
             Some(c) => c,
             None => {
-                warn!(key, "未知键名 — 降级返回已知列表");
+                warn!(key, "unknown key name — degraded, returning known list");
                 return Ok(GuiResult {
                     ok: false,
                     error: Some(format!(
-                        "unknown-key: '{key}'; 支持的键名见 resolve_keycode \
+                        "unknown-key: '{key}'; see resolve_keycode for supported key names \
                          (Return/Tab/Space/Delete/Forward_delete/Escape/Up_arrow/Down_arrow/\
                          Left_arrow/Right_arrow/Home/End/Page_up/Page_down/Help/\
                          F1-F20/Command/Shift/Option/Control/Function/Caps_lock/Mute/\
@@ -626,7 +672,7 @@ impl GuiController {
                 });
             }
         };
-        // 解析 modifiers → (flag, keycode); 未识别 modifier 整体降级
+        // Resolve modifiers → (flag, keycode); an unrecognized modifier degrades the whole action
         let mut mods: Vec<(CGEventFlags, CGKeyCode)> = Vec::new();
         for m in modifiers {
             match Self::resolve_modifier(m) {
@@ -637,11 +683,11 @@ impl GuiController {
                         "option" | "alt" => KeyCode::OPTION,
                         "control" | "ctrl" => KeyCode::CONTROL,
                         _ => {
-                            warn!(modifier = m, "未知修饰键 — 降级");
+                            warn!(modifier = m, "unknown modifier — degraded");
                             return Ok(GuiResult {
                                 ok: false,
                                 error: Some(format!(
-                                    "unknown-modifier: '{m}'; 支持: command/cmd, shift, \
+                                    "unknown-modifier: '{m}'; supported: command/cmd, shift, \
                                      option/alt, control/ctrl",
                                 )),
                                 ..Default::default()
@@ -651,11 +697,11 @@ impl GuiController {
                     mods.push((f, mk));
                 }
                 None => {
-                    warn!(modifier = m, "未知修饰键 — 降级");
+                    warn!(modifier = m, "unknown modifier — degraded");
                     return Ok(GuiResult {
                         ok: false,
                         error: Some(format!(
-                            "unknown-modifier: '{m}'; 支持: command/cmd, shift, option/alt, \
+                            "unknown-modifier: '{m}'; supported: command/cmd, shift, option/alt, \
                              control/ctrl",
                         )),
                         ..Default::default()
@@ -663,45 +709,48 @@ impl GuiController {
                 }
             }
         }
-        // RUN-12: 输入校验已过 (trusted-independent), 再查焦点 app 白名单 — 非白名单 app 拒绝合成事件
+        // RUN-12: input validation passed (trusted-independent), now check the focused app
+        // allowlist — synthesis events rejected for non-allowlisted apps
         if let Some(r) = self.focused_not_allowed() {
             return Ok(r);
         }
-        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            .map_err(|_| anyhow!("CGEventSource 创建失败 (CGEventSourceCreate 返回 null)"))?;
-        // 累加 flag — 修饰键 keydown 事件本身也带全部 modifier flag
+        let source =
+            CGEventSource::new(CGEventSourceStateID::CombinedSessionState).map_err(|_| {
+                anyhow!("CGEventSource creation failed (CGEventSourceCreate returned null)")
+            })?;
+        // Accumulate flags — the modifier keydown events themselves also carry all modifier flags
         let mut combined = CGEventFlags::CGEventFlagNull;
         for (f, _mk) in &mods {
             combined |= *f;
         }
-        // 1. keydown 各 modifier (事件带累加 flag)
+        // 1. keydown each modifier (events carry the accumulated flags)
         for (f, mk) in &mods {
             let e = CGEvent::new_keyboard_event(source.clone(), *mk, true)
-                .map_err(|_| anyhow!("CGEvent modifier keydown 创建失败"))?;
+                .map_err(|_| anyhow!("CGEvent modifier keydown creation failed"))?;
             e.set_flags(*f);
             e.post(CGEventTapLocation::HID);
         }
-        // 2. keydown key (带全部 modifier flag)
+        // 2. keydown key (with all modifier flags)
         let down = CGEvent::new_keyboard_event(source.clone(), code, true)
-            .map_err(|_| anyhow!("CGEvent keydown 创建失败"))?;
+            .map_err(|_| anyhow!("CGEvent keydown creation failed"))?;
         down.set_flags(combined);
         down.post(CGEventTapLocation::HID);
-        // 3. keyup key (flag 清空)
+        // 3. keyup key (flags cleared)
         let up = CGEvent::new_keyboard_event(source.clone(), code, false)
-            .map_err(|_| anyhow!("CGEvent keyup 创建失败"))?;
+            .map_err(|_| anyhow!("CGEvent keyup creation failed"))?;
         up.set_flags(CGEventFlags::CGEventFlagNull);
         up.post(CGEventTapLocation::HID);
-        // 4. keyup modifier 逆序 (flag 清空)
+        // 4. keyup modifiers in reverse order (flags cleared)
         for (_, mk) in mods.iter().rev() {
             let e = CGEvent::new_keyboard_event(source.clone(), *mk, false)
-                .map_err(|_| anyhow!("CGEvent modifier keyup 创建失败"))?;
+                .map_err(|_| anyhow!("CGEvent modifier keyup creation failed"))?;
             e.set_flags(CGEventFlags::CGEventFlagNull);
             e.post(CGEventTapLocation::HID);
         }
         debug!(
             keycode = code,
             mods = mods.len(),
-            "KeyPress 完成 (和弦 keydown+keyup posted)"
+            "KeyPress done (chord keydown+keyup posted)"
         );
         Ok(GuiResult {
             ok: true,
@@ -709,36 +758,39 @@ impl GuiController {
         })
     }
 
-    /// HoldKey — 按住单键 duration_ms 后释放 (keydown → sleep → keyup)。
-    /// 用于长按 (如按住方向键移动光标, 按住 Backspace 连删)。单键无 modifier 和弦。
-    /// 未识别键名同 key_press 降级 ok:false + 已知列表。sleep 阻塞当前线程 (GUI 同步路径)。
+    /// HoldKey — hold a single key for duration_ms then release (keydown → sleep → keyup).
+    /// Used for long presses (e.g. holding an arrow key to move the cursor, holding Backspace
+    /// to delete continuously). Single key, no modifier chords.
+    /// Unknown key names degrade like key_press: ok:false + the known list. sleep blocks the
+    /// current thread (GUI synchronous path).
     fn hold_key(&self, key: &str, duration_ms: u64) -> Result<GuiResult> {
         info!(key, duration_ms, "HoldKey");
-        // M-12.4: duration_ms==0 → keydown 立即 keyup = 单击非按住, 静默 no-op 易误用。
-        // fail-loud 拒绝 (Rule 12), 调用方显式用 key_press 做单击。
+        // M-12.4: duration_ms==0 → keydown immediately followed by keyup = a click, not a hold;
+        // a silent no-op is easy to misuse.
+        // Fail-loud rejection (Rule 12); callers use key_press explicitly for clicks.
         if duration_ms == 0 {
             warn!(
                 key,
-                "HoldKey duration_ms=0 — 拒绝 (keydown 即 keyup 是单击非按住, 显式用 key_press)"
+                "HoldKey duration_ms=0 — rejected (keydown+keyup is a click not a hold, use key_press explicitly)"
             );
             return Ok(GuiResult {
                 ok: false,
                 error: Some(
-                    "hold-key-duration-zero: duration_ms 必须 >0 (按住需非零时长; 单击用 key_press)"
+                    "hold-key-duration-zero: duration_ms must be >0 (a hold needs non-zero duration; use key_press for clicks)"
                         .into(),
                 ),
                 ..Default::default()
             });
         }
-        // RUN-12: trusted-independent keycode 校验先行 (与 key_press 同理)
+        // RUN-12: trusted-independent keycode validation first (same rationale as key_press)
         let code = match Self::resolve_keycode(key) {
             Some(c) => c,
             None => {
-                warn!(key, "未知键名 — 降级返回已知列表");
+                warn!(key, "unknown key name — degraded, returning known list");
                 return Ok(GuiResult {
                     ok: false,
                     error: Some(format!(
-                        "unknown-key: '{key}'; 支持的键名见 resolve_keycode \
+                        "unknown-key: '{key}'; see resolve_keycode for supported key names \
                          (Return/Tab/Space/Delete/Forward_delete/Escape/Up_arrow/Down_arrow/\
                          Left_arrow/Right_arrow/Home/End/Page_up/Page_down/Help/\
                          F1-F20/Command/Shift/Option/Control/Function/Caps_lock/Mute/\
@@ -748,32 +800,34 @@ impl GuiController {
                 });
             }
         };
-        // RUN-12: 焦点 app 白名单 — keycode 已过, 非白名单 app 拒绝合成事件
+        // RUN-12: focused app allowlist — keycode passed, synthesis events rejected for
+        // non-allowlisted apps
         if let Some(r) = self.focused_not_allowed() {
             return Ok(r);
         }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            .map_err(|_| anyhow!("CGEventSource 创建失败 (hold_key)"))?;
+            .map_err(|_| anyhow!("CGEventSource creation failed (hold_key)"))?;
         // keydown
         let down = CGEvent::new_keyboard_event(source.clone(), code, true)
-            .map_err(|_| anyhow!("CGEvent keydown 创建失败 (hold_key)"))?;
+            .map_err(|_| anyhow!("CGEvent keydown creation failed (hold_key)"))?;
         down.post(CGEventTapLocation::HID);
-        // 按住 — 阻塞 sleep (GUI 同步, duration_ms 量级; 超 5s 截断防误用挂死)
+        // Hold — blocking sleep (GUI synchronous, duration_ms magnitude; capped at 5s to prevent
+        // misuse from hanging)
         let capped = duration_ms.min(5000);
         if capped != duration_ms {
             warn!(
                 asked = duration_ms,
-                capped, "HoldKey duration 超 5s 上限, 截断防挂死"
+                capped, "HoldKey duration exceeds the 5s cap, truncated to avoid hanging"
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(capped));
         // keyup
         let up = CGEvent::new_keyboard_event(source.clone(), code, false)
-            .map_err(|_| anyhow!("CGEvent keyup 创建失败 (hold_key)"))?;
+            .map_err(|_| anyhow!("CGEvent keyup creation failed (hold_key)"))?;
         up.post(CGEventTapLocation::HID);
         debug!(
             keycode = code,
-            capped, "HoldKey 完成 (keydown→sleep→keyup posted)"
+            capped, "HoldKey done (keydown→sleep→keyup posted)"
         );
         Ok(GuiResult {
             ok: true,
@@ -781,7 +835,7 @@ impl GuiController {
         })
     }
 
-    /// 修饰键名 (大小写不敏感) → CGEventFlags bit。仅 4 主修饰键。
+    /// Modifier name (case-insensitive) → CGEventFlags bit. Only the 4 main modifiers.
     fn resolve_modifier(name: &str) -> Option<CGEventFlags> {
         let k = name.trim().to_ascii_lowercase();
         let f = match k.as_str() {
@@ -794,7 +848,7 @@ impl GuiController {
         Some(f)
     }
 
-    /// 键名 (不区分大小写) → virtual keycode。匹配 core_graphics::event::KeyCode 常量。
+    /// Key name (case-insensitive) → virtual keycode. Matches core_graphics::event::KeyCode constants.
     fn resolve_keycode(name: &str) -> Option<CGKeyCode> {
         let k = name.trim().to_ascii_lowercase();
         let code = match k.as_str() {
@@ -851,11 +905,11 @@ impl GuiController {
         Some(code)
     }
 
-    /// 找文本输入框 — AXTextField / AXTextArea 角色的 focused 元素, 否则子树第一个
+    /// Find a text input — the focused element with role AXTextField / AXTextArea, otherwise the first in the subtree
     fn find_text_field(root: &AXUIElement) -> Result<AXUIElement> {
         let mut found: Option<AXUIElement> = None;
         Self::walk_first_text(root, 0, &mut found);
-        found.ok_or_else(|| anyhow!("未找到文本输入框 (AXTextField/AXTextArea)"))
+        found.ok_or_else(|| anyhow!("no text input found (AXTextField/AXTextArea)"))
     }
 
     fn walk_first_text(elem: &AXUIElement, depth: usize, found: &mut Option<AXUIElement>) {
@@ -884,12 +938,14 @@ impl GuiController {
         let win = app
             .focused_window()
             .or_else(|_| app.main_window())
-            .map_err(|e| anyhow!("取 focused window 失败: {e}"))?;
+            .map_err(|e| anyhow!("failed to get focused window: {e}"))?;
         let mut count = 0usize;
         let root = Self::build_node(&win, 0, &mut count);
-        let tree = serde_json::to_string(&root).map_err(|e| anyhow!("节点树序列化失败: {e}"))?;
-        // #43: inspect_tree 亦填 scale_factor — 旧版 ..Default::default() 默认 1.0, Retina 机
-        // 调用方误判坐标空间。复用主屏 scale (与 screenshot 同源), 无截图但坐标契约一致。
+        let tree = serde_json::to_string(&root)
+            .map_err(|e| anyhow!("node tree serialization failed: {e}"))?;
+        // #43: inspect_tree also fills scale_factor — the old ..Default::default() left 1.0, which
+        // made callers on Retina machines misjudge the coordinate space. Reuse the main-display
+        // scale (same source as screenshot); no screenshot but a consistent coordinate contract.
         let scale_factor = Self::compute_scale_factor();
         Ok(GuiResult {
             ok: true,
@@ -899,15 +955,16 @@ impl GuiController {
         })
     }
 
-    /// #38/#43: 主屏 backing scale factor = 物理像素 / 逻辑点 (Retina=2.0, 非 Retina=1.0)。
-    /// screenshot + inspect_tree + display_info 共用; bounds.width=0 时降级 1.0 防 NaN。
+    /// #38/#43: main-display backing scale factor = physical pixels / logical points
+    /// (Retina=2.0, non-Retina=1.0). Shared by screenshot + inspect_tree + display_info;
+    /// degrades to 1.0 when bounds.width=0 to avoid NaN.
     fn compute_scale_factor() -> f32 {
         let main = CGDisplay::main();
         let logical_w = main.bounds().size.width;
         if logical_w > 0.0 {
             (main.pixels_wide() as f32 / logical_w as f32).max(1.0)
         } else {
-            warn!("主屏逻辑宽度为 0 — scale_factor 降级 1.0");
+            warn!("main display logical width is 0 — scale_factor degraded to 1.0");
             1.0
         }
     }
@@ -962,9 +1019,11 @@ impl GuiController {
         }
     }
 
-    /// 读 AXPosition — unsafe: AXValueGetValue 是 accessibility-sys extern "C" fn (rustc 1.96 默认 unsafe)。
-    /// 语义: 从 ax_ref 读 CGPoint 写入栈上 pt。ax_ref 来自 CFType downcast (cf_to_axvalue),
-    /// 若类型不符 AXValueGetValue 返回 false (不写)。指针只指向本地栈变量, 生命周期安全。
+    /// Read AXPosition — unsafe: AXValueGetValue is an accessibility-sys extern "C" fn (unsafe by
+    /// default since rustc 1.96). Semantics: read a CGPoint from ax_ref into the stack-local pt.
+    /// ax_ref comes from a CFType downcast (cf_to_axvalue); on type mismatch AXValueGetValue
+    /// returns false (writes nothing). The pointer targets only a local stack variable —
+    /// lifetime-safe.
     fn read_position(elem: &AXUIElement) -> Option<(f64, f64)> {
         let attr = AXAttribute::<CFType>::new(&CFString::from_static_string(kAXPositionAttribute));
         let cf = elem.attribute(&attr).ok()?;
@@ -984,7 +1043,7 @@ impl GuiController {
         }
     }
 
-    /// 读 AXSize — 同 read_position, 写入 CGSize。
+    /// Read AXSize — same as read_position, writing a CGSize.
     fn read_size(elem: &AXUIElement) -> Option<(f64, f64)> {
         let attr = AXAttribute::<CFType>::new(&CFString::from_static_string(kAXSizeAttribute));
         let cf = elem.attribute(&attr).ok()?;
@@ -1004,7 +1063,7 @@ impl GuiController {
         }
     }
 
-    /// CFType → AXValueRef (类型不匹配返回 None, 不 panic)
+    /// CFType → AXValueRef (returns None on type mismatch, no panic)
     fn cf_to_axvalue(cf: &CFType) -> Option<AXValueRef> {
         let ptr = cf.as_concrete_TypeRef() as AXValueRef;
         if ptr.is_null() {
@@ -1014,21 +1073,23 @@ impl GuiController {
         }
     }
 
-    /// #40: 收集焦点 app 焦点窗口内所有 AXSecureTextField (密码框) 的逻辑点矩形 (x, y, w, h)。
-    /// 递归遍历 AX 子树 (复用 build_node 的深度/节点上限防爆炸)。AX 未授权时返空 Vec
-    /// (调用方 screenshot 已在 ax_trusted() 闸门内调用, 此处仍 fail-soft)。
+    /// #40: collect logical-point rects (x, y, w, h) of all AXSecureTextField (password) fields
+    /// inside the focused app's focused window.
+    /// Recursively walks the AX subtree (reuses build_node's depth/node caps to prevent
+    /// explosion). Returns an empty Vec when AX is unauthorized (the caller's screenshot already
+    /// runs inside the ax_trusted() gate; still fail-soft here).
     fn collect_secure_rects() -> Vec<(f64, f64, f64, f64)> {
         let app = match Self::focused_app() {
             Ok(a) => a,
             Err(e) => {
-                warn!(error = %e, "collect_secure_rects: 取 focused app 失败 — 返空");
+                warn!(error = %e, "collect_secure_rects: failed to get focused app — returning empty");
                 return vec![];
             }
         };
         let win = match app.focused_window().or_else(|_| app.main_window()) {
             Ok(w) => w,
             Err(e) => {
-                warn!(error = %e, "collect_secure_rects: 取 focused window 失败 — 返空");
+                warn!(error = %e, "collect_secure_rects: failed to get focused window — returning empty");
                 return vec![];
             }
         };
@@ -1048,7 +1109,7 @@ impl GuiController {
             return;
         }
         *count += 1;
-        // AXSecureTextField: subrole == kAXSecureTextFieldSubrole (密码框显式标记)
+        // AXSecureTextField: subrole == kAXSecureTextFieldSubrole (explicit password-field marker)
         let is_secure = elem
             .subrole()
             .map(|s| s == kAXSecureTextFieldSubrole)
@@ -1069,9 +1130,11 @@ impl GuiController {
         }
     }
 
-    /// #40: 对 RGBA 缓冲区原地涂黑敏感区。rects 是逻辑点 (x, y, w, h); scale 转 物理像素。
-    /// 坐标系换算: AX 原点左上 (y 向下), 位图上下文原点左下 (行 0 = 底) — 故位图行 = h_px - 1 - y_px。
-    /// 越界裁剪到 [0, w_px)/[0, h_px) 防 panic。
+    /// #40: black out sensitive regions of an RGBA buffer in place. rects are logical points
+    /// (x, y, w, h); scale converts to physical pixels.
+    /// Coordinate conversion: the AX origin is top-left (y down), the bitmap context origin is
+    /// bottom-left (row 0 = bottom) — hence bitmap row = h_px - 1 - y_px.
+    /// Out-of-bounds clipped to [0, w_px)/[0, h_px) to avoid panic.
     fn mask_rgba_inplace(
         rgba: &mut [u8],
         w_px: usize,
@@ -1081,7 +1144,7 @@ impl GuiController {
     ) {
         let bytes_per_row = w_px * 4;
         for &(lx, ly, lw, lh) in rects {
-            // 逻辑点 → 物理像素 (向下取整 + clamp)
+            // Logical points → physical pixels (floor + clamp)
             let x0 = ((lx * scale as f64).floor() as isize).max(0) as usize;
             let y0 = ((ly * scale as f64).floor() as isize).max(0) as usize;
             let x1 = (((lx + lw) * scale as f64).ceil() as isize).min(w_px as isize) as usize;
@@ -1089,7 +1152,7 @@ impl GuiController {
             if x0 >= x1 || y0 >= y1 || x0 >= w_px || y0 >= h_px {
                 continue;
             }
-            // 涂黑: RGBA = (0,0,0,255)。y 翻转 — 位图行 0 在底。
+            // Black out: RGBA = (0,0,0,255). y-flip — bitmap row 0 is the bottom.
             for py in y0..y1 {
                 let row = h_px - 1 - py;
                 let base = row * bytes_per_row + x0 * 4;
@@ -1104,10 +1167,12 @@ impl GuiController {
         }
     }
 
-    /// 截图 — CGWindowListCreateImage 全屏 → CGImage → 位图上下文取 RGBA → PNG → base64
-    /// Screen Recording TCC 未授权时 CGImage 为 None → 返回明确错误。
-    /// #40: mask_sensitive=true 时遍历 AX 树查 AXSecureTextField (密码框) 区块, 对 RGBA
-    /// 像素涂黑后编码 — 防 VLM 泄露凭据。需 Accessibility TCC; 未授权跳过遮罩 + warn。
+    /// Screenshot — CGWindowListCreateImage full screen → CGImage → bitmap context to RGBA →
+    /// PNG → base64.
+    /// When Screen Recording TCC is unauthorized the CGImage is None → explicit error.
+    /// #40: with mask_sensitive=true, walk the AX tree for AXSecureTextField (password field)
+    /// regions and black out the RGBA pixels before encoding — prevents VLM credential leakage.
+    /// Requires Accessibility TCC; when unauthorized, skip masking + warn.
     fn screenshot(&self, mask_sensitive: bool) -> Result<GuiResult> {
         info!(mask_sensitive, "Screenshot");
         let bounds = CGRect {
@@ -1125,11 +1190,11 @@ impl GuiController {
         ) {
             Some(i) => i,
             None => {
-                warn!("Screen Recording 未授权 — 截图降级");
+                warn!("Screen Recording not authorized — screenshot degraded");
                 return Ok(GuiResult {
                     ok: false,
                     error: Some(
-                        "screen-recording-permission-required (CGWindowListCreateImage 返回 null)"
+                        "screen-recording-permission-required (CGWindowListCreateImage returned null)"
                             .into(),
                     ),
                     ..Default::default()
@@ -1139,7 +1204,7 @@ impl GuiController {
         let (mut rgba, vw, vh) = match Self::cgimage_to_rgba(&img) {
             Ok(t) => t,
             Err(e) => {
-                warn!(error = %e, "截图编码失败 — 降级");
+                warn!(error = %e, "screenshot encoding failed — degraded");
                 return Ok(GuiResult {
                     ok: false,
                     error: Some(format!("screenshot-encode-failed: {e}")),
@@ -1147,12 +1212,13 @@ impl GuiController {
                 });
             }
         };
-        // #38: scale_factor = 物理像素 / 逻辑点。CGDisplay::main().bounds() 返主屏逻辑点尺寸;
-        // screenshot 是全屏物理像素 (img.width/height)。Retina 上 = 2.0, 非 Retina = 1.0。
-        // bounds.width 为 0 (罕见异常) 时降级 1.0 防 NaN。
+        // #38: scale_factor = physical pixels / logical points. CGDisplay::main().bounds() returns
+        // the main display's logical point size; the screenshot is full-screen physical pixels
+        // (img.width/height). 2.0 on Retina, 1.0 otherwise.
+        // bounds.width of 0 (rare anomaly) degrades to 1.0 to avoid NaN.
         let scale_factor = Self::compute_scale_factor();
-        info!(scale_factor, "Screenshot scale_factor 计算完成");
-        // #40: 敏感区遮罩 — AXSecureTextField (密码框) 像素涂黑。
+        info!(scale_factor, "Screenshot scale_factor computed");
+        // #40: sensitive-area masking — black out AXSecureTextField (password field) pixels.
         let masked_count = if mask_sensitive {
             if Self::ax_trusted() {
                 let rects = Self::collect_secure_rects();
@@ -1161,19 +1227,22 @@ impl GuiController {
                 }
                 rects.len()
             } else {
-                warn!("mask_sensitive=true 但 AX 未授权 — 跳过敏感区遮罩 (截图未遮罩返回)");
+                warn!("mask_sensitive=true but AX unauthorized — skipping sensitive-area masking (screenshot returned unmasked)");
                 0
             }
         } else {
             0
         };
         if masked_count > 0 {
-            info!(masked_count, "敏感区遮罩完成 (AXSecureTextField 区块涂黑)");
+            info!(
+                masked_count,
+                "sensitive-area masking done (AXSecureTextField regions blacked out)"
+            );
         }
         let png_b64 = match Self::rgba_to_png_b64(&rgba, vw, vh) {
             Ok(b) => b,
             Err(e) => {
-                warn!(error = %e, "截图编码失败 — 降级");
+                warn!(error = %e, "screenshot encoding failed — degraded");
                 return Ok(GuiResult {
                     ok: false,
                     error: Some(format!("screenshot-encode-failed: {e}")),
@@ -1191,20 +1260,25 @@ impl GuiController {
         })
     }
 
-    /// CGImage → RGBA Vec<u8> (预乘, premultiplied last) + 宽高。位图上下文统一像素格式。
-    /// 返回 Vec 以便调用方 (mask) 原地改像素后再编码。
+    /// CGImage → RGBA Vec<u8> (premultiplied last) + width/height. The bitmap context uses a
+    /// uniform pixel format.
+    /// Returns a Vec so the caller (mask) can modify pixels in place before encoding.
     ///
-    /// M-12.3: 位图上下文用 kCGImageAlphaPremultipliedLast — CoreGraphics 返回**预乘 RGBA**
-    /// (RGB 已乘 alpha)。PNG 标准期望**非预乘** (straight) alpha。此处直接编码预乘像素,
-    /// 半透明区 (alpha<255) 合成时颜色偏移 (RGB 偏暗)。屏幕截图多为不透明 (alpha=255, 预乘无差异);
-    /// 仅含透明窗/菜单阴影的截图边缘可能色偏。已知取舍 (Rule 2 最小改): 显式 unpremultiply 需逐像素
-    /// 除法 (4*w*h 次, 满屏 4M+ ops) 且 alpha=0 除零特判 — 当前调用方 (mlx-vlm 视觉 grounding)
-    /// 不依赖精确 alpha, 色偏在容差内, 不实装。若未来需精确 alpha, 在此循环 unpremultiply。
+    /// M-12.3: the bitmap context uses kCGImageAlphaPremultipliedLast — CoreGraphics returns
+    /// **premultiplied RGBA** (RGB already multiplied by alpha). The PNG standard expects
+    /// **non-premultiplied** (straight) alpha. Encoding premultiplied pixels directly shifts
+    /// colors in semi-transparent regions (alpha<255) when composited (RGB darker). Screenshots
+    /// are mostly opaque (alpha=255, premultiply makes no difference); only screenshot edges
+    /// containing transparent windows / menu shadows may show slight color drift. Known
+    /// tradeoff (Rule 2 minimal change): explicit unpremultiply needs per-pixel division
+    /// (4*w*h ops, 4M+ for a full screen) plus an alpha=0 divide-by-zero special case — the
+    /// current caller (mlx-vlm visual grounding) does not depend on exact alpha, the drift is
+    /// within tolerance, not implemented. If exact alpha is ever needed, unpremultiply in this loop.
     fn cgimage_to_rgba(img: &CGImage) -> Result<(Vec<u8>, usize, usize)> {
         let w = img.width();
         let h = img.height();
         if w == 0 || h == 0 {
-            return Err(anyhow!("截图尺寸为 0"));
+            return Err(anyhow!("screenshot size is 0"));
         }
         let cs = CGColorSpace::create_device_rgb();
         let bytes_per_row = w * 4;
@@ -1225,12 +1299,12 @@ impl GuiController {
             },
         };
         ctx.draw_image(rect, img);
-        // ctx.data() 是 &[u8] 借用 ctx — copy 到 Vec 后 ctx 可 drop, 再原地 mask。
+        // ctx.data() is a &[u8] borrowing ctx — copy into a Vec so ctx can drop, then mask in place.
         let rgba: Vec<u8> = ctx.data().to_vec();
         Ok((rgba, w, h))
     }
 
-    /// RGBA Vec → PNG → base64。
+    /// RGBA Vec → PNG → base64.
     fn rgba_to_png_b64(rgba: &[u8], w: usize, h: usize) -> Result<String> {
         let mut buf: Vec<u8> = Vec::with_capacity(0);
         {
@@ -1239,24 +1313,25 @@ impl GuiController {
             enc.set_depth(BitDepth::Eight);
             let mut writer = enc
                 .write_header()
-                .map_err(|e| anyhow!("PNG 写头失败: {e}"))?;
+                .map_err(|e| anyhow!("PNG header write failed: {e}"))?;
             writer
                 .write_image_data(rgba)
-                .map_err(|e| anyhow!("PNG 写像素失败: {e}"))?;
+                .map_err(|e| anyhow!("PNG pixel write failed: {e}"))?;
         }
         Ok(B64.encode(&buf))
     }
 
-    /// 滚轮滚动 — CGEvent new_scroll_event (highsierra feature)。
-    /// dx=水平 (axis2), dy=垂直 (axis1); LINE 单位。at 给定则先移动光标到该坐标。
-    /// core-graphics 0.24 safe wrapper 封装 CGEventCreateScrollWheelEvent2 的 unsafe FFI。
+    /// Scroll wheel — CGEvent new_scroll_event (highsierra feature).
+    /// dx=horizontal (axis2), dy=vertical (axis1); LINE units. When at is given, move the cursor
+    /// there first.
+    /// core-graphics 0.24 safe wrapper wraps the unsafe FFI of CGEventCreateScrollWheelEvent2.
     fn scroll(&self, dx: i32, dy: i32, at: Option<(f64, f64)>) -> Result<GuiResult> {
         info!(dx, dy, at = ?at, "Scroll");
         if let Some(r) = self.focused_not_allowed() {
             return Ok(r);
         }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            .map_err(|_| anyhow!("CGEventSource 创建失败 (scroll)"))?;
+            .map_err(|_| anyhow!("CGEventSource creation failed (scroll)"))?;
         if let Some((x, y)) = at {
             let moved = CGEvent::new_mouse_event(
                 source.clone(),
@@ -1264,41 +1339,48 @@ impl GuiController {
                 CGPoint::new(x, y),
                 CGMouseButton::Left,
             )
-            .map_err(|_| anyhow!("CGEvent MouseMoved 创建失败 (scroll 光标定位)"))?;
+            .map_err(|_| {
+                anyhow!("CGEvent MouseMoved creation failed (scroll cursor positioning)")
+            })?;
             moved.post(CGEventTapLocation::HID);
         }
-        // new_scroll_event(source, units, wheel_count, wheel1=axis2水平, wheel2=axis1垂直, wheel3=0)
+        // new_scroll_event(source, units, wheel_count, wheel1=axis2 horizontal, wheel2=axis1 vertical, wheel3=0)
         let ev = CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, dx, dy, 0).map_err(
-            |_| anyhow!("CGEvent scroll 创建失败 (CGEventCreateScrollWheelEvent2 返回 null)"),
+            |_| {
+                anyhow!(
+                    "CGEvent scroll creation failed (CGEventCreateScrollWheelEvent2 returned null)"
+                )
+            },
         )?;
         ev.post(CGEventTapLocation::HID);
-        debug!(dx, dy, "Scroll 完成 (ScrollWheel posted)");
+        debug!(dx, dy, "Scroll done (ScrollWheel posted)");
         Ok(GuiResult {
             ok: true,
             ..Default::default()
         })
     }
 
-    /// 拖拽 — mouseDown(from) → LeftMouseDragged(间帧) → mouseUp(to)。
-    /// 左键单次拖拽; 间帧线性插值平滑 (默认 16 帧)。CGEvent new_mouse_event 各带位置, 无需 set_location。
+    /// Drag — mouseDown(from) → LeftMouseDragged (intermediate frames) → mouseUp(to).
+    /// Left-button single drag; intermediate frames interpolated linearly for smoothness
+    /// (16 frames by default). CGEvent new_mouse_event carries its own position, no set_location needed.
     fn drag(&self, from: (f64, f64), to: (f64, f64)) -> Result<GuiResult> {
         info!(from = ?from, to = ?to, "Drag");
         if let Some(r) = self.focused_not_allowed() {
             return Ok(r);
         }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            .map_err(|_| anyhow!("CGEventSource 创建失败 (drag)"))?;
+            .map_err(|_| anyhow!("CGEventSource creation failed (drag)"))?;
         let steps = 16i32;
-        // 1. mouseDown at from (左键按下)
+        // 1. mouseDown at from (left button down)
         let down = CGEvent::new_mouse_event(
             source.clone(),
             CGEventType::LeftMouseDown,
             CGPoint::new(from.0, from.1),
             CGMouseButton::Left,
         )
-        .map_err(|_| anyhow!("CGEvent LeftMouseDown 创建失败 (drag)"))?;
+        .map_err(|_| anyhow!("CGEvent LeftMouseDown creation failed (drag)"))?;
         down.post(CGEventTapLocation::HID);
-        // 2. LeftMouseDragged 间帧 (from → to 线性插值)
+        // 2. LeftMouseDragged intermediate frames (from → to linear interpolation)
         for i in 1..steps {
             let t = i as f64 / steps as f64;
             let x = from.0 + (to.0 - from.0) * t;
@@ -1309,28 +1391,32 @@ impl GuiController {
                 CGPoint::new(x, y),
                 CGMouseButton::Left,
             )
-            .map_err(|_| anyhow!("CGEvent LeftMouseDragged 创建失败 (drag 间帧 {i})"))?;
+            .map_err(|_| {
+                anyhow!("CGEvent LeftMouseDragged creation failed (drag intermediate frame {i})")
+            })?;
             moved.post(CGEventTapLocation::HID);
         }
-        // 3. mouseUp at to (左键抬起)
+        // 3. mouseUp at to (left button up)
         let up = CGEvent::new_mouse_event(
             source,
             CGEventType::LeftMouseUp,
             CGPoint::new(to.0, to.1),
             CGMouseButton::Left,
         )
-        .map_err(|_| anyhow!("CGEvent LeftMouseUp 创建失败 (drag)"))?;
+        .map_err(|_| anyhow!("CGEvent LeftMouseUp creation failed (drag)"))?;
         up.post(CGEventTapLocation::HID);
-        debug!(steps, "Drag 完成 (down→drag→up posted)");
+        debug!(steps, "Drag done (down→drag→up posted)");
         Ok(GuiResult {
             ok: true,
             ..Default::default()
         })
     }
 
-    /// 双击 — 先定位 AX 点击目标取坐标, 再 CGEvent 合成两次 left click, click_state=2。
-    /// click_state 字段 (EventField::MOUSE_EVENT_CLICK_STATE=1) 告知系统这是连续第二击。
-    /// 复用 find_click_target 取坐标 (与 click() 同路径); 无坐标目标 → 降级。
+    /// Double click — first locate the AX click target for coordinates, then CGEvent synthesizes
+    /// two left clicks with click_state=2.
+    /// The click_state field (EventField::MOUSE_EVENT_CLICK_STATE=1) tells the system this is the
+    /// second click in a row.
+    /// Reuses find_click_target for coordinates (same path as click()); no coordinate target → degrade.
     fn double_click(
         &self,
         ax_label: Option<&str>,
@@ -1342,8 +1428,8 @@ impl GuiController {
         }
         let pos = self.resolve_click_position(ax_label, ax_position)?;
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            .map_err(|_| anyhow!("CGEventSource 创建失败 (double_click)"))?;
-        // 两次 left click, 第二击 click_state=2 (区分单击/双击手势)
+            .map_err(|_| anyhow!("CGEventSource creation failed (double_click)"))?;
+        // Two left clicks, second with click_state=2 (distinguishes single/double-click gestures)
         for click_no in 1..=2i64 {
             let down = CGEvent::new_mouse_event(
                 source.clone(),
@@ -1351,7 +1437,9 @@ impl GuiController {
                 CGPoint::new(pos.0, pos.1),
                 CGMouseButton::Left,
             )
-            .map_err(|_| anyhow!("CGEvent LeftMouseDown 创建失败 (double_click {click_no})"))?;
+            .map_err(|_| {
+                anyhow!("CGEvent LeftMouseDown creation failed (double_click {click_no})")
+            })?;
             down.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_no);
             down.post(CGEventTapLocation::HID);
             let up = CGEvent::new_mouse_event(
@@ -1360,19 +1448,23 @@ impl GuiController {
                 CGPoint::new(pos.0, pos.1),
                 CGMouseButton::Left,
             )
-            .map_err(|_| anyhow!("CGEvent LeftMouseUp 创建失败 (double_click {click_no})"))?;
+            .map_err(|_| {
+                anyhow!("CGEvent LeftMouseUp creation failed (double_click {click_no})")
+            })?;
             up.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_no);
             up.post(CGEventTapLocation::HID);
         }
-        debug!(pos = ?pos, "DoubleClick 完成 (2× down/up posted, click_state=2)");
+        debug!(pos = ?pos, "DoubleClick done (2× down/up posted, click_state=2)");
         Ok(GuiResult {
             ok: true,
             ..Default::default()
         })
     }
 
-    /// 三击 — 同 double_click 定位, CGEvent 合成三次 left click, click_state 递增 1..=3。
-    /// 用于整段/整行文本选择 (如三击选行)。复用 resolve_click_position 取坐标。
+    /// Triple click — locates like double_click, CGEvent synthesizes three left clicks with
+    /// click_state incrementing 1..=3.
+    /// Used for selecting a whole paragraph/line (e.g. triple-click selects a line). Reuses
+    /// resolve_click_position for coordinates.
     fn triple_click(
         &self,
         ax_label: Option<&str>,
@@ -1384,8 +1476,9 @@ impl GuiController {
         }
         let pos = self.resolve_click_position(ax_label, ax_position)?;
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            .map_err(|_| anyhow!("CGEventSource 创建失败 (triple_click)"))?;
-        // 三次 left click, click_state 1/2/3 递增 (系统据连续击数判手势)
+            .map_err(|_| anyhow!("CGEventSource creation failed (triple_click)"))?;
+        // Three left clicks, click_state incrementing 1/2/3 (the system judges the gesture by
+        // consecutive click count)
         for click_no in 1..=3i64 {
             let down = CGEvent::new_mouse_event(
                 source.clone(),
@@ -1393,7 +1486,9 @@ impl GuiController {
                 CGPoint::new(pos.0, pos.1),
                 CGMouseButton::Left,
             )
-            .map_err(|_| anyhow!("CGEvent LeftMouseDown 创建失败 (triple_click {click_no})"))?;
+            .map_err(|_| {
+                anyhow!("CGEvent LeftMouseDown creation failed (triple_click {click_no})")
+            })?;
             down.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_no);
             down.post(CGEventTapLocation::HID);
             let up = CGEvent::new_mouse_event(
@@ -1402,18 +1497,21 @@ impl GuiController {
                 CGPoint::new(pos.0, pos.1),
                 CGMouseButton::Left,
             )
-            .map_err(|_| anyhow!("CGEvent LeftMouseUp 创建失败 (triple_click {click_no})"))?;
+            .map_err(|_| {
+                anyhow!("CGEvent LeftMouseUp creation failed (triple_click {click_no})")
+            })?;
             up.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_no);
             up.post(CGEventTapLocation::HID);
         }
-        debug!(pos = ?pos, "TripleClick 完成 (3× down/up posted, click_state=3)");
+        debug!(pos = ?pos, "TripleClick done (3× down/up posted, click_state=3)");
         Ok(GuiResult {
             ok: true,
             ..Default::default()
         })
     }
 
-    /// 右击 — 先定位取坐标, CGEvent RightMouseDown/RightMouseUp + CGMouseButton::Right。
+    /// Right click — locate for coordinates first, then CGEvent RightMouseDown/RightMouseUp +
+    /// CGMouseButton::Right.
     fn right_click(
         &self,
         ax_label: Option<&str>,
@@ -1425,14 +1523,14 @@ impl GuiController {
         }
         let pos = self.resolve_click_position(ax_label, ax_position)?;
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            .map_err(|_| anyhow!("CGEventSource 创建失败 (right_click)"))?;
+            .map_err(|_| anyhow!("CGEventSource creation failed (right_click)"))?;
         let down = CGEvent::new_mouse_event(
             source.clone(),
             CGEventType::RightMouseDown,
             CGPoint::new(pos.0, pos.1),
             CGMouseButton::Right,
         )
-        .map_err(|_| anyhow!("CGEvent RightMouseDown 创建失败 (right_click)"))?;
+        .map_err(|_| anyhow!("CGEvent RightMouseDown creation failed (right_click)"))?;
         down.post(CGEventTapLocation::HID);
         let up = CGEvent::new_mouse_event(
             source,
@@ -1440,50 +1538,52 @@ impl GuiController {
             CGPoint::new(pos.0, pos.1),
             CGMouseButton::Right,
         )
-        .map_err(|_| anyhow!("CGEvent RightMouseUp 创建失败 (right_click)"))?;
+        .map_err(|_| anyhow!("CGEvent RightMouseUp creation failed (right_click)"))?;
         up.post(CGEventTapLocation::HID);
-        debug!(pos = ?pos, "RightClick 完成 (right down/up posted)");
+        debug!(pos = ?pos, "RightClick done (right down/up posted)");
         Ok(GuiResult {
             ok: true,
             ..Default::default()
         })
     }
 
-    /// 悬停 — CGEvent MouseMoved 到指定坐标 (不按键, 仅移动光标)。
+    /// Hover — CGEvent MouseMoved to the given coordinates (no buttons, cursor movement only).
     fn hover(&self, ax_position: (f64, f64)) -> Result<GuiResult> {
         info!(ax_position = ?ax_position, "Hover");
         if let Some(r) = self.focused_not_allowed() {
             return Ok(r);
         }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            .map_err(|_| anyhow!("CGEventSource 创建失败 (hover)"))?;
+            .map_err(|_| anyhow!("CGEventSource creation failed (hover)"))?;
         let moved = CGEvent::new_mouse_event(
             source,
             CGEventType::MouseMoved,
             CGPoint::new(ax_position.0, ax_position.1),
             CGMouseButton::Left,
         )
-        .map_err(|_| anyhow!("CGEvent MouseMoved 创建失败 (hover)"))?;
+        .map_err(|_| anyhow!("CGEvent MouseMoved creation failed (hover)"))?;
         moved.post(CGEventTapLocation::HID);
-        debug!(pos = ?ax_position, "Hover 完成 (MouseMoved posted)");
+        debug!(pos = ?ax_position, "Hover done (MouseMoved posted)");
         Ok(GuiResult {
             ok: true,
             ..Default::default()
         })
     }
 
-    /// #44: 批量鼠标移动 — 沿有序 waypoints 发 MouseMoved (无按键), 单次往返原子完成。
-    /// duration_ms 总时长分摊到段数, 每段内线性插值 (默认每段 8 帧); 空序列拒绝。
+    /// #44: batch mouse move — sends MouseMoved (no buttons) along ordered waypoints, atomic in a
+    /// single round-trip.
+    /// duration_ms is split across segments, linear interpolation within each segment (8 frames
+    /// per segment by default); empty sequences rejected.
     fn move_path(&self, points: Vec<(f64, f64)>, duration_ms: u64) -> Result<GuiResult> {
         info!(n = points.len(), duration_ms, "MovePath");
         if points.len() < 2 {
             warn!(
                 n = points.len(),
-                "MovePath 点数 < 2 — 拒绝 (至少需起止两点)"
+                "MovePath fewer than 2 points — rejected (needs at least start and end)"
             );
             return Ok(GuiResult {
                 ok: false,
-                error: Some("move_path 需至少 2 个点".into()),
+                error: Some("move_path requires at least 2 points".into()),
                 ..Default::default()
             });
         }
@@ -1491,9 +1591,10 @@ impl GuiController {
             return Ok(r);
         }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            .map_err(|_| anyhow!("CGEventSource 创建失败 (move_path)"))?;
+            .map_err(|_| anyhow!("CGEventSource creation failed (move_path)"))?;
         let segments = (points.len() - 1) as u64;
-        // 每段时长 (µs); duration_ms=0 时取 0 → 瞬时移动仍逐帧 post (无 sleep)。
+        // Per-segment duration (µs); duration_ms=0 yields 0 → instantaneous movement still posts
+        // frame by frame (no sleep).
         let per_seg_us = if duration_ms > 0 {
             (duration_ms * 1000) / segments.max(1)
         } else {
@@ -1513,7 +1614,9 @@ impl GuiController {
                     CGPoint::new(x, y),
                     CGMouseButton::Left,
                 )
-                .map_err(|_| anyhow!("CGEvent MouseMoved 创建失败 (move_path 间帧)"))?;
+                .map_err(|_| {
+                    anyhow!("CGEvent MouseMoved creation failed (move_path intermediate frame)")
+                })?;
                 moved.post(CGEventTapLocation::HID);
             }
             if per_seg_us > 0 {
@@ -1522,7 +1625,7 @@ impl GuiController {
         }
         debug!(
             segments,
-            frames_per_seg, "MovePath 完成 (MouseMoved posted)"
+            frames_per_seg, "MovePath done (MouseMoved posted)"
         );
         Ok(GuiResult {
             ok: true,
@@ -1530,17 +1633,18 @@ impl GuiController {
         })
     }
 
-    /// #43: 显示器能力查询 — 枚举活跃显示器, 返 [{id, scale, bounds, primary}]。
-    /// trusted-independent (CGDisplay, 非 AX)。scale = pixels_wide / bounds.width (Retina=2.0)。
+    /// #43: display capability query — enumerate active displays, returning
+    /// [{id, scale, bounds, primary}].
+    /// trusted-independent (CGDisplay, not AX). scale = pixels_wide / bounds.width (Retina=2.0).
     fn display_info(&self) -> Result<GuiResult> {
         info!("DisplayInfo");
         let ids = match CGDisplay::active_displays() {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = ?e, "CGDisplay::active_displays 失败 — 降级");
+                warn!(error = ?e, "CGDisplay::active_displays failed — degraded");
                 return Ok(GuiResult {
                     ok: false,
-                    error: Some(format!("display_info 失败: {e:?}")),
+                    error: Some(format!("display_info failed: {e:?}")),
                     ..Default::default()
                 });
             }
@@ -1567,9 +1671,9 @@ impl GuiController {
                 "primary": disp.is_main(),
             }));
         }
-        let displays =
-            serde_json::to_string(&entries).map_err(|e| anyhow!("display_info 序列化失败: {e}"))?;
-        info!(count = entries.len(), "DisplayInfo 完成");
+        let displays = serde_json::to_string(&entries)
+            .map_err(|e| anyhow!("display_info serialization failed: {e}"))?;
+        info!(count = entries.len(), "DisplayInfo done");
         Ok(GuiResult {
             ok: true,
             scale_factor: Self::compute_scale_factor(),
@@ -1578,8 +1682,9 @@ impl GuiController {
         })
     }
 
-    /// 解析点击坐标 — 优先 ax_position; 否则 ax_label 匹配 AX 节点读 AXPosition。
-    /// click/double_click/right_click 共用。无 label 无 position → 报错。
+    /// Resolve click coordinates — ax_position first; otherwise match ax_label against the AX
+    /// node and read AXPosition.
+    /// Shared by click/double_click/right_click. Neither label nor position → error.
     fn resolve_click_position(
         &self,
         ax_label: Option<&str>,
@@ -1588,22 +1693,26 @@ impl GuiController {
         if let Some(pos) = ax_position {
             return Ok(pos);
         }
-        let label = ax_label.ok_or_else(|| anyhow!("需 ax_label 或 ax_position 定位点击坐标"))?;
+        let label = ax_label.ok_or_else(|| {
+            anyhow!("ax_label or ax_position required to resolve click coordinates")
+        })?;
         let app = Self::focused_app()?;
         let win = app
             .focused_window()
             .or_else(|_| app.main_window())
-            .map_err(|e| anyhow!("取 focused window 失败: {e}"))?;
+            .map_err(|e| anyhow!("failed to get focused window: {e}"))?;
         let target = Self::find_click_target(&win, Some(label), None)?;
-        Self::read_position(&target).ok_or_else(|| anyhow!("目标节点无 AXPosition, 无法取坐标"))
+        Self::read_position(&target)
+            .ok_or_else(|| anyhow!("target node has no AXPosition, cannot resolve coordinates"))
     }
 
-    /// 窗口按钮 — close/minimize/zoom。按 AX 按钮属性取子元素 → press()。
-    /// bundle_id 给定则聚焦该 app, 否则用当前 focused app。
-    /// 安全: accessibility 0.2 safe wrapper (attribute/press), 零手写 unsafe。
+    /// Window buttons — close/minimize/zoom. Fetches the child via the AX button attribute → press().
+    /// When bundle_id is given, focus that app; otherwise use the current focused app.
+    /// Safety: accessibility 0.2 safe wrapper (attribute/press), zero handwritten unsafe.
     fn window_button(&self, bundle_id: Option<String>, which: &str) -> Result<GuiResult> {
         info!(bundle_id = ?bundle_id, which, "WindowButton");
-        // M-SEC-04: bundle 给定时校验放行 (防越权操作任意 app 窗口); None=当前 focused app, 放行+审计。
+        // M-SEC-04: validate admission when bundle is given (prevents manipulating arbitrary app
+        // windows); None = current focused app, allowed + audited.
         if let Some(b) = bundle_id.as_deref() {
             if self.check_bundle_allowed(b).is_err() {
                 return Ok(GuiResult {
@@ -1615,39 +1724,41 @@ impl GuiController {
         }
         let app = match bundle_id.as_deref() {
             Some(b) => AXUIElement::application_with_bundle(b)
-                .map_err(|e| anyhow!("定位 app 失败 {b}: {e}"))?,
+                .map_err(|e| anyhow!("failed to locate app {b}: {e}"))?,
             None => Self::focused_app()?,
         };
         let win = app
             .focused_window()
             .or_else(|_| app.main_window())
-            .map_err(|e| anyhow!("取 window 失败: {e}"))?;
+            .map_err(|e| anyhow!("failed to get window: {e}"))?;
         let btn_attr_name = match which {
             "close" => kAXCloseButtonAttribute,
             "minimize" => kAXMinimizeButtonAttribute,
             "zoom" => kAXZoomButtonAttribute,
-            other => return Err(anyhow!("未知窗口按钮: {other}")),
+            other => return Err(anyhow!("unknown window button: {other}")),
         };
         let btn_attr = AXAttribute::<CFType>::new(&CFString::from_static_string(btn_attr_name));
         let cf = win
             .attribute(&btn_attr)
-            .map_err(|e| anyhow!("取 {which} 按钮属性失败: {e}"))?;
+            .map_err(|e| anyhow!("failed to get {which} button attribute: {e}"))?;
         let btn = cf
             .downcast::<AXUIElement>()
-            .ok_or_else(|| anyhow!("{which} 按钮属性非 AXUIElement"))?;
+            .ok_or_else(|| anyhow!("{which} button attribute is not an AXUIElement"))?;
         btn.press()
-            .map_err(|e| anyhow!("press {which} 按钮失败: {e}"))?;
-        debug!(which, "WindowButton 完成 (press posted)");
+            .map_err(|e| anyhow!("press {which} button failed: {e}"))?;
+        debug!(which, "WindowButton done (press posted)");
         Ok(GuiResult {
             ok: true,
             ..Default::default()
         })
     }
 
-    /// 窗口缩放 — 拖右下角 resize 把手到目标尺寸。读当前 AXPosition+AXSize 取右下角,
-    /// 算目标右下角, CGEvent 拖拽 (复用 drag 坐标逻辑, 零新增依赖)。
-    /// 用拖拽而非 AXValueCreate 设 AXSize — 后者需新 unsafe block (AXValueCreate extern "C"),
-    /// 超出既定 3 处 unsafe scope; 拖拽走 safe CGEvent wrapper, 复用已测 drag 路径。
+    /// Window resize — drags the bottom-right resize handle to the target size. Reads the current
+    /// AXPosition+AXSize for the bottom-right corner, computes the target bottom-right corner, and
+    /// CGEvent-drags (reuses drag coordinate logic, zero new dependencies).
+    /// Drag instead of setting AXSize via AXValueCreate — the latter needs a new unsafe block
+    /// (AXValueCreate extern "C"), exceeding the established 3-unsafe-block scope; dragging goes
+    /// through the safe CGEvent wrapper and reuses the tested drag path.
     fn window_resize(
         &self,
         bundle_id: Option<String>,
@@ -1655,7 +1766,8 @@ impl GuiController {
         height: f64,
     ) -> Result<GuiResult> {
         info!(bundle_id = ?bundle_id, width, height, "WindowResize");
-        // M-SEC-04: bundle 给定时校验放行 (防越权 resize 任意 app 窗口); None=focused app 放行+审计。
+        // M-SEC-04: validate admission when bundle is given (prevents resizing arbitrary app
+        // windows); None = focused app, allowed + audited.
         if let Some(b) = bundle_id.as_deref() {
             if self.check_bundle_allowed(b).is_err() {
                 return Ok(GuiResult {
@@ -1667,32 +1779,36 @@ impl GuiController {
         }
         let app = match bundle_id.as_deref() {
             Some(b) => AXUIElement::application_with_bundle(b)
-                .map_err(|e| anyhow!("定位 app 失败 {b}: {e}"))?,
+                .map_err(|e| anyhow!("failed to locate app {b}: {e}"))?,
             None => Self::focused_app()?,
         };
         let win = app
             .focused_window()
             .or_else(|_| app.main_window())
-            .map_err(|e| anyhow!("取 window 失败: {e}"))?;
-        let pos = Self::read_position(&win).ok_or_else(|| anyhow!("窗口无 AXPosition"))?;
-        let sz = Self::read_size(&win).ok_or_else(|| anyhow!("窗口无 AXSize"))?;
-        // 右下角 resize 把手 = 当前右下角; 拖到 (左上角 + 目标尺寸) 右下角
+            .map_err(|e| anyhow!("failed to get window: {e}"))?;
+        let pos = Self::read_position(&win).ok_or_else(|| anyhow!("window has no AXPosition"))?;
+        let sz = Self::read_size(&win).ok_or_else(|| anyhow!("window has no AXSize"))?;
+        // Bottom-right resize handle = current bottom-right; drag to (top-left + target size) bottom-right
         let from = (pos.0 + sz.0, pos.1 + sz.1);
         let to = (pos.0 + width, pos.1 + height);
         if width < 50.0 || height < 50.0 {
-            warn!(width, height, "目标尺寸过小, 可能拖不动");
+            warn!(
+                width,
+                height, "target size too small, drag may not take effect"
+            );
         }
         self.drag(from, to)
     }
 
-    /// 等待 — 纯延时, 非 AX/CGEvent。GUI 动作间停顿 (如点击后等动画)。
-    /// seconds 限 [0, 60] 秒, 超界裁剪。trusted-independent (无 TCC 依赖, 可单测)。
+    /// Wait — pure delay, not AX/CGEvent. Pause between GUI actions (e.g. wait for an animation
+    /// after a click).
+    /// seconds clamped to [0, 60] seconds. trusted-independent (no TCC dependency, unit-testable).
     fn wait(&self, seconds: f64) -> Result<GuiResult> {
         let secs = if seconds < 0.0 {
-            warn!(seconds, "Wait 负值, 裁剪为 0");
+            warn!(seconds, "Wait negative value, clamped to 0");
             0.0
         } else if seconds > 60.0 {
-            warn!(seconds, "Wait 超 60s 上限, 裁剪为 60");
+            warn!(seconds, "Wait exceeds the 60s cap, clamped to 60");
             60.0
         } else {
             seconds
@@ -1804,7 +1920,7 @@ mod tests {
             let s = serde_json::to_string(&a).unwrap();
             let back: GuiAction = serde_json::from_str(&s).unwrap();
             let s2 = serde_json::to_string(&back).unwrap();
-            assert_eq!(s, s2, "serde 往返不一致");
+            assert_eq!(s, s2, "serde roundtrip mismatch");
         }
     }
 
@@ -1849,7 +1965,7 @@ mod tests {
         );
         assert!(
             s.contains("\"duration_ms\":50"),
-            "move_path duration_ms 字段: {s}"
+            "move_path duration_ms field: {s}"
         );
         let s = serde_json::to_string(&GuiAction::DisplayInfo {}).unwrap();
         assert!(
@@ -1860,40 +1976,48 @@ mod tests {
 
     #[test]
     fn move_path_empty_rejects() {
-        // <2 点拒绝 (ok=false) — 不需 trusted (focused_not_allowed 之前先查点数)
+        // <2 points rejected (ok=false) — needs no trust (point count checked before focused_not_allowed)
         let g = GuiController::new();
         let r = g.execute(GuiAction::MovePath {
             points: vec![(1.0, 1.0)],
             duration_ms: 10,
         });
         let r = r.unwrap();
-        assert!(!r.ok, "单点 move_path 应拒绝");
-        assert!(r.error.unwrap().contains("至少 2 个点"));
+        assert!(!r.ok, "single-point move_path should be rejected");
+        assert!(r.error.unwrap().contains("at least 2 points"));
         let r = g.execute(GuiAction::MovePath {
             points: vec![],
             duration_ms: 10,
         });
         let r = r.unwrap();
-        assert!(!r.ok, "空 move_path 应拒绝");
+        assert!(!r.ok, "empty move_path should be rejected");
     }
 
     #[test]
     fn display_info_trusted_independent_shape() {
-        // display_info 走 CGDisplay 非 AX — 无 trusted 亦有结果 (CI 路径可达)。
-        // CI 无显示器环境 active_displays 可能返空 Vec → ok=true displays="[]"; 有屏机 ok=true 非空。
-        // 不在此断言 displays 非空 (CI/无头差异), 仅断言 ok=true 且无 error (early-return 路径生效)。
+        // display_info goes through CGDisplay, not AX — yields a result without trust (reachable on CI).
+        // On headless CI active_displays may return an empty Vec → ok=true displays="[]"; machines with
+        // displays get ok=true non-empty.
+        // Does not assert displays non-empty here (CI/headless variance); only asserts ok=true and no
+        // error (early-return path in effect).
         let g = GuiController::new();
         let r = g.execute(GuiAction::DisplayInfo {}).unwrap();
-        assert!(r.ok, "display_info 应 ok (CGDisplay, 非 AX gated): {r:?}");
-        assert!(r.error.is_none(), "display_info 不应有 error: {r:?}");
+        assert!(
+            r.ok,
+            "display_info should be ok (CGDisplay, not AX gated): {r:?}"
+        );
+        assert!(
+            r.error.is_none(),
+            "display_info should have no error: {r:?}"
+        );
         assert!(
             r.displays.is_some(),
-            "displays 字段应填 (display_info 专属)"
+            "displays field should be filled (display_info-specific)"
         );
-        // scale_factor 应来自 compute_scale_factor (非默认 1.0 占位 — 至少 >= 1.0)
+        // scale_factor should come from compute_scale_factor (not the default 1.0 placeholder — at least >= 1.0)
         assert!(
             r.scale_factor >= 1.0,
-            "scale_factor 应 >= 1.0: {}",
+            "scale_factor should be >= 1.0: {}",
             r.scale_factor
         );
     }
@@ -1907,9 +2031,9 @@ mod tests {
         assert!(r.error.is_none());
     }
 
-    /// 未授权时操作降级 — CI 无 TCC, 走此路径。
-    /// IMPL-9: Screenshot 提到 ax_trusted 闸门前, 自探 Screen Recording —
-    /// CI 无 Screen Recording → screen-recording-permission-required (非 accessibility)。
+    /// Operations degrade when unauthorized — CI has no TCC, this is the path taken.
+    /// IMPL-9: Screenshot hoisted before the ax_trusted gate, probes Screen Recording itself —
+    /// CI without Screen Recording → screen-recording-permission-required (not accessibility).
     #[test]
     fn execute_degrades_without_ax_trust() {
         let ctrl = GuiController::new();
@@ -1918,23 +2042,23 @@ mod tests {
                 mask_sensitive: false,
             })
             .unwrap();
-        // IMPL-9: screenshot 走 Screen Recording TCC (CoreGraphics), 非 Accessibility 闸门。
-        // 两路径均合法, 不强断言 ok 字面:
-        //   CI 无 Screen Recording → ok:false + screen-recording-permission-required;
-        //   trusted 机有 Screen Recording → ok:true (PNG)。
+        // IMPL-9: screenshot goes through Screen Recording TCC (CoreGraphics), not the Accessibility
+        // gate. Both paths are valid, no hard assertion on the ok literal:
+        //   CI without Screen Recording → ok:false + screen-recording-permission-required;
+        //   trusted machine with Screen Recording → ok:true (PNG).
         if !GuiController::ax_trusted() {
             assert!(
                 !r.ok,
-                "IMPL-9: 未授权 (无 Screen Recording) 应降级 ok:false"
+                "IMPL-9: unauthorized (no Screen Recording) should degrade to ok:false"
             );
             assert!(
                 r.error.is_some(),
-                "IMPL-9: 未授权应降级 (Screen Recording 或 encode 错误)"
+                "IMPL-9: unauthorized should degrade (Screen Recording or encode error)"
             );
         }
     }
 
-    /// resolve_keycode 覆盖 — 键名大小写不敏感 + 别名 (enter=return, esc=escape, arrows短名)
+    /// resolve_keycode coverage — key names case-insensitive + aliases (enter=return, esc=escape, short arrow names)
     #[test]
     fn resolve_keycode_maps_known_keys() {
         assert_eq!(GuiController::resolve_keycode("Tab"), Some(KeyCode::TAB));
@@ -1966,15 +2090,17 @@ mod tests {
         assert_eq!(GuiController::resolve_keycode("F12"), Some(KeyCode::F12));
     }
 
-    /// 未知键名 → None (不 panic)
+    /// Unknown key name → None (no panic)
     #[test]
     fn resolve_keycode_unknown_returns_none() {
         assert_eq!(GuiController::resolve_keycode("totally-fake-key"), None);
         assert_eq!(GuiController::resolve_keycode(""), None);
     }
 
-    /// 未授权时 KeyPress 降级 (CI 无 TCC); 授权时合成应成功 (手动)
-    /// RUN-12: 用显式无限制 config (None), 测 keycode 逻辑不被默认 allowlist 干扰 (focused 拦截)。
+    /// KeyPress degrades when unauthorized (CI has no TCC); synthesis should succeed when
+    /// authorized (manual).
+    /// RUN-12: uses an explicitly unrestricted config (None) so the keycode logic is not perturbed
+    /// by the default allowlist (focused-app interception).
     #[test]
     fn keypress_unknown_key_degrades_even_if_trusted() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -1988,14 +2114,14 @@ mod tests {
             })
             .unwrap();
         if GuiController::ax_trusted() {
-            assert!(!r.ok, "未知键名应 ok:false");
+            assert!(!r.ok, "unknown key name should be ok:false");
             assert!(
                 r.error.as_deref().unwrap_or("").contains("unknown-key"),
-                "未知键名错误标记: {:?}",
+                "unknown key error marker: {:?}",
                 r.error
             );
         } else {
-            assert!(!r.ok, "未授权应降级");
+            assert!(!r.ok, "unauthorized should degrade");
             assert_eq!(
                 r.error.as_deref(),
                 Some("accessibility-permission-required")
@@ -2003,9 +2129,11 @@ mod tests {
         }
     }
 
-    /// HoldKey 未知键名降级 — trusted 时经 resolve_keycode 返 None → ok:false unknown-key;
-    /// CI 未授权路径在 AX 闸门降级 accessibility-permission-required (闸门先于 dispatch)。
-    /// RUN-12: 用显式无限制 config (None), 测 keycode 逻辑不被默认 allowlist 干扰。
+    /// HoldKey unknown key name degrades — trusted: resolve_keycode returns None → ok:false
+    /// unknown-key; CI unauthorized path degrades at the AX gate to accessibility-permission-required
+    /// (gate precedes dispatch).
+    /// RUN-12: uses an explicitly unrestricted config (None) so the keycode logic is not perturbed
+    /// by the default allowlist.
     #[test]
     fn holdkey_unknown_key_degrades_even_if_trusted() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -2019,14 +2147,14 @@ mod tests {
             })
             .unwrap();
         if GuiController::ax_trusted() {
-            assert!(!r.ok, "未知键名应 ok:false");
+            assert!(!r.ok, "unknown key name should be ok:false");
             assert!(
                 r.error.as_deref().unwrap_or("").contains("unknown-key"),
-                "未知键名错误标记: {:?}",
+                "unknown key error marker: {:?}",
                 r.error
             );
         } else {
-            assert!(!r.ok, "未授权应降级");
+            assert!(!r.ok, "unauthorized should degrade");
             assert_eq!(
                 r.error.as_deref(),
                 Some("accessibility-permission-required")
@@ -2034,7 +2162,7 @@ mod tests {
         }
     }
 
-    /// TripleClick 未授权降级 — 指针动作, CI 无 TCC 走降级路径。
+    /// TripleClick degrades when unauthorized — pointer action, CI without TCC takes the degraded path.
     #[test]
     fn tripleclick_degrades_without_ax_trust() {
         let ctrl = GuiController::new();
@@ -2045,7 +2173,7 @@ mod tests {
             })
             .unwrap();
         if !GuiController::ax_trusted() {
-            assert!(!r.ok, "未授权应降级");
+            assert!(!r.ok, "unauthorized should degrade");
             assert_eq!(
                 r.error.as_deref(),
                 Some("accessibility-permission-required")
@@ -2060,11 +2188,11 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_millis() < 50,
-            "GuiController::new 应 <50ms (lazy), 实际 {elapsed:?}"
+            "GuiController::new should be <50ms (lazy), got {elapsed:?}"
         );
     }
 
-    /// resolve_modifier 覆盖 — 大小写不敏感 + 别名 (cmd/super, alt, ctrl)
+    /// resolve_modifier coverage — case-insensitive + aliases (cmd/super, alt, ctrl)
     #[test]
     fn resolve_modifier_maps_known_mods() {
         assert_eq!(
@@ -2097,15 +2225,16 @@ mod tests {
         );
     }
 
-    /// 未知修饰键 → None (不 panic)
+    /// Unknown modifier → None (no panic)
     #[test]
     fn resolve_modifier_unknown_returns_none() {
         assert_eq!(GuiController::resolve_modifier("hyper"), None);
         assert_eq!(GuiController::resolve_modifier(""), None);
     }
 
-    /// 未知修饰键 → ok:false unknown-modifier (trusted-independent, CI 路径)
-    /// RUN-12: 用显式无限制 config (None), 测 modifier 逻辑不被默认 allowlist 干扰。
+    /// Unknown modifier → ok:false unknown-modifier (trusted-independent, CI path)
+    /// RUN-12: uses an explicitly unrestricted config (None) so the modifier logic is not perturbed
+    /// by the default allowlist.
     #[test]
     fn keypress_unknown_modifier_degrades_even_if_trusted() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -2119,17 +2248,17 @@ mod tests {
             })
             .unwrap();
         if GuiController::ax_trusted() {
-            assert!(!r.ok, "未知修饰键应 ok:false");
+            assert!(!r.ok, "unknown modifier should be ok:false");
             assert!(
                 r.error
                     .as_deref()
                     .unwrap_or("")
                     .contains("unknown-modifier"),
-                "未知修饰键错误标记: {:?}",
+                "unknown modifier error marker: {:?}",
                 r.error
             );
         } else {
-            assert!(!r.ok, "未授权应降级");
+            assert!(!r.ok, "unauthorized should degrade");
             assert_eq!(
                 r.error.as_deref(),
                 Some("accessibility-permission-required")
@@ -2137,7 +2266,7 @@ mod tests {
         }
     }
 
-    /// 新动作 tag snake_case — scroll/drag/wait 序列化 tag
+    /// New-action tag snake_case — serialization tags for scroll/drag/wait
     #[test]
     fn gui_action_new_variants_snake_case() {
         let s = serde_json::to_string(&GuiAction::Scroll {
@@ -2157,7 +2286,7 @@ mod tests {
         assert!(s.contains("\"kind\":\"wait\""), "wait tag: {s}");
     }
 
-    /// v1.5 新动作 serde 往返 — double_click/right_click/hover/window_*/window_resize
+    /// v1.5 new-action serde roundtrip — double_click/right_click/hover/window_*/window_resize
     #[test]
     fn gui_action_v15_variants_serde_roundtrip() {
         let cases = vec![
@@ -2193,11 +2322,11 @@ mod tests {
             let s = serde_json::to_string(&a).unwrap();
             let back: GuiAction = serde_json::from_str(&s).unwrap();
             let s2 = serde_json::to_string(&back).unwrap();
-            assert_eq!(s, s2, "serde 往返不一致: {s}");
+            assert_eq!(s, s2, "serde roundtrip mismatch: {s}");
         }
     }
 
-    /// v1.5 新动作 tag snake_case
+    /// v1.5 new-action tag snake_case
     #[test]
     fn gui_action_v15_variants_snake_case() {
         let s = serde_json::to_string(&GuiAction::DoubleClick {
@@ -2232,11 +2361,12 @@ mod tests {
         assert!(s.contains("\"kind\":\"window_resize\""), "tag: {s}");
     }
 
-    /// 未授权时新窗口动作降级 — CI 无 TCC 走此路径; trusted 机真实 AX 操作手动验
+    /// New window actions degrade when unauthorized — CI without TCC takes this path; real AX
+    /// operations on trusted machines are verified manually.
     #[test]
     fn window_actions_degrade_without_ax_trust() {
         if GuiController::ax_trusted() {
-            // trusted: 真实窗口操作需手动 TCC + GUI 会话, CI/sandbox 跳过
+            // trusted: real window operations need manual TCC + a GUI session, skipped on CI/sandbox
             return;
         }
         let ctrl = GuiController::new();
@@ -2253,16 +2383,16 @@ mod tests {
             },
         ] {
             let r = ctrl.execute(action).unwrap();
-            assert!(!r.ok, "未授权应降级");
+            assert!(!r.ok, "unauthorized should degrade");
             assert_eq!(
                 r.error.as_deref(),
                 Some("accessibility-permission-required"),
-                "未授权错误标记"
+                "unauthorized error marker"
             );
         }
     }
 
-    /// 未授权时 double_click/right_click/hover 降级 (CI 路径)
+    /// double_click/right_click/hover degrade when unauthorized (CI path)
     #[test]
     fn pointer_actions_degrade_without_ax_trust() {
         let ctrl = GuiController::new();
@@ -2281,7 +2411,7 @@ mod tests {
         ] {
             let r = ctrl.execute(action).unwrap();
             if !GuiController::ax_trusted() {
-                assert!(!r.ok, "未授权应降级");
+                assert!(!r.ok, "unauthorized should degrade");
                 assert_eq!(
                     r.error.as_deref(),
                     Some("accessibility-permission-required")
@@ -2290,10 +2420,13 @@ mod tests {
         }
     }
 
-    /// Hover 无坐标降级 — 不可能触发 (ax_position 必填非 Option), 仅编译期保证。
-    /// double_click/right_click 无 label 无 position → resolve_click_position 返 Err (经 ? 上抛)。
-    /// CI 无 TCC → 降级 ok:false; trusted 机 → execute 返 Err (无定位坐标), 不 panic。
-    /// RUN-12: 用显式无限制 config (None), 测 resolve_click_position 逻辑不被默认 allowlist 干扰。
+    /// Hover without coordinates — cannot happen (ax_position is required, not an Option); a
+    /// compile-time guarantee only.
+    /// double_click/right_click with neither label nor position → resolve_click_position returns
+    /// Err (propagated via ?).
+    /// CI without TCC → degraded ok:false; trusted machine → execute returns Err (no coordinates), no panic.
+    /// RUN-12: uses an explicitly unrestricted config (None) so resolve_click_position logic is not
+    /// perturbed by the default allowlist.
     #[test]
     fn double_click_no_target_error_when_trusted() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -2306,52 +2439,56 @@ mod tests {
         });
         if !GuiController::ax_trusted() {
             let r = res.unwrap();
-            assert!(!r.ok, "未授权应降级");
+            assert!(!r.ok, "unauthorized should degrade");
             assert_eq!(
                 r.error.as_deref(),
                 Some("accessibility-permission-required")
             );
         } else {
-            // trusted: 无 label/position → resolve_click_position 报错上抛 Err, 不 panic
-            assert!(res.is_err(), "trusted 无定位坐标应返 Err");
+            // trusted: no label/position → resolve_click_position errors out as Err, no panic
+            assert!(
+                res.is_err(),
+                "trusted without coordinates should return Err"
+            );
             assert!(
                 res.unwrap_err()
                     .to_string()
-                    .contains("ax_label 或 ax_position"),
-                "错误应提及定位缺失"
+                    .contains("ax_label or ax_position"),
+                "error should mention missing target"
             );
         }
     }
 
-    /// Wait trusted-independent — 无 TCC 依赖, CI 可跑。seconds=0 应立即 ok=true。
+    /// Wait trusted-independent — no TCC dependency, runs on CI. seconds=0 should immediately be ok=true.
     #[test]
     fn wait_zero_seconds_ok_without_trust() {
         let ctrl = GuiController::new();
         let r = ctrl.execute(GuiAction::Wait { seconds: 0.0 }).unwrap();
-        assert!(r.ok, "Wait 0s 应 ok=true (trusted-independent)");
-        assert!(r.error.is_none(), "Wait 无错误: {:?}", r.error);
+        assert!(r.ok, "Wait 0s should be ok=true (trusted-independent)");
+        assert!(r.error.is_none(), "Wait has no error: {:?}", r.error);
     }
 
-    /// Wait 裁剪 — 负值裁 0 (不睡眠), 不 panic。正值裁 60 路径手动验 (CI 不跑 60s)。
+    /// Wait clamping — negatives clamped to 0 (no sleep), no panic. The positive-clamped-to-60 path
+    /// is verified manually (CI does not run 60s).
     #[test]
     fn wait_clamps_negative_to_zero() {
         let ctrl = GuiController::new();
         let r = ctrl.execute(GuiAction::Wait { seconds: -5.0 }).unwrap();
-        assert!(r.ok, "负值 Wait 应裁 0 后 ok=true");
+        assert!(r.ok, "negative Wait should clamp to 0 then be ok=true");
     }
 
-    /// RUN-12: 默认 (非空安全集) → 集合外 bundle 拒, 集合内放行。
-    /// 显式传 None = 无限制 opt-in → 任意 bundle 放行 (向后兼容)。
+    /// RUN-12: default (non-empty safe set) → bundles outside the set rejected, inside allowed.
+    /// Explicit None = unrestricted opt-in → any bundle allowed (backward compatible).
     #[test]
     fn msec04_no_allowlist_allows_any_bundle() {
-        // 默认非空 allowlist: evil bundle 拒, 安全 bundle 放行
+        // Default non-empty allowlist: evil bundle rejected, safe bundle allowed
         let ctrl = GuiController::new();
         assert!(
             ctrl.check_bundle_allowed("com.evil.keylogger").is_err(),
-            "RUN-12: 默认 allowlist 应拒未列入的 evil bundle"
+            "RUN-12: default allowlist should reject unlisted evil bundles"
         );
         assert!(ctrl.check_bundle_allowed("com.apple.TextEdit").is_ok());
-        // 显式 None = 无限制 opt-in: 任意 bundle 放行 (向后兼容)
+        // Explicit None = unrestricted opt-in: any bundle allowed (backward compatible)
         let ctrl_unrestricted = GuiController::new_with_config(GuiConfig {
             allowed_bundle_ids: None,
             allow_type_into_secure: false,
@@ -2364,7 +2501,7 @@ mod tests {
             .is_ok());
     }
 
-    /// M-SEC-04: 设 allowlist → 仅集合内 bundle 放行, 集合外拒绝。
+    /// M-SEC-04: with an allowlist set → only bundles inside the set allowed, outside rejected.
     #[test]
     fn msec04_allowlist_rejects_unlisted_bundle() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -2378,40 +2515,44 @@ mod tests {
         assert!(ctrl.check_bundle_allowed("com.apple.Terminal").is_ok());
         assert!(
             ctrl.check_bundle_allowed("com.evil.keylogger").is_err(),
-            "未列入 allowlist 的 bundle 应被拒"
+            "bundles not in the allowlist should be rejected"
         );
         assert!(
             ctrl.check_bundle_allowed("").is_err(),
-            "空 bundle 非白名单应拒"
+            "empty bundle not in the allowlist should be rejected"
         );
     }
 
-    /// RUN-12: GuiConfig default = 非空安全集 (商用安全默认受限, 非无限制)。
-    /// 显式传 None 仍 = 无限制 opt-in (向后兼容本地可信调用方)。
+    /// RUN-12: GuiConfig default = the non-empty safe set (commercial-safe restricted, not
+    /// unrestricted).
+    /// An explicit None still = unrestricted opt-in (backward compatible for local trusted callers).
     #[test]
     fn msec04_gui_config_default_unrestricted() {
         let cfg = GuiConfig::default();
         assert!(
             cfg.allowed_bundle_ids.is_some(),
-            "RUN-12: 默认应有非空 allowlist"
+            "RUN-12: default should have a non-empty allowlist"
         );
         let set = cfg.allowed_bundle_ids.unwrap();
         assert!(
             set.contains(&"com.apple.Terminal".to_string()),
-            "默认集含 Terminal"
+            "default set contains Terminal"
         );
         assert!(
             set.contains(&"com.apple.TextEdit".to_string()),
-            "默认集含 TextEdit"
+            "default set contains TextEdit"
         );
         assert!(
             set.contains(&"com.apple.finder".to_string()),
-            "默认集含 finder"
+            "default set contains finder"
         );
-        assert!(!cfg.allow_type_into_secure, "默认拒绝向密码框 type_text");
+        assert!(
+            !cfg.allow_type_into_secure,
+            "default rejects type_text into password fields"
+        );
     }
 
-    /// M-SEC-04: allow_type_into_secure=true 显式 opt-in 可构造。
+    /// M-SEC-04: allow_type_into_secure=true explicit opt-in is constructible.
     #[test]
     fn msec04_allow_type_into_secure_opt_in() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -2421,18 +2562,20 @@ mod tests {
         assert!(ctrl.config.allow_type_into_secure);
     }
 
-    /// M-SEC-04: kAXSecureTextFieldSubrole 常量正确 (AXSecureTextField, 非空)。
+    /// M-SEC-04: kAXSecureTextFieldSubrole constant is correct (AXSecureTextField, non-empty).
     #[test]
     fn msec04_secure_textfield_subrole_constant() {
         assert_eq!(kAXSecureTextFieldSubrole, "AXSecureTextField");
         assert!(!kAXSecureTextFieldSubrole.is_empty());
     }
 
-    // ===== 0827 fe-gui P0-P3 修复回归测试 =====
+    // ===== 0827 fe-gui P0-P3 fix regression tests =====
 
-    /// C-13: 设 allowlist 但 AX 未授权 (CI 无 TCC) → focused_app_bundle 失败返空串 →
-    /// 空串不在 allowlist → focused_not_allowed 返 Some(degraded)。验证拦截逻辑在 CI 可达
-    /// (execute 的 ax_trusted 闸门早拦截, 故直接测 focused_not_allowed 单元路径)。
+    /// C-13: allowlist set but AX unauthorized (CI, no TCC) → focused_app_bundle fails and returns
+    /// the empty string →
+    /// empty string not in allowlist → focused_not_allowed returns Some(degraded). Verifies the
+    /// interception logic is CI-reachable
+    /// (execute's ax_trusted gate intercepts earlier, so this tests the focused_not_allowed unit path directly).
     #[test]
     fn c13_focused_not_allowed_blocks_when_allowlist_set() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -2440,29 +2583,30 @@ mod tests {
             allow_type_into_secure: false,
         });
         let r = ctrl.focused_not_allowed();
-        // CI 无 AX: bundle 解析失败 → "" → 不在 allowlist → Some(degraded)。
-        // trusted 机且当前 focused=TextEdit: bundle 命中 → None (放行)。两种环境均合法。
+        // CI without AX: bundle resolution fails → "" → not in allowlist → Some(degraded).
+        // Trusted machine with current focus=TextEdit: bundle hits → None (allowed). Both are valid.
         if !GuiController::ax_trusted() {
             assert!(
                 r.is_some(),
-                "C-13: CI 无 AX + allowlist 应拦截 (bundle 解析失败)"
+                "C-13: CI without AX + allowlist should intercept (bundle resolution failure)"
             );
             let res = r.unwrap();
-            assert!(!res.ok, "C-13: 拦截应 ok:false");
+            assert!(!res.ok, "C-13: interception should be ok:false");
             assert!(
                 res.error
                     .as_deref()
                     .unwrap_or("")
                     .contains("focused-app-not-allowed"),
-                "C-13: 错误标记: {:?}",
+                "C-13: error marker: {:?}",
                 res.error
             );
         }
     }
 
-    /// C-13: 无 allowlist (None) → focused_not_allowed 始终 None (放行, 审计)。
-    /// 验证 short-circuit: allowlist=None 时不调 focused_app_bundle (无 AX 调用)。
-    /// RUN-12: 默认非空 allowlist, 须显式传 None 才测无限制 short-circuit。
+    /// C-13: no allowlist (None) → focused_not_allowed always None (allowed, audited).
+    /// Verifies the short-circuit: allowlist=None never calls focused_app_bundle (no AX call).
+    /// RUN-12: the default is a non-empty allowlist, so an explicit None is required to test the
+    /// unrestricted short-circuit.
     #[test]
     fn c13_focused_not_allowed_passes_without_allowlist() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -2471,13 +2615,15 @@ mod tests {
         });
         assert!(
             ctrl.focused_not_allowed().is_none(),
-            "C-13: 无 allowlist (显式 None) 应放行返 None"
+            "C-13: no allowlist (explicit None) should allow and return None"
         );
     }
 
-    /// C-13: type_text 在 allowlist + CI 无 AX 下 — execute 的 ax_trusted 闸门先降级,
-    /// 但若 trusted: focused 非 allowlisted app 应被 focused_not_allowed 拦截 ok:false。
-    /// CI 路径断言 ax_trusted 闸门降级 (闸门在 dispatch 前); trusted 机验证拦截需真实 GUI 手动。
+    /// C-13: type_text with allowlist + CI without AX — execute's ax_trusted gate degrades first,
+    /// but when trusted: a focused non-allowlisted app should be intercepted by focused_not_allowed
+    /// with ok:false.
+    /// The CI path asserts the ax_trusted gate degradation (gate precedes dispatch); verifying
+    /// interception on trusted machines needs a real GUI manually.
     #[test]
     fn c13_type_text_blocked_by_allowlist_when_trusted() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -2488,11 +2634,12 @@ mod tests {
             .execute(GuiAction::TypeText { text: "x".into() })
             .unwrap();
         if GuiController::ax_trusted() {
-            // trusted + 当前 focused app 非 TextEdit → C-13 拦截 (focused-app-not-allowed);
-            // 若 focused 恰为 TextEdit → 放行 ok:true (测试环境依赖, 不强断言 ok 值, 仅验不 panic)。
+            // trusted + current focused app not TextEdit → C-13 interception (focused-app-not-allowed);
+            // if focus happens to be TextEdit → allowed ok:true (environment-dependent, no hard
+            // assertion on ok, just verifying no panic).
             let _ = r.ok;
         } else {
-            assert!(!r.ok, "CI 无 AX 应 ax_trusted 闸门降级");
+            assert!(!r.ok, "CI without AX should degrade at the ax_trusted gate");
             assert_eq!(
                 r.error.as_deref(),
                 Some("accessibility-permission-required")
@@ -2500,10 +2647,12 @@ mod tests {
         }
     }
 
-    /// M-12.4: hold_key duration_ms=0 → ok:false hold-key-duration-zero (fail-loud, 非静默 no-op)。
-    /// trusted-independent? 否 — hold_key 经 execute 的 ax_trusted 闸门。CI 无 AX 走闸门降级;
-    /// trusted 机闸门过后 duration_ms==0 早拒绝 (在 keycode resolve 前)。两路径均 ok:false。
-    /// RUN-12: 用显式无限制 config (None), 测 duration 逻辑不被默认 allowlist 干扰 (focused 拦截)。
+    /// M-12.4: hold_key duration_ms=0 → ok:false hold-key-duration-zero (fail-loud, not a silent no-op).
+    /// trusted-independent? No — hold_key goes through execute's ax_trusted gate. CI without AX
+    /// takes the gate degradation; on trusted machines the gate passes and duration_ms==0 is
+    /// rejected early (before keycode resolution). Both paths are ok:false.
+    /// RUN-12: uses an explicitly unrestricted config (None) so the duration logic is not perturbed
+    /// by the default allowlist (focused-app interception).
     #[test]
     fn m12_4_hold_key_zero_duration_rejected() {
         let ctrl = GuiController::new_with_config(GuiConfig {
@@ -2516,27 +2665,28 @@ mod tests {
                 duration_ms: 0,
             })
             .unwrap();
-        assert!(!r.ok, "M-12.4: duration_ms=0 应 ok:false");
+        assert!(!r.ok, "M-12.4: duration_ms=0 should be ok:false");
         if GuiController::ax_trusted() {
             assert!(
                 r.error
                     .as_deref()
                     .unwrap_or("")
                     .contains("hold-key-duration-zero"),
-                "M-12.4: trusted 应 duration-zero 错误: {:?}",
+                "M-12.4: trusted should yield the duration-zero error: {:?}",
                 r.error
             );
         } else {
             assert_eq!(
                 r.error.as_deref(),
                 Some("accessibility-permission-required"),
-                "M-12.4: CI 无 AX 走闸门降级"
+                "M-12.4: CI without AX takes the gate degradation"
             );
         }
     }
 
-    /// M-12.3: cgimage_to_rgba + rgba_to_png_b64 文档注释显式标注预乘 RGBA 取舍。
-    /// 编译期保证: 两函数可寻址 (拆分后接口, 不破坏调用方)。
+    /// M-12.3: the cgimage_to_rgba + rgba_to_png_b64 doc comments explicitly note the premultiplied
+    /// RGBA tradeoff.
+    /// Compile-time guarantee: both functions addressable (split interface, callers unbroken).
     #[allow(clippy::type_complexity)]
     #[test]
     fn m12_3_premultiplied_rgba_doc_anchors() {
@@ -2546,29 +2696,32 @@ mod tests {
         assert!(std::ptr::addr_of!(f2) as usize != 0);
     }
 
-    /// RUN-12: 默认 GuiController::new() 受限 — 非默认集 bundle 被 check_bundle_allowed 拒。
-    /// 商用安全默认: 防越权驱动任意 app (keylogger 等), 须显式扩 allowlist。
+    /// RUN-12: the default GuiController::new() is restricted — bundles outside the default set are
+    /// rejected by check_bundle_allowed.
+    /// Commercial-safe default: prevents driving arbitrary apps (keyloggers etc.) without an
+    /// explicit allowlist extension.
     #[test]
     fn run12_default_rejects_non_allowlisted_bundle() {
         let ctrl = GuiController::new();
-        // 默认集内: 放行
+        // Inside the default set: allowed
         assert!(ctrl.check_bundle_allowed("com.apple.Terminal").is_ok());
         assert!(ctrl.check_bundle_allowed("com.apple.finder").is_ok());
-        // 默认集外: 拒 (商用安全默认)
+        // Outside the default set: rejected (commercial-safe default)
         assert!(
             ctrl.check_bundle_allowed("com.evil.keylogger").is_err(),
-            "RUN-12: 默认受限应拒 evil bundle"
+            "RUN-12: default restriction should reject evil bundles"
         );
         assert!(
             ctrl.check_bundle_allowed("com.apple.Safari").is_err(),
-            "RUN-12: 默认集不含 Safari 应拒 (须显式扩)"
+            "RUN-12: Safari not in the default set should be rejected (requires explicit extension)"
         );
     }
 
-    /// IMPL-9: Screenshot 提到 ax_trusted 闸门前 — Accessibility 未授权不应误拦截图。
-    /// 截图走 Screen Recording TCC (CoreGraphics), 与 Accessibility 独立。
-    /// CI 无 Screen Recording → screen-recording-permission-required (非 accessibility-permission-required)。
-    /// trusted 机有 Screen Recording → ok:true。两路径均不返 accessibility 错误。
+    /// IMPL-9: Screenshot hoisted before the ax_trusted gate — Accessibility being unauthorized
+    /// should not mistakenly block screenshots.
+    /// Screenshots go through Screen Recording TCC (CoreGraphics), independent of Accessibility.
+    /// CI without Screen Recording → screen-recording-permission-required (not accessibility-permission-required).
+    /// Trusted machine with Screen Recording → ok:true. Neither path returns an accessibility error.
     #[test]
     fn impl9_screenshot_bypasses_accessibility_gate() {
         let ctrl = GuiController::new();
@@ -2577,76 +2730,93 @@ mod tests {
                 mask_sensitive: false,
             })
             .unwrap();
-        // 关键: screenshot 不经 Accessibility 闸门, 故 error 不应是 accessibility-permission-required
+        // Key: screenshot does not go through the Accessibility gate, so the error must not be
+        // accessibility-permission-required
         assert_ne!(
             r.error.as_deref(),
             Some("accessibility-permission-required"),
-            "IMPL-9: screenshot 不应被 Accessibility 闸门拦 (TCC 权限独立)"
+            "IMPL-9: screenshot should not be blocked by the Accessibility gate (TCC permissions independent)"
         );
         if !GuiController::ax_trusted() {
-            // CI 无 Screen Recording → screen-recording 降级 (非 accessibility)
-            assert!(!r.ok, "IMPL-9: CI 无 Screen Recording 应降级 ok:false");
+            // CI without Screen Recording → screen-recording degradation (not accessibility)
+            assert!(
+                !r.ok,
+                "IMPL-9: CI without Screen Recording should degrade to ok:false"
+            );
             assert!(
                 r.error
                     .as_deref()
                     .unwrap_or("")
                     .contains("screen-recording-permission-required"),
-                "IMPL-9: CI 应返 screen-recording 错误: {:?}",
+                "IMPL-9: CI should return the screen-recording error: {:?}",
                 r.error
             );
         }
     }
 
-    /// #38: GuiResult.scale_factor serde 默认 1.0 (absent field → 1.0, 向后兼容)。
+    /// #38: GuiResult.scale_factor serde defaults to 1.0 (absent field → 1.0, backward compatible).
     #[test]
     fn gui_result_scale_factor_serde_default() {
         let json = r#"{"ok":true}"#;
         let r: GuiResult = serde_json::from_str(json).unwrap();
         assert!(r.ok);
-        assert_eq!(r.scale_factor, 1.0, "absent scale_factor 应默认 1.0");
+        assert_eq!(
+            r.scale_factor, 1.0,
+            "absent scale_factor should default to 1.0"
+        );
         let s = serde_json::to_string(&r).unwrap();
         assert!(
             s.contains("\"scale_factor\":1.0"),
-            "scale_factor 应序列化: {s}"
+            "scale_factor should serialize: {s}"
         );
     }
 
-    /// #40: Screenshot mask_sensitive serde 默认 false (absent → false, 不遮罩)。
+    /// #40: Screenshot mask_sensitive serde defaults to false (absent → false, no masking).
     #[test]
     fn screenshot_mask_sensitive_serde_default() {
         let s = r#"{"kind":"screenshot"}"#;
         let a: GuiAction = serde_json::from_str(s).unwrap();
         match a {
             GuiAction::Screenshot { mask_sensitive } => {
-                assert!(!mask_sensitive, "absent mask_sensitive 应默认 false");
+                assert!(
+                    !mask_sensitive,
+                    "absent mask_sensitive should default to false"
+                );
             }
-            _ => panic!("deser 应为 Screenshot"),
+            _ => panic!("deser should be Screenshot"),
         }
         let s2 = r#"{"kind":"screenshot","mask_sensitive":true}"#;
         let a2: GuiAction = serde_json::from_str(s2).unwrap();
         match a2 {
             GuiAction::Screenshot { mask_sensitive } => {
-                assert!(mask_sensitive, "显式 mask_sensitive:true 应保留");
+                assert!(
+                    mask_sensitive,
+                    "explicit mask_sensitive:true should be preserved"
+                );
             }
-            _ => panic!("deser 应为 Screenshot"),
+            _ => panic!("deser should be Screenshot"),
         }
     }
 
-    /// #40: mask_rgba_inplace 涂黑逻辑点矩形 (含 Y 翻转)。
-    /// 构造 2×2 RGBA 全白, rect 覆盖整图 → 全黑。scale=1.0。
+    /// #40: mask_rgba_inplace blacks out logical-point rects (including the y-flip).
+    /// Builds a 2×2 all-white RGBA buffer; a rect covering the whole image → all black. scale=1.0.
     #[test]
     fn mask_rgba_inplace_full_cover() {
         let mut rgba = vec![255u8; 2 * 2 * 4];
         let rects = vec![(0.0f64, 0.0, 2.0, 2.0)];
         GuiController::mask_rgba_inplace(&mut rgba, 2, 2, 1.0, &rects);
         for px in rgba.chunks(4) {
-            assert_eq!(px, &[0, 0, 0, 255], "全图应涂黑 RGBA(0,0,0,255)");
+            assert_eq!(
+                px,
+                &[0, 0, 0, 255],
+                "whole image should be blacked out RGBA(0,0,0,255)"
+            );
         }
     }
 
-    /// #40: mask_rgba_inplace 局部矩形 + scale=2.0 + Y 翻转正确性。
-    /// 4×4 图, rect (1,1,1,1) 逻辑点 → scale 2 → 像素区 [2,4)×[2,4) (物理)。
-    /// Y 翻转: 物理行 = h-1-py, py∈[2,4) → 行 [0,2) (顶两行)。
+    /// #40: mask_rgba_inplace partial rect + scale=2.0 + y-flip correctness.
+    /// 4×4 image, rect (1,1,1,1) in logical points → scale 2 → pixel region [2,4)×[2,4) (physical).
+    /// Y-flip: physical row = h-1-py; py∈[2,4) → rows [0,2) (top two rows).
     #[test]
     fn mask_rgba_inplace_partial_scale_yflip() {
         let mut rgba = vec![255u8; 4 * 4 * 4];
@@ -2657,43 +2827,47 @@ mod tests {
             let i = (row * 4 + x) * 4;
             rgba[i] == 0 && rgba[i + 1] == 0 && rgba[i + 2] == 0 && rgba[i + 3] == 255
         };
-        // py∈[2,4), px∈[2,4) 应黑
+        // py∈[2,4), px∈[2,4) should be black
         for y in 2..4 {
             for x in 2..4 {
-                assert!(is_black(x, y), "({x},{y}) 应黑");
+                assert!(is_black(x, y), "({x},{y}) should be black");
             }
         }
-        // 其余应白
+        // The rest should be white
         for y in 0..4 {
             for x in 0..4 {
                 if !(2..4).contains(&x) || !(2..4).contains(&y) {
-                    assert!(!is_black(x, y), "({x},{y}) 应白");
+                    assert!(!is_black(x, y), "({x},{y}) should be white");
                 }
             }
         }
     }
 
-    /// #40: mask_rgba_inplace 越界裁剪 (rect 超图边界) 不 panic。
+    /// #40: mask_rgba_inplace out-of-bounds clamping (rect beyond the image) — no panic.
     #[test]
     fn mask_rgba_inplace_oob_clamp() {
         let mut rgba = vec![255u8; 2 * 2 * 4];
         let rects = vec![(-5.0f64, -5.0, 100.0, 100.0)];
         GuiController::mask_rgba_inplace(&mut rgba, 2, 2, 1.0, &rects);
         for px in rgba.chunks(4) {
-            assert_eq!(px, &[0, 0, 0, 255], "超界 rect 应裁剪到全图涂黑");
+            assert_eq!(
+                px,
+                &[0, 0, 0, 255],
+                "out-of-bounds rect should clamp to the whole image blacked out"
+            );
         }
     }
 
-    /// #39: gui_action_batch 空 actions → 空 Vec。
+    /// #39: gui_action_batch with empty actions → empty Vec.
     #[test]
     fn gui_action_batch_empty() {
         let ctrl = GuiController::new();
         let results = ctrl.gui_action_batch(vec![]).unwrap();
-        assert!(results.is_empty(), "空 batch 应返空 Vec");
+        assert!(results.is_empty(), "empty batch should return an empty Vec");
     }
 
-    /// #39: gui_action_batch 顺序执行多动作, 收集每步结果。
-    /// CI 无 TCC: Wait trusted-independent ok:true, Click 降级 ok:false。
+    /// #39: gui_action_batch executes multiple actions in order, collecting each step's result.
+    /// CI without TCC: Wait trusted-independent ok:true, Click degraded ok:false.
     #[test]
     fn gui_action_batch_sequential_collects() {
         let ctrl = GuiController::new();
@@ -2706,11 +2880,14 @@ mod tests {
             GuiAction::Wait { seconds: 0.0 },
         ];
         let results = ctrl.gui_action_batch(actions).unwrap();
-        assert_eq!(results.len(), 3, "应收集 3 步结果");
-        assert!(results[0].ok, "Wait[0] trusted-independent 应 ok");
-        assert!(results[2].ok, "Wait[2] trusted-independent 应 ok");
+        assert_eq!(results.len(), 3, "should collect 3 step results");
+        assert!(results[0].ok, "Wait[0] trusted-independent should be ok");
+        assert!(results[2].ok, "Wait[2] trusted-independent should be ok");
         if !GuiController::ax_trusted() {
-            assert!(!results[1].ok, "CI 无 TCC: Click[1] 应降级 ok:false");
+            assert!(
+                !results[1].ok,
+                "CI without TCC: Click[1] should degrade to ok:false"
+            );
         }
     }
 }

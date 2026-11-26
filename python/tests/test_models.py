@@ -61,10 +61,10 @@ def test_execution_result_timeout_code():
     assert result.timed_out is True
 
 
-# ── Blocker 11: extra="forbid" — 静默 schema drift 防护 ──
-# Rust serde struct ↔ Pydantic 字段失配时 fail-loud (旧 extra="ignore" 吞未知字段,
-# Rust 改字段名/serde bug → Pydantic 侧空字段假成功)。每模型断言: 未知字段 → ValidationError,
-# 缺必填字段 → ValidationError。
+# ── Blocker 11: extra="forbid" — silent schema drift protection ──
+# Rust serde struct ↔ Pydantic field mismatch fails loud (old extra="ignore" swallowed unknown fields,
+# Rust field rename/serde bug → Pydantic-side empty fields faking success). Each model asserts: unknown field → ValidationError,
+# missing required field → ValidationError.
 
 
 @pytest.mark.parametrize(
@@ -83,7 +83,7 @@ def test_execution_result_timeout_code():
     ],
 )
 def test_models_reject_extra_fields(model, valid_kwargs, extra_field):
-    # extra="forbid" — 未知字段必须 ValidationError, 不能静默吞
+    # extra="forbid" — unknown field must raise ValidationError, never silently swallowed
     bad = {**valid_kwargs, extra_field: "sneaky"}
     with pytest.raises(ValidationError):
         model.model_validate(bad)
@@ -92,31 +92,31 @@ def test_models_reject_extra_fields(model, valid_kwargs, extra_field):
 @pytest.mark.parametrize(
     "model,required_kwargs",
     [
-        (ExecutionRequest, {"task_id": None}),  # 缺 command
-        (GlobEntry, {"is_dir": False}),  # 缺 path
-        (GrepMatch, {"path": "x", "line_number": 1}),  # 缺 content
-        (TelemetrySample, {"ts_ms": 1, "cpu_pct": 0.0}),  # 缺 mem_mb
+        (ExecutionRequest, {"task_id": None}),  # missing command
+        (GlobEntry, {"is_dir": False}),  # missing path
+        (GrepMatch, {"path": "x", "line_number": 1}),  # missing content
+        (TelemetrySample, {"ts_ms": 1, "cpu_pct": 0.0}),  # missing mem_mb
     ],
 )
 def test_models_reject_missing_required_fields(model, required_kwargs):
-    # 必填字段缺失必须 ValidationError (非默认填充假成功)
+    # missing required fields must raise ValidationError (not default-filled fake success)
     with pytest.raises(ValidationError):
         model.model_validate(required_kwargs)
 
 
 def test_diagnostics_partial_none_ok():
-    # 全 Optional 模型: 空构造合法 (无必填)
+    # all-Optional model: empty construction is legal (no required fields)
     d = Diagnostics()
     assert d.error_type is None
     assert d.line_number is None
     assert Diagnostics.model_validate({}) == d
 
 
-# ── Issue #34: SandboxProfile Pydantic 往返 ──
+# ── Issue #34: SandboxProfile Pydantic round-trip ──
 
 
 def test_sandbox_profile_defaults():
-    # 默认: 全 None/False/空 — 行为同 v0.2.7 (sandbox=None 语义)
+    # defaults: all None/False/empty — behavior identical to v0.2.7 (sandbox=None semantics)
     p = SandboxProfile()
     assert p.network is None
     assert p.filesystem is None
@@ -141,7 +141,7 @@ def test_sandbox_profile_round_trip():
 
 
 def test_execution_request_sandbox_field():
-    # ExecutionRequest.sandbox additive — None 默认不破回归, Some 透传
+    # ExecutionRequest.sandbox additive — None default preserves behavior, Some passes through
     req_default = ExecutionRequest(command="echo hi")
     assert req_default.sandbox is None
     req_sbx = ExecutionRequest(
@@ -151,7 +151,7 @@ def test_execution_request_sandbox_field():
     assert req_sbx.sandbox is not None
     assert req_sbx.sandbox.network == "allow"
     assert req_sbx.sandbox.excluded_commands == ["rm"]
-    # 往返保持
+    # round-trip preserved
     dumped = req_sbx.model_dump()
     restored = ExecutionRequest.model_validate(dumped)
     assert restored.sandbox == req_sbx.sandbox

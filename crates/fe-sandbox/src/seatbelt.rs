@@ -1,49 +1,51 @@
-// fe-sandbox seatbelt — macOS 运行时隔离 (审计 Blocker 1 / 1.1, 0827 C-16/A-12)
+// fe-sandbox seatbelt — macOS runtime isolation (audit Blocker 1 / 1.1, 0827 C-16/A-12)
 //
-// Darwin 25 (macOS 26) 实测结论 (2026-08-25 / D3-3 复测 2026-08-28):
-//   - sandbox-exec **全局** `file-write*` deny 完全失效 (literal/subpath 均不拦写/删)。
-//   - **定向** `file-write*` deny (D3-3: subpath 特定敏感路径及其子项) —
-//     0827 C-16: 注入定向 deny 作 best-effort 纵深防御。D3-3 实测 (probe_seatbelt_fs_subpath_deny,
-//     2026-08-28): Darwin 25 subpath **同样 NO-OP** — 写 tempdir 子文件 exit 0 + 文件落地。
-//     subpath 语义比 literal 更正确 (literal 仅精确路径, 子文件漏网), 但 Darwin 25 两者皆失效。
-//     真隔离靠 fe-security is_sensitive_path (argv 层) + 受限 macOS 用户账号 (OS 级, 非 seatbelt)。
-//   - `process-exec` deny 生效: (deny process-exec (literal "/bin/rm")) → execve 拦截 exit 126。
-//   - `network-outbound` deny 生效: 拦 /dev/tcp 外泄 + curl|sh 载体出网。
+// Darwin 25 (macOS 26) measured findings (2026-08-25 / D3-3 retest 2026-08-28):
+//   - sandbox-exec **global** `file-write*` deny is fully ineffective (neither literal nor subpath blocks writes/deletes).
+//   - **Directed** `file-write*` deny (D3-3: subpath of specific sensitive paths and their children) —
+//     0827 C-16: inject directed denies as best-effort defense-in-depth. D3-3 measurement (probe_seatbelt_fs_subpath_deny,
+//     2026-08-28): Darwin 25 subpath is **also a NO-OP** — writing a tempdir child file exits 0 and the file lands.
+//     subpath semantics are more correct than literal (literal is exact-path only, child files slip through), but on Darwin 25 both fail.
+//     Real isolation relies on fe-security is_sensitive_path (argv layer) + a restricted macOS user account (OS-level, not seatbelt).
+//   - `process-exec` deny works: (deny process-exec (literal "/bin/rm")) → execve blocked, exit 126.
+//   - `network-outbound` deny works: blocks /dev/tcp exfiltration + curl|sh carrier egress.
 //
-// 0827 A-12 修正: 删 DANGEROUS_BINS process-exec denylist — 黑名单天然不可枚举 (rm 重命名/
-// symlink 绕过), fe-security Stage-2 allowlist (更强, 白名单外的二进制全拦) 已覆盖二进制隔离。
-// seatbelt denylist 是冗余弱防线, 留之给"双重保护"错觉。seatbelt 仅留 network-outbound +
-// 定向 FS deny (C-16), 二进制隔离由 fe-security allowlist 主导。
+// 0827 A-12 correction: removed the DANGEROUS_BINS process-exec denylist — blacklists are inherently unenumerable
+// (rm rename/symlink bypass); fe-security Stage-2 allowlist (stronger: blocks every binary outside the whitelist)
+// already covers binary isolation.
+// The seatbelt denylist was a redundant weak line of defense that created a "double protection" illusion. seatbelt keeps only
+// network-outbound + directed FS deny (C-16); binary isolation is led by the fe-security allowlist.
 //
-// 0827 C-16 文档 (FS 非隔离显式声明):
-//   seatbelt 层**非完整 FS 隔离** — whitelist 二进制 (python3/node/cargo) 的 syscall
-//   (unlink/rmdir/open/write) 经定向 deny 守高价值路径, 但**不**全 FS deny。
-//   全局 + 定向 file-write* Darwin 25 均实测失效 (NO-OP); 定向 deny 保留作 best-effort 纵深防御
-//   (subpath 语义正确, 非 NO-OP 的 Darwin 版本将真实拦), 但当前平台不依赖其拦截。
-//   实际隔离项: (1) network-outbound (实测生效), (2) 定向敏感路径 file-write* (best-effort, Darwin 25 NO-OP),
-//   (3) 二进制 exec 由 fe-security allowlist 主导 (非 seatbelt)。
-//   全 FS 隔离需 OS 级 — 专用受限 macOS 用户账号 (非 seatbelt 能力)。
+// 0827 C-16 documentation (explicit FS non-isolation statement):
+//   the seatbelt layer is **not full FS isolation** — syscalls (unlink/rmdir/open/write) of whitelisted
+//   binaries (python3/node/cargo) guard high-value paths via directed deny, but there is **no** full FS deny.
+//   Global + directed file-write* both measured NO-OP on Darwin 25; directed denies are kept as best-effort
+//   defense-in-depth (subpath semantics are correct; Darwin versions without the NO-OP would enforce them for real),
+//   but the current platform does not rely on them for interception.
+//   Actual isolation items: (1) network-outbound (measured working), (2) directed sensitive-path file-write* (best-effort, Darwin 25 NO-OP),
+//   (3) binary exec led by the fe-security allowlist (not seatbelt).
+//   Full FS isolation needs OS-level — a dedicated restricted macOS user account (not a seatbelt capability).
 //
-// 无 unsafe: sandbox-exec 是 /usr/bin 子进程, 走 portable-pty CommandBuilder spawn。
-// crate 仍 unsafe_code="deny" (fe-sandbox 未开 allow)。
+// No unsafe: sandbox-exec is a /usr/bin subprocess spawned via the portable-pty CommandBuilder.
+// The crate stays unsafe_code="deny" (fe-sandbox has no allow).
 //
-// Issue #3 (资源上限): 资源限制经 shell `ulimit` 内建注入 (sh -c 'ulimit -u N; ulimit -t N; <cmd>'),
-// 非 setrlimit FFI — 避免 unsafe + 跨 PTY/stdio 后端一致。
-// Darwin 25 实测 (2026-08-25):
-//   - RLIMIT_AS (ulimit -v) / RLIMIT_DATA (ulimit -d) / RLIMIT_FSIZE (ulimit -f) 均 NO-OP
-//     (setrlimit EINVAL 或接受但不限分配; 无限 malloc 仍逃逸不 cap) — Darwin 平台限制,
-//     非代码缺陷。堆内存上限无可用 rlimit; 输出端 OOM 由 fe-sandbox 环形缓冲兜底 (2*max_output)。
-//     RUN-4 (审计 0827): 内存上限无 OS 机制可用 — 此为 Darwin 平台固有限制, 非代码可修。
-//     文档化 + 环形缓冲 (输出端) + seatbelt 禁网/定向 FS deny (攻击面端) 为现有缓解。
-//   - RLIMIT_NPROC (ulimit -u) 生效: fork bomb 被限并发数 (spread-limit, 非 terminator —
-//     已生成子进程 retry-storm, 真正终止靠 timeout watchdog kill 进程树)。
-//   - RLIMIT_CPU (ulimit -t) 生效: CPU 秒上限, 到顶 SIGXCPU。
-//   - RLIMIT_NOFILE (ulimit -n) 生效: 限每进程打开 FD 数 (Darwin 实测 errno 24 EMFILE
-//     命中 cap, RUN-10 审计 0827 — fork 炸弹配 FD 耗尽攻击拦截)。
-//   - seatbelt profile `resource-limit`/`limit` 关键字 — 不解析 (parse error), 不可用。
-// 策略: 注入实测生效的 ulimit -u (NPROC) + ulimit -t (CPU) + ulimit -n (NOFILE);
-// 不注入 -v/-d/-f (no-op, 假安全违反 Rule 12 fail-visible)。Darwin 堆内存无 rlimit 上限,
-// 文档化为平台限制 (RUN-4)。
+// Issue #3 (resource caps): limits injected via the shell `ulimit` builtin (sh -c 'ulimit -u N; ulimit -t N; <cmd>'),
+// not setrlimit FFI — avoids unsafe + stays consistent across the PTY/stdio backends.
+// Darwin 25 measurements (2026-08-25):
+//   - RLIMIT_AS (ulimit -v) / RLIMIT_DATA (ulimit -d) / RLIMIT_FSIZE (ulimit -f) are all NO-OPs
+//     (setrlimit EINVAL, or accepted but allocations uncapped; infinite malloc still escapes) — a Darwin platform
+//     limitation, not a code defect. No usable rlimit for heap memory; output-side OOM is bounded by the fe-sandbox ring buffer (2*max_output).
+//     RUN-4 (audit 0827): no OS mechanism for a memory cap — an inherent Darwin platform limitation, not fixable in code.
+//     Documentation + ring buffer (output side) + seatbelt network deny/directed FS deny (attack-surface side) are the current mitigations.
+//   - RLIMIT_NPROC (ulimit -u) works: fork bombs get concurrency-limited (spread-limit, not terminator —
+//     already-spawned children retry-storm; real termination relies on the timeout watchdog killing the process tree).
+//   - RLIMIT_CPU (ulimit -t) works: CPU-second cap, SIGXCPU at the ceiling.
+//   - RLIMIT_NOFILE (ulimit -n) works: caps per-process open FDs (Darwin measured errno 24 EMFILE
+//     hitting the cap, RUN-10 audit 0827 — blocks fork-bomb + FD-exhaustion attacks).
+//   - seatbelt profile `resource-limit`/`limit` keywords — unparseable (parse error), unusable.
+// Policy: inject the measured-working ulimit -u (NPROC) + ulimit -t (CPU) + ulimit -n (NOFILE);
+// do not inject -v/-d/-f (no-ops; fake security violates Rule 12 fail-visible). Darwin heap memory has no rlimit cap,
+// documented as a platform limitation (RUN-4).
 
 use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
@@ -51,13 +53,13 @@ use std::process::Command;
 use std::sync::LazyLock;
 use tracing::{debug, info, warn};
 
-/// Issue #34: 每命令可配置 seatbelt profile — 让调用方 (fusion-code) 按命令请求沙箱策略,
-/// 对齐 in-process SandboxSettings 语义 (network allow/deny, filesystem allow/deny-write,
-/// excluded commands)。default-off (Option<SandboxProfile> = None → 现有固定 profile, 字节一致);
-/// Some(profile) → build_profile_from 按字段参数化构建。fail_if_unavailable=true 时若 sandbox-exec
-/// 不可用 → fe-core fail-closed 拒绝执行 (不裸跑高风险命令)。
+/// Issue #34: per-command configurable seatbelt profile — lets the caller (fusion-code) request a sandbox policy per command,
+/// aligned with the in-process SandboxSettings semantics (network allow/deny, filesystem allow/deny-write,
+/// excluded commands). Default-off (Option<SandboxProfile> = None → the existing fixed profile, byte-identical);
+/// Some(profile) → build_profile_from builds parameterized by field. With fail_if_unavailable=true and sandbox-exec
+/// unavailable → fe-core fail-closed rejects execution (high-risk commands never run bare).
 ///
-/// 网络策略 — Allow=放行出网 (不注 network deny); Deny=禁网 (deny network-outbound, 现有默认)。
+/// Network policy — Allow = permit egress (no network deny injected); Deny = network denied (deny network-outbound, the existing default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxNetworkMode {
@@ -66,8 +68,8 @@ pub enum SandboxNetworkMode {
     Deny,
 }
 
-/// 文件系统策略 — Allow=不注 FS deny; DenyWrite=定向敏感路径 file-write* deny (现有默认, Darwin 25
-/// best-effort NO-OP 但语义正确); Deny=全局 file-write* deny (Darwin 25 实测 NO-OP, 仅 best-effort)。
+/// Filesystem policy — Allow = no FS deny injected; DenyWrite = directed sensitive-path file-write* deny (the existing
+/// default, a best-effort NO-OP on Darwin 25 but semantically correct); Deny = global file-write* deny (measured NO-OP on Darwin 25, best-effort only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxFsMode {
@@ -77,9 +79,9 @@ pub enum SandboxFsMode {
     Deny,
 }
 
-/// Issue #34: 每命令 seatbelt profile。None 字段走默认 (network=Deny, fs=DenyWrite)。
-/// excluded_commands → process-exec deny (调用方显式排除特定二进制, 补 fe-security allowlist)。
-/// fail_if_unavailable → profile 请求但 sandbox-exec 缺失时 fail-closed (fe-core 入口校验)。
+/// Issue #34: per-command seatbelt profile. None fields fall back to defaults (network=Deny, fs=DenyWrite).
+/// excluded_commands → process-exec deny (caller explicitly excludes specific binaries, complementing the fe-security allowlist).
+/// fail_if_unavailable → fail-closed when a profile is requested but sandbox-exec is missing (validated at the fe-core entry).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SandboxProfile {
@@ -93,11 +95,12 @@ pub struct SandboxProfile {
     pub fail_if_unavailable: bool,
 }
 
-/// 0827 C-16: 定向 FS deny 的高价值敏感路径 — best-effort 防 whitelist 二进制 syscall 删/读写。
-/// 全局 file-write* Darwin 25 失效; 定向 (D3-3: subpath 路径及其子项) 注入作纵深防御。
-/// 路径基于 $HOME 展开 (调用时替换); 覆盖凭据 (~/.ssh)、模型缓存 (~/.fusion-mlx)、
-/// 系统敏感区 (/etc, /var/db)。失效退回无 FS 保护, 不误报隔离 (Rule 12)。
-/// 全部为目录根 → subpath 安全 (无过拦兄弟目录)。
+/// 0827 C-16: high-value sensitive paths for the directed FS deny — best-effort protection against whitelisted-binary
+/// syscalls deleting/reading/writing them. Global file-write* fails on Darwin 25; directed denies (D3-3: subpath of the
+/// path and its children) are injected as defense-in-depth.
+/// Paths are expanded from $HOME (substituted at call time); covers credentials (~/.ssh), model cache (~/.fusion-mlx),
+/// and system-sensitive areas (/etc, /var/db). On failure falls back to no FS protection, never fakes isolation (Rule 12).
+/// All are directory roots → subpath is safe (no over-blocking of sibling directories).
 const SENSITIVE_FS_PATHS: &[&str] = &[
     "HOME/.ssh",
     "HOME/.fusion-mlx",
@@ -107,21 +110,21 @@ const SENSITIVE_FS_PATHS: &[&str] = &[
     "/Library/Keychains",
 ];
 
-/// 0827 A-12: (已删 DANGEROUS_BINS process-exec denylist) — 二进制隔离由 fe-security
-/// allowlist 主导 (更强: 白名单外全拦), seatbelt denylist 冗余且弱 (rm 重命名/symlink 绕过)。
+/// 0827 A-12: (DANGEROUS_BINS process-exec denylist removed) — binary isolation is led by the fe-security
+/// allowlist (stronger: blocks everything outside the whitelist); the seatbelt denylist was redundant and weak (rm rename/symlink bypass).
 //
-/// 构建 seatbelt profile 字符串 — allow default + 禁网 + 定向敏感路径 file-write* deny。
-/// 0827 C-16/A-12: 删 process-exec denylist (fe-security allowlist 覆盖), 加定向 FS deny。
+/// Build the seatbelt profile string — allow default + network deny + directed sensitive-path file-write* deny.
+/// 0827 C-16/A-12: removed the process-exec denylist (covered by the fe-security allowlist), added the directed FS deny.
 fn build_profile() -> String {
     build_profile_from(None)
 }
 
-/// Issue #34: 参数化 profile 构建 — profile 字段映射到 seatbelt 指令。
-/// None = 现有固定 profile (禁网 + 定向 FS deny, 字节一致)。Some = 按字段:
-///   network: Allow → 不注 network deny (放行出网); Deny/None → deny network-outbound (默认禁网)。
-///   filesystem: Allow → 不注 FS deny; DenyWrite/None → 定向 SENSITIVE_FS_PATHS deny (默认);
-///               Deny → 全局 file-write* deny (Darwin 25 NO-OP, best-effort)。
-///   excluded_commands → (deny process-exec (literal "<cmd>")) — 调用方显式排除, 补 fe-security allowlist。
+/// Issue #34: parameterized profile build — profile fields map to seatbelt directives.
+/// None = the existing fixed profile (network deny + directed FS deny, byte-identical). Some = per field:
+///   network: Allow → no network deny injected (egress permitted); Deny/None → deny network-outbound (default deny).
+///   filesystem: Allow → no FS deny; DenyWrite/None → directed SENSITIVE_FS_PATHS deny (default);
+///               Deny → global file-write* deny (Darwin 25 NO-OP, best-effort).
+///   excluded_commands → (deny process-exec (literal "<cmd>")) — caller-excluded, complementing the fe-security allowlist.
 fn build_profile_from(profile: Option<&SandboxProfile>) -> String {
     let mut p = String::from("(version 1)(allow default)");
     let net = profile.and_then(|pr| pr.network).unwrap_or_default();
@@ -157,9 +160,10 @@ fn build_profile_from(profile: Option<&SandboxProfile>) -> String {
     p
 }
 
-/// Issue #34: 净化 profile 注入字符串 — 防调用方在 excluded_commands 灌 `"`/反斜杠/换行
-/// 破坏 seatbelt profile 语法 (注入逃逸)。剥离控制符 + 引号转义。profile literal 串不支持
-/// 转义序列, 故直接移除 `"` 与 `\` 及控制符 (fail-safe: 清洗后空则跳过该条, 不注入)。
+/// Issue #34: sanitize profile-injected strings — prevents a caller stuffing `"`/backslash/newline into
+/// excluded_commands to break the seatbelt profile syntax (injection escape). Strips control chars + quote escaping.
+/// Profile literal strings do not support escape sequences, so `"` and `\` and control chars are removed outright
+/// (fail-safe: an entry that sanitizes to empty is skipped, not injected).
 fn sanitize_profile_string(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '"' && *c != '\\' && !c.is_control())
@@ -168,32 +172,33 @@ fn sanitize_profile_string(s: &str) -> String {
         .to_string()
 }
 
-/// Issue #34: 探活 sandbox-exec 是否可用 (PATH 解析)。fail_if_unavailable=true 调用方据此 fail-closed。
-/// /usr/bin/sandbox-exec 是 macOS 内置; 非 macOS / 被移除 → 不可用。safe Rust, 无 unsafe。
+/// Issue #34: probe whether sandbox-exec is available (PATH resolution). fail_if_unavailable=true callers use this to fail closed.
+/// /usr/bin/sandbox-exec is macOS built-in; non-macOS / removed → unavailable. Safe Rust, no unsafe.
 pub fn seatbelt_available() -> bool {
     if let Ok(path) = which::which("sandbox-exec") {
-        debug!(?path, "seatbelt sandbox-exec 可用");
+        debug!(?path, "seatbelt sandbox-exec available");
         true
     } else {
-        warn!("seatbelt sandbox-exec 不可用 — fail_if_unavailable 调用方应 fail-closed");
+        warn!("seatbelt sandbox-exec unavailable — fail_if_unavailable callers should fail closed");
         false
     }
 }
 
-/// D4-1: seatbelt profile 缓存 — build_profile 首次构造后进 LazyLock, 后续 exec 复用同一 String
-/// (profile 是进程静态: HOME 在首调时解析, SIGHUP 重载白名单不影响 seatbelt profile —
-/// sandbox-exec profile 串不跟 env 联动)。消除每次 build_command 的 String 重建 + HOME env 查。
+/// D4-1: seatbelt profile cache — build_profile constructs once into a LazyLock; subsequent execs reuse the same String
+/// (the profile is process-static: HOME resolves at first call, SIGHUP whitelist reload does not affect the seatbelt profile —
+/// the sandbox-exec profile string does not track env). Eliminates per-build_command String rebuilds + HOME env lookups.
 static SEATBELT_PROFILE: LazyLock<String> = LazyLock::new(build_profile);
 
-/// 返回缓存的 seatbelt profile (D4-1, 默认固定 profile)。测试仍可直调 build_profile/build_profile_from 验证构造逻辑。
+/// Returns the cached seatbelt profile (D4-1, default fixed profile). Tests can still call build_profile/build_profile_from
+/// directly to verify construction logic.
 fn profile() -> &'static str {
     &SEATBELT_PROFILE
 }
 
-/// Issue #3 + RUN-10: 资源上限包装 — 在命令串前注入实测生效的 ulimit 内建。
-/// -u (NPROC, 防进程炸弹) + -t (CPU, 防死循环烧 CPU) + -n (NOFILE, 防 FD 耗尽) 生效;
-/// -v/-d/-f Darwin no-op 不注入。nproc=0/cpu_sec=0/nofile=0 → 对应项不限。
-/// 注入到 sh -c 脚本内, 跨 PTY/stdio 后端一致, 无 unsafe。
+/// Issue #3 + RUN-10: resource-cap wrapper — injects the measured-working ulimit builtins ahead of the command string.
+/// -u (NPROC, fork-bomb defense) + -t (CPU, infinite-loop CPU burn) + -n (NOFILE, FD exhaustion) all work;
+/// -v/-d/-f are Darwin no-ops and are not injected. nproc=0/cpu_sec=0/nofile=0 → the corresponding item is uncapped.
+/// Injected inside the sh -c script, consistent across PTY/stdio backends, no unsafe.
 fn wrap_rlimits(command: &str, nproc: u32, cpu_sec: u32, nofile: u32) -> String {
     if nproc == 0 && cpu_sec == 0 && nofile == 0 {
         return command.to_string();
@@ -208,27 +213,28 @@ fn wrap_rlimits(command: &str, nproc: u32, cpu_sec: u32, nofile: u32) -> String 
     if nofile > 0 {
         prefix.push_str(&format!("ulimit -n {} 2>/dev/null; ", nofile));
     }
-    // 2>/dev/null 吞 Darwin 对某些 limit 的 EINVAL 噪声 (已知 -v no-op 会报; 我们只注入生效项,
-    // 但保守吞错防 stderr 污染诊断)。前缀失败不短路 (; 继续跑命令) — rlimit 是 best-effort 纵深防御,
-    // 真正的硬上限由 timeout watchdog + 输出环形缓冲保底。
+    // 2>/dev/null swallows Darwin's EINVAL noise on some limits (the known -v no-op reports; we only inject working items,
+    // but conservatively swallow errors to keep stderr from polluting diagnostics). A failed prefix does not short-circuit
+    // (; the command still runs) — rlimits are best-effort defense-in-depth;
+    // the real hard caps are guaranteed by the timeout watchdog + the output ring buffer.
     let wrapped = format!("{prefix}{command}");
     debug!(
         nproc,
         cpu_sec,
         nofile,
         wrapped_len = wrapped.len(),
-        "注入 ulimit 资源上限"
+        "ulimit resource caps injected"
     );
     wrapped
 }
 
-/// 构建子进程 CommandBuilder。
-/// seatbelt=true → sandbox-exec -p '<profile>' sh -c '<cmd>' (运行时隔离)
-/// seatbelt=false → sh -c '<cmd>' (裸跑, 兼容旧调用方)
-/// Issue #3 + RUN-10: nproc/cpu_sec/nofile 经 wrap_rlimits 注入到 sh -c 脚本 (实测生效的 ulimit)。
-/// cwd/env 在返回的 cmd 上由调用方继续设置。
-/// Issue #34: sandbox_profile=Some → build_profile_from 按字段参数化 (network/fs/excluded_commands);
-/// None → 现有固定 profile (字节一致)。fail_if_unavailable 校验在 fe-core 入口, 此处假定可用。
+/// Build the child CommandBuilder.
+/// seatbelt=true → sandbox-exec -p '<profile>' sh -c '<cmd>' (runtime isolation)
+/// seatbelt=false → sh -c '<cmd>' (bare run, compatible with legacy callers)
+/// Issue #3 + RUN-10: nproc/cpu_sec/nofile injected into the sh -c script via wrap_rlimits (measured-working ulimits).
+/// cwd/env are set by the caller on the returned cmd.
+/// Issue #34: sandbox_profile=Some → build_profile_from parameterized by field (network/fs/excluded_commands);
+/// None → the existing fixed profile (byte-identical). fail_if_unavailable is validated at the fe-core entry; assumed available here.
 pub fn build_command(
     command: &str,
     seatbelt: bool,
@@ -251,7 +257,7 @@ pub fn build_command(
             profile_len = profile.len(),
             fs_paths = SENSITIVE_FS_PATHS.len(),
             custom = sandbox_profile.is_some(),
-            "seatbelt 运行时隔离启用 — sandbox-exec 包装 (禁网 + 定向 FS deny)"
+            "seatbelt runtime isolation enabled — sandbox-exec wrapper (network deny + directed FS deny)"
         );
         debug!(profile = %profile, "seatbelt profile");
         let mut cmd = CommandBuilder::new("sandbox-exec");
@@ -262,7 +268,7 @@ pub fn build_command(
         cmd.arg(&wrapped);
         cmd
     } else {
-        debug!("seatbelt 未启用 — 裸 sh -c");
+        debug!("seatbelt not enabled — bare sh -c");
         let mut cmd = CommandBuilder::new("sh");
         cmd.arg("-c");
         cmd.arg(&wrapped);
@@ -270,11 +276,11 @@ pub fn build_command(
     }
 }
 
-/// Issue #4: stdio 后端命令构建 — 与 build_command 同语义 (seatbelt 包装 / 裸 sh -c),
-/// 但返回 std::process::Command (stdout/stderr 独立 Stdio::piped, 非 PTY)。
-/// use_pty=false 路径专用, 保留与 PTY 路径一致的 seatbelt 行为。
-/// Issue #3 + RUN-10: nproc/cpu_sec/nofile 同样经 wrap_rlimits 注入。
-/// Issue #34: sandbox_profile 同 build_command (None=固定 profile, Some=参数化)。
+/// Issue #4: stdio backend command build — same semantics as build_command (seatbelt wrapper / bare sh -c),
+/// but returns a std::process::Command (stdout/stderr as independent Stdio::piped, not PTY).
+/// Dedicated to the use_pty=false path, keeping seatbelt behavior consistent with the PTY path.
+/// Issue #3 + RUN-10: nproc/cpu_sec/nofile likewise injected via wrap_rlimits.
+/// Issue #34: sandbox_profile same as build_command (None=fixed profile, Some=parameterized).
 pub fn build_std_command(
     command: &str,
     seatbelt: bool,
@@ -297,13 +303,13 @@ pub fn build_std_command(
             profile_len = profile.len(),
             fs_paths = SENSITIVE_FS_PATHS.len(),
             custom = sandbox_profile.is_some(),
-            "seatbelt (stdio) 运行时隔离启用 — sandbox-exec 包装 (禁网 + 定向 FS deny)"
+            "seatbelt (stdio) runtime isolation enabled — sandbox-exec wrapper (network deny + directed FS deny)"
         );
         let mut cmd = Command::new("sandbox-exec");
         cmd.arg("-p").arg(profile).arg("sh").arg("-c").arg(&wrapped);
         cmd
     } else {
-        debug!("seatbelt (stdio) 未启用 — 裸 sh -c");
+        debug!("seatbelt (stdio) not enabled — bare sh -c");
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(&wrapped);
         cmd
@@ -317,25 +323,28 @@ mod tests {
     #[test]
     fn profile_blocks_network_and_sensitive_fs() {
         let p = build_profile();
-        assert!(p.contains("(deny network-outbound)"), "profile 必须禁网");
-        // C-16 + D3-3: 定向 FS deny (subpath) 覆盖高价值路径及其子项
+        assert!(
+            p.contains("(deny network-outbound)"),
+            "profile must deny network"
+        );
+        // C-16 + D3-3: directed FS deny (subpath) covers high-value paths and their children
         let home = std::env::var("HOME").unwrap_or_default();
         assert!(
             p.contains(&format!("(deny file-write* (subpath \"{}/.ssh\"))", home)),
-            "profile 必须定向 deny ~/.ssh 写 (subpath 覆盖子项)"
+            "profile must direct-deny ~/.ssh writes (subpath covers children)"
         );
         assert!(
             p.contains("(deny file-write* (subpath \"/etc\"))"),
-            "profile 必须定向 deny /etc 写 (subpath 覆盖子项)"
+            "profile must direct-deny /etc writes (subpath covers children)"
         );
         assert!(
             p.contains("(deny file-write* (subpath \"/Library/Keychains\"))"),
-            "profile 必须定向 deny Keychains 写 (subpath 覆盖子项)"
+            "profile must direct-deny Keychains writes (subpath covers children)"
         );
-        // A-12: process-exec denylist 已删 (fe-security allowlist 覆盖)
+        // A-12: process-exec denylist removed (covered by the fe-security allowlist)
         assert!(
             !p.contains("(deny process-exec"),
-            "A-12: process-exec denylist 应已删除 (fe-security allowlist 主导)"
+            "A-12: process-exec denylist should be removed (fe-security allowlist leads)"
         );
         assert!(p.starts_with("(version 1)(allow default)"));
     }
@@ -348,7 +357,7 @@ mod tests {
             let resolved = path.replacen("HOME", &home, 1);
             assert!(
                 p.contains(&format!("(deny file-write* (subpath \"{}\"))", resolved)),
-                "profile 缺敏感路径 subpath deny: {}",
+                "profile missing sensitive-path subpath deny: {}",
                 resolved
             );
         }
@@ -357,7 +366,7 @@ mod tests {
     #[test]
     fn build_command_seatbelt_wraps_sandbox_exec() {
         let cmd = build_command("echo hi", true, 0, 0, 0, None);
-        // CommandBuilder 无直接 introspect API — 验证不 panic 且 profile 含禁网即可
+        // CommandBuilder has no direct introspection API — just verify no panic and that the profile denies network
         let p = build_profile();
         assert!(p.contains("network-outbound"));
         let _ = cmd;
@@ -366,70 +375,86 @@ mod tests {
     #[test]
     fn build_command_bare_when_disabled() {
         let cmd = build_command("echo hi", false, 0, 0, 0, None);
-        let _ = cmd; // 不 panic
+        let _ = cmd; // no panic
     }
 
     #[test]
     fn wrap_rlimits_injects_nproc_and_cpu() {
         let w = wrap_rlimits("echo hi", 1024, 30, 0);
-        assert!(w.contains("ulimit -u 1024"), "应注入 NPROC: {}", w);
-        assert!(w.contains("ulimit -t 30"), "应注入 CPU: {}", w);
-        assert!(w.ends_with("echo hi"), "原命令应在末尾: {}", w);
+        assert!(
+            w.contains("ulimit -u 1024"),
+            "NPROC should be injected: {}",
+            w
+        );
+        assert!(w.contains("ulimit -t 30"), "CPU should be injected: {}", w);
+        assert!(
+            w.ends_with("echo hi"),
+            "original command should be at the end: {}",
+            w
+        );
     }
 
-    // RUN-10: NOFILE 注入实测生效 (Darwin errno 24 EMFILE)
+    // RUN-10: NOFILE injection measured working (Darwin errno 24 EMFILE)
     #[test]
     fn wrap_rlimits_injects_nofile() {
         let w = wrap_rlimits("echo hi", 0, 0, 1024);
-        assert!(w.contains("ulimit -n 1024"), "应注入 NOFILE: {}", w);
-        assert!(!w.contains("ulimit -u"), "nproc=0 不应注入 NPROC");
-        assert!(w.ends_with("echo hi"), "原命令应在末尾: {}", w);
+        assert!(
+            w.contains("ulimit -n 1024"),
+            "NOFILE should be injected: {}",
+            w
+        );
+        assert!(!w.contains("ulimit -u"), "nproc=0 must not inject NPROC");
+        assert!(
+            w.ends_with("echo hi"),
+            "original command should be at the end: {}",
+            w
+        );
     }
 
     #[test]
     fn wrap_rlimits_skips_when_zero() {
         let w = wrap_rlimits("echo hi", 0, 0, 0);
-        assert_eq!(w, "echo hi", "全零不应注入任何前缀");
+        assert_eq!(w, "echo hi", "all-zero must not inject any prefix");
     }
 
     #[test]
     fn wrap_rlimits_only_nproc() {
         let w = wrap_rlimits("echo hi", 512, 0, 0);
         assert!(w.contains("ulimit -u 512"));
-        assert!(!w.contains("ulimit -t"), "cpu=0 不应注入 CPU");
-        assert!(!w.contains("ulimit -n"), "nofile=0 不应注入 NOFILE");
+        assert!(!w.contains("ulimit -t"), "cpu=0 must not inject CPU");
+        assert!(!w.contains("ulimit -n"), "nofile=0 must not inject NOFILE");
     }
 
     #[test]
     fn build_std_command_accepts_rlimits() {
-        // 验证 stdio 后端 build 不 panic + 接受 rlimit 参数 (不 introspect Command args)
+        // Verify the stdio backend build does not panic + accepts rlimit args (no Command arg introspection)
         let _ = build_std_command("echo hi", false, 1024, 30, 1024, None);
         let _ = build_std_command("echo hi", true, 1024, 30, 1024, None);
     }
 
-    // D3-3: 经验探针 — 验证 seatbelt subpath FS deny 在 Darwin 25 是否真实拦截。
-    // 用临时目录 + 定制 profile (subpath deny 该 tempdir) 探活, 不触碰真实敏感路径 (~/.ssh 等) —
-    // 探针写 tempdir 内子文件: 若 subpath 生效应被拦 (exit!=0 或文件不存在);
-    // 若 Darwin 25 subpath 也 NO-OP → 写成功, 探针记录 best-effort 现状 (Rule 12 fail-visible)。
-    // 不硬断言 blocked (Darwin 平台限制); 探针跑过即证明 subpath 语法被 sandbox-exec 接受。
+    // D3-3: empirical probe — verifies whether the seatbelt subpath FS deny really blocks on Darwin 25.
+    // Uses a temp directory + a custom profile (subpath deny on that tempdir) to probe, without touching real sensitive paths (~/.ssh etc.) —
+    // the probe writes a child file inside the tempdir: if subpath works it should be blocked (exit != 0 or file absent);
+    // if Darwin 25 subpath is also a NO-OP → the write succeeds and the probe records the best-effort status quo (Rule 12 fail-visible).
+    // No hard blocked assertion (Darwin platform limitation); the probe merely proves the subpath syntax is accepted by sandbox-exec.
     #[test]
     fn probe_seatbelt_fs_subpath_deny() {
         let tmp = match std::env::temp_dir().canonicalize() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("D3-3 探针: temp_dir canonicalize 失败 {} — 跳过", e);
+                eprintln!("D3-3 probe: temp_dir canonicalize failed {} — skipping", e);
                 return;
             }
         };
         let probe_dir = tmp.join("fe-probe-d3-3-dir");
         let _ = std::fs::remove_dir_all(&probe_dir);
         if std::fs::create_dir_all(&probe_dir).is_err() {
-            eprintln!("D3-3 探针: 建探针目录失败 — 跳过");
+            eprintln!("D3-3 probe: failed to create probe dir — skipping");
             return;
         }
         let probe_file = probe_dir.join("probe.txt");
         let dir_str = probe_dir.to_string_lossy();
-        // 定制 profile: 仅 deny 该 tempdir (subpath 覆盖其子项), 验证 subpath 语义本身。
+        // Custom profile: deny only this tempdir (subpath covers its children), validating the subpath semantics itself.
         let profile = format!(
             "(version 1)(allow default)(deny network-outbound)(deny file-write* (subpath \"{}\"))",
             dir_str
@@ -445,29 +470,32 @@ mod tests {
         let blocked = match out {
             Ok(o) => {
                 let wrote = probe_file.exists();
-                // 写成功 (文件存在 + exit 0) → subpath 未拦; 否则视为拦截生效
+                // Write succeeded (file exists + exit 0) → subpath did not block; otherwise interception is effective
                 !(wrote && o.status.success())
             }
             Err(e) => {
-                eprintln!("D3-3 探针: sandbox-exec 调用失败 {} — 视为未拦", e);
+                eprintln!(
+                    "D3-3 probe: sandbox-exec invocation failed {} — treated as not blocked",
+                    e
+                );
                 false
             }
         };
-        // 清理探针过程数据 (只留日志)
+        // Clean up probe process data (logs only)
         let _ = std::fs::remove_dir_all(&probe_dir);
         if blocked {
-            info!("D3-3 探针: subpath FS deny 生效 — tempdir 子项写被拦 (真实隔离语义)");
+            info!("D3-3 probe: subpath FS deny enforced — tempdir child write blocked (real isolation semantics)");
         } else {
             warn!(
-                "D3-3 探针: subpath FS deny 未拦 tempdir 子项 — Darwin 25 best-effort NO-OP 现状, \
-                 退回 fe-security argv 层 + 文档 (非 seatbelt 可解)"
+                "D3-3 probe: subpath FS deny did not block the tempdir child write — Darwin 25 best-effort NO-OP status quo, \
+                 falls back to the fe-security argv layer + documentation (not solvable by seatbelt)"
             );
         }
-        // 探针对平台变化保持诚实: 不伪装隔离。subpath 语法被接受 (profile 解析无错) 即探针价值。
+        // The probe stays honest about platform changes: no faked isolation. The subpath syntax being accepted (profile parses without error) is the probe's value.
         let _ = blocked;
     }
 
-    // Issue #34: SandboxProfile serde 往返 — snake_case + None 字段默认 + deny_unknown_fields 拒未知字段。
+    // Issue #34: SandboxProfile serde roundtrip — snake_case + None-field defaults + deny_unknown_fields rejecting unknown fields.
     #[test]
     fn sandbox_profile_serde_roundtrip() {
         let json = r#"{"network":"allow","filesystem":"allow","excluded_commands":["rm","curl"],"fail_if_unavailable":true}"#;
@@ -506,17 +534,20 @@ mod tests {
         let json = r#"{"network":"allow","bogus":1}"#;
         assert!(
             serde_json::from_str::<SandboxProfile>(json).is_err(),
-            "deny_unknown_fields 应拒未知字段"
+            "deny_unknown_fields should reject unknown fields"
         );
     }
 
-    // Issue #34: build_profile_from 参数化 — None=固定 profile (字节一致); network Allow=不注 deny;
-    // fs Allow=不注 FS deny; fs Deny=全局 file-write* deny; excluded_commands → process-exec deny。
+    // Issue #34: build_profile_from parameterization — None=fixed profile (byte-identical); network Allow=no deny injected;
+    // fs Allow=no FS deny; fs Deny=global file-write* deny; excluded_commands → process-exec deny.
     #[test]
     fn build_profile_from_none_matches_fixed() {
         let fixed = build_profile();
         let from_none = build_profile_from(None);
-        assert_eq!(fixed, from_none, "None profile 应字节等于固定 profile");
+        assert_eq!(
+            fixed, from_none,
+            "None profile should be byte-equal to the fixed profile"
+        );
     }
 
     #[test]
@@ -528,7 +559,7 @@ mod tests {
         let prof = build_profile_from(Some(&p));
         assert!(
             !prof.contains("(deny network-outbound)"),
-            "network Allow 不应注 network deny: {}",
+            "network Allow must not inject a network deny: {}",
             prof
         );
     }
@@ -542,7 +573,7 @@ mod tests {
         let prof = build_profile_from(Some(&p));
         assert!(
             !prof.contains("(deny file-write*"),
-            "fs Allow 不应注 FS deny: {}",
+            "fs Allow must not inject an FS deny: {}",
             prof
         );
     }
@@ -556,7 +587,7 @@ mod tests {
         let prof = build_profile_from(Some(&p));
         assert!(
             prof.contains("(deny file-write*)"),
-            "fs Deny 应注全局 file-write* deny: {}",
+            "fs Deny should inject the global file-write* deny: {}",
             prof
         );
     }
@@ -570,7 +601,7 @@ mod tests {
         let prof = build_profile_from(Some(&p));
         assert!(
             prof.contains(r#"(deny process-exec (literal "/bin/rm"))"#),
-            "excluded_commands 应注 process-exec deny: {}",
+            "excluded_commands should inject a process-exec deny: {}",
             prof
         );
         assert!(prof.contains(r#"(deny process-exec (literal "curl"))"#));
@@ -578,7 +609,7 @@ mod tests {
 
     #[test]
     fn build_profile_from_excluded_commands_sanitizes_injection() {
-        // 调用方灌 `"`/`\`/换行 试图破坏 seatbelt profile 语法 — 净化后不注入逃逸字符。
+        // The caller stuffs `"`/`\`/newline trying to break the seatbelt profile syntax — after sanitizing no escape chars are injected.
         let p = SandboxProfile {
             excluded_commands: vec![
                 "evil\"(allow default))".to_string(),
@@ -587,13 +618,21 @@ mod tests {
             ..Default::default()
         };
         let prof = build_profile_from(Some(&p));
-        assert!(!prof.contains(r#""(allow"#), "净化应剥引号防逃逸: {}", prof);
-        assert!(!prof.contains(r#"\\"#), "净化应剥反斜杠: {}", prof);
+        assert!(
+            !prof.contains(r#""(allow"#),
+            "sanitize should strip quotes to prevent escape: {}",
+            prof
+        );
+        assert!(
+            !prof.contains(r#"\\"#),
+            "sanitize should strip backslashes: {}",
+            prof
+        );
     }
 
     #[test]
     fn build_profile_from_excluded_commands_drops_empty() {
-        // 全控制符/空 → 净化后空, 跳过不注入空 literal。
+        // All control chars/empty → sanitizes to empty, skipped so an empty literal is never injected.
         let p = SandboxProfile {
             excluded_commands: vec!["   ".to_string(), "\n".to_string()],
             ..Default::default()
@@ -601,7 +640,7 @@ mod tests {
         let prof = build_profile_from(Some(&p));
         assert!(
             !prof.contains(r#"(deny process-exec (literal ""))"#),
-            "空 cleaned 不应注入空 literal: {}",
+            "empty cleaned value must not inject an empty literal: {}",
             prof
         );
     }

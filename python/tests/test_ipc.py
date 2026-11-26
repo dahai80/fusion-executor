@@ -26,7 +26,7 @@ def _wait_sock(path: str, timeout: float = 10.0) -> None:
         if os.path.exists(path):
             return
         time.sleep(0.05)
-    raise TimeoutError(f"socket 未出现: {path}")
+    raise TimeoutError(f"socket did not appear: {path}")
 
 
 def _rpc(path: str, req: dict) -> dict:
@@ -82,7 +82,7 @@ def test_health_over_uds(server: str):
 
 
 def test_pidfile_write_remove_roundtrip(tmp_path: Path):
-    # D6-01: pidfile helpers 直接测 (不跑 serve — serve 阻塞)。写 → 读校验 pid → 删 → 删后 no-op。
+    # D6-01: pidfile helpers tested directly (no serve run — serve blocks). write → read-verify pid → delete → no-op after delete.
     from fusion_executor.executor import remove_pidfile, write_pidfile
 
     pid_path = str(tmp_path / "fe-test.pid")
@@ -91,16 +91,16 @@ def test_pidfile_write_remove_roundtrip(tmp_path: Path):
     assert os.path.exists(pid_path)
     with open(pid_path, encoding="utf-8") as f:
         pid_str = f.read()
-    assert pid_str == str(os.getpid()), "pidfile 应写入当前进程 pid"
+    assert pid_str == str(os.getpid()), "pidfile should contain the current process pid"
     remove_pidfile(pid_path)
-    assert not os.path.exists(pid_path), "删除后 pidfile 应不存在"
-    # 删不存在文件应 no-op 不抛
+    assert not os.path.exists(pid_path), "pidfile should not exist after deletion"
+    # deleting a nonexistent file should be a no-op without raising
     remove_pidfile(pid_path)
 
 
 def test_pidfile_serve_lifecycle(tmp_path: Path):
-    # D6-01: serve 启动写 pidfile, 停机删 — 跨进程验证。注入 FUSION_EXECUTOR_PIDFILE 指向 tmp,
-    # 不污染 HOME。启动子进程 serve → 等 pidfile 出现 → 读校验 pid 匹配 → 停机 → 验证已删。
+    # D6-01: serve writes the pidfile on startup and deletes it on shutdown — verified cross-process. Point FUSION_EXECUTOR_PIDFILE at tmp,
+    # keeping HOME unpolluted. Start a child serve → wait for the pidfile → read and verify the pid matches → shut down → verify deletion.
     pid_path = str(tmp_path / "fe-lifecycle.pid")
     sock = _sock_path()
     env = dict(os.environ, FUSION_EXECUTOR_SOCK=sock, FUSION_EXECUTOR_PIDFILE=pid_path)
@@ -121,10 +121,10 @@ def test_pidfile_serve_lifecycle(tmp_path: Path):
             if os.path.exists(pid_path):
                 break
             time.sleep(0.05)
-        assert os.path.exists(pid_path), "serve 启动应写 pidfile"
+        assert os.path.exists(pid_path), "serve startup should write the pidfile"
         with open(pid_path, encoding="utf-8") as f:
             written_pid = int(f.read().strip())
-        assert written_pid == proc.pid, f"pidfile pid {written_pid} 应匹配 serve 子进程 {proc.pid}"
+        assert written_pid == proc.pid, f"pidfile pid {written_pid} should match the serve child {proc.pid}"
     finally:
         proc.terminate()
         try:
@@ -134,8 +134,8 @@ def test_pidfile_serve_lifecycle(tmp_path: Path):
             proc.wait()
         if os.path.exists(sock):
             os.unlink(sock)
-    # 停机后 pidfile 应被 finally remove_pidfile 清理
-    assert not os.path.exists(pid_path), "serve 停机应删 pidfile"
+    # after shutdown the pidfile should be cleaned up by finally remove_pidfile
+    assert not os.path.exists(pid_path), "serve shutdown should delete the pidfile"
 
 
 def test_execute_echo_over_uds(server: str):
@@ -169,7 +169,7 @@ def test_unknown_method_over_uds(server: str):
 
 
 def test_metrics_over_uds(server: str):
-    # C-OPS-05b: 先跑一次成功命令累计数, 再读 metrics 快照
+    # C-OPS-05b: run one successful command to accumulate counts, then read the metrics snapshot
     _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "executor.execute", "params": {"command": "echo hi"}})
     resp = _rpc(server, {"jsonrpc": "2.0", "id": 3, "method": "executor.metrics", "params": {}})
     m = resp["result"]
@@ -182,7 +182,7 @@ def test_metrics_over_uds(server: str):
 
 
 def test_metrics_wrapper_method(server: str):
-    # C-OPS-05b: Python FusionSandboxExecutor.metrics() 包装 UDS 调用
+    # C-OPS-05b: Python FusionSandboxExecutor.metrics() wraps the UDS call
     from fusion_executor import FusionSandboxExecutor
 
     _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "executor.execute", "params": {"command": "echo hi"}})
@@ -193,7 +193,7 @@ def test_metrics_wrapper_method(server: str):
 
 
 def test_metrics_prometheus_over_uds(server: str):
-    # M-OPS-02: Prometheus text format — execute 一次后 fe_exec_total 命中 + HELP/TYPE 头
+    # M-OPS-02: Prometheus text format — after one execute fe_exec_total is present + HELP/TYPE headers
     _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "executor.execute", "params": {"command": "echo hi"}})
     resp = _rpc(server, {"jsonrpc": "2.0", "id": 3, "method": "executor.metrics_prometheus", "params": {}})
     assert resp["result"]["ok"] is True
@@ -205,7 +205,7 @@ def test_metrics_prometheus_over_uds(server: str):
 
 
 def test_metrics_prometheus_wrapper_method(server: str):
-    # M-OPS-02: Python FusionSandboxExecutor.metrics_prometheus() 包装 UDS 调用
+    # M-OPS-02: Python FusionSandboxExecutor.metrics_prometheus() wraps the UDS call
     from fusion_executor import FusionSandboxExecutor
 
     _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "executor.execute", "params": {"command": "echo hi"}})
@@ -235,7 +235,7 @@ def test_snapshot_rollback_over_uds(server: str, tmp_path: Path):
         {"jsonrpc": "2.0", "id": 5, "method": "executor.snapshot_create", "params": {"cwd": str(d)}},
     )
     sid = snap["result"]["snapshot_id"]
-    assert sid, "快照 id 非空"
+    assert sid, "snapshot id is empty"
 
     (d / "app.py").write_text("WORSE\n")
     rb = _rpc(
@@ -252,7 +252,7 @@ def test_snapshot_rollback_over_uds(server: str, tmp_path: Path):
 
 
 def test_list_snapshots_over_uds(server: str, tmp_path: Path):
-    # D6-03 (审计 0827 product): 快照清单 — snapshot_create 写 on-disk 索引, list_snapshots 读回。
+    # D6-03 (audit 0827 product): snapshot inventory — snapshot_create writes an on-disk index, list_snapshots reads it back.
     d = tmp_path / "repo"
     d.mkdir()
 
@@ -271,18 +271,18 @@ def test_list_snapshots_over_uds(server: str, tmp_path: Path):
         {"jsonrpc": "2.0", "id": 5, "method": "executor.snapshot_create", "params": {"cwd": str(d)}},
     )
     sid = snap["result"]["snapshot_id"]
-    assert sid, "快照 id 非空"
+    assert sid, "snapshot id is empty"
 
     lst = _rpc(
         server,
         {"jsonrpc": "2.0", "id": 6, "method": "executor.list_snapshots", "params": {"cwd": str(d)}},
     )
     snaps = lst["result"]["snapshots"]
-    assert len(snaps) >= 1, "清单应含至少一条快照"
+    assert len(snaps) >= 1, "inventory should contain at least one snapshot"
     first = snaps[0]
-    assert first["id"] == sid, "清单首条 id 应匹配 snapshot_create 返回"
-    assert first["kind"] == "head", "无改动快照 kind 应为 head"
-    assert isinstance(first["created_ms"], int), "created_ms 应为整数"
+    assert first["id"] == sid, "first inventory entry id should match the snapshot_create return"
+    assert first["kind"] == "head", "no-change snapshot kind should be head"
+    assert isinstance(first["created_ms"], int), "created_ms should be an integer"
 
 
 def test_execute_stream_chunks_then_done_over_uds(server: str):
@@ -313,17 +313,17 @@ def test_execute_stream_chunks_then_done_over_uds(server: str):
                     break
             if frames and frames[-1].get("result", {}).get("type") == "done":
                 break
-    assert frames, "应至少收到一帧"
+    assert frames, "should receive at least one frame"
     types = [f["result"]["type"] for f in frames]
     assert types[-1] == "done"
-    assert all(f["id"] == 7 for f in frames), "所有帧共用 id"
+    assert all(f["id"] == 7 for f in frames), "all frames share the id"
     done = frames[-1]["result"]["result"]
     assert done["exit_code"] == 0
 
 
-# gap #5 回归: 64 并发 echo 全完成, 无死锁饥饿。
-# 旧 bug: serve_blocking 跑共享 BLOCKING_RT (上限 8 worker), 64 连接扇出饥饿 →
-# 响应写不出 → recv 30s 超时 (32/64 hang)。修复后专属 IPC_RT (clamp 4-16) 隔离。
+# gap #5 regression: 64 concurrent echoes all complete, no deadlock starvation.
+# old bug: serve_blocking ran on the shared BLOCKING_RT (8 worker cap), 64-connection fan-out starved →
+# responses could not be written → recv 30s timeout (32/64 hang). Fixed by isolating on the dedicated IPC_RT (clamped 4-16).
 def test_concurrent_echo_64_no_hang(server: str):
     n = 64
     results: list[tuple[int, dict | str]] = []
@@ -342,7 +342,7 @@ def test_concurrent_echo_64_no_hang(server: str):
             )
             with lock:
                 results.append((i, resp))
-        except Exception as e:  # 记录任意异常供断言
+        except Exception as e:  # record any exception for the assertion
             with lock:
                 results.append((i, f"{type(e).__name__}: {e}"))
 
@@ -354,10 +354,10 @@ def test_concurrent_echo_64_no_hang(server: str):
         t.join(timeout=20.0)
     wall = time.time() - t0
 
-    # 全线程须在 20s 内返回 (旧 bug 32/64 hang 30s 超时)
+    # all threads must return within 20s (old bug: 32/64 hung until the 30s timeout)
     alive = [t for t in threads if t.is_alive()]
-    assert not alive, f"{len(alive)}/{n} 线程仍挂起 (旧 bug 死锁): {[t.name for t in alive]}"
-    assert len(results) == n, f"仅 {len(results)}/{n} 返回: {results[:5]}"
+    assert not alive, f"{len(alive)}/{n} threads still hung (old bug deadlock): {[t.name for t in alive]}"
+    assert len(results) == n, f"only {len(results)}/{n} returned: {results[:5]}"
 
     ok = 0
     errs = []
@@ -370,5 +370,5 @@ def test_concurrent_echo_64_no_hang(server: str):
             ok += 1
         else:
             errs.append(f"{i}:exit{ec}:{resp}")
-    assert ok == n, f"仅 {ok}/{n} exit_code==0, errs={errs[:5]}"
-    assert wall < 15.0, f"wall {wall:.1f}s 超预算 (旧 bug 30s 死锁)"
+    assert ok == n, f"only {ok}/{n} exit_code==0, errs={errs[:5]}"
+    assert wall < 15.0, f"wall {wall:.1f}s over budget (old bug 30s deadlock)"

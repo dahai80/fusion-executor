@@ -1,11 +1,11 @@
 // fe-security — Security Guard Engine (FR-01)
 //
-// 两级校验机制：
-//   1. 静态正则黑名单 (stage=Regex) — 快速过滤特权/毁灭性指令
-//   2. Token 级 AST 分词 (stage=Tokenizer) — 链式命令 (&&/||/;/|) 全量解析，
-//      每段 argv[0] 校验白名单，防止链式拼装绕过 (NFR)
+// Two-stage validation:
+//   1. Static regex blocklist (stage=Regex) — fast filter for privilege/destructive commands
+//   2. Token-level AST tokenization (stage=Tokenizer) — full parse of chained commands (&&/||/;/|),
+//      each segment's argv[0] is checked against the allowlist, preventing chain-assembly bypass (NFR)
 //
-// 返回 SecurityVerdict { allowed, reason, stage }
+// Returns SecurityVerdict { allowed, reason, stage }
 
 use std::collections::HashSet;
 use std::env;
@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
 pub enum SecurityError {
-    #[error("正则编译失败: {0}")]
+    #[error("regex compile failed: {0}")]
     Regex(#[from] regex::Error),
 }
 
@@ -32,10 +32,11 @@ pub enum SecurityStage {
     Semantic,
 }
 
-// SecurityVerdict 不跨 IPC/PyO3 序列化 (wire 只携 blocked_by_security:bool +
-// security_reason:Option<String>); 故不 derive Serialize/Deserialize — 增字段 wire-safe,
-// 且杜绝未来误跨 IPC 接它破 wire (fix #4)。guard 集成增 risk_level/requires_approval/
-// action_id/seatbelt_required 供 fe-core 强制层读取 (验收 #5 映射 + #3 seatbelt 门控)。
+// SecurityVerdict is not serialized across IPC/PyO3 (wire only carries blocked_by_security:bool +
+// security_reason:Option<String>); hence no Serialize/Deserialize derive — adding fields is wire-safe,
+// and prevents future accidental cross-IPC exposure from breaking the wire (fix #4). Guard integration
+// adds risk_level/requires_approval/action_id/seatbelt_required for the fe-core enforcement layer
+// (acceptance #5 mapping + #3 seatbelt gating).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityVerdict {
     pub allowed: bool,
@@ -72,8 +73,9 @@ impl SecurityVerdict {
         }
     }
 
-    // guard 集成 (验收 #5): 从 GuardVerdict 映射, 携 risk_level/action_id/seatbelt_required。
-    // 调用点在 validate() guard 编排后, 用于 block (Block/L4/L3/Redact) 与 allow 透传 (Allow L1/L2)。
+    // Guard integration (acceptance #5): maps from GuardVerdict, carrying
+    // risk_level/action_id/seatbelt_required. Called after the guard orchestration in validate(),
+    // used for block (Block/L4/L3/Redact) and allow passthrough (Allow L1/L2).
     fn block_guard(reason: impl Into<String>, verdict: &GuardVerdict) -> Self {
         Self {
             allowed: false,
@@ -99,8 +101,8 @@ impl SecurityVerdict {
     }
 }
 
-/// 敏感路径 — 禁止作为 cwd、mv/cp 目的地、`>` 重定向目标、读源 (cat/grep/...)
-/// Issue #5: 补齐凭据目录 — Claude SDK/真实泄露面覆盖 AWS/GPG/Docker/K8s/Netrc/npmrc/gcloud/pass
+/// Sensitive paths — forbidden as cwd, mv/cp destination, `>` redirect target, read source (cat/grep/...)
+/// Issue #5: complete the credential directories — Claude SDK/real leak surface covers AWS/GPG/Docker/K8s/Netrc/npmrc/gcloud/pass
 const SENSITIVE_PATHS: &[&str] = &[
     "~/.ssh",
     "~/.aws",
@@ -121,10 +123,12 @@ const SENSITIVE_PATHS: &[&str] = &[
     "/root",
 ];
 
-/// 命令白名单 — 二进制程序白名单 (argv[0] 校验)
-/// A-1: validate_argv 默认 arm — 公认只读无害二进制 (无专门 argv arm 但不改 fs/不执行任意命令/
-/// 不网络), 显式枚举走 Ok。其余白名单二进制 (解释器/构建链/SIGHUP extras) 走 warn 分支暴露校验缺口。
-/// 判据: 是否 "按设计就执行任意代码/联网/改文件系统" — 是则不列入 (交 seatbelt+UDS 纵深 + warn 日志)。
+/// Command allowlist — binary allowlist (argv[0] check)
+/// A-1: validate_argv default arm — well-known read-only harmless binaries (no dedicated argv arm but
+/// no fs mutation / no arbitrary command execution / no network), explicitly enumerated to Ok. Other
+/// allowlisted binaries (interpreters/build chain/SIGHUP extras) take the warn branch to expose the gap.
+/// Criterion: whether it "executes arbitrary code / touches the network / mutates the filesystem by
+/// design" — if so, it is not listed (left to seatbelt+UDS defense-in-depth + warn logging).
 const READONLY_NOARM_BINARY: &[&str] = &[
     "ls", "echo", "pwd", "which", "file", "wc", "sort", "uniq", "stat", "du", "df", "tr", "cut",
     "diff", "cmp", "fd", "exa", "true", "false", "test", "rmdir", "mkdir", "touch",
@@ -203,12 +207,13 @@ const WHITELIST: &[&str] = &[
     "cd",
 ];
 
-/// 命令输入长度上限 — 防 M-SEC-06 大输入放大 DoS
+/// Command input length cap — guards against M-SEC-06 large-input amplification DoS
 const MAX_COMMAND_LEN: usize = 1_000_000;
 
-/// ARCH-2: 可信二进制目录基线 — resolved-path 校验用。
-/// 白名单解释器 (python3/node/cargo...) 经 basename 命中后, 须再校验其绝对路径
-/// 落在可信前缀内, 拒 `/tmp/python3` 同名投毒。venv/项目 bin 由 with_trusted_bin_dirs 追加。
+/// ARCH-2: trusted binary directories baseline — used by resolved-path validation.
+/// Allowlisted interpreters (python3/node/cargo...) that match by basename must additionally have
+/// their absolute path under a trusted prefix, rejecting same-name poisoning like `/tmp/python3`.
+/// venv/project bin dirs are appended via with_trusted_bin_dirs.
 const TRUSTED_BIN_DIRS: &[&str] = &[
     "/usr/bin",
     "/usr/local/bin",
@@ -223,27 +228,30 @@ const TRUSTED_BIN_DIRS: &[&str] = &[
     "/sbin",
 ];
 
-/// Security Guard — 两级校验
+/// Security Guard — two-stage validation
 pub struct SecurityGuard {
     blocklist: Vec<(Regex, &'static str)>,
-    // ARCH-2: 可信二进制目录 (resolved-path 校验)。基线 TRUSTED_BIN_DIRS + 项目扩展
-    // (with_trusted_bin_dirs)。validate_segment 解析二进制绝对路径后 starts_with 校验。
+    // ARCH-2: trusted binary directories (resolved-path check). Baseline TRUSTED_BIN_DIRS + project
+    // extensions (with_trusted_bin_dirs). validate_segment resolves the binary absolute path then
+    // checks starts_with.
     trusted_bin_dirs: Vec<PathBuf>,
-    // 白名单 — 基线 (WHITELIST) + 项目扩展 (with_extra_whitelist)。Issue #10:
-    // 项目可声明额外允许的二进制 (如项目专用工具), 基线不可被收缩 (仅追加)。
-    // m-OPS-02: ArcSwap 内部可变性 — SIGHUP 运行时热重载 (reload_extras) 经 store(&self),
-    // 无需 &mut self。validate 经 load() 读取, 无锁读路径。
+    // Allowlist — baseline (WHITELIST) + project extensions (with_extra_whitelist). Issue #10:
+    // projects may declare extra allowed binaries (e.g. project-specific tools); the baseline can
+    // never shrink (append-only).
+    // m-OPS-02: ArcSwap interior mutability — SIGHUP runtime hot reload (reload_extras) goes through
+    // store(&self), no &mut self needed. validate reads via load(), lock-free read path.
     whitelist: ArcSwap<HashSet<String>>,
     sensitive_paths: Vec<String>,
     sensitive_paths_exp: Vec<String>,
     redirect_re: Regex,
-    // D3-1 (审计 0827 product): 内联解释器网关。false(企业硬化默认)=拒 python -c / node -e /
-    // ruby -e / perl -e 等内联代码 (绕白名单语义, agent-driven 下模型可生成任意 payload);
-    // true(trusted-caller opt-in)=保留内联执行能力。validate_argv gate 读此字段。
+    // D3-1 (audit 0827 product): inline interpreter gateway. false (enterprise-hardening default)
+    // = reject python -c / node -e / ruby -e / perl -e and other inline code (bypasses allowlist
+    // semantics; under agent-driven operation the model can generate arbitrary payloads);
+    // true (trusted-caller opt-in) = keep inline execution capability. validate_argv gate reads this.
     allow_inline_interpreter: bool,
-    // Issue #23 (fusion-guard Phase 3): guard 集成 — 默认 None (guard OFF, 向后兼容)。
-    // Some(Arc<GuardClient>) 由 with_guard 开启。Arc 跨 Executor 线程共享 (Send+Sync)。
-    // RulesCache (Arc<RulesCache>) 缓存 guard.rules.dump 的 regex-stage 规则, guard 宕机降级用。
+    // Issue #23 (fusion-guard Phase 3): guard integration — default None (guard OFF, backward compatible).
+    // Some(Arc<GuardClient>) enables it via with_guard. Arc is shared across Executor threads (Send+Sync).
+    // RulesCache (Arc<RulesCache>) caches guard.rules.dump regex-stage rules for guard-down degradation.
     guard: Option<Arc<GuardClient>>,
     guard_cache: Option<Arc<RulesCache>>,
 }
@@ -252,14 +260,15 @@ impl Clone for SecurityGuard {
     fn clone(&self) -> Self {
         Self {
             blocklist: self.blocklist.clone(),
-            // ArcSwap 无 Clone — clone 内部快照重建 (热重载语义下, clone 反映当前白名单)。
+            // ArcSwap has no Clone — rebuild the clone from an internal snapshot (under hot-reload
+            // semantics, clone reflects the current allowlist).
             whitelist: ArcSwap::from_pointee((**self.whitelist.load()).clone()),
             trusted_bin_dirs: self.trusted_bin_dirs.clone(),
             sensitive_paths: self.sensitive_paths.clone(),
             sensitive_paths_exp: self.sensitive_paths_exp.clone(),
             redirect_re: self.redirect_re.clone(),
             allow_inline_interpreter: self.allow_inline_interpreter,
-            // guard/cache 经 Arc::clone 便宜共享 (Arc<GuardClient>/Arc<RulesCache> 均 Clone)。
+            // guard/cache shared cheaply via Arc::clone (Arc<GuardClient>/Arc<RulesCache> are both Clone).
             guard: self.guard.clone(),
             guard_cache: self.guard_cache.clone(),
         }
@@ -281,7 +290,7 @@ impl SecurityGuard {
             .collect::<HashSet<_>>();
         let sensitive_paths = SENSITIVE_PATHS.iter().map(|s| (*s).to_string()).collect();
         let sensitive_paths_exp = SENSITIVE_PATHS.iter().map(|s| expand_tilde(s)).collect();
-        let redirect_re = Regex::new(r"(?:\d)?>>?\s*(\S+)").expect("重定向正则编译失败");
+        let redirect_re = Regex::new(r"(?:\d)?>>?\s*(\S+)").expect("redirect regex compile failed");
         let trusted_bin_dirs = TRUSTED_BIN_DIRS.iter().map(PathBuf::from).collect();
         Self {
             blocklist,
@@ -290,40 +299,49 @@ impl SecurityGuard {
             sensitive_paths,
             sensitive_paths_exp,
             redirect_re,
-            // D3-1: 企业硬化默认 false — 拒内联解释器 -c/-e。trusted-caller opt-in 经
-            // with_allow_inline_interpreter(true) 开启 (测试机/本地交互场景)。
+            // D3-1: enterprise-hardening default false — reject inline interpreter -c/-e. Trusted-caller
+            // opt-in via with_allow_inline_interpreter(true) (test machines/local interactive scenarios).
             allow_inline_interpreter: false,
-            // Issue #23: guard 默认 OFF — None 走现有 validate() 不变 (向后兼容)。
-            // with_guard(sock, tenant) 开启 guard 集成 (构造 client + 缓存)。
+            // Issue #23: guard default OFF — None keeps validate() unchanged (backward compatible).
+            // with_guard(sock, tenant) enables guard integration (builds client + cache).
             guard: None,
             guard_cache: None,
         }
     }
 
-    /// Issue #10: 项目级白名单扩展 — 追加额外允许的二进制 (仅追加, 不收缩基线)。
-    /// 调用方 (fusion-code/CLI) 按项目声明专用工具; 基线 WHITELIST 恒在。
-    /// 安全约束: 扩展项不得含 shell 解释器/危险内建 (sh/bash/zsh/fish/exec/eval/source/.),
-    /// 否则忽略并记日志 (防项目配置自我后门)。
+    /// Issue #10: project-level allowlist extension — append extra allowed binaries (append-only,
+    /// never shrinks the baseline). Callers (fusion-code/CLI) declare project-specific tools;
+    /// the baseline WHITELIST always stays.
+    /// Security constraint: extension entries must not contain shell interpreters/dangerous builtins
+    /// (sh/bash/zsh/fish/exec/eval/source/.); otherwise ignored and logged (prevents project-config
+    /// self-backdoor).
     pub fn with_extra_whitelist(self, extras: &[&str]) -> Self {
         let next = merge_whitelist(&self.whitelist, extras);
         self.whitelist.store(Arc::new(next));
         self
     }
 
-    /// m-OPS-02: SIGHUP 运行时白名单热重载 — 从基线 WHITELIST + 新 extras 重建 (非累加)。
-    /// 语义: 丢弃旧扩展, 以 extras 为新项目扩展集 (基线恒在)。无锁写 (ArcSwap store),
-    /// 读路径 (validate) 无感切换。extras 为空 → 回退纯基线 (项目扩展清空)。
-    /// 区别 with_extra_whitelist: 后者累加 (builder 链, 构造期); reload 重建 (丢弃旧扩展)。
+    /// m-OPS-02: SIGHUP runtime allowlist hot reload — rebuilt from baseline WHITELIST + new extras
+    /// (non-accumulating). Semantics: drop old extensions, extras become the new project extension
+    /// set (baseline always stays). Lock-free write (ArcSwap store); read path (validate) switches
+    /// seamlessly. Empty extras → fall back to pure baseline (project extensions cleared).
+    /// Difference from with_extra_whitelist: the latter accumulates (builder chain, construction time);
+    /// reload rebuilds (discards old extensions).
     pub fn reload_extras(&self, extras: &[&str]) {
         let base: HashSet<String> = WHITELIST.iter().map(|s| (*s).to_string()).collect();
         let next = merge_into(base, extras);
         self.whitelist.store(Arc::new(next));
-        debug!(extras = extras.len(), "SIGHUP 白名单热重载完成 (基线重建)");
+        debug!(
+            extras = extras.len(),
+            "SIGHUP allowlist hot reload complete (rebuilt from baseline)"
+        );
     }
 
-    /// ARCH-2: 追加可信二进制目录 (venv bin / 项目 bin 等)。基线 TRUSTED_BIN_DIRS 恒在,
-    /// extras 仅追加。调用方按项目声明其解释器来源目录; validate_segment 解析二进制绝对路径
-    /// 后须 starts_with 任一可信目录, 否则 fail-closed 拒 (防 /tmp/python3 投毒绕过)。
+    /// ARCH-2: append trusted binary directories (venv bin / project bin etc). Baseline
+    /// TRUSTED_BIN_DIRS always stays; extras are append-only. Callers declare the directory their
+    /// interpreters come from; validate_segment resolves the binary absolute path and it must
+    /// starts_with one of the trusted directories, otherwise fail-closed reject (guards against
+    /// /tmp/python3 poisoning bypass).
     pub fn with_trusted_bin_dirs(mut self, dirs: &[&str]) -> Self {
         for d in dirs {
             let p = d.trim();
@@ -338,31 +356,35 @@ impl SecurityGuard {
         self
     }
 
-    /// D3-1 (审计 0827 product): 内联解释器网关 opt-in。true=允许 python -c / node -e /
-    /// ruby -e / perl -e (保留 trusted-caller 内联执行能力, 测试机/本地交互场景); 默认 false
-    /// (企业硬化拒内联代码, 防 agent-driven 任意 payload 绕白名单语义)。validate_argv 读此字段。
+    /// D3-1 (audit 0827 product): inline interpreter gateway opt-in. true = allow python -c / node -e /
+    /// ruby -e / perl -e (keeps trusted-caller inline execution, test machines/local interactive
+    /// scenarios); default false (enterprise hardening rejects inline code, preventing agent-driven
+    /// arbitrary payloads bypassing allowlist semantics). validate_argv reads this field.
     pub fn with_allow_inline_interpreter(mut self, allow: bool) -> Self {
         self.allow_inline_interpreter = allow;
         if allow {
-            info!("SecurityGuard 开启内联解释器 (D3-1 trusted-caller opt-in: 允许 -c/-e)");
+            info!("SecurityGuard inline interpreter enabled (D3-1 trusted-caller opt-in: -c/-e allowed)");
         }
         self
     }
 
-    // Issue #23 (fusion-guard Phase 3): 开启 guard 集成。opt-in — 默认 OFF, 调用方显式传
-    // guard_sock/guard_tenant (或 env FUSION_GUARD_SOCK/FUSION_EXECUTOR_TENANT) 才开启。
+    // Issue #23 (fusion-guard Phase 3): enable guard integration. Opt-in — default OFF; callers must
+    // explicitly pass guard_sock/guard_tenant (or env FUSION_GUARD_SOCK/FUSION_EXECUTOR_TENANT).
     //
-    // 构造期: 建 GuardClient + RulesCache。探活 (ping) 成功 → rules_dump 种子缓存 (fix #1:
-    // 冷启动 caller_epoch 非 0, 之后 evaluate 携非零 epoch 让 guard 检 staleness)。
-    // 探活失败 → warn 降级, 仍存 client (连接惰性, evaluate 自带超时兜底) + 缓存从盘读
-    // (冷启动可能空)。无论探活成败, guard 开启 = validate() 走 guard 编排路径。
+    // Construction time: build GuardClient + RulesCache. Ping success → rules_dump seeds the cache
+    // (fix #1: caller_epoch non-zero after cold start, subsequent evaluate carries the non-zero epoch
+    // so guard can check staleness).
+    // Ping failure → warn + degrade, still stores the client (lazy connect, evaluate has its own
+    // timeout fallback) + cache read from disk (may be empty on cold start). Regardless of ping
+    // outcome, guard enabled = validate() takes the guard orchestration path.
     //
-    // 缓存目录 ~/.fusion-executor/guard-rules.json (HOME-private, 0o600)。
+    // Cache directory ~/.fusion-executor/guard-rules.json (HOME-private, 0o600).
     pub fn with_guard(mut self, sock: &str, tenant: &str) -> Self {
         let cache_path = guard_cache_path();
         let cache = RulesCache::new(cache_path);
         let client = GuardClient::new(sock, tenant.to_string());
-        // 探活 + 种子 (fix #1)。ping 失败不阻塞构造 — 降级路径靠缓存 + 白名单栅栏。
+        // Ping + seed (fix #1). Ping failure does not block construction — degradation relies on
+        // cache + allowlist fence.
         match client.ping() {
             Ok(ping) => {
                 debug!(rules_epoch = ping.rules_epoch, version = %ping.version, "guard ping ok — seeding rules cache");
@@ -377,7 +399,7 @@ impl SecurityGuard {
                 }
             }
             Err(e) => {
-                warn!(error = %e, sock, "guard ping 不可达 — 降级 fail-closed (evaluate 将自超时兜底, cache 走盘)");
+                warn!(error = %e, sock, "guard ping unreachable — degraded fail-closed (evaluate falls back on its own timeout, cache reads from disk)");
             }
         }
         self.guard = Some(Arc::new(client));
@@ -385,31 +407,39 @@ impl SecurityGuard {
         self
     }
 
-    // guard 是否开启 (供 fe-core 强制层判断是否走 seatbelt 门控/TOCTOU 复检)。
+    // Whether guard is enabled (lets the fe-core enforcement layer decide on seatbelt gating/TOCTOU recheck).
     pub fn guard_enabled(&self) -> bool {
         self.guard.is_some()
     }
 
-    // H4 TOCTOU 路径复检 (验收 #4, fix #3): validate 后、spawn 前在 fe-core 调用。
-    // 复用 validate 期同一套 resolve_binary_path (DRY) + symlink_metadata 拒执行前窗口新现 symlink
-    // (validate 时非 symlink, recheck 时变 symlink → 拒; safe Rust, 无 libc/unsafe — O_NOFOLLOW
-    // 不可行且需 libc 违 unsafe_code=deny)。
-    // 注: homebrew /opt/homebrew/bin/git→Cellar symlink 是 by-design 不拒 (resolve_binary_path
-    // 文档); H4 仅拒 validate→recheck 之间新现的 symlink (TOCTOU 窗口被替换/投毒)。
+    // H4 TOCTOU path recheck (acceptance #4, fix #3): called by fe-core after validate, before spawn.
+    // Reuses the same resolve_binary_path as validate (DRY) + symlink_metadata to reject symlinks
+    // appearing in the pre-exec window (not a symlink at validate time, becomes one by recheck →
+    // reject; safe Rust, no libc/unsafe — O_NOFOLLOW is not viable and would need libc, violating
+    // unsafe_code=deny).
+    // Note: homebrew /opt/homebrew/bin/git→Cellar symlink is by-design not rejected (resolve_binary_path
+    // docs); H4 only rejects symlinks newly appearing between validate→recheck (TOCTOU window
+    // replacement/poisoning).
     pub fn recheck_binary(&self, first_token: &str) -> Result<PathBuf, String> {
-        let resolved = resolve_binary_path(first_token)
-            .ok_or_else(|| format!("TOCTOU 复检: 二进制路径执行前消失: {}", first_token))?;
+        let resolved = resolve_binary_path(first_token).ok_or_else(|| {
+            format!(
+                "TOCTOU recheck: binary path disappeared before exec: {}",
+                first_token
+            )
+        })?;
         let md = std::fs::symlink_metadata(&resolved).map_err(|e| {
             format!(
-                "TOCTOU 复检: 路径 metadata 读取失败 {}: {}",
+                "TOCTOU recheck: failed to read path metadata {}: {}",
                 resolved.display(),
                 e
             )
         })?;
-        // symlink 处置: homebrew /opt/homebrew/bin/python3 → Cellar 是 by-design 受信 (包管理器写入,
-        // 需 root, 超出 ARCH-2 威胁模型), symlink 本身落在 trusted_bin_dirs 内 → 放行。
-        // 仅拒 symlink 落在可信目录外 (validate 时非 symlink 的可信 regular file, 执行前窗口被替换
-        // 为 symlink 指向攻击者路径 = TOCTOU 投毒)。这把 H4 拒 symlink 限制在"可信目录外的新现 symlink"。
+        // Symlink handling: homebrew /opt/homebrew/bin/python3 → Cellar is by-design trusted
+        // (package-manager-written, root-gated, outside the ARCH-2 threat model); the symlink itself
+        // lives inside trusted_bin_dirs → allow.
+        // Only reject symlinks outside the trusted directories (a trusted regular file at validate
+        // time replaced by a symlink pointing to an attacker path in the pre-exec window = TOCTOU
+        // poisoning). This limits H4 symlink rejection to "newly appeared symlinks outside trusted dirs".
         if md.file_type().is_symlink()
             && !self
                 .trusted_bin_dirs
@@ -417,27 +447,29 @@ impl SecurityGuard {
                 .any(|d| resolved.starts_with(d))
         {
             return Err(format!(
-                "TOCTOU 拒: 二进制路径执行前变 symlink 且不在可信目录 (validate 时非 symlink): {}",
+                "TOCTOU reject: binary path became a symlink before exec and is outside trusted directories (not a symlink at validate time): {}",
                 resolved.display()
             ));
         }
         Ok(resolved)
     }
 
-    /// 校验入口 — 先正则快筛，再 token 解析防链式绕过
+    /// Validation entry — regex fast screen first, then token parse against chain bypass
     pub fn validate(&self, command: &str) -> SecurityVerdict {
-        // D4-2/D4-3 perf 评估 (2026-08-29): 正则已 struct-field 缓存 (build_blocklist/redirect_re
-        // 在 new() 一次编译, 非每调编译) — 无 LazyLock 必要。resolve_binary_path 走 fs stat (非 CPU),
-        // 路径缓存仅对同进程内重复同名的二进制有益, validate 逐命令调用 binary 名罕密集重复;
-        // 加 Mutex<HashMap> 反在热路径引入锁竞争 (Rule 2 简单优先)。故两项均不改, 诚实标注。
-        // M-SEC-05: 空字节清理 — 命令含 \0 拒绝 (echo hi\0id)
+        // D4-2/D4-3 perf assessment (2026-08-29): regexes are already cached as struct fields
+        // (build_blocklist/redirect_re compiled once in new(), not per call) — no LazyLock needed.
+        // resolve_binary_path does fs stat (not CPU); path caching only helps repeated same-name
+        // binaries within one process, and validate sees each command's binary name rarely densely
+        // repeated; a Mutex<HashMap> would instead add lock contention on the hot path (Rule 2
+        // simplicity first). Both left unchanged, honestly noted.
+        // M-SEC-05: null byte sanitization — reject commands containing \0 (echo hi\0id)
         if command.contains('\0') {
-            return SecurityVerdict::block("命令含空字节 (null byte)", SecurityStage::Regex);
+            return SecurityVerdict::block("command contains null byte", SecurityStage::Regex);
         }
-        // M-SEC-06: 输入长度上限 — 防大输入放大 DoS
+        // M-SEC-06: input length cap — guards against large-input amplification DoS
         if command.len() > MAX_COMMAND_LEN {
             return SecurityVerdict::block(
-                format!("命令超长 ({} > {})", command.len(), MAX_COMMAND_LEN),
+                format!("command too long ({} > {})", command.len(), MAX_COMMAND_LEN),
                 SecurityStage::Regex,
             );
         }
@@ -447,31 +479,31 @@ impl SecurityGuard {
             return SecurityVerdict::allow();
         }
 
-        // C-SEC-05: 命令替换全盲 — 拒绝 $(/反引号/`<(>`/`<<<`
+        // C-SEC-05: command substitution fully blind — reject $(/backtick/<(/<<<
         if let Some(reason) = check_shell_substitution(trimmed) {
-            debug!(%reason, "命令替换命中拒绝");
+            debug!(%reason, "command substitution hit, rejected");
             return SecurityVerdict::block(reason, SecurityStage::Tokenizer);
         }
 
-        // Stage 1: 静态正则黑名单
+        // Stage 1: static regex blocklist
         for (re, reason) in &self.blocklist {
             if re.is_match(trimmed) {
-                debug!(regex = %re.as_str(), %reason, "正则黑名单命中");
+                debug!(regex = %re.as_str(), %reason, "regex blocklist hit");
                 return SecurityVerdict::block(*reason, SecurityStage::Regex);
             }
         }
 
-        // Stage 2: Token 级链式解析 — 每段 argv[0] 白名单校验
+        // Stage 2: token-level chain parse — per-segment argv[0] allowlist check
         let local_ok = match self.validate_tokens(trimmed) {
             Ok(()) => true,
             Err(reason) => {
-                // 本地拒 → guard 不推翻本地拒绝 (双向纵深), 直接返。
+                // Local reject → guard does not overturn a local rejection (two-way defense-in-depth), return directly.
                 return SecurityVerdict::block(reason, SecurityStage::Tokenizer);
             }
         };
 
-        // Issue #23: guard 编排 (验收 #5/#6/#7)。本地允许后, guard 开启则调 evaluate。
-        // guard OFF → 沿用现有 allow (向后兼容, 行为同现状)。
+        // Issue #23: guard orchestration (acceptance #5/#6/#7). After local allow, if guard is
+        // enabled call evaluate. guard OFF → keep existing allow (backward compatible, same behavior).
         if !local_ok {
             return SecurityVerdict::allow();
         }
@@ -481,9 +513,10 @@ impl SecurityGuard {
         }
     }
 
-    // guard 编排: 调 evaluate 取裁决, 映射 SecurityVerdict (验收 #5); 失败降级 fail-closed (验收 #7)。
+    // Guard orchestration: call evaluate for the verdict, map to SecurityVerdict (acceptance #5);
+    // on failure degrade fail-closed (acceptance #7).
     fn guard_authorize(&self, client: &Arc<GuardClient>, command: &str) -> SecurityVerdict {
-        // caller_epoch 取缓存 epoch (fix #1: with_guard 种子后非 0, 让 guard 检 staleness)。
+        // caller_epoch takes the cache epoch (fix #1: non-zero after with_guard seeding, so guard checks staleness).
         let caller_epoch = self.guard_cache.as_ref().map(|c| c.epoch()).unwrap_or(0);
         match client.evaluate(
             command,
@@ -498,72 +531,89 @@ impl SecurityGuard {
         }
     }
 
-    // GuardVerdict → SecurityVerdict 映射 (验收 #5)。
+    // GuardVerdict → SecurityVerdict mapping (acceptance #5).
     fn map_guard_verdict(&self, v: &GuardVerdict) -> SecurityVerdict {
-        // Block OR L4 → 绝对拒 (验收 #6: executor 不执行)。
+        // Block OR L4 → absolute reject (acceptance #6: executor does not execute).
         if v.action.is_block() || matches!(v.risk_level, RiskLevel::L4) {
-            return SecurityVerdict::block_guard(format!("guard 拒绝 (Block/L4): {}", v.reason), v);
-        }
-        // L3 (requires_approval) → executor 无人工审批回路, 视同拒 (用户决策: L3 = block fail-closed)。
-        if matches!(v.risk_level, RiskLevel::L3) {
-            return SecurityVerdict::block_guard(format!("guard 要求审批 (L3): {}", v.reason), v);
-        }
-        // Redact → executor 整命令执行, 不支持流式改写 → 拒 (防半 redact 误执行)。
-        if matches!(v.action, GuardAction::Redact) {
             return SecurityVerdict::block_guard(
-                format!("guard 要求 redact, executor 不支持流式改写: {}", v.reason),
+                format!("guard denied (Block/L4): {}", v.reason),
                 v,
             );
         }
-        // Preview → allow 但透传 requires_approval (调用方可观察, 不本批实装 confirm 回路)。
-        // Allow + L1/L2 → allow, 透传 risk_level/seatbelt_required (验收 #3 seatbelt 门控源)。
+        // L3 (requires_approval) → executor has no human-approval loop, treat as reject (user decision: L3 = block fail-closed).
+        if matches!(v.risk_level, RiskLevel::L3) {
+            return SecurityVerdict::block_guard(
+                format!("guard requires approval (L3): {}", v.reason),
+                v,
+            );
+        }
+        // Redact → executor runs the whole command, no streaming rewrite support → reject (prevents half-redact misexecution).
+        if matches!(v.action, GuardAction::Redact) {
+            return SecurityVerdict::block_guard(
+                format!(
+                    "guard requires redact, executor does not support streaming rewrite: {}",
+                    v.reason
+                ),
+                v,
+            );
+        }
+        // Preview → allow but pass through requires_approval (observable by callers; confirm loop not
+        // implemented in this batch).
+        // Allow + L1/L2 → allow, pass through risk_level/seatbelt_required (acceptance #3 seatbelt gating source).
         SecurityVerdict::allow_guard(v)
     }
 
-    // 降级 fail-closed (验收 #7): guard 宕机/超时/不可达 → 永不 fail-open。
-    // 严于 live guard: 缓存 regex 命中即 block + 非白名单 binary 已被 validate_tokens 拦 (栅栏)。
+    // Degrade fail-closed (acceptance #7): guard down/timeout/unreachable → never fail-open.
+    // Stricter than live guard: cached regex hit blocks + non-allowlisted binaries were already
+    // stopped by validate_tokens (fence).
     fn guard_degrade(&self, command: &str, e: &GuardError) -> SecurityVerdict {
-        // -32001 鉴权失败 = 误配, 非 daemon 宕机 → fail-closed block (fix #9, 降级可能开门)。
+        // -32001 auth failure = misconfiguration, not daemon down → fail-closed block (fix #9, degradation may open doors).
         if let GuardError::Unauthorized(msg) = e {
-            warn!(error = %msg, "guard 鉴权失败 (-32001) — 误配 fail-closed block");
+            warn!(error = %msg, "guard authentication failed (-32001) — misconfiguration fail-closed block");
             return SecurityVerdict::block(
-                format!("guard 鉴权失败, 拒绝执行 (检查 tenant 绑定): {}", msg),
+                format!(
+                    "guard authentication failed, execution denied (check tenant binding): {}",
+                    msg
+                ),
                 SecurityStage::Semantic,
             );
         }
-        warn!(error = %e, "guard 不可达 — 降级 fail-closed (缓存 + 白名单栅栏)");
-        // 缓存 regex 命中 → block (严于 live guard)。
+        warn!(error = %e, "guard unreachable — degraded fail-closed (cache + allowlist fence)");
+        // Cached regex hit → block (stricter than live guard).
         if let Some(cache) = &self.guard_cache {
             if let Some(hit) = cache.run_cached_rules(command) {
-                debug!(reason = %hit.reason, "guard 宕机, 缓存规则命中 block");
+                debug!(reason = %hit.reason, "guard down, cached rule hit block");
                 return SecurityVerdict::block_guard(
-                    format!("guard 不可达, 缓存命中: {}", hit.reason),
+                    format!("guard unreachable, cached rule hit: {}", hit.reason),
                     &hit,
                 );
             }
         }
-        // 缓存未命中 + allow_inline_interpreter==true + 命中内联形式 → block (fix #2:
-        // 无 guard 无法评估风险, fail-closed; 防 python -c "os.system('rm -rf /')")。
+        // Cache miss + allow_inline_interpreter==true + inline form hit → block (fix #2:
+        // no guard means risk cannot be assessed, fail-closed; prevents python -c "os.system('rm -rf /')").
         if self.allow_inline_interpreter && self.is_inline_interpreter(command) {
-            warn!("guard 宕机 + 缓存空 + 内联解释器 — fail-closed block (无 guard 无法评估风险)");
+            warn!("guard down + empty cache + inline interpreter — fail-closed block (risk not assessable without guard)");
             return SecurityVerdict::block(
-                "guard 不可达, 内联解释器高风险, 拒绝 (降级 fail-closed)",
+                "guard unreachable, inline interpreter high risk, denied (degraded fail-closed)",
                 SecurityStage::Semantic,
             );
         }
-        // 缓存未命中 + 白名单 binary (validate_tokens 已过) → allow + warn (风险等级未知)。
-        // 永不 fail-open: 降级路径不比 guard 活时宽松 — 非白名单 binary 已在 validate_tokens 被拦。
-        debug!("guard 宕机, 缓存未命中, 白名单 binary allow (风险等级未知)");
+        // Cache miss + allowlisted binary (already passed validate_tokens) → allow + warn (risk level unknown).
+        // Never fail-open: the degrade path is not looser than live guard — non-allowlisted binaries
+        // were already stopped in validate_tokens.
+        debug!("guard down, cache miss, allowlisted binary allowed (risk level unknown)");
         SecurityVerdict::allow()
     }
 
-    // 原始字符串探测内联解释器 (python -c / node -e / ruby -e / perl -e), 降级路径用。
-    // 不走 token parse (validate_tokens 已过白名单栅栏, 此处仅判内联形式本身 — 无 guard 无法评估
-    // -c/-e payload 风险, fail-closed 拒)。与 validate_argv 的精确 argv 级判不同, 此处保守宽匹配。
+    // Detect inline interpreters (python -c / node -e / ruby -e / perl -e) from the raw string,
+    // used by the degrade path. Does not go through token parse (validate_tokens already passed the
+    // allowlist fence; here we only judge the inline form itself — without guard the -c/-e payload
+    // risk cannot be assessed, fail-closed reject). Unlike validate_argv's precise argv-level check,
+    // this is a conservative wide match.
     fn is_inline_interpreter(&self, command: &str) -> bool {
         let lower = command.to_lowercase();
         let inline_flags = ["-c", "-e", "--eval", "-p", "--print"];
-        // 解释器名 (含可能的版本后缀 python3.12) + 后续出现内联 flag 即命中。
+        // Interpreter name (possibly with version suffix python3.12) + a later inline flag = hit.
         let inline_interps = [
             "python", "python2", "python3", "node", "ruby", "perl", "perl5",
         ];
@@ -578,41 +628,45 @@ impl SecurityGuard {
             inline_flags.iter().any(|f| {
                 *w == *f
                     || w.starts_with(&format!("{}=", f))
-                    // 附着形式: -cPAYLOAD / -ePAYLOAD (短选项无 = 紧贴 payload)。
-                    // 与 validate_argv 网关对齐 — 防 -c'import os;...' 单 token 绕降级路径。
+                    // Attached form: -cPAYLOAD / -ePAYLOAD (short option with payload glued on, no =).
+                    // Aligned with the validate_argv gateway — prevents a single token -c'import os;...'
+                    // bypassing the degrade path.
                     || (f.starts_with('-') && !f.starts_with("--") && w.starts_with(f) && w.len() > f.len())
             })
         })
     }
 
-    /// 校验 cwd — 禁止敏感路径 / 禁止 .. 逃逸
+    /// Validate cwd — forbid sensitive paths / forbid .. escape
     pub fn validate_cwd(&self, cwd: &str) -> SecurityVerdict {
-        // A-7: .. 逃逸嫌疑 — cwd 含 .. 组件拒绝 (绕过 cwd 边界)
+        // A-7: .. escape suspicion — reject cwd containing .. components (cwd boundary bypass)
         if std::path::Path::new(cwd)
             .components()
             .any(|comp| comp == std::path::Component::ParentDir)
         {
             return SecurityVerdict::block(
-                format!("cwd 含 .. 组件, 拒绝逃逸嫌疑: {}", cwd),
+                format!(
+                    "cwd contains .. component, escape suspicion rejected: {}",
+                    cwd
+                ),
                 SecurityStage::Regex,
             );
         }
-        // C-11: `~user` 用户名展开 — 视为可疑 (绕过 ~/.ssh 前缀, `~root`→敏感)
+        // C-11: `~user` username expansion — treated as suspicious (bypasses ~/.ssh prefix, `~root`→sensitive)
         if is_tilde_user_form(cwd) {
             return SecurityVerdict::block(
-                format!("cwd 为 ~user 用户名展开形式, 拒绝: {}", cwd),
+                format!("cwd uses ~user username expansion form, rejected: {}", cwd),
                 SecurityStage::Regex,
             );
         }
         let expanded = expand_tilde(cwd);
         for (sens, sens_exp) in self.sensitive_paths.iter().zip(&self.sensitive_paths_exp) {
-            // P-3: 避免 format! 逐项分配 — 直接字节边界判断
+            // P-3: avoid per-item format! allocation — direct byte-boundary check
             if &expanded == sens_exp
                 || (expanded.starts_with(sens_exp)
                     && expanded.as_bytes().get(sens_exp.len()) == Some(&b'/'))
             {
                 return SecurityVerdict::block(
-                    format!("cwd 位于敏感路径: {} (匹配 {})", cwd, sens),
+                    format!("cwd is on a sensitive path: {} (matched {})", cwd, sens),
                     SecurityStage::Regex,
                 );
             }
@@ -620,7 +674,7 @@ impl SecurityGuard {
         SecurityVerdict::allow()
     }
 
-    /// Token 级解析 — 按 &&/||/;/| 拆分，逐段校验
+    /// Token-level parse — split on &&/||/;/| and validate each segment
     fn validate_tokens(&self, command: &str) -> Result<(), String> {
         for segment in split_chain(command) {
             let segment = segment.trim();
@@ -632,22 +686,22 @@ impl SecurityGuard {
         Ok(())
     }
 
-    /// 校验单段命令
+    /// Validate a single command segment
     fn validate_segment(&self, segment: &str) -> Result<(), String> {
-        // 处理重定向 — 校验 `>` 目标不在敏感路径
+        // Handle redirects — check `>` targets are not on sensitive paths
         if let Some(reason) = self.check_redirect(segment) {
             return Err(reason);
         }
 
         let words = match shell_words::split(segment) {
             Ok(w) => w,
-            Err(e) => return Err(format!("命令分词失败: {}", e)),
+            Err(e) => return Err(format!("command tokenization failed: {}", e)),
         };
         if words.is_empty() {
             return Ok(());
         }
 
-        // 跳过环境变量前缀 (FOO=bar cmd ...)
+        // Skip environment variable prefixes (FOO=bar cmd ...)
         let mut idx = 0;
         while idx < words.len() && words[idx].contains('=') && !words[idx].starts_with('=') {
             idx += 1;
@@ -659,53 +713,59 @@ impl SecurityGuard {
         let binary = words[idx].as_str();
         let binary_basename = basename(binary);
 
-        // 白名单校验
+        // Allowlist check
         if !self.whitelist.load().contains(binary_basename) {
-            return Err(format!("二进制程序不在白名单: {}", binary));
+            return Err(format!("binary not in allowlist: {}", binary));
         }
 
-        // ARCH-2: resolved-path 校验 — basename 命中后须再确认二进制绝对路径落在可信目录内。
-        // 防 /tmp/python3 (攻击者可控二进制) 同名投毒绕过: 能解析到绝对路径但不在可信目录 → 拒。
-        // D3-6 (审计 0827 product): 解析失败 (None) → fail-closed 拒 (非放行)。企业硬化默认:
-        // 不可解析的二进制不应通过安全门 (即便执行期会 command-not-found, 安全门本身不得 fail-open)。
-        // canonicalize 跳过 (by-design): homebrew /opt/homebrew/bin/git symlink → Cellar 真实路径越界
-        // 可信前缀, 但 symlink 由包管理器写入 /opt/homebrew/bin (root-gated), 超出 ARCH-2 威胁模型
-        // (/tmp 投毒 + PATH 前置恶意 bin)。字面 starts_with 即拦该威胁面。
+        // ARCH-2: resolved-path check — after basename match, confirm the binary absolute path is
+        // inside a trusted directory. Prevents /tmp/python3 (attacker-controlled binary) same-name
+        // poisoning bypass: resolvable to an absolute path but outside trusted dirs → reject.
+        // D3-6 (audit 0827 product): resolve failure (None) → fail-closed reject (not allow).
+        // Enterprise-hardening default: an unresolvable binary must not pass the security gate
+        // (even if it would be command-not-found at exec time, the gate itself must not fail-open).
+        // canonicalize skipped (by-design): homebrew /opt/homebrew/bin/git symlink → Cellar real path
+        // goes outside the trusted prefix, but the symlink is written by the package manager into
+        // /opt/homebrew/bin (root-gated), outside the ARCH-2 threat model (/tmp poisoning + PATH-
+        // prepended malicious bin). Literal starts_with covers that threat surface.
         match resolve_binary_path(binary) {
             Some(abs) => {
                 if !self.trusted_bin_dirs.iter().any(|d| abs.starts_with(d)) {
-                    warn!(binary = binary, resolved = ?abs, "二进制不在可信目录 (ARCH-2 投毒防护)");
+                    warn!(binary = binary, resolved = ?abs, "binary outside trusted directories (ARCH-2 poisoning guard)");
                     return Err(format!(
-                        "二进制不在可信目录 (投毒防护): {} -> {}",
+                        "binary outside trusted directories (poisoning guard): {} -> {}",
                         binary,
                         abs.display()
                     ));
                 }
-                debug!(binary = binary, resolved = ?abs, "二进制可信目录校验通过");
+                debug!(binary = binary, resolved = ?abs, "binary trusted-directory check passed");
             }
             None => {
                 warn!(
                     binary = binary,
-                    "二进制路径无法解析, fail-closed 拒绝 (D3-6 企业硬化: 不可解析不放行)"
+                    "binary path unresolvable, fail-closed reject (D3-6 enterprise hardening: unresolvable is not allowed)"
                 );
-                return Err(format!("二进制无法解析 (投毒防护 fail-closed): {}", binary));
+                return Err(format!(
+                    "binary path unresolvable (poisoning guard fail-closed): {}",
+                    binary
+                ));
             }
         }
 
-        // argv 级约束 — mv/cp 目的地、sed -i 等 (跳过 argv[0] 二进制名)
+        // argv-level constraints — mv/cp destination, sed -i etc (skip argv[0] binary name)
         self.validate_argv(binary_basename, &words[idx + 1..])?;
 
         Ok(())
     }
 
-    /// 校验重定向目标
+    /// Validate redirect targets
     fn check_redirect(&self, segment: &str) -> Option<String> {
         for cap in self.redirect_re.captures_iter(segment) {
             if let Some(target) = cap.get(1) {
-                // C-11: `~user` 重定向目标 — 视为可疑 (绕过 ~/.ssh 前缀, `~root`→敏感)
+                // C-11: `~user` redirect target — treated as suspicious (bypasses ~/.ssh prefix, `~root`→sensitive)
                 if is_tilde_user_form(target.as_str()) {
                     return Some(format!(
-                        "重定向目标为 ~user 用户名展开形式, 拒绝: {}",
+                        "redirect target uses ~user username expansion form, rejected: {}",
                         target.as_str()
                     ));
                 }
@@ -713,19 +773,19 @@ impl SecurityGuard {
                 for (sens, sens_exp) in self.sensitive_paths.iter().zip(&self.sensitive_paths_exp) {
                     if &expanded == sens_exp || expanded.starts_with(&format!("{}/", sens_exp)) {
                         return Some(format!(
-                            "重定向目标位于敏感路径: {} (匹配 {})",
+                            "redirect target is on a sensitive path: {} (matched {})",
                             target.as_str(),
                             sens
                         ));
                     }
                 }
-                // C-12: .. 逃逸嫌疑 — 重定向目标含 .. 组件拒绝 (绕过 cwd 写敏感区)
+                // C-12: .. escape suspicion — reject redirect targets containing .. components (cwd-sensitive-area write bypass)
                 if std::path::Path::new(target.as_str())
                     .components()
                     .any(|comp| comp == std::path::Component::ParentDir)
                 {
                     return Some(format!(
-                        "重定向目标含 .. 组件, 拒绝逃逸嫌疑: {}",
+                        "redirect target contains .. component, escape suspicion rejected: {}",
                         target.as_str()
                     ));
                 }
@@ -734,12 +794,14 @@ impl SecurityGuard {
         None
     }
 
-    /// argv 级约束
+    /// argv-level constraints
     fn validate_argv(&self, binary: &str, args: &[String]) -> Result<(), String> {
-        // D3-1 (审计 0827 product) 内联解释器网关 — 见下方 gate。企业硬化默认 false 拒
-        // python -c / node -e / ruby -e / perl -e (绕白名单语义: 解释器在白名单跑脚本文件,
-        // -c/-e 使参数变任意代码, regex 无法枚举危险 one-liner; agent-driven 下模型可生成任意 payload)。
-        // trusted-caller opt-in (测试机/本地交互) 经 with_allow_inline_interpreter(true) 开启保留能力。
+        // D3-1 (audit 0827 product) inline interpreter gateway — see gate below. Enterprise-hardening
+        // default false rejects python -c / node -e / ruby -e / perl -e (bypasses allowlist semantics:
+        // interpreters are allowlisted to run script files, -c/-e turns arguments into arbitrary code,
+        // regex cannot enumerate dangerous one-liners; under agent-driven operation the model can
+        // generate arbitrary payloads). Trusted-caller opt-in (test machines/local interactive) keeps
+        // the capability via with_allow_inline_interpreter(true).
         if !self.allow_inline_interpreter {
             let is_inline_interp = matches!(
                 binary,
@@ -748,9 +810,10 @@ impl SecurityGuard {
             if is_inline_interp
                 && args.iter().any(|a| {
                     let a = a.as_str();
-                    // 精确 flag + 附着形式 (-cPAYLOAD / -ePAYLOAD, shell_words 不拆附着 token)
-                    // + 长选项 = 形式 (--eval=PAYLOAD)。附着形式是 D3-1 网关关键缺口:
-                    // python3 -c'import os;os.system("id")' 单 token 绕过精确 matches!("-c")。
+                    // Exact flag + attached form (-cPAYLOAD / -ePAYLOAD, shell_words does not split
+                    // attached tokens) + long-option = form (--eval=PAYLOAD). The attached form is the
+                    // key D3-1 gateway gap: python3 -c'import os;os.system("id")' as a single token
+                    // bypasses the exact matches!("-c").
                     matches!(a, "-c" | "-e" | "-E" | "--eval" | "-p" | "--print")
                         || (a.starts_with("-c") && a.len() > 2)
                         || (a.starts_with("-e") && a.len() > 2)
@@ -759,18 +822,20 @@ impl SecurityGuard {
                 })
             {
                 warn!(
-                    "D3-1 内联解释器拦截: {} -c/-e 被拒 (企业硬化默认; allow_inline_interpreter opt-in)",
+                    "D3-1 inline interpreter block: {} -c/-e denied (enterprise-hardening default; allow_inline_interpreter opt-in)",
                     binary
                 );
                 return Err(format!(
-                    "禁止 {} -c/-e 内联代码执行 (D3-1 企业硬化; 用 allow_inline_interpreter=True opt-in)",
+                    "inline code execution via {} -c/-e is blocked (D3-1 enterprise hardening; opt in with allow_inline_interpreter=True)",
                     binary
                 ));
             }
         }
         match binary {
-            // C-5: mv/cp 全非选项参数校验 — 旧版仅校验最后一个 (目地), 源参数可读 ~/.ssh/id_rsa
-            // 镜像 cat/grep 读源守卫: 敏感路径 + 敏感文件名 + .. 逃逸, 全非选项参数 (含源与目地)
+            // C-5: mv/cp validate all non-option arguments — the old version only checked the last
+            // (destination); source arguments could read ~/.ssh/id_rsa. Mirrors the cat/grep read-
+            // source guard: sensitive paths + sensitive filenames + .. escape, on all non-option
+            // arguments (both source and destination)
             "mv" | "cp" => {
                 for a in args.iter() {
                     if a.starts_with('-') || a.starts_with('>') {
@@ -778,13 +843,13 @@ impl SecurityGuard {
                     }
                     if self.is_sensitive_path(a) {
                         return Err(format!(
-                            "{} 参数位于敏感路径: {} (禁止触碰私钥/系统文件)",
+                            "{} argument is on a sensitive path: {} (private keys/system files are protected)",
                             binary, a
                         ));
                     }
                     if self.is_sensitive_filename(a) {
                         return Err(format!(
-                            "{} 参数为凭据文件 (敏感文件名模式): {} (C-SEC-03)",
+                            "{} argument is a credential file (sensitive filename pattern): {} (C-SEC-03)",
                             binary, a
                         ));
                     }
@@ -792,14 +857,17 @@ impl SecurityGuard {
                         .components()
                         .any(|comp| comp == std::path::Component::ParentDir)
                     {
-                        return Err(format!("{} 路径含 .. 组件, 拒绝逃逸嫌疑: {}", binary, a));
+                        return Err(format!(
+                            "{} path contains .. component, escape suspicion rejected: {}",
+                            binary, a
+                        ));
                     }
                 }
                 Ok(())
             }
             "sed" => {
                 if args.iter().any(|a| a == "-i" || a.starts_with("-i")) {
-                    return Err("禁止 sed -i 原地编辑".into());
+                    return Err("sed -i in-place edit is blocked".into());
                 }
                 Ok(())
             }
@@ -808,7 +876,10 @@ impl SecurityGuard {
                     .iter()
                     .any(|a| a == "-exec" || a == "-execdir" || a == "-ok" || a == "-delete")
                 {
-                    return Err("禁止 find -exec/-execdir/-ok/-delete 任意命令执行".into());
+                    return Err(
+                        "find -exec/-execdir/-ok/-delete arbitrary command execution is blocked"
+                            .into(),
+                    );
                 }
                 Ok(())
             }
@@ -822,7 +893,9 @@ impl SecurityGuard {
                     || prog.contains("| getline")
                     || prog.contains("|getline")
                 {
-                    return Err("禁止 awk system()/getline 任意命令执行".into());
+                    return Err(
+                        "awk system()/getline arbitrary command execution is blocked".into(),
+                    );
                 }
                 Ok(())
             }
@@ -832,7 +905,7 @@ impl SecurityGuard {
                         continue;
                     }
                     if self.is_sensitive_path(a) {
-                        return Err(format!("tee 目标位于敏感路径: {}", a));
+                        return Err(format!("tee target is on a sensitive path: {}", a));
                     }
                 }
                 Ok(())
@@ -843,7 +916,7 @@ impl SecurityGuard {
                         continue;
                     }
                     if self.is_sensitive_path(a) {
-                        return Err(format!("chmod 敏感路径: {}", a));
+                        return Err(format!("chmod sensitive path: {}", a));
                     }
                 }
                 Ok(())
@@ -851,13 +924,14 @@ impl SecurityGuard {
             "cd" => {
                 if let Some(dest) = args.first() {
                     if self.is_sensitive_path(dest) {
-                        return Err(format!("cd 敏感路径: {}", dest));
+                        return Err(format!("cd sensitive path: {}", dest));
                     }
                 }
                 Ok(())
             }
-            // Blocker 2 finding 1.4: 读工具 cat/grep/head/tail/less/more 源参数无校验
-            // — 私钥 /etc/shadow 直泄。读源 (非选项参数) 落敏感区 → 拒绝
+            // Blocker 2 finding 1.4: read tools cat/grep/head/tail/less/more had no source-argument
+            // validation — private keys / /etc/shadow leak directly. Read source (non-option argument)
+            // landing in a sensitive area → reject
             "cat" | "grep" | "head" | "tail" | "less" | "more" | "bat" | "rg" => {
                 for a in args.iter() {
                     if a.starts_with('-') {
@@ -865,35 +939,43 @@ impl SecurityGuard {
                     }
                     if self.is_sensitive_path(a) {
                         return Err(format!(
-                            "{} 读源位于敏感路径: {} (禁止读取私钥/系统文件)",
+                            "{} read source is on a sensitive path: {} (private keys/system files are protected)",
                             binary, a
                         ));
                     }
-                    // C-SEC-03: 凭据文件名模式 (id_rsa* / *.pem / *.key 等) — cwd 内或任意绝对路径
+                    // C-SEC-03: credential filename patterns (id_rsa* / *.pem / *.key etc) — in cwd or any absolute path
                     if self.is_sensitive_filename(a) {
                         return Err(format!(
-                            "{} 读源为凭据文件 (敏感文件名模式): {} (C-SEC-03)",
+                            "{} read source is a credential file (sensitive filename pattern): {} (C-SEC-03)",
                             binary, a
                         ));
                     }
-                    // .. 逃逸嫌疑 — 路径含 .. 组件拒绝 (绕过 cwd)
+                    // .. escape suspicion — reject paths containing .. components (cwd bypass)
                     if std::path::Path::new(a)
                         .components()
                         .any(|comp| comp == std::path::Component::ParentDir)
                     {
-                        return Err(format!("{} 路径含 .. 组件, 拒绝逃逸嫌疑: {}", binary, a));
+                        return Err(format!(
+                            "{} path contains .. component, escape suspicion rejected: {}",
+                            binary, a
+                        ));
                     }
                 }
                 Ok(())
             }
             "git" => self.validate_git_argv(args),
-            // A-1: 默认 arm — 旧版 `_ => Ok(())` 对任何无专门 arm 的白名单二进制零 argv 校验,
-            // 新增白名单二进制 (SIGHUP extra / builder) 立获 "零校验" 待遇。Stage-2 whitelist 只校验
-            // 二进制名不校验参数, 危险在参数 (rm -rf 的危险在 -rf 不在 rm)。把 "未知" 当 "安全" 违反 fail-closed。
-            // 修正: 公认只读无害工具 (不改 fs/不执行任意命令/不网络) 显式枚举 → Ok;
-            // 其余 (含 SIGHUP extras) 记 warn 暴露 argv 校验缺口 → 仍 Ok (不破 trusted-caller 工具链,
-            // 真实威胁由 seatbelt C-SEC-02 + UDS 鉴权 M-SEC-01 纵深封堵, 见 C-SEC-03 边界注释)。
-            // warn 是 fail-loud 的 "log 证据" — 运维可见 extra 工具零校验, 决定是否加专门 arm 或叠加 seatbelt。
+            // A-1: default arm — the old `_ => Ok(())` gave zero argv validation to any allowlisted
+            // binary without a dedicated arm; newly added allowlisted binaries (SIGHUP extra / builder)
+            // would immediately get "zero validation" treatment. Stage-2 whitelist only checks the
+            // binary name, not arguments; the danger lives in arguments (rm -rf's danger is -rf, not rm).
+            // Treating "unknown" as "safe" violates fail-closed.
+            // Fix: well-known read-only harmless tools (no fs mutation / no arbitrary execution / no
+            // network) are explicitly enumerated → Ok; the rest (incl. SIGHUP extras) log a warn to
+            // expose the argv-validation gap → still Ok (does not break the trusted-caller toolchain;
+            // the real threats are covered by seatbelt C-SEC-02 + UDS auth M-SEC-01 defense-in-depth,
+            // see the C-SEC-03 boundary comment).
+            // The warn is fail-loud "log evidence" — ops can see that extra tools have zero validation
+            // and decide whether to add a dedicated arm or layer seatbelt.
             other => {
                 if READONLY_NOARM_BINARY.contains(&other) {
                     Ok(())
@@ -901,7 +983,7 @@ impl SecurityGuard {
                     warn!(
                         binary = other,
                         argc = args.len(),
-                        "argv 校验缺口: 白名单二进制无专门 argv 守卫 (extra/toolchain); 依赖 seatbelt+UDS 鉴权纵深"
+                        "argv validation gap: allowlisted binary without a dedicated argv guard (extra/toolchain); relies on seatbelt+UDS auth defense-in-depth"
                     );
                     Ok(())
                 }
@@ -909,10 +991,11 @@ impl SecurityGuard {
         }
     }
 
-    /// 路径是否敏感 (含 ~ 展开) — 仅供内部 argv/cwd 校验复用
+    /// Whether the path is sensitive (with ~ expansion) — internal reuse for argv/cwd validation
     fn is_sensitive_path(&self, path: &str) -> bool {
-        // C-11: 仅接受 `~` (家目录) 与 `~/...` 展开; `~user/...` (bash 用户名展开) 视为可疑
-        // 路径 — `~root/.ssh` 之类绕过 ~/.ssh 前缀匹配。无 `/` 时 (`~root` 裸) 同样拒绝。
+        // C-11: only accept `~` (home) and `~/...` expansion; `~user/...` (bash username expansion)
+        // is treated as a suspicious path — things like `~root/.ssh` bypass ~/.ssh prefix matching.
+        // Bare `~root` (no `/`) is rejected as well.
         if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
             return true;
         }
@@ -921,7 +1004,7 @@ impl SecurityGuard {
         }
         let expanded = expand_tilde(path);
         for (_, sens_exp) in self.sensitive_paths.iter().zip(&self.sensitive_paths_exp) {
-            // P-3: 避免 format! 逐项分配 — 直接字节边界判断
+            // P-3: avoid per-item format! allocation — direct byte-boundary check
             if &expanded == sens_exp
                 || (expanded.starts_with(sens_exp)
                     && expanded.as_bytes().get(sens_exp.len()) == Some(&b'/'))
@@ -932,10 +1015,12 @@ impl SecurityGuard {
         false
     }
 
-    /// C-SEC-03: 文件名模式敏感校验 — 捕获 cwd 内或任意绝对路径的凭据文件
-    /// (路径前缀校验只拦 ~/.ssh/* 等目录, 漏 cwd 内 id_rsa / 任意位置 *.pem/*.key)
-    /// 匹配: id_rsa* (含 .pub 之外的私钥/备份) / *.pem / *.key / *.p12 / *.pfx / *.keystore
-    /// 注: *.pub 公钥不拦 (非机密); trusted-caller 模型下 cwd 内私钥读仍为纵深防御
+    /// C-SEC-03: sensitive filename pattern check — catches credential files in cwd or at any
+    /// absolute path (path-prefix checks only stop ~/.ssh/* style directories; they miss cwd
+    /// id_rsa / *.pem/*.key anywhere)
+    /// Matches: id_rsa* (private keys/backups other than .pub) / *.pem / *.key / *.p12 / *.pfx / *.keystore
+    /// Note: *.pub public keys are not blocked (not secret); under the trusted-caller model, reading
+    /// private keys in cwd is still defense-in-depth
     pub fn is_sensitive_filename(&self, path: &str) -> bool {
         let fname = Path::new(path)
             .file_name()
@@ -951,22 +1036,23 @@ impl SecurityGuard {
         suffixes.iter().any(|s| fname.ends_with(s))
     }
 
-    /// git 子命令约束 — C-SEC-02: 拒 config/-c/alias.*/core.*; C-6: 拒 force-push 主分支
+    /// git subcommand constraints — C-SEC-02: reject config/-c/alias.*/core.*; C-6: reject force-push to main branches
     fn validate_git_argv(&self, args: &[String]) -> Result<(), String> {
-        // C-SEC-02: 拒 config/-c/alias.*/core.* 持久/临时后门
+        // C-SEC-02: reject config/-c/alias.*/core.* persistent/temporary backdoors
         for a in args.iter() {
             if a == "config" {
-                return Err("禁止 git config 持久配置后门".into());
+                return Err("git config persistent configuration backdoor is blocked".into());
             }
             if a == "-c" {
-                return Err("禁止 git -c 临时配置注入".into());
+                return Err("git -c temporary configuration injection is blocked".into());
             }
             if a.starts_with("alias.") || a.starts_with("core.") {
-                return Err("禁止 git config alias/core 持久后门".into());
+                return Err("git config alias/core persistent backdoor is blocked".into());
             }
         }
-        // C-6: force-push 主分支 — 强制标志 (--force/-f/+) 与受保护分支名 (main/master/origin/*)
-        // 在 argv 任意位置出现即拒绝 (旧正则要求 --force 在 main 之前, `git push origin main --force` 绕过)
+        // C-6: force-push to main branches — force flags (--force/-f/+) and protected branch names
+        // (main/master/origin/*) anywhere in argv → reject (the old regex required --force before
+        // main; `git push origin main --force` bypassed it)
         if args.iter().any(|a| a == "push") {
             let has_force = args.iter().any(|a| {
                 a == "--force" || a == "-f" || a == "--force-with-lease" || a.starts_with('+')
@@ -975,7 +1061,7 @@ impl SecurityGuard {
                 a == "main" || a == "master" || a == "origin/main" || a == "origin/master"
             });
             if has_force && targets_main {
-                return Err("禁止 force-push 主分支 (main/master)".into());
+                return Err("force-push to main/master is blocked".into());
             }
         }
         Ok(())
@@ -987,8 +1073,9 @@ impl SecurityGuard {
     }
 }
 
-/// 白名单扩展共用过滤 — 拒危险解释器/内建 (sh/bash/zsh/exec/eval/source/. 等), 空项跳过。
-/// with_extra_whitelist (累加, clone 当前快照) 与 reload_extras (重建, 传基线 set) 共用。
+/// Shared allowlist-extension filter — rejects dangerous interpreters/builtins (sh/bash/zsh/exec/
+/// eval/source/. etc), skips empty entries. Shared by with_extra_whitelist (accumulating, clones the
+/// current snapshot) and reload_extras (rebuild, receives the baseline set).
 const DENY_EXTEND: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "exec", "eval", "source", ".",
     "system", "sudo", "doas",
@@ -1001,7 +1088,10 @@ fn merge_into(mut base: HashSet<String>, extras: &[&str]) -> HashSet<String> {
             continue;
         }
         if DENY_EXTEND.contains(&n) {
-            debug!(binary = n, "白名单扩展拒绝危险解释器/内建");
+            debug!(
+                binary = n,
+                "allowlist extension rejected dangerous interpreter/builtin"
+            );
             continue;
         }
         base.insert(n.to_string());
@@ -1009,95 +1099,125 @@ fn merge_into(mut base: HashSet<String>, extras: &[&str]) -> HashSet<String> {
     base
 }
 
-/// with_extra_whitelist 用 — clone 当前白名单快照 (基线 + 已有扩展) 再追加 extras (累加)。
+/// Used by with_extra_whitelist — clones the current allowlist snapshot (baseline + existing
+/// extensions) then appends extras (accumulating).
 fn merge_whitelist(current: &ArcSwap<HashSet<String>>, extras: &[&str]) -> HashSet<String> {
     merge_into((**current.load()).clone(), extras)
 }
 
-/// 构建正则黑名单
+/// Build the regex blocklist
 fn build_blocklist() -> Vec<(Regex, &'static str)> {
     let patterns: &[(&str, &str)] = &[
-        // 毁灭性删除 — L-4: 兼容拆分标志 (`rm -r -f /`) 与合并标志 (`rm -rf /`)
-        // 要求 rm 后任意位置出现 -r/--recursive 且 -f/--force, 再命中根/家目录
+        // Destructive deletion — L-4: cover split flags (`rm -r -f /`) and merged flags (`rm -rf /`)
+        // requires -r/--recursive and -f/--force anywhere after rm, then hitting root/home
         (
             r"rm\s+.*(-[a-zA-Z]*r[a-zA-Z]*f?|--recursive).*(/|~|\$HOME|\*)",
-            "rm -rf 毁灭性删除根/家目录",
+            "rm -rf destructive deletion of root/home",
         ),
         (
             r"rm\s+.*(-[a-zA-Z]*f[a-zA-Z]*r?|--force).*(-[a-zA-Z]*r|--recursive).*(/|~|\$HOME|\*)",
-            "rm -rf 毁灭性删除根/家目录",
+            "rm -rf destructive deletion of root/home",
         ),
-        (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+/\s*$", "rm -rf 根目录"),
-        (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+~\s*$", "rm -rf 家目录"),
-        // 特权提升 — L-5: su root 在 argv 任意位置 (`su - root` / `su root -`)
-        (r"\bsudo\b", "禁止 sudo 特权提升"),
-        (r"\bsu\b.*\broot\b", "禁止 su root 特权提升"),
-        (r"\bdoas\b", "禁止 doas 特权提升"),
-        // 磁盘格式化/擦除
+        (
+            r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+/\s*$",
+            "rm -rf root directory",
+        ),
+        (
+            r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+~\s*$",
+            "rm -rf home directory",
+        ),
+        // Privilege escalation — L-5: su root anywhere in argv (`su - root` / `su root -`)
+        (r"\bsudo\b", "sudo privilege escalation is blocked"),
+        (
+            r"\bsu\b.*\broot\b",
+            "su root privilege escalation is blocked",
+        ),
+        (r"\bdoas\b", "doas privilege escalation is blocked"),
+        // Disk format/erase
         (
             r"\bdiskutil\s+(eraseDisk|reformat|eraseVolume)\b",
-            "禁止 diskutil 擦除磁盘",
+            "diskutil disk erase is blocked",
         ),
-        (r"\bmkfs\b", "禁止 mkfs 格式化"),
-        (r"\bdd\b.*\bof=/dev/(rdisk|sd|disk)", "禁止 dd 写入设备"),
-        // 远程脚本管道执行
+        (r"\bmkfs\b", "mkfs formatting is blocked"),
+        (
+            r"\bdd\b.*\bof=/dev/(rdisk|sd|disk)",
+            "dd write to device is blocked",
+        ),
+        // Remote script pipe execution
         (
             r"(curl|wget)\b.*\|\s*(sh|bash|zsh|fish)\b",
-            "禁止远程脚本管道执行",
+            "remote script pipe execution is blocked",
         ),
-        (r"(curl|wget)\b.*\bsh\b.*\bhttps?://", "禁止远程脚本执行"),
+        (
+            r"(curl|wget)\b.*\bsh\b.*\bhttps?://",
+            "remote script execution is blocked",
+        ),
         (
             r"\bnc\b.*\|\s*(sh|bash|zsh)\b",
-            "禁止 netcat 管道执行 shell",
+            "netcat pipe to shell is blocked",
         ),
-        (r"\bbash\b.*\bhttps?://", "禁止远程脚本执行"),
-        // 设备写入
-        (r">\s*/dev/sd[a-z]", "禁止写入块设备"),
-        (r">\s*/dev/disk", "禁止写入磁盘设备"),
+        (
+            r"\bbash\b.*\bhttps?://",
+            "remote script execution is blocked",
+        ),
+        // Device writes
+        (r">\s*/dev/sd[a-z]", "write to block device is blocked"),
+        (r">\s*/dev/disk", "write to disk device is blocked"),
         // fork bomb
-        (r":\s*\(\)\s*\{\s*:\|:&\s*\}\s*;:", "禁止 fork bomb"),
-        // 受保护分支 force-push / reset —hard — C-6: 位置无关
-        // force 标志 (--force/-f/+) 与受保护分支名任意顺序; 双向覆盖
+        (r":\s*\(\)\s*\{\s*:\|:&\s*\}\s*;:", "fork bomb is blocked"),
+        // Protected branch force-push / reset --hard — C-6: position-independent
+        // force flags (--force/-f/+) and protected branch names in any order; bidirectional coverage
         (
             r"git\s+push\b.*(--force|-f\b|\+\w)(origin/)?(main|master)",
-            "禁止 force-push 主分支",
+            "force-push to protected branch is blocked",
         ),
         (
             r"git\s+push\b.*(origin/)?(main|master).*(--force|-f\b)",
-            "禁止 force-push 主分支",
+            "force-push to protected branch is blocked",
         ),
-        // M-SEC-08: git push origin +main force-push `+` 简写
+        // M-SEC-08: git push origin +main force-push `+` shorthand
         (
             r"git\s+push\b.*\s\+(origin/)?(main|master)",
-            "禁止 force-push 主分支 (+ 简写)",
+            "force-push to protected branch (+ shorthand) is blocked",
         ),
         (
             r"git\s+reset\s+--hard\b.*\s(origin/)?(main|master)",
-            "禁止 reset --hard 主分支",
+            "reset --hard to protected branch is blocked",
         ),
-        // M-SEC-04: chmod 777 敏感路径 — 扩 /root/~/.ssh//dev
+        // M-SEC-04: chmod 777 on sensitive paths — extended to /root/~/.ssh//dev
         (
             r"chmod\s+(-R\s+)?777\s+(/(etc|System|Library|usr|root|dev)|~/\.ssh)",
-            "禁止 777 敏感路径",
+            "chmod 777 on sensitive path is blocked",
         ),
-        // Issue #10: shell 内建/解释器动态执行 — eval/source/exec/`. cmd`
-        // (解释器本身未在白名单, 此处显式拦截给清晰错误 + 纵深防御)
-        (r"(^|[\s;|&])eval\b", "禁止 eval 动态执行"),
-        (r"(^|[\s;|&])source\b", "禁止 source 动态执行脚本"),
-        (r"(^|[\s;|&])exec\b", "禁止 exec 替换进程/动态执行"),
-        // Issue #10: 解释器 -c 动态脚本执行 — bash -c '...' / sh -c '...' / zsh -c ...
+        // Issue #10: shell builtins/interpreter dynamic execution — eval/source/exec/`. cmd`
+        // (the interpreters themselves are not in the allowlist; blocked here explicitly for a clear
+        // error + defense-in-depth)
+        (r"(^|[\s;|&])eval\b", "eval dynamic execution is blocked"),
+        (
+            r"(^|[\s;|&])source\b",
+            "source dynamic script execution is blocked",
+        ),
+        (
+            r"(^|[\s;|&])exec\b",
+            "exec process replacement/dynamic execution is blocked",
+        ),
+        // Issue #10: interpreter -c dynamic script execution — bash -c '...' / sh -c '...' / zsh -c ...
         (
             r"\b(bash|sh|zsh|fish|dash|ksh|csh|tcsh)\s+-c\b",
-            "禁止解释器 -c 动态脚本执行",
+            "interpreter -c dynamic script execution is blocked",
         ),
-        // Issue #10: base64 解码管道执行 — base64 -d | sh / 任意 | base64 -d | bash
+        // Issue #10: base64 decode pipe execution — base64 -d | sh / anything | base64 -d | bash
         (
             r"base64\s+(-d|--decode)\b.*\|\s*(sh|bash|zsh|fish)\b",
-            "禁止 base64 解码管道执行 shell",
+            "base64 decode pipe to shell is blocked",
         ),
-        // Issue #10: 任意管道到解释器 — echo ... | sh / printf ... | bash (非 curl/wget 源)
-        // \b 词边界防误匹配 (| sort 等); 兼容管道后带参数 (| sh -x) 与行尾 (| sh)
-        (r"\|\s*(sh|bash|zsh|fish)\b", "禁止管道执行 shell 解释器"),
+        // Issue #10: any pipe to an interpreter — echo ... | sh / printf ... | bash (non curl/wget sources)
+        // \b word boundary prevents false matches (| sort etc); covers arguments after the pipe
+        // (| sh -x) and end of line (| sh)
+        (
+            r"\|\s*(sh|bash|zsh|fish)\b",
+            "pipe to shell interpreter is blocked",
+        ),
     ];
 
     patterns
@@ -1106,7 +1226,7 @@ fn build_blocklist() -> Vec<(Regex, &'static str)> {
         .collect()
 }
 
-/// 按 &&/||/;/| 拆分链式命令 (保留每个段)
+/// Split chained commands on &&/||/;/| (keeping every segment)
 fn split_chain(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -1149,15 +1269,16 @@ fn split_chain(command: &str) -> Vec<String> {
             ';' => {
                 segments.push(std::mem::take(&mut current));
             }
-            // C-SEC-06: 换行符作命令分隔符 — 同 ;/| 拆分 (引号内除外)
+            // C-SEC-06: newline as command separator — split like ;/| (except inside quotes)
             '\n' | '\r' => {
                 segments.push(std::mem::take(&mut current));
             }
             '|' => {
                 segments.push(std::mem::take(&mut current));
             }
-            // C-1: 裸 & 后台运算符 — 同 ;/| 拆分 (引号内除外), 防 `cmd & evil` 整段绕过白名单
-            // (&& 已被上方 peek 分支消费, 此处仅剩单 &)
+            // C-1: bare & background operator — split like ;/| (except inside quotes), prevents
+            // `cmd & evil` bypassing the allowlist as one segment
+            // (&& already consumed by the peek branch above; only single & reaches here)
             '&' => {
                 segments.push(std::mem::take(&mut current));
             }
@@ -1177,12 +1298,15 @@ fn basename(path: &str) -> &str {
     }
 }
 
-/// ARCH-2: 解析二进制绝对路径 (literal, 不 canonicalize)。绝对路径 → 原样;
-/// 相对名 (python3) → 扫 $PATH 各目录首个匹配 → join 字面路径。解析失败返 None。
-/// D3-6: None 由调用方 (validate_segment) fail-closed 拒, 非放行 — 企业硬化默认。
-/// 不 canonicalize: homebrew /opt/homebrew/bin/git symlink → Cellar 真实路径会越界可信
-/// 前缀, 但 symlink 本身由包管理器写入可信目录, 写入需 root, 超出 ARCH-2 威胁模型
-/// (/tmp 投毒 + PATH 注入)。威胁 = 绝对路径投毒 + PATH 前置恶意 bin, 字面 starts_with 即拦。
+/// ARCH-2: resolve the binary absolute path (literal, no canonicalize). Absolute path → as-is;
+/// relative name (python3) → scan $PATH directories for the first match → join literal path.
+/// Resolve failure returns None.
+/// D3-6: None is fail-closed rejected by the caller (validate_segment), not allowed — enterprise-
+/// hardening default.
+/// No canonicalize: homebrew /opt/homebrew/bin/git symlink → Cellar real path would fall outside
+/// the trusted prefix, but the symlink itself is written by the package manager into a trusted
+/// directory, root-gated, outside the ARCH-2 threat model (/tmp poisoning + PATH injection).
+/// Threat = absolute-path poisoning + PATH-prepended malicious bin; literal starts_with covers it.
 fn resolve_binary_path(binary: &str) -> Option<PathBuf> {
     let p = Path::new(binary);
     if p.is_absolute() {
@@ -1191,7 +1315,7 @@ fn resolve_binary_path(binary: &str) -> Option<PathBuf> {
         }
         return None;
     }
-    // 相对名含 `/` (./foo, a/b) → join cwd 字面路径
+    // Relative name containing `/` (./foo, a/b) → join cwd literal path
     if binary.contains('/') {
         let abs = env::current_dir().ok()?.join(binary);
         if abs.is_file() {
@@ -1212,29 +1336,30 @@ fn resolve_binary_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
-// guard 规则缓存路径: ~/.fusion-executor/guard-rules.json (HOME-private 0o700 目录, 0o600 文件)。
-// 不引 dirs crate — std::env::var("HOME")。目录不存在则建 (0o700); 解析失败返临时回退 (不崩)。
+// guard rules cache path: ~/.fusion-executor/guard-rules.json (HOME-private 0o700 dir, 0o600 file).
+// No dirs crate — std::env::var("HOME"). Creates the dir if missing (0o700); on resolve failure
+// returns a temp fallback (does not crash).
 fn guard_cache_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = Path::new(&home).join(".fusion-executor");
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!(dir = %dir.display(), error = %e, "guard 缓存目录创建失败 — 用临时回退");
+        warn!(dir = %dir.display(), error = %e, "guard cache dir creation failed — using temp fallback");
         return PathBuf::from("/tmp/fusion-executor-guard-rules.json");
     }
-    // best-effort 0o700 (mkdir 默认受 umask; 显式 set_permissions 静默失败不崩)
+    // best-effort 0o700 (mkdir default is umask-bound; explicit set_permissions failing silently does not crash)
     let perms = std::fs::Permissions::from_mode(0o700);
     let _ = std::fs::set_permissions(&dir, perms);
     dir.join("guard-rules.json")
 }
 
-/// C-SEC-05: 检测 shell 命令替换 — 拒绝 $(/反引号/`<(>`/`<<<`
-/// 引号内仍视作危险 — 解释器 -c payload 内含 $(...) 同样可执行
+/// C-SEC-05: detect shell command substitution — reject $(/backtick/<(/<<<
+/// Inside quotes still counts as dangerous — interpreter -c payloads containing $(...) execute too
 fn check_shell_substitution(command: &str) -> Option<String> {
     if command.contains("$(") || command.contains('`') {
-        return Some("禁止命令替换 $(...)/反引号".into());
+        return Some("command substitution $(...)/backtick is blocked".into());
     }
     if command.contains("<(") || command.contains("<<<") {
-        return Some("禁止进程替换 <(...)/<<<".into());
+        return Some("process substitution <(...)/<<< is blocked".into());
     }
     None
 }
@@ -1249,21 +1374,23 @@ fn expand_tilde(path: &str) -> String {
     }
 }
 
-/// C-11: 检测 `~user` 用户名展开形式 (bash `~root` → `/var/root`)。
-/// 仅 `~` 与 `~/...` 走标准家目录展开; `~user`/`~user/...` 被视为可疑 —
-/// 绕过 `~/.ssh` 前缀匹配, 且 `~root` 展开到敏感 `/var/root`。
+/// C-11: detect `~user` username expansion form (bash `~root` → `/var/root`).
+/// Only `~` and `~/...` take standard home expansion; `~user`/`~user/...` are treated as suspicious —
+/// they bypass `~/.ssh` prefix matching, and `~root` expands to the sensitive `/var/root`.
 fn is_tilde_user_form(path: &str) -> bool {
     path.starts_with('~') && path != "~" && !path.starts_with("~/")
 }
+// __PART2__
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn guard() -> SecurityGuard {
-        // ARCH-2: 测试 guard 须对齐 Executor::new 的可信目录登记 — 否则 venv 内
-        // python/pytest (PATH 上是 .venv/bin/python) resolved-path 校验 fail-closed 拒,
-        // allows_python / allows_pytest 等基线用例误红。登记 VIRTUAL_ENV/bin + 当前 exe 父目录。
+        // ARCH-2: the test guard must register the same trusted directories as Executor::new —
+        // otherwise venv python/pytest (.venv/bin/python on PATH) get fail-closed rejected by
+        // resolved-path validation and baseline cases like allows_python / allows_pytest go red
+        // by mistake. Register VIRTUAL_ENV/bin + the current exe's parent directory.
         let mut trusted: Vec<String> = Vec::new();
         if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
             let venv_bin = std::path::Path::new(&venv).join("bin");
@@ -1278,10 +1405,11 @@ mod tests {
                 }
             }
         }
-        // ARCH-2: rustup 标准安装位 ($HOME/.cargo/bin) — 与 Executor::new 对齐登记。
-        // cargo/rustc 在此 (CI macos-14 runner = rustup, 非 homebrew)。非攻击者可控 (home 目录),
-        // 不违 /tmp 投毒威胁模型。登记使 allows_cargo_test / a1_toolchain_noarm 用例在
-        // rustup-only 环境通过; homebrew 机器 cargo 在 /opt/homebrew/bin 已基线可信。
+        // ARCH-2: rustup standard install location ($HOME/.cargo/bin) — registered to align with
+        // Executor::new. cargo/rustc live there (CI macos-14 runner = rustup, not homebrew). Not
+        // attacker-controlled (home directory), does not violate the /tmp poisoning threat model.
+        // Registration lets allows_cargo_test / a1_toolchain_noarm pass in rustup-only environments;
+        // on homebrew machines cargo is already baseline-trusted in /opt/homebrew/bin.
         if let Ok(home) = std::env::var("HOME") {
             let cargo_bin = std::path::Path::new(&home).join(".cargo").join("bin");
             if let Some(s) = cargo_bin.to_str() {
@@ -1296,107 +1424,137 @@ mod tests {
         }
     }
 
-    // ── Blocker 2: 读源敏感路径防护 (finding 1.4) ──
+    // ── Blocker 2: read-source sensitive path protection (finding 1.4) ──
 
     #[test]
     fn blocks_cat_sensitive_path() {
         let v = guard().validate("cat /etc/shadow");
-        assert!(!v.allowed, "cat /etc/shadow 应被拦截");
-        assert!(v.reason.as_deref().unwrap().contains("敏感路径"));
+        assert!(!v.allowed, "cat /etc/shadow should be blocked");
+        assert!(v.reason.as_deref().unwrap().contains("sensitive path"));
     }
 
     #[test]
     fn blocks_cat_ssh_key() {
         let v = guard().validate("cat ~/.ssh/id_rsa");
-        assert!(!v.allowed, "cat 私钥应被拦截");
+        assert!(!v.allowed, "cat private key should be blocked");
     }
 
     #[test]
     fn blocks_grep_sensitive_source() {
         let v = guard().validate("grep root /etc/passwd");
-        assert!(!v.allowed, "grep /etc/passwd 应被拦截");
+        assert!(!v.allowed, "grep /etc/passwd should be blocked");
     }
 
     #[test]
     fn blocks_head_sensitive() {
         let v = guard().validate("head /etc/master.passwd");
-        assert!(!v.allowed, "head 敏感文件应被拦截");
+        assert!(!v.allowed, "head on a sensitive file should be blocked");
     }
 
     #[test]
     fn blocks_cat_dotdot_escape() {
         let v = guard().validate("cat ../../etc/shadow");
-        assert!(!v.allowed, "cat 含 .. 逃逸应被拦截");
+        assert!(!v.allowed, "cat with .. escape should be blocked");
         assert!(v.reason.as_deref().unwrap().contains(".."));
     }
 
-    // ── C-SEC-03: 凭据文件名模式读拦截 (cwd 内 / 任意位置) ──
+    // ── C-SEC-03: credential filename pattern read block (cwd / anywhere) ──
 
     #[test]
     fn is_sensitive_filename_blocks_credential_patterns() {
         let g = guard();
-        assert!(g.is_sensitive_filename("secrets.pem"), "pem 应拦");
-        assert!(g.is_sensitive_filename("/tmp/x.key"), "绝对 .key 应拦");
-        assert!(g.is_sensitive_filename("id_rsa"), "id_rsa 应拦");
-        assert!(g.is_sensitive_filename("id_rsa_backup"), "id_rsa_ 前缀应拦");
-        assert!(g.is_sensitive_filename("cert.p12"), "p12 应拦");
-        assert!(g.is_sensitive_filename("server.pfx"), "pfx 应拦");
-        assert!(g.is_sensitive_filename("CA.keystore"), "keystore 应拦");
+        assert!(
+            g.is_sensitive_filename("secrets.pem"),
+            "pem should be blocked"
+        );
+        assert!(
+            g.is_sensitive_filename("/tmp/x.key"),
+            "absolute .key should be blocked"
+        );
+        assert!(
+            g.is_sensitive_filename("id_rsa"),
+            "id_rsa should be blocked"
+        );
+        assert!(
+            g.is_sensitive_filename("id_rsa_backup"),
+            "id_rsa_ prefix should be blocked"
+        );
+        assert!(g.is_sensitive_filename("cert.p12"), "p12 should be blocked");
+        assert!(
+            g.is_sensitive_filename("server.pfx"),
+            "pfx should be blocked"
+        );
+        assert!(
+            g.is_sensitive_filename("CA.keystore"),
+            "keystore should be blocked"
+        );
         assert!(
             g.is_sensitive_filename("./creds/agent.key"),
-            "相对 .key 应拦"
+            "relative .key should be blocked"
         );
     }
 
     #[test]
     fn is_sensitive_filename_allows_public_key_and_normal() {
         let g = guard();
-        assert!(!g.is_sensitive_filename("id_rsa.pub"), "公钥 .pub 不拦");
-        assert!(!g.is_sensitive_filename("app.py"), "普通文件不拦");
-        assert!(!g.is_sensitive_filename("README.md"), "普通文件不拦");
-        assert!(!g.is_sensitive_filename(""), "空名不拦");
-        assert!(!g.is_sensitive_filename("not_a_key.pem.txt"), "伪后缀不拦");
+        assert!(
+            !g.is_sensitive_filename("id_rsa.pub"),
+            "public key .pub is not blocked"
+        );
+        assert!(
+            !g.is_sensitive_filename("app.py"),
+            "normal files are not blocked"
+        );
+        assert!(
+            !g.is_sensitive_filename("README.md"),
+            "normal files are not blocked"
+        );
+        assert!(!g.is_sensitive_filename(""), "empty names are not blocked");
+        assert!(
+            !g.is_sensitive_filename("not_a_key.pem.txt"),
+            "fake suffixes are not blocked"
+        );
     }
 
     #[test]
     fn blocks_cat_credential_filename() {
         let v = guard().validate("cat cert.pem");
-        assert!(!v.allowed, "cat cert.pem 应被拦截");
-        assert!(v.reason.as_deref().unwrap().contains("凭据文件"));
+        assert!(!v.allowed, "cat cert.pem should be blocked");
+        assert!(v.reason.as_deref().unwrap().contains("credential file"));
     }
 
     #[test]
     fn blocks_grep_id_rsa_filename() {
         let v = guard().validate("grep foo id_rsa");
-        assert!(!v.allowed, "grep id_rsa 应被拦截");
+        assert!(!v.allowed, "grep id_rsa should be blocked");
         assert!(v.reason.as_deref().unwrap().contains("C-SEC-03"));
     }
 
     #[test]
     fn blocks_head_credential_filename() {
         let v = guard().validate("head secret.key");
-        assert!(!v.allowed, "head secret.key 应被拦截");
+        assert!(!v.allowed, "head secret.key should be blocked");
     }
 
     #[test]
     fn allows_cat_id_rsa_pub() {
         let v = guard().validate("cat id_rsa.pub");
-        assert!(v.allowed, "cat 公钥 id_rsa.pub 不应被拦截");
+        assert!(v.allowed, "cat public key id_rsa.pub should not be blocked");
     }
 
     #[test]
     fn allows_cat_normal_file() {
         let v = guard().validate("cat app.py");
-        assert!(v.allowed, "cat 普通文件应放行");
+        assert!(v.allowed, "cat on a normal file should be allowed");
     }
 
     #[test]
     fn blocks_less_sensitive() {
         let v = guard().validate("less /etc/sudoers");
-        assert!(!v.allowed, "less 敏感文件应被拦截");
+        assert!(!v.allowed, "less on a sensitive file should be blocked");
     }
 
-    // ── 正则黑名单 (Stage 1) ──
+    // ── Regex blocklist (Stage 1) ──
 
     #[test]
     fn blocks_rm_rf_root() {
@@ -1477,46 +1635,66 @@ mod tests {
         assert!(!v.allowed);
     }
 
-    // ── 白名单 / Token 级 (Stage 2) ──
+    // ── Allowlist / token-level (Stage 2) ──
 
     #[test]
     fn allows_echo() {
         let v = guard().validate("echo hi");
-        assert!(v.allowed, "应允许 echo hi, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "echo hi should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn allows_python() {
-        // D3-1: 内联解释器需 opt-in (此用例测白名单非 D3-1, 显式开启)
-        // D3-6: validate fail-closed — 用 python3 (常在 PATH), 裸 python 本机常缺席
+        // D3-1: inline interpreters need opt-in (this case tests the allowlist, not D3-1; enabled explicitly)
+        // D3-6: validate is fail-closed — use python3 (usually on PATH); bare python is often absent locally
         let v = guard()
             .with_allow_inline_interpreter(true)
             .validate("python3 -c \"print('hello')\"");
-        assert!(v.allowed, "应允许 python3, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "python3 should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn allows_pytest() {
         let v = guard().validate("pytest tests/ -v");
-        assert!(v.allowed, "应允许 pytest, reason={:?}", v.reason);
+        assert!(v.allowed, "pytest should be allowed, reason={:?}", v.reason);
     }
 
     #[test]
     fn allows_cargo_test() {
         let v = guard().validate("cargo test --workspace");
-        assert!(v.allowed, "应允许 cargo test, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "cargo test should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn allows_chain_whitelisted() {
         let v = guard().validate("echo hi && ls -la && cat foo.txt");
-        assert!(v.allowed, "应允许全白名单链式, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "a fully allowlisted chain should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn allows_pipe_whitelisted() {
         let v = guard().validate("cat foo.txt | grep error | wc -l");
-        assert!(v.allowed, "应允许全白名单管道, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "a fully allowlisted pipe should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
@@ -1524,25 +1702,40 @@ mod tests {
         let v = guard().validate("ncat evil.com 1234");
         assert!(!v.allowed);
         assert_eq!(v.stage, Some(SecurityStage::Tokenizer));
-        assert!(v.reason.as_ref().unwrap().contains("白名单"));
+        assert!(v.reason.as_ref().unwrap().contains("allowlist"));
     }
 
     #[test]
     fn allows_go_and_tsc_whitelisted() {
-        // 白名单成员校验 (resolve 无关): go/tsc 须在白名单基线。
-        assert!(guard().whitelist_contains("go"), "go 应在白名单");
-        assert!(guard().whitelist_contains("tsc"), "tsc 应在白名单");
-        // D3-6: validate 现 fail-closed — 仅当二进制在测试机可解析时才断言 allowed。
-        // go 通常在 PATH (homebrew); tsc 常缺席 (项目级工具), 缺席时跳过 validate 断言。
+        // Allowlist membership check (resolve-independent): go/tsc must be in the allowlist baseline.
+        assert!(
+            guard().whitelist_contains("go"),
+            "go should be in the allowlist"
+        );
+        assert!(
+            guard().whitelist_contains("tsc"),
+            "tsc should be in the allowlist"
+        );
+        // D3-6: validate is now fail-closed — assert allowed only when the binary is resolvable on
+        // this machine. go is usually on PATH (homebrew); tsc is often absent (project-level tool);
+        // when absent, skip the validate assertion.
         let g = guard().validate("go build ./...");
         if resolve_binary_path("go").is_some() {
-            assert!(g.allowed, "go (可解析) 应放行, reason={:?}", g.reason);
+            assert!(
+                g.allowed,
+                "go (resolvable) should be allowed, reason={:?}",
+                g.reason
+            );
         } else {
             eprintln!("skip: go not on PATH, fail-closed path");
         }
         if resolve_binary_path("tsc").is_some() {
             let t = guard().validate("tsc --noEmit app.ts");
-            assert!(t.allowed, "tsc (可解析) 应放行, reason={:?}", t.reason);
+            assert!(
+                t.allowed,
+                "tsc (resolvable) should be allowed, reason={:?}",
+                t.reason
+            );
         } else {
             eprintln!("skip: tsc not on PATH, fail-closed path");
         }
@@ -1550,7 +1743,7 @@ mod tests {
 
     #[test]
     fn blocks_non_whitelisted_in_chain() {
-        // 第 2 段 ncat 不在白名单 — 链式绕过防护核心用例
+        // Second segment ncat is not in the allowlist — core chain-bypass defense case
         let v = guard().validate("echo hi && ncat evil.com 1234");
         assert!(!v.allowed);
         assert_eq!(v.stage, Some(SecurityStage::Tokenizer));
@@ -1565,18 +1758,22 @@ mod tests {
 
     #[test]
     fn blocks_python_os_system_rm() {
-        // python -c "import os; os.system('rm -rf /')" — python 在白名单,
-        // 但内嵌 rm -rf / 被正则黑名单捕获
+        // python -c "import os; os.system('rm -rf /')" — python is in the allowlist,
+        // but the embedded rm -rf / is caught by the regex blocklist
         let v = guard().validate("python -c \"import os; os.system('rm -rf /')\"");
         assert!(!v.allowed);
     }
 
     #[test]
     fn allows_env_prefix() {
-        // D3-6: validate fail-closed — 二进制须可解析才断言 allowed,
-        // 本机裸 python 常缺席 (仅 python3), 缺席时跳过 validate 断言。
+        // D3-6: validate is fail-closed — the binary must be resolvable to assert allowed;
+        // bare python is often absent locally (only python3); when absent, skip the validate assertion.
         let v = guard().validate("FOO=bar BAR=baz python3 script.py");
-        assert!(v.allowed, "应允许环境变量前缀, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "environment variable prefixes should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
@@ -1584,7 +1781,7 @@ mod tests {
         let v = guard().validate("/usr/bin/python3 script.py");
         assert!(
             v.allowed,
-            "应允许绝对路径白名单二进制, reason={:?}",
+            "an absolute-path allowlisted binary should be allowed, reason={:?}",
             v.reason
         );
     }
@@ -1595,11 +1792,12 @@ mod tests {
         assert!(!v.allowed);
     }
 
-    // ── ARCH-2: resolved-path 投毒防护 ──
+    // ── ARCH-2: resolved-path poisoning guard ──
 
     #[test]
     fn arch2_rejects_planted_poison_binary() {
-        // 在非可信目录植入同名 python3 (真实可执行) → basename 命中白名单, 但 resolve 落非可信目录 → 拒。
+        // Plant a real same-name python3 in a non-trusted directory → basename matches the allowlist,
+        // but resolve lands outside trusted dirs → reject.
         let poison = std::env::temp_dir().join("python3");
         std::fs::write(&poison, "#!/bin/sh\necho pwned\n").unwrap();
         #[cfg(unix)]
@@ -1611,17 +1809,21 @@ mod tests {
         }
         let cmd = format!("{} -c \"print('hi')\"", poison.display());
         let v = guard().validate(&cmd);
-        assert!(!v.allowed, "投毒二进制应被拒, reason={:?}", v.reason);
         assert!(
-            v.reason.as_deref().unwrap().contains("可信目录"),
-            "应报可信目录原因"
+            !v.allowed,
+            "a poisoned binary should be rejected, reason={:?}",
+            v.reason
+        );
+        assert!(
+            v.reason.as_deref().unwrap().contains("trusted directories"),
+            "should report the trusted-directories reason"
         );
         let _ = std::fs::remove_file(&poison);
     }
 
     #[test]
     fn arch2_allows_system_python3() {
-        // /usr/bin/python3 在 TRUSTED_BIN_DIRS 基线内 → 放行 (若机器有该文件)。
+        // /usr/bin/python3 is inside the TRUSTED_BIN_DIRS baseline → allowed (if the machine has it).
         let p = Path::new("/usr/bin/python3");
         if !p.is_file() {
             eprintln!("skip: /usr/bin/python3 not present on this machine");
@@ -1630,16 +1832,24 @@ mod tests {
         let v = guard()
             .with_allow_inline_interpreter(true)
             .validate("/usr/bin/python3 -c \"print('hi')\"");
-        assert!(v.allowed, "系统 python3 应放行, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "system python3 should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn d311_blocks_inline_exec_payload_variants() {
-        // D3-11 (审计 0827 product): 内联解释器网关须覆盖 -c payload 所有变体, 不限危险词。
-        // agent-driven 模型可生成 exec()/os.system()/__import__ 等 one-liner 绕 regex 危险词枚举。
-        // 网关在 payload 内容前拦截 (binary+flag 级), 故任意 payload 一律拒 (默认 allow_inline=false)。
-        // 仅用白名单解释器 (python3/node) + 不含 Stage1 危险词 payload — 隔离测试网关本身
-        // (非白名单解释器如 ruby/perl 先被 Stage2 拦, 不达网关; 含危险词 payload 先被 Stage1 拦)。
+        // D3-11 (audit 0827 product): the inline interpreter gateway must cover all -c payload
+        // variants, not just dangerous words. An agent-driven model can generate exec()/os.system()/
+        // __import__ one-liners that bypass regex dangerous-word enumeration. The gateway blocks
+        // before the payload content (binary+flag level), so any payload is rejected by default
+        // (allow_inline=false).
+        // Only allowlisted interpreters (python3/node) + payloads without Stage1 dangerous words —
+        // isolates the gateway itself (non-allowlisted interpreters like ruby/perl are stopped at
+        // Stage2 first and never reach the gateway; payloads with dangerous words are stopped at
+        // Stage1 first).
         for cmd in [
             "python3 -c \"exec('print(1)')\"",
             "python3 -c \"__import__('socket')\"",
@@ -1650,40 +1860,42 @@ mod tests {
             let v = guard().validate(cmd);
             assert!(
                 !v.allowed,
-                "D3-11: 内联 -c/-e payload 须拒 (网关 binary+flag 级, 与 payload 无关): {cmd}, reason={:?}",
+                "D3-11: inline -c/-e payloads must be rejected (gateway is binary+flag level, payload-independent): {cmd}, reason={:?}",
                 v.reason
             );
             assert!(
                 v.reason.as_deref().unwrap_or("").contains("-c")
                     || v.reason.as_deref().unwrap_or("").contains("-e"),
-                "D3-11: 拒因须指 -c/-e 网关, 非 payload 危险词 (防误依赖 regex 枚举): reason={:?}",
+                "D3-11: the reject reason must point at the -c/-e gateway, not payload dangerous words (prevents relying on regex enumeration): reason={:?}",
                 v.reason
             );
         }
-        // 危险词 payload (含 rm -rf) 经 Stage1 拦 — 双层防御, 仍拒 (任一层拦即可)。
+        // Dangerous-word payload (contains rm -rf) is stopped at Stage1 — two-layer defense, still
+        // rejected (either layer blocking suffices).
         let v_danger = guard().validate("python3 -c \"os.system('rm -rf /')\"");
         assert!(
             !v_danger.allowed,
-            "D3-11: 含危险词 -c payload 须拒 (Stage1 或网关)"
+            "D3-11: dangerous-word -c payloads must be rejected (Stage1 or gateway)"
         );
-        // opt-in 后仍跑 (受信本地), payload 危险词由 Stage1/Stage2 regex 兜底。
+        // With opt-in it still runs (trusted local); payload dangerous words fall back to Stage1/Stage2 regex.
         let v2 = guard()
             .with_allow_inline_interpreter(true)
             .validate("python3 -c \"print('safe')\"");
         assert!(
             v2.allowed,
-            "D3-11: opt-in 后无害 -c 须放行, reason={:?}",
+            "D3-11: after opt-in, harmless -c should be allowed, reason={:?}",
             v2.reason
         );
     }
 
     #[test]
     fn d312_blocks_inline_exec_attached_form() {
-        // D3-12 (审计 0827 product adversarial): 附着形式 -cPAYLOAD / -ePAYLOAD 绕过网关。
-        // shell_words 不拆附着 token → python3 -c'print(1)' 单 token, 精确 matches!("-c") 漏。
-        // 真实解释器接受附着形式 (python3 -c'print("hi")' 执行; perl -e'print 1' 执行;
-        // ruby -e'puts 1' 执行), 故附着形式与空格分隔等价可执行 → 须同等拦截。
-        // 仅白名单解释器 + 无害 payload (隔离测网关本身)。
+        // D3-12 (audit 0827 product adversarial): attached forms -cPAYLOAD / -ePAYLOAD bypass the gateway.
+        // shell_words does not split attached tokens → python3 -c'print(1)' is one token and the exact
+        // matches!("-c") misses it. Real interpreters accept attached forms (python3 -c'print("hi")'
+        // executes; perl -e'print 1' executes; ruby -e'puts 1' executes), so attached forms are
+        // equivalent to space-separated and executable → must be blocked identically.
+        // Only allowlisted interpreters + harmless payloads (isolates the gateway itself).
         for cmd in [
             "python3 -cprint('hi')",
             "python3 -c'print(\"hi\")'",
@@ -1695,35 +1907,36 @@ mod tests {
             let v = guard().validate(cmd);
             assert!(
                 !v.allowed,
-                "D3-12: 附着形式 -cPAYLOAD 须拒 (与 -c 空格分隔等价可执行): {cmd}, reason={:?}",
+                "D3-12: attached -cPAYLOAD forms must be rejected (equivalent to -c with a space): {cmd}, reason={:?}",
                 v.reason
             );
         }
-        // 降级路径 (is_inline_interpreter) 亦须覆盖附着形式 — 防 guard 宕机时降级 fail-open。
-        let g = guard(); // allow_inline=false 默认
+        // The degrade path (is_inline_interpreter) must also cover attached forms — prevents fail-open
+        // degradation when guard is down.
+        let g = guard(); // allow_inline=false default
         for cmd in [
             "python3 -cprint('hi')",
             "python3 -c'import os; os.system(\"id\")'",
         ] {
             assert!(
                 g.is_inline_interpreter(cmd),
-                "D3-12: is_inline_interpreter 须识别附着 -cPAYLOAD (降级 fail-closed): {cmd}"
+                "D3-12: is_inline_interpreter must recognize attached -cPAYLOAD (degrade fail-closed): {cmd}"
             );
         }
-        // opt-in 后附着形式无害 payload 须放行 (受信本地)。
+        // After opt-in, attached-form harmless payloads must be allowed (trusted local).
         let v2 = guard()
             .with_allow_inline_interpreter(true)
             .validate("python3 -cprint('safe')");
         assert!(
             v2.allowed,
-            "D3-12: opt-in 后附着 -c 无害 payload 须放行, reason={:?}",
+            "D3-12: after opt-in, attached -c harmless payloads must be allowed, reason={:?}",
             v2.reason
         );
     }
 
     #[test]
     fn arch2_allows_path_resolved_python3() {
-        // bare `python3` 经 PATH 解析到 /opt/homebrew/bin/python3 或 /usr/bin/python3 → 放行。
+        // bare `python3` resolved via PATH to /opt/homebrew/bin/python3 or /usr/bin/python3 → allowed.
         if std::env::var("PATH")
             .ok()
             .and_then(|p| {
@@ -1740,16 +1953,18 @@ mod tests {
         let v = guard().validate("python3 --version");
         assert!(
             v.allowed,
-            "PATH 解析的 python3 应放行, reason={:?}",
+            "PATH-resolved python3 should be allowed, reason={:?}",
             v.reason
         );
     }
 
     #[test]
     fn arch2_unresolvable_binary_fail_closed() {
-        // D3-6: basename 命中白名单但二进制不存在 → resolve=None → fail-closed 拒 (非放行)。
-        // 用白名单内但此机器不存在的名字 (rustup 白名单基线, 本机无)。
-        // 若机器恰好有 rustup, resolve=Some → 走 starts_with 分支 (非本测试目标), skip。
+        // D3-6: basename matches the allowlist but the binary does not exist → resolve=None →
+        // fail-closed reject (not allowed). Uses a name that is allowlisted but absent on this
+        // machine (rustup is an allowlist baseline, absent locally).
+        // If the machine happens to have rustup, resolve=Some → takes the starts_with branch (not
+        // this test's target), skip.
         let probe = "rustup";
         if resolve_binary_path(probe).is_some() {
             eprintln!(
@@ -1761,39 +1976,41 @@ mod tests {
         let v = guard().validate(&format!("{} --version", probe));
         assert!(
             !v.allowed,
-            "不可解析的二进制应 fail-closed 拒 (D3-6), reason={:?}",
+            "an unresolvable binary should be fail-closed rejected (D3-6), reason={:?}",
             v.reason
         );
         assert!(
-            v.reason.as_deref().unwrap().contains("无法解析"),
-            "应报无法解析原因, got={:?}",
+            v.reason.as_deref().unwrap().contains("unresolvable"),
+            "should report the unresolvable reason, got={:?}",
             v.reason
         );
     }
 
     #[test]
     fn arch2_nonexistent_absolute_path_fail_closed() {
-        // D3-6: 绝对路径但文件不存在 → resolve=None → fail-closed 拒。
-        // basename 取白名单内名 (python3), 路径在 /tmp 不存在 → resolve=None。
-        // basename = nonexistent-fe-python3-xyz 不在白名单 → 会先被白名单拒, 非本测试目标。
-        // 故用白名单 basename + 不存在父目录: /tmp/fe_no_such_dir/python3。
+        // D3-6: absolute path but the file does not exist → resolve=None → fail-closed reject.
+        // basename takes an allowlisted name (python3), path under /tmp does not exist → resolve=None.
+        // basename = nonexistent-fe-python3-xyz is not in the allowlist → it would be rejected by the
+        // allowlist first, not this test's target. So use an allowlisted basename + nonexistent parent:
+        // /tmp/fe_no_such_dir/python3.
         let cmd = "/tmp/fe_no_such_dir_xyz/python3 -c \"print(1)\"";
         let v = guard().with_allow_inline_interpreter(true).validate(cmd);
         assert!(
             !v.allowed,
-            "不存在的绝对路径二进制应 fail-closed 拒 (D3-6), reason={:?}",
+            "a nonexistent absolute-path binary should be fail-closed rejected (D3-6), reason={:?}",
             v.reason
         );
         assert!(
-            v.reason.as_deref().unwrap().contains("无法解析"),
-            "应报无法解析原因 (非白名单原因), got={:?}",
+            v.reason.as_deref().unwrap().contains("unresolvable"),
+            "should report the unresolvable reason (not the allowlist reason), got={:?}",
             v.reason
         );
     }
 
     #[test]
     fn arch2_with_trusted_bin_dirs_allows_project_tool() {
-        // 项目 bin 目录扩展: myproj-runner 植入项目 bin → 加入可信目录 → 放行。
+        // Project bin directory extension: plant myproj-runner in a project bin → register the dir
+        // as trusted → allowed.
         let dir = std::env::temp_dir().join("fe_arch2_projbin");
         std::fs::create_dir_all(&dir).unwrap();
         let tool = dir.join("myproj-runner");
@@ -1805,7 +2022,7 @@ mod tests {
             perm.set_mode(0o755);
             std::fs::set_permissions(&tool, perm).unwrap();
         }
-        // 先把 myproj-runner 加入白名单 (项目工具), 再把目录加可信。
+        // First add myproj-runner to the allowlist (project tool), then register the directory as trusted.
         let g = guard()
             .with_extra_whitelist(&["myproj-runner"])
             .with_trusted_bin_dirs(&[dir.to_str().unwrap()]);
@@ -1813,7 +2030,7 @@ mod tests {
         let v = g.validate(&cmd);
         assert!(
             v.allowed,
-            "项目可信 bin 内工具应放行, reason={:?}",
+            "tools inside a trusted project bin should be allowed, reason={:?}",
             v.reason
         );
         let _ = std::fs::remove_file(&tool);
@@ -1822,7 +2039,7 @@ mod tests {
 
     #[test]
     fn arch2_rejects_poison_in_untrusted_dir_with_allowlist() {
-        // myproj-runner 在白名单但植入 /tmp (非可信) → 拒 (投毒)。
+        // myproj-runner is allowlisted but planted in /tmp (untrusted) → reject (poisoning).
         let poison = std::env::temp_dir().join("myproj-runner");
         std::fs::write(&poison, "#!/bin/sh\necho pwn\n").unwrap();
         #[cfg(unix)]
@@ -1835,12 +2052,16 @@ mod tests {
         let g = guard().with_extra_whitelist(&["myproj-runner"]);
         let cmd = format!("{} --version", poison.display());
         let v = g.validate(&cmd);
-        assert!(!v.allowed, "非可信目录投毒工具应拒, reason={:?}", v.reason);
-        assert!(v.reason.as_deref().unwrap().contains("可信目录"));
+        assert!(
+            !v.allowed,
+            "a poisoned tool in an untrusted directory should be rejected, reason={:?}",
+            v.reason
+        );
+        assert!(v.reason.as_deref().unwrap().contains("trusted directories"));
         let _ = std::fs::remove_file(&poison);
     }
 
-    // ── argv 级约束 ──
+    // ── argv-level constraints ──
 
     #[test]
     fn blocks_sed_inplace() {
@@ -1852,29 +2073,37 @@ mod tests {
     #[test]
     fn allows_sed_non_inplace() {
         let v = guard().validate("sed 's/old/new/g' file.txt");
-        assert!(v.allowed, "应允许非原地 sed, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "non-in-place sed should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn blocks_mv_to_etc() {
         let v = guard().validate("mv file.txt /etc/evil");
         assert!(!v.allowed);
-        assert!(v.reason.as_ref().unwrap().contains("敏感路径"));
+        assert!(v.reason.as_ref().unwrap().contains("sensitive path"));
     }
 
     #[test]
     fn allows_mv_relative() {
         let v = guard().validate("mv file.txt subdir/");
-        assert!(v.allowed, "应允许相对路径 mv, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "relative-path mv should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
-    // ── 重定向 ──
+    // ── Redirects ──
 
     #[test]
     fn blocks_redirect_to_ssh() {
         let v = guard().validate("echo key > ~/.ssh/authorized_keys");
         assert!(!v.allowed);
-        assert!(v.reason.as_ref().unwrap().contains("敏感路径"));
+        assert!(v.reason.as_ref().unwrap().contains("sensitive path"));
     }
 
     #[test]
@@ -1886,10 +2115,14 @@ mod tests {
     #[test]
     fn allows_redirect_to_cwd_file() {
         let v = guard().validate("echo data > out.txt");
-        assert!(v.allowed, "应允许重定向到 cwd 文件, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "redirect to a cwd file should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
-    // ── cwd 校验 ──
+    // ── cwd validation ──
 
     #[test]
     fn blocks_cwd_ssh() {
@@ -1923,52 +2156,52 @@ mod tests {
         assert!(!guard().whitelist_contains("ncat"));
     }
 
-    // ── C-SEC-05: 命令替换拒绝 ──
+    // ── C-SEC-05: command substitution rejection ──
 
     #[test]
     fn blocks_dollar_paren_substitution() {
         let v = guard().validate("echo $(id)");
         assert!(!v.allowed);
         assert_eq!(v.stage, Some(SecurityStage::Tokenizer));
-        assert!(v.reason.as_ref().unwrap().contains("命令替换"));
+        assert!(v.reason.as_ref().unwrap().contains("command substitution"));
     }
 
     #[test]
     fn blocks_backtick_substitution() {
         let v = guard().validate("echo `id`");
         assert!(!v.allowed);
-        assert!(v.reason.as_ref().unwrap().contains("命令替换"));
+        assert!(v.reason.as_ref().unwrap().contains("command substitution"));
     }
 
     #[test]
     fn blocks_process_substitution() {
         let v = guard().validate("cat <(ls)");
         assert!(!v.allowed);
-        assert!(v.reason.as_ref().unwrap().contains("进程替换"));
+        assert!(v.reason.as_ref().unwrap().contains("process substitution"));
     }
 
     #[test]
     fn blocks_heredoc_string() {
         let v = guard().validate("cat <<< hi");
         assert!(!v.allowed);
-        assert!(v.reason.as_ref().unwrap().contains("进程替换"));
+        assert!(v.reason.as_ref().unwrap().contains("process substitution"));
     }
 
     #[test]
     fn blocks_substitution_in_interpreter_payload() {
-        // python -c payload 内含 $(...) — 仍拒 (C-SEC-05 顶层扫全串)
+        // python -c payload containing $(...) — still rejected (C-SEC-05 scans the whole string at the top level)
         let v = guard().validate("python -c \"print('$(id)')\"");
         assert!(!v.allowed);
-        assert!(v.reason.as_ref().unwrap().contains("命令替换"));
+        assert!(v.reason.as_ref().unwrap().contains("command substitution"));
     }
 
-    // ── C-SEC-06: 换行分隔符拆分 ──
+    // ── C-SEC-06: newline separator splitting ──
 
     #[test]
     fn blocks_newline_separator() {
         let v = guard().validate("echo hi\nsudo id");
         assert!(!v.allowed);
-        // sudo 命中正则黑名单 (Stage1)
+        // sudo hits the regex blocklist (Stage1)
     }
 
     #[test]
@@ -1984,7 +2217,7 @@ mod tests {
         assert_eq!(v.stage, Some(SecurityStage::Tokenizer));
     }
 
-    // ── C-SEC-02: git 安全子白名单 ──
+    // ── C-SEC-02: git security sub-allowlist ──
 
     #[test]
     fn blocks_git_config() {
@@ -2003,15 +2236,27 @@ mod tests {
     #[test]
     fn allows_git_status() {
         let v = guard().validate("git status");
-        assert!(v.allowed, "git status 应允许, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "git status should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn allows_git_log_diff() {
         let v = guard().validate("git log --oneline -5");
-        assert!(v.allowed, "git log 应允许, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "git log should be allowed, reason={:?}",
+            v.reason
+        );
         let d = guard().validate("git diff HEAD~1");
-        assert!(d.allowed, "git diff 应允许, reason={:?}", d.reason);
+        assert!(
+            d.allowed,
+            "git diff should be allowed, reason={:?}",
+            d.reason
+        );
     }
 
     #[test]
@@ -2041,7 +2286,11 @@ mod tests {
     #[test]
     fn allows_find_simple() {
         let v = guard().validate("find . -name '*.py'");
-        assert!(v.allowed, "find 简单查询应允许, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "simple find queries should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     // ── M-SEC-02: awk system() ──
@@ -2056,25 +2305,33 @@ mod tests {
     #[test]
     fn allows_awk_simple() {
         let v = guard().validate("awk '{print $1}' file.txt");
-        assert!(v.allowed, "awk 简单应允许, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "simple awk should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
-    // ── M-SEC-03: tee 敏感目标 ──
+    // ── M-SEC-03: tee sensitive target ──
 
     #[test]
     fn blocks_tee_ssh() {
         let v = guard().validate("echo key | tee ~/.ssh/authorized_keys");
         assert!(!v.allowed);
-        assert!(v.reason.as_ref().unwrap().contains("敏感路径"));
+        assert!(v.reason.as_ref().unwrap().contains("sensitive path"));
     }
 
     #[test]
     fn allows_tee_cwd() {
         let v = guard().validate("echo data | tee out.txt");
-        assert!(v.allowed, "tee cwd 应允许, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "tee to cwd should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
-    // ── M-SEC-04: chmod 777 扩敏感路径 ──
+    // ── M-SEC-04: chmod 777 extended sensitive paths ──
 
     #[test]
     fn blocks_chmod_777_root() {
@@ -2096,20 +2353,20 @@ mod tests {
 
     #[test]
     fn blocks_chmod_777_dev_via_argv() {
-        // argv 级也拦截
+        // Also blocked at argv level
         let v = guard().validate("chmod 755 /dev/sda");
         assert!(!v.allowed);
         assert!(v.reason.as_ref().unwrap().contains("chmod"));
     }
 
-    // ── M-SEC-05/06: 空字节 + 长度上限 ──
+    // ── M-SEC-05/06: null byte + length cap ──
 
     #[test]
     fn blocks_null_byte() {
         let v = guard().validate("echo hi\0id");
         assert!(!v.allowed);
         assert_eq!(v.stage, Some(SecurityStage::Regex));
-        assert!(v.reason.as_ref().unwrap().contains("空字节"));
+        assert!(v.reason.as_ref().unwrap().contains("null byte"));
     }
 
     #[test]
@@ -2117,10 +2374,10 @@ mod tests {
         let big = "echo ".to_string() + &"a".repeat(MAX_COMMAND_LEN);
         let v = guard().validate(&big);
         assert!(!v.allowed);
-        assert!(v.reason.as_ref().unwrap().contains("超长"));
+        assert!(v.reason.as_ref().unwrap().contains("too long"));
     }
 
-    // ── M-SEC-07: cd 敏感路径 ──
+    // ── M-SEC-07: cd sensitive path ──
 
     #[test]
     fn blocks_cd_etc() {
@@ -2135,14 +2392,18 @@ mod tests {
         assert!(!v.allowed);
     }
 
-    // ── 回归: 解释器 -c 仍允许 (用户决策保留) ──
+    // ── Regression: interpreter -c still allowed (user decision to keep) ──
 
     #[test]
     fn allows_python_c_inline() {
         let v = guard()
             .with_allow_inline_interpreter(true)
             .validate("python3 -c \"print('hello')\"");
-        assert!(v.allowed, "python -c 应保留允许, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "python -c should remain allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
@@ -2150,87 +2411,91 @@ mod tests {
         let v = guard()
             .with_allow_inline_interpreter(true)
             .validate("node -e \"console.log(1)\"");
-        assert!(v.allowed, "node -e 应保留允许, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "node -e should remain allowed, reason={:?}",
+            v.reason
+        );
     }
 
-    // ── Issue #5: 凭据目录敏感路径防护 ──
+    // ── Issue #5: credential directory sensitive-path protection ──
 
     #[test]
     fn blocks_cat_aws_credentials() {
         let v = guard().validate("cat ~/.aws/credentials");
-        assert!(!v.allowed, "cat AWS 凭据应被拦截");
-        assert!(v.reason.as_deref().unwrap().contains("敏感路径"));
+        assert!(!v.allowed, "cat AWS credentials should be blocked");
+        assert!(v.reason.as_deref().unwrap().contains("sensitive path"));
     }
 
     #[test]
     fn blocks_cat_gnupg() {
         let v = guard().validate("cat ~/.gnupg/secring.gpg");
-        assert!(!v.allowed, "cat GPG 私钥环应被拦截");
+        assert!(!v.allowed, "cat GPG keyring should be blocked");
     }
 
     #[test]
     fn blocks_cat_kube_config() {
         let v = guard().validate("cat ~/.kube/config");
-        assert!(!v.allowed, "cat K8s config 应被拦截");
+        assert!(!v.allowed, "cat K8s config should be blocked");
     }
 
     #[test]
     fn blocks_cat_netrc() {
         let v = guard().validate("cat ~/.netrc");
-        assert!(!v.allowed, "cat .netrc 凭据应被拦截");
+        assert!(!v.allowed, "cat .netrc credentials should be blocked");
     }
 
     #[test]
     fn blocks_cat_npmrc() {
         let v = guard().validate("cat ~/.npmrc");
-        assert!(!v.allowed, "cat .npmrc token 应被拦截");
+        assert!(!v.allowed, "cat .npmrc token should be blocked");
     }
 
     #[test]
     fn blocks_cat_gcloud_creds() {
         let v = guard().validate("cat ~/.config/gcloud/credentials.db");
-        assert!(!v.allowed, "cat gcloud 凭据应被拦截");
+        assert!(!v.allowed, "cat gcloud credentials should be blocked");
     }
 
     #[test]
     fn blocks_cat_password_store() {
         let v = guard().validate("cat ~/.password-store/email.gpg");
-        assert!(!v.allowed, "cat pass 密码库应被拦截");
+        assert!(!v.allowed, "cat pass password store should be blocked");
     }
 
     #[test]
     fn blocks_cat_docker_creds() {
         let v = guard().validate("cat ~/.docker/config.json");
-        assert!(!v.allowed, "cat docker 凭据应被拦截");
+        assert!(!v.allowed, "cat docker credentials should be blocked");
     }
 
     #[test]
     fn blocks_redirect_to_aws() {
         let v = guard().validate("echo key > ~/.aws/credentials");
-        assert!(!v.allowed, "写 AWS 凭据应被拦截");
-        assert!(v.reason.as_deref().unwrap().contains("敏感路径"));
+        assert!(!v.allowed, "writing AWS credentials should be blocked");
+        assert!(v.reason.as_deref().unwrap().contains("sensitive path"));
     }
 
     #[test]
     fn blocks_cwd_gnupg() {
         let v = guard().validate_cwd("~/.gnupg");
-        assert!(!v.allowed, "cwd ~/.gnupg 应被拦截");
+        assert!(!v.allowed, "cwd ~/.gnupg should be blocked");
     }
 
     #[test]
     fn blocks_mv_to_password_store() {
         let v = guard().validate("mv file.txt ~/.password-store/evil");
-        assert!(!v.allowed, "mv 到密码库应被拦截");
+        assert!(!v.allowed, "mv into the password store should be blocked");
     }
 
     #[test]
     fn blocks_grep_aws_subtree() {
-        // 子树访问 — ~/.aws/credentials 在 ~/.aws 下应被拦
+        // Subtree access — ~/.aws/credentials under ~/.aws should be blocked
         let v = guard().validate("grep AKIA ~/.aws/credentials");
-        assert!(!v.allowed, "grep AWS 子树应被拦截");
+        assert!(!v.allowed, "grep AWS subtree should be blocked");
     }
 
-    // ── Issue #10: 白名单覆盖 + 项目扩展 + 动态执行拦截 + split_chain 边界 ──
+    // ── Issue #10: allowlist coverage + project extensions + dynamic execution blocks + split_chain edges ──
 
     #[test]
     fn whitelist_covers_common_agent_toolset() {
@@ -2239,13 +2504,18 @@ mod tests {
             "rg", "fd", "jq", "gh", "make", "cmake", "bun", "deno", "uv", "pip", "cargo", "npm",
             "pnpm", "yarn", "go", "rustc", "swift", "python3", "git", "tsc",
         ] {
-            assert!(g.whitelist_contains(name), "白名单应含: {}", name);
+            assert!(
+                g.whitelist_contains(name),
+                "allowlist should contain: {}",
+                name
+            );
         }
     }
 
     #[test]
     fn with_extra_whitelist_allows_project_tool() {
-        // D3-6: validate 现 fail-closed — 项目工具须真实存在于可信目录才能 resolve 通过。
+        // D3-6: validate is now fail-closed — a project tool must really exist in a trusted
+        // directory to pass resolve.
         let dir = std::env::temp_dir().join("fe_proj_tool_dir");
         std::fs::create_dir_all(&dir).unwrap();
         let tool = dir.join("myproj-runner");
@@ -2262,30 +2532,40 @@ mod tests {
             .with_trusted_bin_dirs(&[dir.to_str().unwrap()]);
         let cmd = format!("{} --version", tool.display());
         let v = g.validate(&cmd);
-        assert!(v.allowed, "项目扩展工具应放行: {:?}", v.reason);
+        assert!(
+            v.allowed,
+            "project extension tools should be allowed: {:?}",
+            v.reason
+        );
         let _ = std::fs::remove_file(&tool);
         let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
     fn with_extra_whitelist_rejects_shell_interpreter() {
-        // 解释器/内建不可经项目扩展自我后门
-        // 用 guard() 登记 venv 可信目录 — 否则 ARCH-2 resolved-path 拦 venv python3,
-        // 干扰 "基线工具不受影响" 断言 (基线放行的前提是可信目录已登记)。
+        // Interpreters/builtins cannot self-backdoor via project extensions
+        // Uses guard() to register the venv trusted directory — otherwise ARCH-2 resolved-path
+        // blocks venv python3 and interferes with the "baseline tools unaffected" assertion
+        // (the baseline allows only because trusted directories are registered).
         let g = guard().with_extra_whitelist(&["bash", "sh", "exec", "eval"]);
         for cmd in ["bash -c 'x'", "sh -c 'x'", "eval 'x'", "exec foo"] {
             let v = g.validate(cmd);
-            assert!(!v.allowed, "危险扩展项应仍被拦: {}", cmd);
+            assert!(
+                !v.allowed,
+                "dangerous extension entries must still be blocked: {}",
+                cmd
+            );
         }
-        // 基线工具不受扩展拒绝影响
+        // Baseline tools are unaffected by extension rejections
         let v = g.validate("python3 --version");
-        assert!(v.allowed, "基线工具不受影响: {:?}", v.reason);
+        assert!(v.allowed, "baseline tools are unaffected: {:?}", v.reason);
     }
 
     #[test]
     fn d3_1_inline_interpreter_blocked_by_default() {
-        // D3-1 (审计 0827 product): 企业硬化默认拒内联解释器 (python -c / node -e / ruby -e / perl -e),
-        // 防 agent-driven 任意 payload 绕白名单语义。Default SecurityGuard::new() 即拦。
+        // D3-1 (audit 0827 product): enterprise-hardening default rejects inline interpreters
+        // (python -c / node -e / ruby -e / perl -e), preventing agent-driven arbitrary payloads
+        // bypassing allowlist semantics. Default SecurityGuard::new() blocks them.
         let g = guard();
         for cmd in [
             "python3 -c 'print(1)'",
@@ -2296,19 +2576,23 @@ mod tests {
             "perl5 -e 'print 1'",
         ] {
             let v = g.validate(cmd);
-            assert!(!v.allowed, "D3-1 默认应拒内联解释器: {}", cmd);
+            assert!(
+                !v.allowed,
+                "D3-1 default should reject inline interpreters: {}",
+                cmd
+            );
         }
     }
 
     #[test]
     fn d3_1_inline_interpreter_opt_in_allows() {
-        // D3-1: with_allow_inline_interpreter(true) opt-in 保留内联执行能力 (测试机/本地交互)。
+        // D3-1: with_allow_inline_interpreter(true) opt-in keeps inline execution (test machines/local interactive).
         let g = guard().with_allow_inline_interpreter(true);
         for cmd in ["python3 -c 'print(1)'", "node -e 'console.log(1)'"] {
             let v = g.validate(cmd);
             assert!(
                 v.allowed,
-                "D3-1 opt-in 应放行内联解释器: {} — {:?}",
+                "D3-1 opt-in should allow inline interpreters: {} — {:?}",
                 cmd, v.reason
             );
         }
@@ -2316,13 +2600,14 @@ mod tests {
 
     #[test]
     fn d3_1_inline_interpreter_preserves_normal_binary_use() {
-        // D3-1: 网关只拦 -c/-e/--eval/-p/--print; 普通解释器调用 (python3 script.py) 不受影响。
+        // D3-1: the gateway only blocks -c/-e/--eval/-p/--print; normal interpreter invocations
+        // (python3 script.py) are unaffected.
         let g = guard();
         for cmd in ["python3 --version", "python3 -m pytest", "node --version"] {
             let v = g.validate(cmd);
             assert!(
                 v.allowed,
-                "D3-1 不应影响普通解释器调用: {} — {:?}",
+                "D3-1 must not affect normal interpreter invocations: {} — {:?}",
                 cmd, v.reason
             );
         }
@@ -2330,12 +2615,12 @@ mod tests {
 
     #[test]
     fn blocks_eval_dynamic_exec() {
-        // 用不含 rm-rf 的 payload, 确保命中的是 eval 规则而非 rm-rf 规则
+        // Uses a payload without rm-rf to ensure the eval rule is what matched, not the rm-rf rule
         let v = guard().validate("eval 'echo hi'");
-        assert!(!v.allowed, "eval 应被拦");
+        assert!(!v.allowed, "eval should be blocked");
         assert!(
             v.reason.as_deref().unwrap().contains("eval"),
-            "reason 应提及 eval"
+            "reason should mention eval"
         );
     }
 
@@ -2354,65 +2639,80 @@ mod tests {
     #[test]
     fn blocks_bash_c_dynamic_script() {
         let v = guard().validate("bash -c 'echo pwned'");
-        assert!(!v.allowed, "bash -c 应被拦");
+        assert!(!v.allowed, "bash -c should be blocked");
         let v = guard().validate("sh -c 'echo pwned'");
-        assert!(!v.allowed, "sh -c 应被拦");
+        assert!(!v.allowed, "sh -c should be blocked");
     }
 
     #[test]
     fn blocks_base64_pipe_to_shell() {
         let v = guard().validate("echo aGVsbG8= | base64 -d | sh");
-        assert!(!v.allowed, "base64 -d | sh 应被拦");
+        assert!(!v.allowed, "base64 -d | sh should be blocked");
     }
 
     #[test]
     fn blocks_any_pipe_to_shell() {
         let v = guard().validate("echo 'rm -rf /' | sh");
-        assert!(!v.allowed, "echo | sh 应被拦");
+        assert!(!v.allowed, "echo | sh should be blocked");
         let v = guard().validate("printf 'pwn' | bash");
-        assert!(!v.allowed, "printf | bash 应被拦");
+        assert!(!v.allowed, "printf | bash should be blocked");
     }
 
     #[test]
     fn allows_pipe_to_non_shell() {
-        // 管道到非解释器工具应放行 (防误拦)
+        // Pipes to non-interpreter tools should be allowed (prevents false blocks)
         let v = guard().validate("echo hi | grep hi");
-        assert!(v.allowed, "echo | grep 应放行: {:?}", v.reason);
+        assert!(v.allowed, "echo | grep should be allowed: {:?}", v.reason);
         let v = guard().validate("git log --oneline | head -5");
-        assert!(v.allowed, "git log | head 应放行: {:?}", v.reason);
+        assert!(
+            v.allowed,
+            "git log | head should be allowed: {:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn split_chain_handles_quoted_operators() {
-        // 引号内 && 不应拆段
+        // && inside quotes must not split segments
         let v = guard().validate("echo \"a && b\"");
-        assert!(v.allowed, "引号内 && 应作字面量: {:?}", v.reason);
+        assert!(
+            v.allowed,
+            "&& inside quotes should be literal: {:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn split_chain_handles_single_quoted_pipe() {
         let v = guard().validate("echo 'a | b'");
-        assert!(v.allowed, "单引号内 | 应作字面量: {:?}", v.reason);
+        assert!(
+            v.allowed,
+            "| inside single quotes should be literal: {:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn split_chain_newline_is_separator() {
-        // 换行作分隔符 — 第二段非白名单应拦
+        // Newline as separator — a non-allowlisted second segment must be blocked
         let v = guard().validate("echo hi\nbashbadthing");
-        assert!(!v.allowed, "换行分隔后非白名单二进制应拦");
+        assert!(
+            !v.allowed,
+            "non-allowlisted binaries after a newline separator should be blocked"
+        );
     }
 
     #[test]
     fn split_chain_heredoc_body_validated() {
-        // heredoc 主体含 rm -rf / 应被正则拦截 (无绕过)
+        // A heredoc body containing rm -rf / should be caught by the regex blocklist (no bypass)
         let v = guard().validate("cat <<EOF\nrm -rf /\nEOF");
-        assert!(!v.allowed, "heredoc 内 rm -rf 应被拦");
+        assert!(!v.allowed, "rm -rf inside a heredoc should be blocked");
     }
 
     #[test]
     fn reload_extras_replaces_not_accumulates() {
-        // m-OPS-02: reload 重建语义 — 旧扩展丢弃, 新 extras 生效, 基线恒在
-        // D3-6: validate 现 fail-closed — tool-c 须真实存在于可信目录才能 resolve 通过。
+        // m-OPS-02: reload rebuild semantics — old extensions dropped, new extras take effect, baseline stays
+        // D3-6: validate is now fail-closed — tool-c must really exist in a trusted directory to pass resolve.
         let dir = std::env::temp_dir().join("fe_reload_extras_dir");
         std::fs::create_dir_all(&dir).unwrap();
         let tool_c = dir.join("tool-c");
@@ -2428,28 +2728,32 @@ mod tests {
             .with_extra_whitelist(&["tool-a", "tool-b"])
             .with_trusted_bin_dirs(&[dir.to_str().unwrap()]);
         assert!(g.whitelist_contains("tool-a") && g.whitelist_contains("tool-b"));
-        // reload 仅给 tool-c → tool-a/tool-b 应消失 (非累加), tool-c 在, 基线 python 在
+        // Reload only grants tool-c → tool-a/tool-b should disappear (non-accumulating), tool-c
+        // present, baseline python present
         g.reload_extras(&["tool-c"]);
         assert!(
             !g.whitelist_contains("tool-a"),
-            "reload 应丢弃旧扩展 tool-a"
+            "reload should drop the old extension tool-a"
         );
         assert!(
             !g.whitelist_contains("tool-b"),
-            "reload 应丢弃旧扩展 tool-b"
+            "reload should drop the old extension tool-b"
         );
-        assert!(g.whitelist_contains("tool-c"), "reload 应含新扩展 tool-c");
-        assert!(g.whitelist_contains("python"), "基线恒在");
-        // 验证放行生效 (tool-c 在可信目录 + 白名单 → resolve 通过)
+        assert!(
+            g.whitelist_contains("tool-c"),
+            "reload should include the new extension tool-c"
+        );
+        assert!(g.whitelist_contains("python"), "the baseline always stays");
+        // Verify the allow takes effect (tool-c in a trusted directory + allowlist → resolve passes)
         let cmd = format!("{} --version", tool_c.display());
         assert!(
             g.validate(&cmd).allowed,
-            "新扩展 tool-c 应放行, reason={:?}",
+            "the new extension tool-c should be allowed, reason={:?}",
             g.validate(&cmd).reason
         );
         assert!(
             !g.validate("tool-a --version").allowed,
-            "旧扩展 tool-a 应已拦 (白名单缺失, resolve 前拒)"
+            "the old extension tool-a should now be blocked (missing from allowlist, rejected before resolve)"
         );
         let _ = std::fs::remove_file(&tool_c);
         let _ = std::fs::remove_dir(&dir);
@@ -2457,209 +2761,276 @@ mod tests {
 
     #[test]
     fn reload_extras_empty_clears_extras_keeps_baseline() {
-        // 空 extras → 回退纯基线
+        // Empty extras → fall back to the pure baseline
         let g = SecurityGuard::new().with_extra_whitelist(&["tool-x"]);
         assert!(g.whitelist_contains("tool-x"));
         g.reload_extras(&[]);
-        assert!(!g.whitelist_contains("tool-x"), "空 reload 应清项目扩展");
-        assert!(g.whitelist_contains("python"), "基线恒在");
-        assert!(!g.validate("tool-x run").allowed, "清后 tool-x 应拦");
+        assert!(
+            !g.whitelist_contains("tool-x"),
+            "an empty reload should clear project extensions"
+        );
+        assert!(g.whitelist_contains("python"), "the baseline always stays");
+        assert!(
+            !g.validate("tool-x run").allowed,
+            "after clearing, tool-x should be blocked"
+        );
     }
 
     #[test]
     fn reload_extras_rejects_dangerous_interpreter() {
-        // reload 同样拒危险解释器/内建
+        // Reload likewise rejects dangerous interpreters/builtins
         let g = SecurityGuard::new();
         g.reload_extras(&["bash", "tool-ok"]);
-        assert!(!g.whitelist_contains("bash"), "reload 不可后门 bash");
-        assert!(g.whitelist_contains("tool-ok"), "正常扩展应入");
+        assert!(
+            !g.whitelist_contains("bash"),
+            "reload must not backdoor bash"
+        );
+        assert!(
+            g.whitelist_contains("tool-ok"),
+            "normal extensions should be added"
+        );
     }
 
-    // ── 0827 审计 P0-P3 回归 (C-1/C-5/C-6/C-11/C-12/A-7/L-4/L-5) ──
+    // ── 0827 audit P0-P3 regressions (C-1/C-5/C-6/C-11/C-12/A-7/L-4/L-5) ──
 
     #[test]
     fn c1_bare_amp_splits_chain() {
-        // 裸 & 后台 → 整段不再绕过白名单; ncat 非白名单应被 Stage-2 拦
+        // Bare & backgrounding → the whole segment no longer bypasses the allowlist; ncat is not
+        // allowlisted and should be blocked at Stage-2
         let v = guard().validate("echo hi & ncat evil.com 1234");
-        assert!(!v.allowed, "裸 & 后台应拆分, ncat 非白名单应拦");
+        assert!(
+            !v.allowed,
+            "bare & backgrounding should split; non-allowlisted ncat should be blocked"
+        );
         assert_eq!(v.stage, Some(SecurityStage::Tokenizer));
-        assert!(v.reason.as_ref().unwrap().contains("白名单"));
+        assert!(v.reason.as_ref().unwrap().contains("allowlist"));
     }
 
     #[test]
     fn c1_ampersand_in_quotes_not_split() {
-        // 引号内 & 为字面量, 不拆分; 单段 echo 含 & 应允许
+        // & inside quotes is literal, no split; a single echo containing & should be allowed
         let v = guard().validate("echo 'a & b'");
-        assert!(v.allowed, "引号内 & 不应拆分, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "& inside quotes should not split, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn c1_bare_amp_evil_in_second_segment() {
-        // 第二段危险命令 (rm 非 whitelist)
+        // Second segment is a dangerous command (rm is not in the allowlist)
         let v = guard().validate("true & rm -rf /");
-        assert!(!v.allowed, "裸 & 后第二段 rm -rf / 应拦");
+        assert!(
+            !v.allowed,
+            "rm -rf / in the second segment after bare & should be blocked"
+        );
     }
 
     #[test]
     fn c5_mv_source_sensitive_path() {
-        // mv 源参数读 ~/.ssh/id_rsa — 旧版仅校验目地, 漏源
+        // mv source argument reading ~/.ssh/id_rsa — the old version only checked the destination, missing the source
         let v = guard().validate("mv ~/.ssh/id_rsa /tmp/x");
-        assert!(!v.allowed, "mv 敏感源应拦, reason={:?}", v.reason);
+        assert!(
+            !v.allowed,
+            "mv with a sensitive source should be blocked, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn c5_cp_sensitive_filename_source() {
-        // cp 源为凭据文件名模式 (任意位置 *.pem)
+        // cp source is a credential filename pattern (*.pem anywhere)
         let v = guard().validate("cp foo.pem /tmp/out");
-        assert!(!v.allowed, "cp 凭据文件名源应拦");
+        assert!(
+            !v.allowed,
+            "cp with a credential filename source should be blocked"
+        );
     }
 
     #[test]
     fn c5_mv_dotdot_escape() {
-        // mv 含 .. 组件拒绝
+        // mv containing .. components is rejected
         let v = guard().validate("mv ../../etc/passwd /tmp/x");
-        assert!(!v.allowed, "mv .. 逃逸应拦");
+        assert!(!v.allowed, "mv with .. escape should be blocked");
     }
 
     #[test]
     fn c5_mv_normal_allowed() {
-        // 正常 mv 应允许
+        // Normal mv should be allowed
         let v = guard().validate("mv a.txt b.txt");
-        assert!(v.allowed, "正常 mv 应允许, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "normal mv should be allowed, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn c6_force_push_main_any_order() {
-        // `git push origin main --force` — force 在 main 之后, 旧正则漏
+        // `git push origin main --force` — force after main, the old regex missed it
         let v = guard().validate("git push origin main --force");
-        assert!(!v.allowed, "force-push 主分支任意顺序应拦");
+        assert!(
+            !v.allowed,
+            "force-push to a main branch in any order should be blocked"
+        );
     }
 
     #[test]
     fn c6_force_push_short_flag_after() {
         let v = guard().validate("git push origin master -f");
-        assert!(!v.allowed, "force-push -f 在 master 之后应拦");
+        assert!(
+            !v.allowed,
+            "force-push with -f after master should be blocked"
+        );
     }
 
     #[test]
     fn c6_force_push_nonmain_allowed() {
-        // force-push 普通分支不拦 (仅 main/master)
+        // force-push to a normal branch is not blocked (only main/master)
         let v = guard().validate("git push --force origin feature-branch");
-        assert!(v.allowed, "force-push 普通分支不拦, reason={:?}", v.reason);
+        assert!(
+            v.allowed,
+            "force-push to a normal branch is not blocked, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn c11_tilde_user_cwd_rejected() {
-        // `~root` 用户名展开 cwd — 视为可疑
+        // `~root` username expansion as cwd — treated as suspicious
         let v = guard().validate_cwd("~root");
-        assert!(!v.allowed, "~user cwd 应拒");
+        assert!(!v.allowed, "~user cwd should be rejected");
     }
 
     #[test]
     fn c11_tilde_user_redirect_rejected() {
-        // `~root/x` 重定向目标 — 视为可疑
+        // `~root/x` as a redirect target — treated as suspicious
         let v = guard().validate("echo hi > ~root/.ssh/authorized_keys");
-        assert!(!v.allowed, "~user 重定向应拒, reason={:?}", v.reason);
+        assert!(
+            !v.allowed,
+            "~user redirects should be rejected, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn c11_normal_tilde_allowed() {
-        // `~/` 正常家目录展开不误伤
+        // `~/` normal home expansion is not a false positive
         let v = guard().validate_cwd("~/projects");
-        assert!(v.allowed, "~/ 应允许, reason={:?}", v.reason);
+        assert!(v.allowed, "~/ should be allowed, reason={:?}", v.reason);
     }
 
     #[test]
     fn c12_redirect_dotdot_rejected() {
-        // 重定向目标含 .. 组件拒绝
+        // Redirect targets containing .. components are rejected
         let v = guard().validate("echo hi > ../escape.txt");
-        assert!(!v.allowed, "重定向 .. 应拒, reason={:?}", v.reason);
+        assert!(
+            !v.allowed,
+            "redirect with .. should be rejected, reason={:?}",
+            v.reason
+        );
     }
 
     #[test]
     fn a7_cwd_dotdot_rejected() {
         let v = guard().validate_cwd("../escape");
-        assert!(!v.allowed, "cwd .. 应拒");
+        assert!(!v.allowed, "cwd with .. should be rejected");
     }
 
     #[test]
     fn l4_rm_split_flags_root() {
-        // `rm -r -f /` 拆分标志 — 旧正则漏 (要求合并 -rf)
+        // `rm -r -f /` split flags — the old regex missed it (required merged -rf)
         let v = guard().validate("rm -r -f /");
-        assert!(!v.allowed, "rm 拆分标志根目录应拦");
+        assert!(!v.allowed, "rm with split flags on root should be blocked");
     }
 
     #[test]
     fn l4_rm_long_flags_root() {
         // `rm --recursive --force /`
         let v = guard().validate("rm --recursive --force /");
-        assert!(!v.allowed, "rm 长标志根目录应拦");
+        assert!(!v.allowed, "rm with long flags on root should be blocked");
     }
 
     #[test]
     fn l5_su_dash_root() {
-        // `su - root` — root 在 - 之后, 旧正则 `su\s+root` 漏
+        // `su - root` — root after -, the old regex `su\s+root` missed it
         let v = guard().validate("su - root");
-        assert!(!v.allowed, "su - root 应拦");
+        assert!(!v.allowed, "su - root should be blocked");
     }
 
     #[test]
     fn l5_su_root_trailing() {
         // `su root -`
         let v = guard().validate("su root -");
-        assert!(!v.allowed, "su root - 应拦");
+        assert!(!v.allowed, "su root - should be blocked");
     }
 
-    // ── 0827 审计 A-1 回归 (validate_argv 默认 arm) ──
+    // ── 0827 audit A-1 regression (validate_argv default arm) ──
 
-    // A-1: 只读无害二进制 (ls) 无专门 arm → Ok (READONLY_NOARM_BINARY 静默放行)
+    // A-1: read-only harmless binaries (ls) without a dedicated arm → Ok (READONLY_NOARM_BINARY silently allows)
     #[test]
     fn a1_readonly_noarm_binary_allowed() {
         let v = guard().validate("ls -la /tmp");
-        assert!(v.allowed, "只读 ls 应允许, reason={:?}", v.reason);
-        assert_eq!(v.stage, None, "通过校验无拦截 stage");
+        assert!(
+            v.allowed,
+            "read-only ls should be allowed, reason={:?}",
+            v.reason
+        );
+        assert_eq!(
+            v.stage, None,
+            "passing validation carries no blocking stage"
+        );
     }
 
-    // A-1: 工具链二进制 (cargo, 白名单内) 无专门 arm → warn 但 Ok (不破 trusted-caller 工具链)
-    // 真实威胁由 seatbelt C-SEC-02 + UDS 鉴权 M-SEC-01 纵深封堵, 非 argv 校验
+    // A-1: toolchain binaries (cargo, allowlisted) without a dedicated arm → warn but Ok (does not
+    // break the trusted-caller toolchain). Real threats are covered by seatbelt C-SEC-02 + UDS auth
+    // M-SEC-01 defense-in-depth, not argv validation
     #[test]
     fn a1_toolchain_noarm_binary_warn_but_allowed() {
         let v = guard().validate("cargo build --release");
         assert!(
             v.allowed,
-            "cargo 工具链应 warn 但 Ok (不破 trusted-caller), reason={:?}",
+            "the cargo toolchain should warn but be Ok (does not break trusted-caller), reason={:?}",
             v.reason
         );
     }
 
-    // A-1: extra 白名单二进制 (SIGHUP 注入) 无专门 arm → warn 但 Ok
+    // A-1: extra allowlisted binaries (SIGHUP injected) without a dedicated arm → warn but Ok
     #[test]
     fn a1_extra_whitelist_noarm_warn_but_allowed() {
         let g = SecurityGuard::new().with_extra_whitelist(&["jq"]);
         let v = g.validate("jq '.field' input.json");
         assert!(
             v.allowed,
-            "extra jq 应 warn 但 Ok (SIGHUP 注入工具链), reason={:?}",
+            "extra jq should warn but be Ok (SIGHUP-injected toolchain), reason={:?}",
             v.reason
         );
     }
 
-    // A-1: READONLY_NOARM_BINARY 不含危险解释器 — 被拦截的是 Stage-1 regex / DENY_EXTEND, 非 argv arm
+    // A-1: READONLY_NOARM_BINARY does not contain dangerous interpreters — the blocking comes from
+    // Stage-1 regex / DENY_EXTEND, not an argv arm
     #[test]
     fn a1_dangerous_interpreter_still_blocked_by_regex() {
-        // bash 在 DENY_EXTEND, 即使强行加 extra 也不入白名单 → Stage-2 拦
+        // bash is in DENY_EXTEND; even force-added as extra it never enters the allowlist → Stage-2 blocks
         let g = SecurityGuard::new().with_extra_whitelist(&["bash"]);
         let v = g.validate("bash -c 'rm -rf /'");
-        assert!(!v.allowed, "bash 不入白名单, 应被 Stage-2 拦");
+        assert!(
+            !v.allowed,
+            "bash does not enter the allowlist, should be blocked at Stage-2"
+        );
     }
+    // __PART3__
 
-    // ---------- Issue #23 guard 集成测试 ----------
+    // ---------- Issue #23 guard integration tests ----------
 
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    // mock guard server: 读一行 JSON-RPC 请求, 按 method 回预设响应。每条命令可注入 verdict JSON。
-    // 用闭包 closure 接收 method+content → 回 response body (result 字段 JSON 字符串) 或 None (不回, 模拟宕机断连)。
+    // Mock guard server: reads one line of JSON-RPC request, replies with a preset response by
+    // method. Each command can inject a verdict JSON.
+    // The closure receives method+content → returns the response body (result field JSON string)
+    // or None (no reply, simulates a down/cut connection).
     struct MockGuard {
         sock: PathBuf,
         _handle: Option<std::thread::JoinHandle<()>>,
@@ -2671,7 +3042,7 @@ mod tests {
         }
     }
 
-    // verdict_body: 构造 guard.evaluate result JSON (GuardVerdict 形状)。
+    // verdict_body: builds a guard.evaluate result JSON (GuardVerdict shape).
     fn verdict_json(
         action: &str,
         risk: &str,
@@ -2690,8 +3061,9 @@ mod tests {
         )
     }
 
-    // 起 mock guard: 按 command → verdict_json 闭包回 evaluate; ping/rules_dump 回固定值。
-    // error_body Some(code,msg) → 回 JSON-RPC error 而非 result (模拟 -32001 等)。
+    // Start the mock guard: per command → the verdict_json closure answers evaluate; ping/rules_dump
+    // return fixed values.
+    // error_body Some(code,msg) → replies with a JSON-RPC error instead of a result (simulates -32001 etc).
     fn spawn_mock_guard<F>(verdict_for: F) -> MockGuard
     where
         F: Fn(&str) -> Option<(String, Option<(i32, String)>)> + Send + 'static,
@@ -2715,7 +3087,7 @@ mod tests {
                 if reader.read_line(&mut line).is_err() {
                     continue;
                 }
-                // 粗解析 method + content (位置 params[0] = content, params[1] = caller_epoch)
+                // Coarse parse of method + content (positional params[0] = content, params[1] = caller_epoch)
                 let method = extract_json_field(&line, "method");
                 let id = extract_json_field(&line, "id")
                     .and_then(|s| s.parse::<u64>().ok())
@@ -2737,7 +3109,8 @@ mod tests {
                                 format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}\n", id, body)
                             }
                             None => {
-                                // 模拟宕机: 断连不回 (evaluate 客户端 read 超时/EOF → Unavailable)
+                                // Simulate down: cut the connection without replying (the evaluate client
+                                // read times out/EOF → Unavailable)
                                 let _ = stream.shutdown(std::net::Shutdown::Both);
                                 continue;
                             }
@@ -2754,14 +3127,16 @@ mod tests {
         }
     }
 
-    // 全局递增序号, 避免同进程多 mock socket 名冲突 (Math::random 不可用 — 用 AtomicU64)。
+    // Global incrementing sequence number, avoiding mock socket name collisions across multiple mocks
+    // in one process (Math::random unavailable — uses AtomicU64).
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     static MOCK_SEQ: AtomicU64 = AtomicU64::new(0);
     fn guard_mock_seq() -> u64 {
         MOCK_SEQ.fetch_add(1, AtomicOrdering::SeqCst)
     }
 
-    // 粗提取 JSON 行中首个 "field":"value" 的 value (不引完整 JSON 解析, 测试用, 限定 mock 协议)。
+    // Coarse extraction of the first "field":"value" from a JSON line (no full JSON parsing; test
+    // only, scoped to the mock protocol).
     fn extract_json_field(line: &str, field: &str) -> Option<String> {
         let needle = format!("\"{}\":", field);
         let idx = line.find(&needle)?;
@@ -2775,19 +3150,19 @@ mod tests {
         }
     }
 
-    // guard OFF (默认 new) → validate 行为同现状: echo allow, rm -rf 拒 (Stage-1 regex)。
+    // guard OFF (default new) → validate behaves as today: echo allowed, rm -rf rejected (Stage-1 regex).
     #[test]
     fn guard_off_regression_unchanged() {
         let g = SecurityGuard::new();
-        assert!(!g.guard_enabled(), "默认 guard OFF");
-        assert!(g.validate("echo hi").allowed, "guard OFF echo allow");
+        assert!(!g.guard_enabled(), "guard OFF by default");
+        assert!(g.validate("echo hi").allowed, "guard OFF echo allowed");
         assert!(
             !g.validate("rm -rf /").allowed,
-            "guard OFF rm -rf 仍被 Stage-1 拦"
+            "guard OFF rm -rf still blocked at Stage-1"
         );
     }
 
-    // guard ON + Allow L1 → allow, 透传 risk_level/seatbelt_required (验收 #5)。
+    // guard ON + Allow L1 → allow, passthrough risk_level/seatbelt_required (acceptance #5).
     #[test]
     fn guard_on_allow_l1_passes_through() {
         let mock = spawn_mock_guard({
@@ -2797,11 +3172,15 @@ mod tests {
         let g = guard().with_guard(mock.sock.to_str().unwrap(), "tenant");
         let v = g.validate("echo hi");
         assert!(v.allowed, "guard Allow L1 → executor allow");
-        assert_eq!(v.risk_level, Some(RiskLevel::L1), "risk_level 透传 L1");
-        assert!(!v.seatbelt_required, "L1 不要求 seatbelt");
+        assert_eq!(
+            v.risk_level,
+            Some(RiskLevel::L1),
+            "risk_level passthrough L1"
+        );
+        assert!(!v.seatbelt_required, "L1 does not require seatbelt");
     }
 
-    // guard ON + Block L4 → block, 带 action_id/seatbelt_required (验收 #5/#6: executor 不执行)。
+    // guard ON + Block L4 → block, carrying action_id/seatbelt_required (acceptance #5/#6: executor does not execute).
     #[test]
     fn guard_on_block_l4_blocked_with_action_id() {
         let mock = spawn_mock_guard({
@@ -2817,17 +3196,17 @@ mod tests {
         });
         let g = guard().with_guard(mock.sock.to_str().unwrap(), "tenant");
         let v = g.validate("echo hi");
-        assert!(!v.allowed, "guard Block L4 → executor 拒");
+        assert!(!v.allowed, "guard Block L4 → executor denies");
         assert_eq!(v.risk_level, Some(RiskLevel::L4));
-        assert!(v.seatbelt_required, "L4 透传 seatbelt_required");
+        assert!(v.seatbelt_required, "L4 passthrough seatbelt_required");
         assert_eq!(
             v.action_id.as_deref(),
             Some("11111111-1111-1111-1111-111111111111"),
-            "action_id 透传"
+            "action_id passthrough"
         );
     }
 
-    // guard ON + L3 requires_approval → block (executor 无人工审批回路, 用户决策 L3=fail-closed)。
+    // guard ON + L3 requires_approval → block (executor has no human-approval loop; user decision L3=fail-closed).
     #[test]
     fn guard_on_l3_requires_approval_blocked() {
         let mock = spawn_mock_guard({
@@ -2843,12 +3222,12 @@ mod tests {
         });
         let g = guard().with_guard(mock.sock.to_str().unwrap(), "tenant");
         let v = g.validate("echo hi");
-        assert!(!v.allowed, "guard L3 → executor 拒 (无审批回路)");
+        assert!(!v.allowed, "guard L3 → executor denies (no approval loop)");
         assert_eq!(v.risk_level, Some(RiskLevel::L3));
-        assert!(v.requires_approval, "requires_approval 透传");
+        assert!(v.requires_approval, "requires_approval passthrough");
     }
 
-    // guard ON + Redact → block (executor 整命令执行, 不支持流式改写)。
+    // guard ON + Redact → block (executor runs the whole command, no streaming rewrite support).
     #[test]
     fn guard_on_redact_blocked() {
         let mock = spawn_mock_guard({
@@ -2857,10 +3236,14 @@ mod tests {
         });
         let g = guard().with_guard(mock.sock.to_str().unwrap(), "tenant");
         let v = g.validate("echo hi");
-        assert!(!v.allowed, "guard Redact → executor 拒 (不支持流式改写)");
+        assert!(
+            !v.allowed,
+            "guard Redact → executor denies (no streaming rewrite support)"
+        );
     }
 
-    // guard 宕机 (socket 不存在) → 降级 fail-closed: 白名单 binary allow + warn (风险未知), 非 fail-open。
+    // guard down (socket does not exist) → degrade fail-closed: allowlisted binary allowed + warn
+    // (risk unknown), not fail-open.
     #[test]
     fn guard_down_degrade_whitelist_binary_allow() {
         let sock = std::env::temp_dir().join(format!(
@@ -2869,16 +3252,17 @@ mod tests {
             guard_mock_seq()
         ));
         let _ = std::fs::remove_file(&sock);
-        // with_guard ping 不可达 → warn 降级, 仍存 Some(client); evaluate 连不存在的 socket → Unavailable → 降级。
+        // with_guard ping unreachable → warn + degrade, still stores Some(client); evaluate to a
+        // nonexistent socket → Unavailable → degrade.
         let g = guard().with_guard(sock.to_str().unwrap(), "tenant");
         let v = g.validate("echo hi");
         assert!(
             v.allowed,
-            "guard 宕机 + 缓存未命中 + 白名单 binary → allow (风险未知, 非放行高危)"
+            "guard down + cache miss + allowlisted binary → allow (risk unknown, not a high-risk pass)"
         );
     }
 
-    // guard 宕机 + -32001 鉴权失败 → block 非 degrade (fix #9: 误配 fail-closed, 不开门)。
+    // guard down + -32001 auth failure → block, not degrade (fix #9: misconfiguration fail-closed, no door opened).
     #[test]
     fn guard_unauthorized_blocks_not_degrades() {
         let mock = spawn_mock_guard({
@@ -2893,11 +3277,11 @@ mod tests {
         let v = g.validate("echo hi");
         assert!(
             !v.allowed,
-            "-32001 鉴权失败 → block (误配 fail-closed, 不降级开门)"
+            "-32001 auth failure → block (misconfiguration fail-closed, no degraded door opening)"
         );
     }
 
-    // guard 宕机 + allow_inline_interpreter + 缓存空 → 内联解释器 fail-closed block (fix #2)。
+    // guard down + allow_inline_interpreter + empty cache → inline interpreter fail-closed block (fix #2).
     #[test]
     fn guard_down_inline_interpreter_fail_closed() {
         let sock = std::env::temp_dir().join(format!(
@@ -2909,20 +3293,22 @@ mod tests {
         let g = guard()
             .with_allow_inline_interpreter(true)
             .with_guard(sock.to_str().unwrap(), "tenant");
-        // python 在白名单, -c 被内联网关放行 (allow_inline_interpreter=true), 但 guard 宕机降级 → block。
+        // python is allowlisted; -c passes the inline gateway (allow_inline_interpreter=true), but
+        // guard is down and degrades → block.
         let v = g.validate("python3 -c \"print('hi')\"");
         assert!(
             !v.allowed,
-            "guard 宕机 + 内联解释器 + 缓存空 → fail-closed block (fix #2)"
+            "guard down + inline interpreter + empty cache → fail-closed block (fix #2)"
         );
     }
 
-    // guard 宕机 + 缓存规则命中 → block (严于 live guard)。
-    // 需先种缓存: with_guard ping 成功 + rules_dump 拿规则 → cache.refresh。这里 mock ping+rules_dump 返回规则,
-    // 但 evaluate 宕机 (断连) → 走 degrade → run_cached_rules 命中 block。
+    // guard down + cached rule hit → block (stricter than live guard).
+    // Requires seeding the cache first: with_guard ping succeeds + rules_dump fetches rules →
+    // cache.refresh. Here the mock ping+rules_dump return rules, but evaluate is down (connection
+    // cut) → takes degrade → run_cached_rules hit blocks.
     #[test]
     fn guard_down_cached_rule_hit_blocks() {
-        // mock: ping/rules_dump 回规则 (含一条 rm -rf block), evaluate 断连。
+        // mock: ping/rules_dump return rules (one rm -rf block rule), evaluate cuts the connection.
         let block_rule_json = "{\"name\":\"rmrf\",\"pattern\":\"rm\\\\s+-rf\",\"stage\":\"regex\",\"action\":\"block\",\"risk_level\":\"l4\",\"reason\":\"rm -rf\",\"scope\":\"command\"}";
         let sock = std::env::temp_dir().join(format!(
             "fe-guard-cachehit-{}-{}.sock",
@@ -2950,7 +3336,7 @@ mod tests {
                 let resp = match method.as_deref() {
                     Some("guard.ping") => format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"pong\":true,\"version\":\"mock\",\"rules_epoch\":1}}}}\n", id),
                     Some("guard.rules.dump") => format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"rules\":[{}],\"epoch\":1}}}}\n", id, rules_json),
-                    // evaluate → 断连 (模拟宕机, 走降级)
+                    // evaluate → cut the connection (simulates down, takes the degrade path)
                     Some("guard.evaluate") => { let _ = stream.shutdown(std::net::Shutdown::Both); continue; }
                     _ => format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":-32601,\"message\":\"nf\"}}}}\n", id),
                 };
@@ -2959,31 +3345,34 @@ mod tests {
         });
         let g = guard().with_guard(sock.to_str().unwrap(), "tenant");
         let v = g.validate("rm -rf /");
-        assert!(!v.allowed, "guard 宕机 + 缓存规则命中 rm -rf → block");
+        assert!(!v.allowed, "guard down + cached rule hit on rm -rf → block");
         let _ = std::fs::remove_file(&sock);
         drop(handle);
     }
 
-    // recheck_binary (fix #3): 非 symlink binary → Ok; 路径消失 → Err; 可信目录外 symlink → Err。
-    // homebrew /opt/homebrew/bin/* symlink 落在 trusted_bin_dirs → by-design 放行 (ARCH-2 威胁模型外)。
+    // recheck_binary (fix #3): non-symlink binary → Ok; path gone → Err; symlink outside trusted
+    // directories → Err.
+    // homebrew /opt/homebrew/bin/* symlinks live inside trusted_bin_dirs → by-design allowed
+    // (outside the ARCH-2 threat model).
     #[test]
     fn recheck_binary_rejects_symlink_and_missing() {
         let g = guard();
-        // 白名单 binary (echo) recheck → Ok (非 symlink, 存在)。
+        // Allowlisted binary (echo) recheck → Ok (not a symlink, exists).
         let r = g.recheck_binary("echo");
-        assert!(r.is_ok(), "echo recheck 应 Ok, got {:?}", r);
-        // 不存在 binary → Err。
+        assert!(r.is_ok(), "echo recheck should be Ok, got {:?}", r);
+        // Nonexistent binary → Err.
         let r2 = g.recheck_binary("definitely-not-a-binary-xyz-123");
-        assert!(r2.is_err(), "不存在 binary recheck → Err");
+        assert!(r2.is_err(), "nonexistent binary recheck → Err");
     }
 
-    // recheck_binary 可信目录内 symlink 放行 (homebrew): /opt/homebrew/bin/python3 是 symlink → Cellar,
-    // 但落在 trusted_bin_dirs (/opt/homebrew/bin) 内 → by-design 放行, 不误拒真实执行环境。
+    // recheck_binary allows symlinks inside trusted directories (homebrew): /opt/homebrew/bin/python3
+    // is a symlink → Cellar, but it lives inside trusted_bin_dirs (/opt/homebrew/bin) → by-design
+    // allowed, no false rejection of real execution environments.
     #[test]
     fn recheck_binary_allows_trusted_dir_symlink() {
         let g = guard();
-        // python3 在 homebrew 上是 /opt/homebrew/bin/python3 → Cellar symlink。
-        // 若解析到且在 trusted_bin_dirs 内 → Ok (不因 symlink 误拒)。
+        // On homebrew, python3 is the /opt/homebrew/bin/python3 → Cellar symlink.
+        // If resolved and inside trusted_bin_dirs → Ok (not rejected merely for being a symlink).
         if let Some(resolved) = resolve_binary_path("python3") {
             let is_sym = std::fs::symlink_metadata(&resolved)
                 .map(|m| m.file_type().is_symlink())
@@ -2992,13 +3381,14 @@ mod tests {
                 let r = g.recheck_binary("python3");
                 assert!(
                     r.is_ok(),
-                    "可信目录内 symlink binary (homebrew) recheck 应 Ok, got {:?}",
+                    "symlinked binary inside trusted directories (homebrew) recheck should be Ok, got {:?}",
                     r
                 );
             }
-            // python3 非白名单 → validate 仍拒, 但 recheck 只复检路径不变 symlink, 不查白名单。
+            // python3 is not in the allowlist → validate still rejects, but recheck only rechecks the
+            // path (unchanged symlink), not the allowlist.
         }
-        // 构造可信目录外 symlink → Err (TOCTOU 投毒模拟)。
+        // Construct a symlink outside trusted directories → Err (TOCTOU poisoning simulation).
         let tmp = std::env::temp_dir().join(format!("fe-recheck-sym-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let target = std::env::temp_dir().join("fe-recheck-sym-target");
@@ -3008,11 +3398,11 @@ mod tests {
             use std::os::unix::fs::symlink;
             let _ = symlink(&target, &tmp);
         }
-        // tmp 不在任何 trusted_bin_dirs (在 temp_dir) → symlink recheck Err。
+        // tmp is not in any trusted_bin_dirs (in temp_dir) → symlink recheck Err.
         let r3 = g.recheck_binary(tmp.to_str().unwrap());
         assert!(
             r3.is_err(),
-            "可信目录外 symlink recheck 应 Err, got {:?}",
+            "symlink outside trusted directories recheck should be Err, got {:?}",
             r3
         );
         let _ = std::fs::remove_file(&tmp);
@@ -3020,15 +3410,19 @@ mod tests {
     }
 }
 
-// 属性测试 (caveat #4 弥补 — cargo-fuzz 需 nightly 本机无 rustup, 改 proptest stable 跑)。
-// 目标: validate() 对任意输入不 panic / 不死循环 / 不 ReDoS, 恒返 verdict (allow|block)。
-// 策略: 随机字节串 + shell 元字符混合 + 已知危险前缀, 断言有限时间内返合法 verdict。
+// Property tests (caveat #4 workaround — cargo-fuzz needs nightly and this machine has no rustup,
+// so proptest on stable is used instead).
+// Goal: validate() never panics / never loops forever / no ReDoS on any input, always returns a
+// verdict (allow|block).
+// Strategy: random byte strings + shell metacharacter mixes + known dangerous prefixes, asserting a
+// legal verdict returns within bounded time.
 #[cfg(test)]
 mod proptests {
     use super::*;
     use proptest::prelude::*;
 
-    // 合法 shell 字符集 (含元字符触发链式解析分支) — 排除 \0 (validate 前置拒)。
+    // Legal shell character set (including metacharacters to trigger chain-parse branches) —
+    // excludes \0 (rejected up front by validate).
     fn arb_command() -> impl Strategy<Value = String> {
         (
             0..40usize,
@@ -3049,7 +3443,7 @@ mod proptests {
                     Just(b'\\'),
                     Just(b'('),
                     Just(b')'),
-                    0x20u8..0x7e, // 可见 ASCII
+                    0x20u8..0x7e, // printable ASCII
                 ],
                 0..256,
             ),
@@ -3058,7 +3452,8 @@ mod proptests {
     }
 
     proptest! {
-        // 任意命令不得 panic, 须返 allow 或 block (allowed 字段明确), 非未定义状态。
+        // No command may panic; must return allow or block (explicit allowed field), never an
+        // undefined state.
         #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
         #[test]
         fn validate_never_panics(cmd in arb_command()) {
@@ -3071,7 +3466,8 @@ mod proptests {
             }
         }
 
-        // 命令替换/重定向前缀必拒 (block) — 反证 allow 不漏放危险结构。
+        // Command substitution/redirect prefixes must be blocked — counter-proves that allow never
+        // lets dangerous structures through.
         #[test]
         fn dangerous_prefixes_blocked(
             prefix in prop_oneof![
@@ -3089,7 +3485,7 @@ mod proptests {
             prop_assert!(!v.allowed);
         }
 
-        // ReDoS 时间上限 — 病态回溯输入在 1s 内返 (regex cap 保护)。
+        // ReDoS time cap — pathological backtracking inputs return within 1s (regex cap protection).
         #[test]
         fn no_redos(input in "([a-z]+ )*([a-z]+)?") {
             let g = SecurityGuard::default();
@@ -3100,7 +3496,8 @@ mod proptests {
             prop_assert!(v.allowed || !v.allowed);
         }
 
-        // 链式复合命令 (&&/||/;/|) 每段独立校验 — 非白名单 binary 必拒。
+        // Chained compound commands (&&/||/;/|) validate each segment independently — non-allowlisted
+        // binaries must be rejected.
         #[test]
         fn compound_nonwhitelisted_blocked(bin in "[a-z]{1,15}") {
             let g = SecurityGuard::default();
