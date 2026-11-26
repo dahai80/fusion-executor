@@ -1,12 +1,12 @@
-// fe-shell — 后台持久 Shell 注册表 (Issue #1, Claude Code run_in_background/BashOutput/KillShell parity)
+// fe-shell — background persistent shell registry (Issue #1, Claude Code run_in_background/BashOutput/KillShell parity)
 //
-// ShellRegistry = Arc<Mutex<HashMap<shell_id, ShellHandle>>>。shell_start 复用 fe-sandbox::spawn_pty
-// (proven env/seatbelt/PTY setup) → 自管 std::thread reader (累积 tail) + std::thread waiter (child.wait)
-// shell_output 轮询 tail 快照 + running/exit_code; kill_shell 复用 fe_sandbox::kill_tree; list_shells
-// 轮询模型 (poll-only): 不接 BroadcastHub server-push — 后续 issue 再补 live-tail
+// ShellRegistry = Arc<Mutex<HashMap<shell_id, ShellHandle>>>. shell_start reuses fe-sandbox::spawn_pty
+// (proven env/seatbelt/PTY setup) with self-managed std::thread reader (accumulates tail) + std::thread waiter (child.wait)
+// shell_output polls the tail snapshot + running/exit_code; kill_shell reuses fe_sandbox::kill_tree; list_shells
+// is poll-only: no BroadcastHub server-push wiring — live-tail deferred to a follow-up issue
 //
-// 安全: fe-shell 不做命令校验 — fe-core 在 shell_start 前用 self.security.validate 拦 (fail-closed)
-// fe-shell 仅 spawn allowed 命令。0 新增 unsafe (复用 fe-sandbox safe wrapper + portable-pty)
+// Safety: fe-shell does not validate commands — fe-core intercepts via self.security.validate before shell_start (fail-closed)
+// fe-shell only spawns allowed commands. 0 new unsafe (reuses fe-sandbox safe wrappers + portable-pty)
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -21,38 +21,38 @@ use tracing::{debug, error, info, warn};
 
 use fe_sandbox::{kill_process_group, spawn_pty, SpawnedPty};
 
-/// 尾部输出上限 — 防 OOM (同 fe-sandbox DEFAULT_MAX_OUTPUT/HARD_CEILING 语义)
+/// Tail output cap — prevents OOM (same semantics as fe-sandbox DEFAULT_MAX_OUTPUT/HARD_CEILING)
 const TAIL_CAP: usize = 100_000;
 
-/// 注册表上限 — 超 MAX_SHELLS 时自动回收已退 shell (最旧优先), 防长寿命 serve() 内存单调增长
-/// pub: M-OPS-05 health 告警阈值需读此值 (fe-ipc probe_health_depth)。
+/// Registry cap — when MAX_SHELLS is exceeded, exited shells are auto-reaped (oldest first), preventing
+/// monotonic memory growth in a long-lived serve(). pub: the M-OPS-05 health alert threshold reads this value (fe-ipc probe_health_depth).
 pub const MAX_SHELLS: usize = 256;
 
-/// m-SEC-02: 已退 shell 保留上限 — 每次 shell_start/list_shells 回收超出此数的已退 shell (最旧优先),
-/// 防 256 个已退 shell 各 100KB tail 累积 (最坏 25MB)。保留近 MAX_FINISHED_RETAINED 个供调用方查 exit_code。
+/// m-SEC-02: exited-shell retention cap — each shell_start/list_shells reaps exited shells beyond this count (oldest first),
+/// preventing 256 exited shells each holding a 100KB tail (worst case 25MB). Keeps up to MAX_FINISHED_RETAINED for callers to read exit_code.
 const MAX_FINISHED_RETAINED: usize = 32;
 
-/// m-SEC-01: 默认空闲超时 (秒) — 无输出超此值的后台 shell 自动 kill (调用方忘 kill 不永跑)。0 = 不限。
+/// m-SEC-01: default idle timeout (seconds) — background shells with no output beyond this are auto-killed (a caller that forgets kill does not run forever). 0 = unlimited.
 pub const DEFAULT_MAX_IDLE_SEC: u64 = 3600;
 
-/// M-9: 默认 kill 宽限期 (毫秒) — kill_process_group 的 SIGINT→grace→SIGKILL 间隔。
-/// kill_shell/expire_idle/Drop 默认用此值; ShellStartParams.kill_grace_ms 可按 shell 覆盖。
-/// 生产默认值 500 由 fe-pyo3/fe-ipc 层传入; 此常量供测试构造默认 ShellStartParams。
+/// M-9: default kill grace period (ms) — the SIGINT→grace→SIGKILL interval for kill_process_group.
+/// kill_shell/expire_idle/Drop use this by default; ShellStartParams.kill_grace_ms can override per shell.
+/// The production default 500 is passed in by the fe-pyo3/fe-ipc layers; this constant is for building default ShellStartParams in tests.
 #[allow(dead_code)]
 const DEFAULT_KILL_GRACE_MS: u64 = 500;
 
-/// 后台 shell 启动结果
+/// Background shell start result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellStartResult {
     pub ok: bool,
     pub shell_id: Option<String>,
-    /// fe-core 已校验, 这里恒 false — 保留字段对齐 wire schema
+    /// Already validated by fe-core, always false here — reserved field to align with the wire schema
     pub blocked_by_security: bool,
     pub security_reason: Option<String>,
     pub error: Option<String>,
 }
 
-/// shell_output 轮询结果 — output = 累积 tail 快照 (非增量; 调用方自去重)
+/// shell_output poll result — output = accumulated tail snapshot (not incremental; caller deduplicates)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellOutput {
     pub shell_id: String,
@@ -61,7 +61,7 @@ pub struct ShellOutput {
     pub exit_code: Option<i32>,
 }
 
-/// list_shells 条目
+/// list_shells entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellInfo {
     pub shell_id: String,
@@ -73,7 +73,7 @@ pub struct ShellInfo {
     pub exit_code: Option<i32>,
 }
 
-/// shell_start 参数聚合 (fe-core 组装; fe-shell 不接 SecurityGuard)
+/// shell_start parameter aggregate (assembled by fe-core; fe-shell does not take SecurityGuard)
 #[derive(Debug, Clone)]
 pub struct ShellStartParams {
     pub command: String,
@@ -85,15 +85,15 @@ pub struct ShellStartParams {
     pub inherit_env: bool,
     pub max_nproc: u32,
     pub max_cpu_sec: u32,
-    /// RUN-10 (审计 0827): 文件描述符上限 (RLIMIT_NOFILE)。默认 1024, 0=不限。透传 SandboxConfig。
+    /// RUN-10 (audit 0827): file descriptor limit (RLIMIT_NOFILE). Default 1024, 0=unlimited. Passed through to SandboxConfig.
     pub max_nofile: u32,
-    /// m-SEC-01: 空闲超时 (秒) — 无输出超此值的 shell 自动 kill。0 = 不限 (向后兼容)。
+    /// m-SEC-01: idle timeout (seconds) — shells with no output beyond this are auto-killed. 0 = unlimited (backward compatible).
     pub max_idle_sec: u64,
-    /// M-9: kill 宽限期 (毫秒) — kill_shell/expire_idle/Drop 用此值作 SIGINT→grace→SIGKILL 间隔。
-    /// 0 = 立即 SIGKILL; 默认 DEFAULT_KILL_GRACE_MS (500)。
+    /// M-9: kill grace period (ms) — kill_shell/expire_idle/Drop use this as the SIGINT→grace→SIGKILL interval.
+    /// 0 = immediate SIGKILL; default DEFAULT_KILL_GRACE_MS (500).
     pub kill_grace_ms: u64,
-    /// Issue #64: 可选 per-shell seatbelt profile (透传 SandboxConfig.sandbox_profile)。
-    /// None = 沿用 seatbelt bool 固定 profile (向后兼容, 字节级不变); Some = 参数化 profile。
+    /// Issue #64: optional per-shell seatbelt profile (passed through to SandboxConfig.sandbox_profile).
+    /// None = keep the seatbelt-bool fixed profile (backward compatible, byte-identical); Some = parameterized profile.
     pub sandbox_profile: Option<fe_sandbox::seatbelt::SandboxProfile>,
 }
 
@@ -105,13 +105,13 @@ struct ShellHandle {
     command: String,
     started_at_ms: u128,
     finished: Arc<std::sync::atomic::AtomicBool>,
-    /// m-SEC-01: 最近一次输出/启动时间 (ms since epoch)。空闲超时判定 = now - last_output_ms > max_idle_sec*1000。
+    /// m-SEC-01: last output/start time (ms since epoch). Idle-timeout check = now - last_output_ms > max_idle_sec*1000.
     last_output_ms: Arc<std::sync::atomic::AtomicU64>,
-    /// m-SEC-01: 该 shell 的空闲超时 (秒); 0 = 不限。存 handle 供 list_shells/Drop 无参 expire 判定。
+    /// m-SEC-01: this shell's idle timeout (seconds); 0 = unlimited. Stored on the handle so list_shells/Drop can expire without args.
     max_idle_sec: u64,
-    /// M-9: 该 shell 的 kill 宽限期 (毫秒); kill_shell/expire_idle/Drop 读此值而非硬编码 500。
+    /// M-9: this shell's kill grace period (ms); kill_shell/expire_idle/Drop read this instead of hardcoding 500.
     kill_grace_ms: u64,
-    // m-PERF-02: 持有 reader/waiter 线程 handle, Drop 时 join 回收 (防 detach 线程泄漏)
+    // m-PERF-02: holds reader/waiter thread handles, joined on Drop (prevents detached thread leaks)
     reader_thread: Option<std::thread::JoinHandle<()>>,
     waiter_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -130,7 +130,7 @@ impl ShellRegistry {
         }
     }
 
-    /// 启动后台 shell — 复用 fe-sandbox::spawn_pty, 自管 reader + waiter 线程
+    /// Start a background shell — reuses fe-sandbox::spawn_pty with self-managed reader + waiter threads
     pub fn shell_start(&self, p: ShellStartParams) -> ShellStartResult {
         if p.command.trim().is_empty() {
             return ShellStartResult {
@@ -138,7 +138,7 @@ impl ShellRegistry {
                 shell_id: None,
                 blocked_by_security: false,
                 security_reason: None,
-                error: Some("命令为空".to_string()),
+                error: Some("empty command".to_string()),
             };
         }
         let sb_cfg = fe_sandbox::SandboxConfig {
@@ -153,19 +153,19 @@ impl ShellRegistry {
             max_nproc: p.max_nproc,
             max_cpu_sec: p.max_cpu_sec,
             max_nofile: p.max_nofile,
-            rss_limit_mb: 0, // D3-4: 后台 shell 不加 RSS 上限 — poll-model 长驻任务, 调用方自管 kill_shell
+            rss_limit_mb: 0, // D3-4: no RSS cap for background shells — long-lived poll-model tasks, caller manages kill_shell itself
             sandbox_profile: p.sandbox_profile,
         };
         let spawned: SpawnedPty = match spawn_pty(&sb_cfg) {
             Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, command = %p.command, "shell_start spawn 失败");
+                warn!(error = %e, command = %p.command, "shell_start spawn failed");
                 return ShellStartResult {
                     ok: false,
                     shell_id: None,
                     blocked_by_security: false,
                     security_reason: None,
-                    error: Some(format!("spawn 失败: {e}")),
+                    error: Some(format!("spawn failed: {e}")),
                 };
             }
         };
@@ -174,25 +174,25 @@ impl ShellRegistry {
         let tail = Arc::new(Mutex::new(String::new()));
         let exit = Arc::new(OnceLock::new());
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // m-SEC-01: idle 计时起点 = 启动时刻 (无输出也算空闲流逝)
+        // m-SEC-01: idle clock starts at launch time (elapsed idle counts even with no output)
         let started_at_ms = now_ms() as u128;
         let last_output = Arc::new(std::sync::atomic::AtomicU64::new(started_at_ms as u64));
-        info!(%shell_id, ?pid, command = %p.command, max_idle_sec = p.max_idle_sec, "后台 shell 已起");
+        info!(%shell_id, ?pid, command = %p.command, max_idle_sec = p.max_idle_sec, "background shell started");
 
-        // reader 线程 — 累积 tail (超 TAIL_CAP 留尾), EOF 时 drop master, 然后 mark finished
-        // finished 由 reader 置位 (非 waiter) — 保证 running=false 时 tail 已全部落地, 调用方轮询无末段丢失
+        // reader thread — accumulates the tail (keeps the tail beyond TAIL_CAP), drops master on EOF, then marks finished
+        // finished is set by the reader (not the waiter) — guarantees the tail has fully landed when running=false, so caller polls lose no final segment
         let tail_r = Arc::clone(&tail);
         let finished_r = Arc::clone(&finished);
-        // M-8: reader panic 时记 exit=-1 fail-loud (正常路径 exit 由 waiter 线程置)
+        // M-8: on reader panic record exit=-1 fail-loud (on the normal path exit is set by the waiter thread)
         let exit_r = Arc::clone(&exit);
-        // m-SEC-01: 每次输出刷新 last_output_ms, 供 idle-timeout 判定 (now - last_output_ms > max_idle_sec*1000)
+        // m-SEC-01: refresh last_output_ms on every output, for the idle-timeout check (now - last_output_ms > max_idle_sec*1000)
         let last_output_r = Arc::clone(&last_output);
         let mut reader = spawned.reader;
         let master = spawned.master;
         let reader_thread = std::thread::spawn(move || {
-            // M-8: catch_unwind 防 reader panic 静默吞 — PTY read/utf8 panic 不应让 finished 永不置位
-            // (旧版 panic 跳过 finished.store → running=true 永挂, tail 截断无错误指示)。
-            // AssertUnwindSafe: reader (portable-pty MasterReader) 非 UnwindSafe, Arc clone 可跨 unwind。
+            // M-8: catch_unwind prevents a reader panic from being silently swallowed — a PTY read/utf8 panic must not leave finished unset forever
+            // (the old version skipped finished.store on panic → running=true hung forever, tail truncated with no error indication).
+            // AssertUnwindSafe: the reader (portable-pty MasterReader) is not UnwindSafe; Arc clones can cross the unwind.
             let mut tmp = [0u8; 4096];
             let mut pending: Vec<u8> = Vec::new();
             let panicked = std::panic::catch_unwind(AssertUnwindSafe(move || {
@@ -207,7 +207,7 @@ impl ShellRegistry {
                             pending = combined[safe..].to_vec();
                             let chunk = String::from_utf8_lossy(decodable).replace("\r\n", "\n");
                             if !chunk.is_empty() {
-                                // m-SEC-01: 输出到达即刷新 idle 计时
+                                // m-SEC-01: refresh the idle clock as soon as output arrives
                                 last_output_r.store(now_ms(), Ordering::Release);
                                 let mut g = match tail_r.lock() {
                                     Ok(g) => g,
@@ -224,7 +224,7 @@ impl ShellRegistry {
                             }
                         }
                         Err(e) => {
-                            warn!(error = %e, "shell reader read 失败");
+                            warn!(error = %e, "shell reader read failed");
                             break;
                         }
                     }
@@ -232,17 +232,17 @@ impl ShellRegistry {
             }));
             drop(master);
             if let Err(payload) = panicked {
-                // M-8: reader panic — fail-loud: 记 exit=-1 + finished, 防 running=true 永挂无指示
-                error!(error = ?payload, "shell reader 线程 panic, 置 finished + exit=-1 fail-loud");
+                // M-8: reader panic — fail-loud: record exit=-1 + finished, prevents running=true hanging forever with no indication
+                error!(error = ?payload, "shell reader thread panicked; set finished + exit=-1 fail-loud");
                 let _ = exit_r.set(-1);
             } else {
-                debug!("shell reader 线程结束 (finished 已置)");
+                debug!("shell reader thread ended (finished set)");
             }
-            // EOF/panic 均置 finished (running=false 必伴随 tail 已落地或 panic 截断标记)
+            // EOF and panic both set finished (running=false always implies the tail landed or a panic truncation marker)
             finished_r.store(true, Ordering::Release);
         });
 
-        // waiter 线程 — 仅阻塞 child.wait → 记 exit_code (finished 由 reader 置, 不在此)
+        // waiter thread — only blocks on child.wait → records exit_code (finished is set by the reader, not here)
         let exit_w = Arc::clone(&exit);
         let child = spawned.child;
         let waiter_thread = std::thread::spawn(move || {
@@ -251,14 +251,14 @@ impl ShellRegistry {
             let code = match status {
                 Ok(s) => s.exit_code() as i32,
                 Err(e) => {
-                    warn!(error = %e, "shell waiter child.wait 失败");
+                    warn!(error = %e, "shell waiter child.wait failed");
                     -1
                 }
             };
             let _ = exit_w.set(code);
             debug!(
                 exit_code = code,
-                "shell waiter: 子进程已退 (exit_code 已记)"
+                "shell waiter: child process exited (exit_code recorded)"
             );
         });
 
@@ -276,12 +276,12 @@ impl ShellRegistry {
             reader_thread: Some(reader_thread),
             waiter_thread: Some(waiter_thread),
         };
-        // P-4/P-5: reap_finished/expire_idle 锁内仅收集, 释放 guard 后锁外 join/kill (防锁内阻塞/死锁)
+        // P-4/P-5: reap_finished/expire_idle only collect while holding the lock; join/kill happen outside after the guard is released (prevents in-lock blocking/deadlock)
         let (reaped, expired) = {
             let mut g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
-            // m-SEC-02: 每次注册前回收超 MAX_FINISHED_RETAINED 的已退 shell (不仅超 256 ceiling)
+            // m-SEC-02: reap exited shells beyond MAX_FINISHED_RETAINED before each registration (not just above the 256 ceiling)
             let reaped = reap_finished(&mut g);
-            // m-SEC-01: 空闲超时 shell 自动 kill (idle > max_idle_sec), 逐 shell 判定 (0=不限跳过)
+            // m-SEC-01: auto-kill idle-timed-out shells (idle > max_idle_sec), checked per shell (0=unlimited skips)
             let expired = expire_idle(&mut g);
             g.insert(shell_id.clone(), handle);
             (reaped, expired)
@@ -297,16 +297,16 @@ impl ShellRegistry {
         }
     }
 
-    /// 轮询 tail 快照 + 运行/退出状态
+    /// Poll the tail snapshot + running/exit status
     pub fn shell_output(&self, shell_id: &str) -> Result<ShellOutput> {
         let g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
         let h = g
             .get(shell_id)
-            .with_context(|| format!("shell 未找到: {shell_id}"))?;
+            .with_context(|| format!("shell not found: {shell_id}"))?;
         let output = match h.tail.lock() {
             Ok(s) => s.clone(),
             Err(e) => {
-                warn!(error = %e, %shell_id, "shell_output tail lock poisoned, 返回哨兵标记 (可能丢数据)");
+                warn!(error = %e, %shell_id, "shell_output tail lock poisoned, returning sentinel marker (data may be lost)");
                 "\n<lock-poisoned-output-lost>\n".to_string()
             }
         };
@@ -320,17 +320,17 @@ impl ShellRegistry {
         })
     }
 
-    /// kill 进程组 — 复用 fe_sandbox::kill_process_group (SIGINT→grace→SIGKILL)
-    /// finished 正常由 reader EOF 置位; kill 强制置 finished 防 reader 在死 PTY 上阻塞永挂
-    /// (kill 场景调用方期望终止非末段输出, 末段丢失可接受)
-    /// reap=false: fe-shell 自管 waiter 线程 child.wait 回收, 避 L-13 双重 waitpid 竞态
+    /// Kill the process group — reuses fe_sandbox::kill_process_group (SIGINT→grace→SIGKILL)
+    /// finished is normally set by reader EOF; kill force-sets finished so the reader does not block forever on a dead PTY
+    /// (in the kill scenario the caller expects termination, not the final output segment; losing it is acceptable)
+    /// reap=false: fe-shell's own waiter thread reaps via child.wait, avoiding the L-13 double-waitpid race
     pub fn kill_shell(&self, shell_id: &str) -> Result<bool> {
-        // M-9: 读 kill_grace_ms (per-shell 覆盖) + pid, 持锁取出后释放, kill 在锁外 (P-5)
+        // M-9: read kill_grace_ms (per-shell override) + pid, take them under the lock then release; kill happens outside the lock (P-5)
         let (pid, grace_ms) = {
             let g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
             let h = g
                 .get(shell_id)
-                .with_context(|| format!("shell 未找到: {shell_id}"))?;
+                .with_context(|| format!("shell not found: {shell_id}"))?;
             (h.pid, h.kill_grace_ms)
         };
         let res = kill_process_group(pid, false, grace_ms);
@@ -340,12 +340,12 @@ impl ShellRegistry {
             h.finished.store(true, Ordering::Release);
             let _ = h.exit.set(exit);
         }
-        info!(%shell_id, ?pid, grace_ms, kill_exit = exit, "kill_shell 完成");
+        info!(%shell_id, ?pid, grace_ms, kill_exit = exit, "kill_shell done");
         Ok(true)
     }
 
-    /// 列出全部 shell (含已退) — 回收超 MAX_FINISHED_RETAINED 已退 (最旧优先) + 空闲超时 kill
-    /// P-4/P-5: reap_finished/expire_idle 锁内仅收集, 释放 guard 后锁外 join/kill (防锁内阻塞/死锁)
+    /// List all shells (including exited) — reaps exited shells beyond MAX_FINISHED_RETAINED (oldest first) + kills idle-timed-out ones
+    /// P-4/P-5: reap_finished/expire_idle only collect while holding the lock; join/kill happen outside after the guard is released (prevents in-lock blocking/deadlock)
     pub fn list_shells(&self) -> Vec<ShellInfo> {
         let (reaped, expired, infos) = {
             let mut g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
@@ -371,15 +371,15 @@ impl ShellRegistry {
     }
 }
 
-/// C-OPS-02: ShellRegistry drop 时 kill 所有活跃 shell, 防 serve() 退出孤儿进程泄漏。
-/// 进程退出 (signal/crash) 时 registry drop → 遍历 finished==false 的 shell kill_process_group,
-/// reader/waiter 线程随 PTY 关闭自然退出。fail-loud: 记录 kill 失败, 不静默吞。
-/// reap=false: drop 阶段 waiter 线程随 PTY 关闭速退并回收, 此处仅信号不重复回收。
+/// C-OPS-02: kill all active shells when the ShellRegistry drops, preventing orphan-process leaks on serve() exit.
+/// On process exit (signal/crash) the registry drops → iterate shells with finished==false and kill_process_group,
+/// reader/waiter threads exit naturally as the PTYs close. Fail-loud: record kill failures, never swallow silently.
+/// reap=false: at drop time the waiter threads exit and reap quickly as the PTYs close; here we only signal, no double reap.
 impl Drop for ShellRegistry {
     fn drop(&mut self) {
-        // D5-5: 进程清理 + 线程回收 (m-PERF-02 已实装 kill+join, 本 Drop 验证无泄漏:
-        //   活跃 shell kill_process_group → reader/waiter 线程在 PTY 关闭后速退 → join 回收)。
-        //   P-5: 锁内仅收集 (id, pid, grace) + take 所有 handle 供锁外 join, 释放 guard 后锁外 kill+join
+        // D5-5: process cleanup + thread reclamation (m-PERF-02 already implements kill+join; this Drop verifies no leaks:
+        //   active shells kill_process_group → reader/waiter threads exit quickly after the PTY closes → joined).
+        //   P-5: collect only (id, pid, grace) under the lock + take all handles for out-of-lock join; kill+join happen outside after the guard is released
         let (active, all_handles) = {
             let mut g = self.shells.lock().unwrap_or_else(|e| e.into_inner());
             let active: Vec<(String, Option<u32>, u64)> = g
@@ -387,24 +387,27 @@ impl Drop for ShellRegistry {
                 .filter(|(_, h)| !h.finished.load(Ordering::Acquire))
                 .map(|(id, h)| (id.clone(), h.pid, h.kill_grace_ms))
                 .collect();
-            // P-5: 全部 handle 移出 map, 锁外 join (防 join 在锁内阻塞)
+            // P-5: move all handles out of the map, join outside the lock (prevents join blocking inside the lock)
             let all_handles: Vec<(String, ShellHandle)> = g.drain().collect();
             (active, all_handles)
         };
         if active.is_empty() && all_handles.is_empty() {
             return;
         }
-        info!(count = active.len(), "ShellRegistry drop: drain 活跃 shell");
-        // M-9: 用 per-shell kill_grace_ms 而非硬编码 500
+        info!(
+            count = active.len(),
+            "ShellRegistry drop: draining active shells"
+        );
+        // M-9: use per-shell kill_grace_ms instead of a hardcoded 500
         for (shell_id, pid, grace_ms) in active {
             if let Some(pid) = pid {
                 let res = kill_process_group(Some(pid), false, grace_ms);
-                info!(%shell_id, pid, grace_ms, kill_exit = res.exit_code, "drop drain kill 完成");
+                info!(%shell_id, pid, grace_ms, kill_exit = res.exit_code, "drop drain kill done");
             } else {
-                warn!(%shell_id, "drop drain: shell 无 pid, 跳过 kill");
+                warn!(%shell_id, "drop drain: shell has no pid, skipping kill");
             }
         }
-        // m-PERF-02: kill 后 join 全部 shell 的 reader/waiter 线程回收 (PTY 关闭后线程速退), 锁外 (P-5)
+        // m-PERF-02: after kill, join all shells' reader/waiter threads to reclaim them (threads exit quickly after the PTY closes), outside the lock (P-5)
         for (id, mut h) in all_handles {
             join_handle_threads(&mut h, &id);
         }
@@ -417,13 +420,13 @@ impl Default for ShellRegistry {
     }
 }
 
-/// 回收已退 shell (m-SEC-02) — 每次 shell_start/list_shells 触发 (不再仅超 MAX_SHELLS):
-/// 1. 超 MAX_SHELLS ceiling 必收 (防无界注册);
-/// 2. 已退条目超 MAX_FINISHED_RETAINED 时按 started_at_ms 最旧优先收 (防 256×100KB=25MB tail 累积)。
+/// Reap exited shells (m-SEC-02) — triggered on every shell_start/list_shells (no longer only above MAX_SHELLS):
+/// 1. above the MAX_SHELLS ceiling always reaps (prevents unbounded registration);
+/// 2. when exited entries exceed MAX_FINISHED_RETAINED, reap oldest-first by started_at_ms (prevents 256×100KB=25MB tail accumulation).
 ///
-/// 仅移除 finished 且 exit_code 已知的条目 (running=false 尚无 exit_code 过渡态保留, 防 waiter 落后误删)。
-/// P-5: 锁内只 remove handle (返回给调用方), **不在此 join** — join 移到锁外防 reader panic 永阻塞死锁全注册表。
-/// 返回已移除的 ShellHandle 供调用方锁外 join 线程回收。
+/// Only removes entries that are finished with a known exit_code (a running=false-without-exit_code transition state is kept, preventing premature removal while the waiter lags).
+/// P-5: under the lock only remove the handle (returned to the caller), **do not join here** — join moves outside the lock so a reader panic cannot block the whole registry forever.
+/// Returns the removed ShellHandles so the caller can join their threads outside the lock.
 fn reap_finished(shells: &mut HashMap<String, ShellHandle>) -> Vec<(String, ShellHandle)> {
     let finished_count = shells
         .values()
@@ -441,26 +444,26 @@ fn reap_finished(shells: &mut HashMap<String, ShellHandle>) -> Vec<(String, Shel
         return Vec::new();
     }
     finished.sort_unstable_by_key(|(_, t)| *t);
-    // 收到 ceiling 之下且已退保留数 <= MAX_FINISHED_RETAINED: 至少收 (总-上限) 或 (已退-保留)
+    // Reap down to under the ceiling with exited retention <= MAX_FINISHED_RETAINED: reap at least (total-cap) or (exited-retention)
     let over_ceiling = shells.len().saturating_sub(MAX_SHELLS);
     let over_retained = finished_count.saturating_sub(MAX_FINISHED_RETAINED);
     let remove_count = over_ceiling.max(over_retained);
     let mut reaped = Vec::new();
     for (id, _) in finished.into_iter().take(remove_count) {
         if let Some(h) = shells.remove(&id) {
-            debug!(%id, "reap_finished: 已退 shell 已移除 (线程锁外 join)");
+            debug!(%id, "reap_finished: exited shell removed (threads joined outside the lock)");
             reaped.push((id, h));
         }
     }
     reaped
 }
 
-/// m-SEC-01: 空闲超时回收 — 无输出超 max_idle_sec 的活跃 shell 自动 kill_process_group。
-/// 逐 shell 读自身 max_idle_sec (0=不限跳过); 已退 shell 不处理 (reap_finished 负责)。
-/// P-4: 锁内只收 (id, pid, grace_ms) 标记 finished/exit, **kill 移到锁外** —
-/// 旧版 kill_process_group 500ms×N 在锁内阻塞所有 shell_output/list_shells。
-/// 返回待 kill 的 (shell_id, pid, grace_ms) 供调用方锁外执行。
-/// reap=false: waiter 线程自管回收, 避 L-13 双重 waitpid 竞态。
+/// m-SEC-01: idle-timeout reap — auto kill_process_group for active shells with no output beyond max_idle_sec.
+/// Reads each shell's own max_idle_sec (0=unlimited skips); exited shells are not handled here (reap_finished owns that).
+/// P-4: under the lock only collect (id, pid, grace_ms) and mark finished/exit, **kill moves outside the lock** —
+/// the old version blocked all shell_output/list_shells with kill_process_group 500ms×N inside the lock.
+/// Returns (shell_id, pid, grace_ms) pending kill for the caller to execute outside the lock.
+/// reap=false: the waiter thread reaps itself, avoiding the L-13 double-waitpid race.
 fn expire_idle(shells: &mut HashMap<String, ShellHandle>) -> Vec<(String, Option<u32>, u64)> {
     let now = now_ms();
     let expired: Vec<(String, Option<u32>, u64)> = shells
@@ -477,7 +480,7 @@ fn expire_idle(shells: &mut HashMap<String, ShellHandle>) -> Vec<(String, Option
             }
         })
         .collect();
-    // 锁内仅置 finished + exit 占位 (防重复过期); 真正 kill + exit 覆写锁外完成
+    // Under the lock only set finished + a placeholder exit (prevents double expiration); the real kill + exit overwrite happen outside the lock
     for (id, _, _) in &expired {
         if let Some(h) = shells.get(id) {
             h.finished.store(true, Ordering::Release);
@@ -487,29 +490,29 @@ fn expire_idle(shells: &mut HashMap<String, ShellHandle>) -> Vec<(String, Option
     expired
 }
 
-/// P-4/P-5: 锁外执行 expire 收集的 kill (调用方已 drop Mutex guard)。
+/// P-4/P-5: execute the kills collected by expire outside the lock (caller has already dropped the Mutex guard).
 fn kill_expired(expired: Vec<(String, Option<u32>, u64)>) {
     for (id, pid, grace_ms) in expired {
         let res = kill_process_group(pid, false, grace_ms);
         let exit = res.exit_code;
         warn!(%id, ?pid, grace_ms, kill_exit = exit,
-            "m-SEC-01: 空闲超时 shell 已自动 kill (调用方忘 kill 不永跑)");
+            "m-SEC-01: idle-timed-out shell auto-killed (a caller that forgets kill does not run forever)");
     }
 }
 
-/// P-5: 锁外 join 已移除 handle 的 reader/waiter 线程回收 (调用方已 drop Mutex guard)。
+/// P-5: join the removed handles' reader/waiter threads outside the lock (caller has already dropped the Mutex guard).
 fn join_reaped(reaped: Vec<(String, ShellHandle)>) {
     for (id, mut h) in reaped {
         join_handle_threads(&mut h, &id);
     }
 }
 
-/// Drop join 超时上限 (毫秒) — waiter 线程阻塞 child.wait(), kill 失败 (pid 重用/僵尸/setsid 脱组) 时
-/// child.wait() 永不返 → 无界 join 阻塞 serve() 退出。超时 detach (线程随进程退出被 OS 杀, 不阻塞 Drop)。
+/// Drop join timeout cap (ms) — the waiter thread blocks on child.wait(); when kill fails (pid reuse/zombie/setsid escape)
+/// child.wait() never returns → an unbounded join would block serve() exit. Detach on timeout (the OS kills the thread at process exit, Drop not blocked).
 const DROP_JOIN_TIMEOUT_MS: u64 = 2000;
 const DROP_JOIN_POLL_MS: u64 = 50;
 
-/// C-OPS-fix: 有界 join — is_finished() 轮询, 超时 detach (防 serve() 退出挂死)。
+/// C-OPS-fix: bounded join — is_finished() polling, detach on timeout (prevents serve() exit hang).
 fn join_thread_bounded(t: Option<std::thread::JoinHandle<()>>, shell_id: &str, label: &str) {
     let Some(t) = t else {
         return;
@@ -519,21 +522,21 @@ fn join_thread_bounded(t: Option<std::thread::JoinHandle<()>>, shell_id: &str, l
     while std::time::Instant::now() < deadline {
         if t.is_finished() {
             if let Err(e) = t.join() {
-                warn!(%shell_id, label, error = ?e, "{label} 线程 join 失败 (panic?)");
+                warn!(%shell_id, label, error = ?e, "{label} thread join failed (panic?)");
             }
-            debug!(%shell_id, label, "{label} 线程 join 回收完成");
+            debug!(%shell_id, label, "{label} thread join reclaimed");
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(DROP_JOIN_POLL_MS));
     }
     warn!(
         %shell_id, label, timeout_ms = DROP_JOIN_TIMEOUT_MS,
-        "{label} 线程 join 超时 — detach (进程退出由 OS 回收, 防 serve() 挂死)"
+        "{label} thread join timed out — detach (the OS reclaims it at process exit, prevents serve() hang)"
     );
     drop(t);
 }
 
-/// m-SEC-01: 当前 ms since epoch (reader 线程刷新 last_output_ms + idle 判定用)
+/// m-SEC-01: current ms since epoch (reader thread refreshes last_output_ms + idle check uses this)
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -541,15 +544,15 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// m-PERF-02: join 一个 shell 的 reader/waiter 线程回收 (防 detach 线程泄漏)。
-/// 已退 shell join 即返; 活跃 shell 调用方应先 kill (PTY 关闭后线程速退)。
-/// P-5: 必须在 Mutex guard 释放后调用 (锁外 join 防 reader panic 永阻塞死锁)。
+/// m-PERF-02: join one shell's reader/waiter threads to reclaim them (prevents detached thread leaks).
+/// Exited shells return from join immediately; for active shells the caller should kill first (threads exit quickly after the PTY closes).
+/// P-5: must be called after the Mutex guard is released (out-of-lock join prevents a reader panic from deadlocking everything).
 fn join_handle_threads(h: &mut ShellHandle, shell_id: &str) {
     join_thread_bounded(h.reader_thread.take(), shell_id, "reader");
     join_thread_bounded(h.waiter_thread.take(), shell_id, "waiter");
 }
 
-/// 跨块多字节 UTF-8 — 保留尾部不完整字节 (同 fe-sandbox L-SB-02)
+/// Multi-byte UTF-8 across chunk boundaries — preserve trailing incomplete bytes (same as fe-sandbox L-SB-02)
 fn utf8_safe_prefix_len(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
@@ -613,9 +616,9 @@ mod tests {
         assert!(out.output.contains("hi"), "output: {}", out.output);
     }
 
-    /// Issue #64: Some(sandbox_profile) 透传 SandboxConfig — 参数化 profile (excluded_commands
-    /// 拒一个未被调用的 binary) 下命令仍正常执行; seatbelt 不可用 (非 macOS / CI 无 sandbox-exec)
-    /// 时静默降级 (fail_if_unavailable=false 默认), 断言仅 ok。
+    /// Issue #64: Some(sandbox_profile) passes through to SandboxConfig — the command still runs normally under a
+    /// parameterized profile (excluded_commands denying a binary that is never invoked); when seatbelt is unavailable
+    /// (non-macOS / CI without sandbox-exec) it silently degrades (fail_if_unavailable=false default), so only ok is asserted.
     #[test]
     fn shell_start_with_sandbox_profile() {
         let reg = ShellRegistry::new();
@@ -638,7 +641,7 @@ mod tests {
         let id = reg.shell_start(params("echo done", None)).shell_id.unwrap();
         std::thread::sleep(Duration::from_millis(800));
         let out = reg.shell_output(&id).unwrap();
-        assert!(!out.running, "应已结束");
+        assert!(!out.running, "should have finished");
         assert_eq!(out.exit_code, Some(0));
     }
 
@@ -651,12 +654,12 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let mid = reg.shell_output(&id).unwrap();
-        assert!(mid.running, "长任务应仍在跑");
+        assert!(mid.running, "long task should still be running");
         let ok = reg.kill_shell(&id).unwrap();
         assert!(ok);
         std::thread::sleep(Duration::from_millis(800));
         let after = reg.shell_output(&id).unwrap();
-        assert!(!after.running, "kill 后应结束");
+        assert!(!after.running, "should have finished after kill");
     }
 
     #[test]
@@ -681,7 +684,7 @@ mod tests {
         let reg = ShellRegistry::new();
         let r = reg.shell_start(params("   ", None));
         assert!(!r.ok);
-        assert!(r.error.unwrap().contains("空"));
+        assert!(r.error.unwrap().contains("empty"));
     }
 
     #[test]
@@ -696,7 +699,7 @@ mod tests {
         for i in 0..5 {
             assert!(
                 out.output.contains(&i.to_string()),
-                "缺 {i}: {}",
+                "missing {i}: {}",
                 out.output
             );
         }
@@ -704,15 +707,15 @@ mod tests {
 
     #[test]
     fn utf8_safe_prefix_len_handles_multibyte() {
-        // 完整 3 字节中文字符
-        let full = "中".as_bytes();
+        // Full 3-byte CJK character
+        let full = "中".as_bytes(); // i18n: user-facing
         assert_eq!(utf8_safe_prefix_len(full), 3);
-        // 截断首字节 — 应回退到 0 (留全字符到下块)
-        let partial = &"中".as_bytes()[..1];
+        // Truncated first byte — should fall back to 0 (keep the whole char for the next chunk)
+        let partial = &"中".as_bytes()[..1]; // i18n: user-facing
         assert_eq!(utf8_safe_prefix_len(partial), 0);
     }
 
-    // reader-sets-finished 保证: finished=true 时末段输出已落地, 无末段丢失
+    // reader-sets-finished guarantee: when finished=true the final output segment has landed, no tail loss
     #[test]
     fn finished_implies_final_output_drained() {
         let reg = ShellRegistry::new();
@@ -720,7 +723,7 @@ mod tests {
             .shell_start(params("echo final_marker_xyz", None))
             .shell_id
             .unwrap();
-        // 轮询直到 running=false, 然后立即读 output — 末段必须已在
+        // Poll until running=false, then read output immediately — the final segment must be present
         let mut out = reg.shell_output(&id).unwrap();
         let mut waited = 0;
         while out.running && waited < 2000 {
@@ -728,35 +731,35 @@ mod tests {
             out = reg.shell_output(&id).unwrap();
             waited += 50;
         }
-        assert!(!out.running, "应已结束 (waited={}ms)", waited);
+        assert!(!out.running, "should have finished (waited={}ms)", waited);
         assert!(
             out.output.contains("final_marker_xyz"),
-            "finished=true 时末段应已落地: {}",
+            "final segment should have landed when finished=true: {}",
             out.output
         );
     }
 
-    // 自动回收: 超 MAX_SHELLS 时 list_shells 触发 reap_finished 移除最旧已退 shell
+    // Auto-reap: when over MAX_SHELLS, list_shells triggers reap_finished to remove the oldest exited shells
     #[test]
     fn reap_finished_drops_oldest_when_over_ceiling() {
         let reg = ShellRegistry::new();
-        // 起超 MAX_SHELLS 个快速退出的 shell, 触发 shell_start 内的 reap
+        // Start more than MAX_SHELLS fast-exiting shells to trigger the reap inside shell_start
         for _ in 0..(MAX_SHELLS + 10) {
             let _ = reg.shell_start(params("echo x", None)).shell_id.unwrap();
         }
         std::thread::sleep(Duration::from_millis(600));
-        // list_shells 再 reap 一次; 总数应回落到 <= MAX_SHELLS
+        // list_shells reaps once more; the total should fall back to <= MAX_SHELLS
         let list = reg.list_shells();
         assert!(
             list.len() <= MAX_SHELLS,
-            "reap 后应 <= {} 条, 实际 {}",
+            "after reap should be <= {} entries, got {}",
             MAX_SHELLS,
             list.len()
         );
     }
 
-    /// C-OPS-02: ShellRegistry drop 必须 kill 活跃 shell, 防孤儿进程。
-    /// 起一个 sleep 长任务, drop registry 后确认子进程不再存活 (kill -0 退出码非 0)。
+    /// C-OPS-02: ShellRegistry drop must kill active shells, preventing orphan processes.
+    /// Start a long sleep task, drop the registry, then confirm the child is no longer alive (kill -0 exit code non-zero).
     #[test]
     fn drop_drains_active_shells() {
         let pid = {
@@ -767,32 +770,32 @@ mod tests {
                 .unwrap();
             std::thread::sleep(Duration::from_millis(300));
             let out = reg.shell_output(&id).unwrap();
-            assert!(out.running, "drop 前长任务应仍在跑");
-            // pid 在 ShellInfo (list_shells), 不在 ShellOutput
+            assert!(out.running, "long task should still be running before drop");
+            // pid is in ShellInfo (list_shells), not in ShellOutput
             reg.list_shells()
                 .into_iter()
                 .find(|i| i.shell_id == id)
                 .and_then(|i| i.pid)
-                .expect("shell 应有 pid")
+                .expect("shell should have a pid")
         };
-        // reg 离作用域 → Drop 触发 kill_tree; 等待 kill 生效
+        // reg leaves scope → Drop triggers kill_tree; wait for the kill to take effect
         std::thread::sleep(Duration::from_millis(1500));
-        // kill -0 探进程存活: 存活返 exit 0, 不存在返非 0 (无 unsafe, 走子进程)
+        // kill -0 probes process liveness: alive returns exit 0, gone returns non-zero (no unsafe, via a child process)
         let status = std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .status()
-            .expect("kill 命令应可执行");
+            .expect("kill command should be executable");
         assert!(
             !status.success(),
-            "drop 后子进程 pid={} 应被 kill, kill -0 仍成功 = 孤儿进程",
+            "after drop child pid={} should be killed; kill -0 still succeeding = orphan process",
             pid
         );
     }
 
-    /// m-SEC-01: 空闲超时自动 kill — max_idle_sec=1, 无输出 sleep 30s 任务,
-    /// 启动另一 shell 触发 expire_idle, 超时 shell 应被 kill (running=false)。
-    /// exit_code 可能是 kill_tree 的 -124 或 waiter 线程 race 先记的信号杀码 (OnceLock first-wins);
-    /// 关键断言 = 不再 running (kill 生效), 非具体码值。
+    /// m-SEC-01: idle-timeout auto-kill — max_idle_sec=1, a 30s sleep task with no output,
+    /// starting another shell triggers expire_idle; the timed-out shell should be killed (running=false).
+    /// exit_code may be kill_tree's -124 or a signal-kill code recorded first by the waiter thread racing (OnceLock first-wins);
+    /// the key assertion = no longer running (kill took effect), not the specific code value.
     #[test]
     fn msec01_idle_timeout_kills_silent_shell() {
         let reg = ShellRegistry::new();
@@ -801,20 +804,23 @@ mod tests {
         let id = reg.shell_start(p).shell_id.unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let mid = reg.shell_output(&id).unwrap();
-        assert!(mid.running, "触发前长任务应仍在跑");
-        // 等 idle > 1s, 再起另一 shell 触发 shell_start 内 expire_idle
+        assert!(
+            mid.running,
+            "long task should still be running before trigger"
+        );
+        // Wait for idle > 1s, then start another shell to trigger expire_idle inside shell_start
         std::thread::sleep(Duration::from_millis(1500));
         let _trigger = reg.shell_start(params("echo trigger", None));
         std::thread::sleep(Duration::from_millis(500));
         let out = reg.shell_output(&id).unwrap();
         assert!(
             !out.running,
-            "m-SEC-01: 空闲超时 shell 应被自动 kill, 仍 running = {}",
+            "m-SEC-01: idle-timed-out shell should be auto-killed, still running = {}",
             out.running
         );
     }
 
-    /// m-SEC-01: max_idle_sec=0 (默认) 不限 — 持续输出的 shell 不被 idle 误杀。
+    /// m-SEC-01: max_idle_sec=0 (default) unlimited — a shell with continuous output is not mistakenly killed by the idle check.
     #[test]
     fn msec01_zero_idle_no_kill() {
         let reg = ShellRegistry::new();
@@ -823,15 +829,18 @@ mod tests {
             .shell_id
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        // 触发 expire_idle (max_idle_sec=0 → 跳过)
+        // Trigger expire_idle (max_idle_sec=0 → skipped)
         let _ = reg.list_shells();
         std::thread::sleep(Duration::from_millis(200));
         let out = reg.shell_output(&id).unwrap();
-        assert!(out.running, "m-SEC-01: max_idle_sec=0 不应 kill 活跃 shell");
+        assert!(
+            out.running,
+            "m-SEC-01: max_idle_sec=0 should not kill an active shell"
+        );
     }
 
-    /// m-SEC-02: 每次 shell_start 回收超 MAX_FINISHED_RETAINED 的已退 shell (不积 25MB)。
-    /// 起 MAX_FINISHED_RETAINED+N 个快速退出 shell, 末次 shell_start 后已退数应 <= MAX_FINISHED_RETAINED。
+    /// m-SEC-02: each shell_start reaps exited shells beyond MAX_FINISHED_RETAINED (no 25MB accumulation).
+    /// Start MAX_FINISHED_RETAINED+N fast-exiting shells; after the last shell_start the exited count should be <= MAX_FINISHED_RETAINED.
     #[test]
     fn msec02_reap_finished_beyond_retention() {
         let reg = ShellRegistry::new();
@@ -844,14 +853,14 @@ mod tests {
         let finished_count = list.iter().filter(|i| i.finished).count();
         assert!(
             finished_count <= MAX_FINISHED_RETAINED,
-            "m-SEC-02: 已退 shell 应 <= 保留上限 {}, 实际 {}",
+            "m-SEC-02: exited shells should be <= retention cap {}, got {}",
             MAX_FINISHED_RETAINED,
             finished_count
         );
     }
 
-    /// P-4: expire_idle 不在锁内 kill。混空闲超时 + 新 shell_start, 不应死锁/阻塞。
-    /// (旧版锁内 kill_tree 阻塞 500ms×N, 此测试靠超时窗口证锁外 kill 不卡 list_shells)
+    /// P-4: expire_idle does not kill inside the lock. Mixing an idle timeout with new shell_starts must not deadlock/block.
+    /// (The old version blocked inside the lock with kill_tree 500ms×N; this test uses the timeout window to prove out-of-lock kill does not stall list_shells)
     #[test]
     fn p4_expire_idle_kills_outside_lock() {
         let reg = ShellRegistry::new();
@@ -860,38 +869,38 @@ mod tests {
         let idle_id = reg.shell_start(idle).shell_id.unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert!(reg.shell_output(&idle_id).unwrap().running);
-        // 等空闲超 1s, 起 5 个触发 shell + 并发 list_shells — 证 expire 锁外 kill 不串行阻塞
+        // Wait for idle > 1s, start 5 trigger shells + concurrent list_shells — proves expire's out-of-lock kill does not serialize/block
         std::thread::sleep(Duration::from_millis(1500));
         for _ in 0..5 {
             let _ = reg.shell_start(params("echo t", None));
         }
         let list = reg.list_shells();
-        // list 返回 = 未死锁; idle shell 应已被 expire_idle 标 finished
+        // list returning = no deadlock; the idle shell should already be marked finished by expire_idle
         let idle_info = list.iter().find(|i| i.shell_id == idle_id);
         assert!(
             idle_info.map(|i| i.finished).unwrap_or(true),
-            "P-4: 空闲超时 shell 应 finished (锁外 kill 完成)"
+            "P-4: idle-timed-out shell should be finished (out-of-lock kill done)"
         );
     }
 
-    /// P-5: reap_finished 移 handle 后锁外 join。大量已退 shell + list_shells 不死锁。
+    /// P-5: reap_finished removes handles then joins outside the lock. Many exited shells + list_shells must not deadlock.
     #[test]
     fn p5_reap_finished_joins_outside_lock() {
         let reg = ShellRegistry::new();
-        // 起 MAX_FINISHED_RETAINED + extra 个快速退出 shell → 触发 reap + join
+        // Start MAX_FINISHED_RETAINED + extra fast-exiting shells → triggers reap + join
         for _ in 0..(MAX_FINISHED_RETAINED + 5) {
             let _ = reg.shell_start(params("echo gone", None)).shell_id.unwrap();
         }
         std::thread::sleep(Duration::from_millis(800));
-        // 连续 list_shells 触发 reap (join 线程) — 证锁外 join 不阻塞 map 借用
+        // Consecutive list_shells trigger reap (joining threads) — proves out-of-lock join does not block map borrows
         for _ in 0..3 {
             let list = reg.list_shells();
             assert!(list.iter().all(|i| !i.shell_id.is_empty()));
         }
     }
 
-    /// M-9: kill_grace_ms 透传。起一个长 shell, kill_shell 后应在 grace 窗口内结束。
-    /// (grace 存 ShellHandle, kill_shell 读 handle.kill_grace_ms 传 kill_process_group)
+    /// M-9: kill_grace_ms passthrough. Start a long shell; after kill_shell it should finish within the grace window.
+    /// (grace is stored on ShellHandle; kill_shell reads handle.kill_grace_ms and passes it to kill_process_group)
     #[test]
     fn m9_kill_grace_ms_stored_and_used() {
         let reg = ShellRegistry::new();
@@ -902,15 +911,21 @@ mod tests {
         assert!(reg.shell_output(&id).unwrap().running);
         let t0 = std::time::Instant::now();
         assert!(reg.kill_shell(&id).unwrap());
-        // kill + 200ms grace + cleanup — 应在 5s 内结束 (证 grace 被用, 非无限挂)
+        // kill + 200ms grace + cleanup — should finish within 5s (proves grace is used, not an infinite hang)
         std::thread::sleep(Duration::from_millis(1000));
         let after = reg.shell_output(&id).unwrap();
-        assert!(!after.running, "M-9: kill_grace_ms 生效, shell 应结束");
-        assert!(t0.elapsed() < Duration::from_secs(5), "kill 不应挂死");
+        assert!(
+            !after.running,
+            "M-9: kill_grace_ms effective, shell should finish"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "kill should not hang"
+        );
     }
 
-    /// C-OPS-fix: join_thread_bounded 超时 detach — 永阻塞线程超 DROP_JOIN_TIMEOUT_MS 后返,
-    /// 不挂死调用方 (防 serve() 退出 hang)。已退线程立即回收 (is_finished=true)。
+    /// C-OPS-fix: join_thread_bounded detaches on timeout — a forever-blocking thread returns after DROP_JOIN_TIMEOUT_MS,
+    /// not hanging the caller (prevents serve() exit hang). Finished threads are reclaimed immediately (is_finished=true).
     #[test]
     fn join_thread_bounded_detaches_blocking_thread() {
         let blocking = std::thread::spawn(|| {

@@ -64,12 +64,12 @@ def test_rollback_without_cwd_raises():
         ex.rollback("snap-id", cwd=None)
 
 
-# ── T8 M-CLI-01: --serve flag + 退出码映射 ──
+# ── T8 M-CLI-01: --serve flag + exit-code mapping ──
 
 
 def test_cli_timeout_exit_code_124():
-    # M-CLI-01: -124 超时映射 124 (旧版 -1/-124 全 → 1, 超时身份丢失)
-    # D3-1: python3 -c 需 --allow-inline-interpreter opt-in (企业硬化默认拒内联解释器)
+    # M-CLI-01: -124 timeout maps to 124 (old version mapped -1/-124 all → 1, losing timeout identity)
+    # D3-1: python3 -c requires --allow-inline-interpreter opt-in (enterprise hardening rejects inline interpreters by default)
     code, out = _run_main(
         [
             "fusion-executor",
@@ -79,26 +79,26 @@ def test_cli_timeout_exit_code_124():
             "--allow-inline-interpreter",
         ]
     )
-    assert code == 124, f"超时应退 124, 得 {code}"
+    assert code == 124, f"timeout should exit 124, got {code}"
     data = json.loads(out)
     assert data["exit_code"] == -124
     assert data["timed_out"] is True
 
 
 def test_cli_blocked_exit_code_1():
-    # 已有 test_cli_main_blocked_returns_nonzero 覆盖 ==1; 此处显式断言语义
+    # test_cli_main_blocked_returns_nonzero already covers ==1; here we assert the semantics explicitly
     code, _ = _run_main(["fusion-executor", "rm -rf /"])
     assert code == 1
 
 
 def test_cli_env_flag_invalid_returns_2():
-    # M-CLI-01: 参数错误 try/except → 退 2 (非裸 traceback)
+    # M-CLI-01: argument errors go through try/except → exit 2 (no bare traceback)
     code, _ = _run_main(["fusion-executor", "echo hi", "--env", "NO_EQUALS_SIGN"])
     assert code == 2
 
 
 def test_cli_env_flag_passes_value():
-    # D3-1: python3 -c 需 --allow-inline-interpreter opt-in (企业硬化默认拒内联解释器)
+    # D3-1: python3 -c requires --allow-inline-interpreter opt-in (enterprise hardening rejects inline interpreters by default)
     code, out = _run_main(
         [
             "fusion-executor",
@@ -113,7 +113,7 @@ def test_cli_env_flag_passes_value():
 
 
 def test_cli_m5_bad_cwd_exits_2():
-    # M-5: --cwd 目录不存在 → 启动期 fail-fast sys.exit(2), 非延迟到首请求
+    # M-5: --cwd directory missing → startup fail-fast sys.exit(2), not deferred to the first request
     import pytest
 
     with pytest.raises(SystemExit) as ei:
@@ -122,7 +122,7 @@ def test_cli_m5_bad_cwd_exits_2():
 
 
 def test_cli_m5_bad_sock_parent_exits_2():
-    # M-5: --sock 父目录不存在 → serve 模式 fail-fast sys.exit(2)
+    # M-5: --sock parent directory missing → serve mode fail-fast sys.exit(2)
     import pytest
 
     with pytest.raises(SystemExit) as ei:
@@ -131,7 +131,7 @@ def test_cli_m5_bad_sock_parent_exits_2():
 
 
 def test_cli_serve_flag_starts_and_cleans_socket():
-    # M-CLI-01 + C-PYO3-02: --serve 启 UDS server, SIGTERM 后 finally 清理 socket
+    # M-CLI-01 + C-PYO3-02: --serve starts a UDS server, finally cleans up the socket after SIGTERM
     import os
     import socket
     import subprocess
@@ -152,12 +152,12 @@ def test_cli_serve_flag_starts_and_cleans_socket():
         stderr=subprocess.DEVNULL,
     )
     try:
-        # 轮询 socket 出现 (serve 起来)
+        # poll for the socket to appear (serve is up)
         deadline = time.time() + 8.0
         bound = False
         while time.time() < deadline:
             if os.path.exists(sock_path):
-                # 确认可连 (可能 bind 中)
+                # confirm connectable (may still be binding)
                 try:
                     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                         s.settimeout(1.0)
@@ -167,12 +167,12 @@ def test_cli_serve_flag_starts_and_cleans_socket():
                 except OSError:
                     pass
             time.sleep(0.1)
-        assert bound, "serve 应在 8s 内绑定 socket 并可连"
-        # SIGTERM → Python signal handler 抛 KeyboardInterrupt → finally os.unlink
+        assert bound, "serve should bind the socket and be connectable within 8s"
+        # SIGTERM → Python signal handler raises KeyboardInterrupt → finally os.unlink
         proc.terminate()
         rc = proc.wait(timeout=8.0)
-        assert rc in (0, -15, 1), f"serve SIGTERM 退出码异常: {rc}"
-        assert not os.path.exists(sock_path), "serve 停机后应清理 socket"
+        assert rc in (0, -15, 1), f"serve SIGTERM exit code unexpected: {rc}"
+        assert not os.path.exists(sock_path), "serve should clean up the socket after shutdown"
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -182,7 +182,7 @@ def test_cli_serve_flag_starts_and_cleans_socket():
 
 
 def test_cli_serve_keyboard_interrupt_exits_1(monkeypatch):
-    # D6-09: --serve 收 KeyboardInterrupt 应退 1 (非 0), 区分中断与正常停机。
+    # D6-09: --serve receiving KeyboardInterrupt should exit 1 (not 0), distinguishing interrupt from normal shutdown.
     import os
 
     sock = "/tmp/fe-test-cli-kbi.sock"
@@ -194,6 +194,6 @@ def test_cli_serve_keyboard_interrupt_exits_1(monkeypatch):
 
     monkeypatch.setattr(FusionSandboxExecutor, "serve", _raise_keyboardinterrupt)
     code, _ = _run_main(["fusion-executor", "--serve", "--sock", sock])
-    assert code == 1, f"D6-09: serve KeyboardInterrupt 应退 1, 实际 {code}"
+    assert code == 1, f"D6-09: serve KeyboardInterrupt should exit 1, got {code}"
     if os.path.exists(sock):
         os.unlink(sock)

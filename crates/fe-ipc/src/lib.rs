@@ -1,27 +1,33 @@
-// fe-ipc — UDS JSON-RPC 2.0 server (P3) + 双向 server-push (v1.5 #14)
+// fe-ipc — UDS JSON-RPC 2.0 server (P3) + bidirectional server-push (v1.5 #14)
 //
-// Socket /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK), 换行分隔
-// Mirror fusion-cowork/fusion_cowork/server/desk_rpc.py 协议:
-//   line = read_line(); 响应 = serde_json::to_string(resp) + "\n"
-//   jsonrpc "2.0", id 透传; 错误码 -32700(parse)/-32600(invalid req)/-32601(method)/-32603(internal)
-//   扩展: -32010 安全拦截, -32011 超时, -32012 回滚失败, -32013 AX 未授权
-// 匹配 fusion-studio IPCClient.swift: 按字节读到 0x0A, 8s 超时
+// Socket /tmp/fusion-executor.sock (override FUSION_EXECUTOR_SOCK), newline-delimited
+// Mirror of fusion-cowork/fusion_cowork/server/desk_rpc.py protocol:
+//   line = read_line(); response = serde_json::to_string(resp) + "\n"
+//   jsonrpc "2.0", id passthrough; error codes -32700(parse)/-32600(invalid req)/-32601(method)/-32603(internal)
+//   Extensions: -32010 security block, -32011 timeout, -32012 rollback failure, -32013 AX not authorized
+// Matches fusion-studio IPCClient.swift: byte-wise read up to 0x0A, 8s timeout
 //
-// 方法: executor.health/execute/execute_stream/telemetry_stream/snapshot_create/list_snapshots/rollback/gui_action/diagnostics
-//       executor.file_edit/glob/grep/apply_patch/replace_function/shutdown
-//       executor.subscribe/unsubscribe  (v1.5 #14 — 双向 server-push)
+// Methods: executor.health/execute/execute_stream/telemetry_stream/snapshot_create/list_snapshots/rollback/gui_action/diagnostics
+//          executor.file_edit/glob/grep/apply_patch/replace_function/shutdown
+//          executor.subscribe/unsubscribe  (v1.5 #14 — bidirectional server-push)
 //
-// v1.5 #14 双向 server-push (PRD §5 — fusion-studio 120Hz 看板广播):
-//   连接 DUPLEX: read_task (分发请求) + push_task (写 server-push 帧) 共享 writer (Arc<Mutex>)。
+// v1.5 #14 bidirectional server-push (PRD §5 — fusion-studio 120Hz dashboard broadcast):
+//   Connection is DUPLEX: read_task (dispatches requests) + push_task (writes server-push
+//   frames) share the writer (Arc<Mutex>).
 //   subscribe {channels:["telemetry"|"stdio"|"screenshot"], interval_ms?:100, screenshot_interval_ms?:1000}
-//     → 响应 {ok:true, subscription_id:"sub-N"}; 之后 server 持续推 notification 帧:
+//     → response {ok:true, subscription_id:"sub-N"}; afterwards the server keeps pushing
+//       notification frames:
 //       {"jsonrpc":"2.0","method":"executor.event","params":{"subscription_id":..,"channel":..,"data":..}}
-//     notification 无 id (JSON-RPC notification 约定), 客户端按有无 id 区分响应 vs 推送。
-//   通道源 (hub 内 lazy 启停, 0 订阅自退):
-//     telemetry — 单一 executor.telemetry_stream 扇出给所有 telemetry 订阅 (10Hz 默认)。
-//     screenshot — 周期 executor.gui_action(Screenshot), TCC 未授权 → 帧 data.ok=false 不崩。
-//     stdio — execute/execute_stream 处理器扇出 chunk/done, 按 per-sub scope 过滤 (Blocker 10, 默认 own_conn)。
-//   unsubscribe {subscription_id} → 停该订阅; 连接断开 → 清该连接所有订阅。
+//     Notifications carry no id (JSON-RPC notification convention); the client distinguishes
+//     responses vs pushes by the presence of id.
+//   Channel sources (lazily started/stopped inside the hub; self-exit at 0 subscribers):
+//     telemetry — a single executor.telemetry_stream fanned out to all telemetry subs (10Hz default).
+//     screenshot — periodic executor.gui_action(Screenshot); TCC not authorized → frame
+//       data.ok=false, no crash.
+//     stdio — execute/execute_stream handlers fan out chunk/done, filtered per sub scope
+//       (Blocker 10, default own_conn).
+//   unsubscribe {subscription_id} → stop that subscription; connection drop → clear all
+//   subscriptions of that connection.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -44,14 +50,15 @@ use fe_core::{Diagnostics, ExecutionRequest, ExecutionResult, Executor};
 
 pub mod logging;
 
-/// 默认 socket 目录 — M-SEC-01: 私有 0o700 目录 (非全局可扫描 /tmp)。
-/// 同主机他 UID 无法进入该目录 → 无法 connect socket, 阻跨 UID 越权。
-/// 仍可经 FUSION_EXECUTOR_SOCK 覆盖回 /tmp (用户显式 opt-in, 自担风险)。
+/// Default socket directory — M-SEC-01: private 0o700 directory (not globally scannable /tmp).
+/// Other UIDs on the same host cannot enter the directory → cannot connect to the socket,
+/// blocking cross-UID privilege escalation.
+/// Can still be overridden back to /tmp via FUSION_EXECUTOR_SOCK (explicit user opt-in, own risk).
 pub const DEFAULT_SOCK_DIR: &str = ".fusion-executor";
 pub const DEFAULT_SOCK_NAME: &str = "fe.sock";
 
-/// 解析默认 socket 路径 — ~/.fusion-executor/fe.sock (HOME 下私有目录)。
-/// HOME 缺失时回退 /tmp/fusion-executor.sock (退化为旧路径, 仅 chmod 0o600)。
+/// Resolve the default socket path — ~/.fusion-executor/fe.sock (private directory under HOME).
+/// Falls back to /tmp/fusion-executor.sock when HOME is missing (degrades to the legacy path, chmod 0o600 only).
 fn default_sock_path() -> String {
     match std::env::var("HOME") {
         Ok(h) if !h.is_empty() => {
@@ -64,64 +71,72 @@ fn default_sock_path() -> String {
     }
 }
 
-/// JSON-RPC 错误码
+/// JSON-RPC error codes
 const ERR_PARSE: i64 = -32700;
 const ERR_INVALID_REQ: i64 = -32600;
 const ERR_METHOD_NOT_FOUND: i64 = -32601;
 const ERR_INTERNAL: i64 = -32603;
 
-/// 通道名常量
+/// Channel name constants
 const CH_TELEMETRY: &str = "telemetry";
 const CH_STDIO: &str = "stdio";
 const CH_SCREENSHOT: &str = "screenshot";
 
-/// 默认采样间隔
+/// Default sampling intervals
 const DEFAULT_INTERVAL_MS: u64 = 100;
 const DEFAULT_SCREENSHOT_INTERVAL_MS: u64 = 1000;
 
-/// 单行 JSON-RPC 请求上限 (1MB) — 防 10GB 无换行 OOM (C-IPC-04)
+/// Per-line JSON-RPC request size cap (1MB) — prevents OOM from a 10GB newline-less stream (C-IPC-04)
 const MAX_LINE_BYTES: usize = 1024 * 1024;
-/// 并发连接上限 — 防 accept 无限累积 DoS (C-IPC-05)
+/// Concurrent connection cap — prevents unbounded accept accumulation DoS (C-IPC-05)
 const MAX_CONNECTIONS: usize = 64;
-/// 审计 2.11: 并发 **执行** 上限 — 连接信号量限连接非限执行 (64 连接各跑 cargo build = 64 并发子进程超额)。
-/// 独立执行信号量限真实子进程并发, 与连接数解耦。8 核机 16 并发重命令留 2x 余量。
+/// Audit 2.11: concurrent **exec** cap — the connection semaphore limits connections, not
+/// execs (64 connections each running cargo build = 64 concurrent subprocesses, over budget).
+/// A separate exec semaphore limits real subprocess concurrency, decoupled from connection
+/// count. 16 concurrent heavy commands leaves 2x headroom on an 8-core machine.
 const MAX_CONCURRENT_EXECS: usize = 16;
-/// RUN-3: 并发 **流式执行** 上限 — 与非流式 exec_sem (16) 分离。
-/// 流式 (execute_stream) 持 permit 跨整 chunk→done 生命周期; 若共用 exec_sem (16),
-/// 16 长流占满 permit → 短 execute 命令饿死。独立 stream_sem 容量 = MAX_CONNECTIONS (64),
-/// 流式按连接数上限 (连接信号量已限总连接), 不与非流式短执行争抢。
+/// RUN-3: concurrent **streaming exec** cap — separate from the non-streaming exec_sem (16).
+/// A stream (execute_stream) holds its permit across the whole chunk→done lifetime; sharing
+/// exec_sem (16) would let 16 long streams exhaust the permits and starve short execute
+/// commands. Independent stream_sem capacity = MAX_CONNECTIONS (64): streams are bounded by
+/// connection count (the connection semaphore already caps total connections), so they do not
+/// contend with non-streaming short executions.
 const MAX_CONCURRENT_STREAMS: usize = MAX_CONNECTIONS;
-/// 单连接 idle 读超时 — 防 slowloris 占连接不读 (C-IPC-05)
+/// Per-connection idle read timeout — prevents slowloris holding connections without reading (C-IPC-05)
 const IDLE_READ_TIMEOUT_SECS: u64 = 30;
-/// 截图 b64 帧上限 (4MB) — 超此降级去 png_b64 防 N 订阅内存堆积 (P-IPC-03)
+/// Screenshot b64 frame cap (4MB) — above this, degrade by dropping png_b64 to prevent memory
+/// buildup across N subscribers (P-IPC-03)
 const MAX_SCREENSHOT_B64_BYTES: usize = 4 * 1024 * 1024;
-/// C-OPS-03: 优雅 drain 默认截止 — join in-flight 连接 10s, 超时 abort 剩余 (强制停, 防挂死)。
-/// M-OPS-03: 运行时可经 FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS 覆盖 (1..=300s, 越界回退此默认)。
+/// C-OPS-03: default graceful drain deadline — join in-flight connections for 10s, abort the
+/// rest on timeout (forced stop, prevents hang).
+/// M-OPS-03: overridable at runtime via FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS (1..=300s,
+/// out-of-range falls back to this default).
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 
-/// M-OPS-03: 解析优雅 drain 超时 — env `FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS` 覆盖默认 10s。
-/// 合法区间 1..=300 (秒): 过短误杀 in-flight, 过长拖延停机。越界/非数字 → 回退默认, fail-loud warn。
+/// M-OPS-03: resolve the graceful drain timeout — env `FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS`
+/// overrides the 10s default. Valid range 1..=300 (seconds): too short kills in-flight work,
+/// too long drags out shutdown. Out-of-range/non-numeric → fall back to the default, fail-loud warn.
 fn resolve_shutdown_timeout() -> Duration {
     parse_shutdown_timeout(std::env::var("FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS").ok())
 }
 
-/// M-OPS-03: 纯函数解析 (无 env 副作用, 可单测) — env 值 → Duration。
+/// M-OPS-03: pure parse function (no env side effects, unit-testable) — env value → Duration.
 fn parse_shutdown_timeout(raw: Option<String>) -> Duration {
     match raw {
         Some(v) => match v.trim().parse::<u64>() {
             Ok(secs) if (1..=300).contains(&secs) => {
-                info!(secs, "M-OPS-03: shutdown drain 超时 env 覆盖");
+                info!(secs, "M-OPS-03: shutdown drain timeout overridden via env");
                 Duration::from_secs(secs)
             }
             Ok(secs) => {
                 warn!(
                     secs,
-                    "M-OPS-03: shutdown 超时越界 (须 1..=300), 回退默认 10s"
+                    "M-OPS-03: shutdown timeout out of range (must be 1..=300), falling back to 10s default"
                 );
                 SHUTDOWN_DEADLINE
             }
             Err(e) => {
-                warn!(raw = %v, error = %e, "M-OPS-03: shutdown 超时非数字, 回退默认 10s");
+                warn!(raw = %v, error = %e, "M-OPS-03: shutdown timeout not numeric, falling back to 10s default");
                 SHUTDOWN_DEADLINE
             }
         },
@@ -129,11 +144,14 @@ fn parse_shutdown_timeout(raw: Option<String>) -> Duration {
     }
 }
 
-/// D6-02: execute 墙钟直方图固定桶上界 (秒)。+Inf 末桶不计入数组 (独立 total = exec_total)。
-/// 桶选型覆盖 CLI 沙箱典型档: <5ms init / <50ms 快命令 / <500ms 编译 / <5s 测试套 / <30s 长跑 / +Inf 尾部。
+/// D6-02: fixed bucket upper bounds (seconds) for the execute wall-clock histogram. The +Inf
+/// last bucket is not stored in the array (tracked separately, total = exec_total).
+/// Bucket selection covers typical CLI sandbox tiers: <5ms init / <50ms fast commands /
+/// <500ms compile / <5s test suite / <30s long runs / +Inf tail.
 const DURATION_BUCKETS_LE: [f64; 5] = [0.005, 0.05, 0.5, 5.0, 30.0];
 
-/// D6-02: 墙钟 (秒) → 桶下标; 越过所有有限桶 → None (落入 +Inf 末桶, 不递增数组)。
+/// D6-02: wall-clock (seconds) → bucket index; beyond all finite buckets → None (falls into the
+/// +Inf last bucket, not counted in the array).
 fn duration_bucket_index(sec: f64) -> Option<usize> {
     for (i, le) in DURATION_BUCKETS_LE.iter().enumerate() {
         if sec <= *le {
@@ -143,8 +161,10 @@ fn duration_bucket_index(sec: f64) -> Option<usize> {
     None
 }
 
-/// D6-02: histogram_quantile 插值 — 累计计数数组 (每桶含自身及更小) → 分位值 (秒)。
-/// q ∈ [0,1]。线性插值跨相邻桶 (Prometheus _quantile_ 约定)。空/不足 → 0.0。
+/// D6-02: histogram_quantile interpolation — cumulative count array (each bucket inclusive of
+/// itself and smaller) → quantile value (seconds).
+/// q ∈ [0,1]. Linear interpolation across adjacent buckets (Prometheus _quantile_ convention).
+/// Empty/insufficient → 0.0.
 fn histogram_quantile(cumulative: &[u64], q: f64) -> f64 {
     let total = cumulative.last().copied().unwrap_or(0);
     if total == 0 {
@@ -171,41 +191,47 @@ fn histogram_quantile(cumulative: &[u64], q: f64) -> f64 {
             return lo + (hi - lo) * frac;
         }
     }
-    // q 落在 +Inf 末桶 (超过所有有限桶累计) → 返回最大有限上界 (保守, 不假装无限)。
+    // q falls into the +Inf last bucket (beyond all finite-bucket totals) → return the largest
+    // finite bound (conservative, do not pretend it is infinite).
     DURATION_BUCKETS_LE.last().copied().unwrap_or(0.0)
 }
 
-/// M-OPS-02: Prometheus recorder handle — global, idempotent 安装。
-/// metrics-exporter-prometheus 的 PrometheusBuilder::install() 安装全局 recorder,
-/// 返 PrometheusHandle (render() 出 Prometheus text format 供 scrape)。
-/// install 幂等: 重复调返 Err, 我们吞掉 — 首次成功后全局 recorder 已就位。
+/// M-OPS-02: Prometheus recorder handle — global, idempotent install.
+/// metrics-exporter-prometheus's PrometheusBuilder::install() installs the global recorder and
+/// returns a PrometheusHandle (render() emits Prometheus text format for scraping).
+/// install is idempotent: repeat calls return Err, which we swallow — after the first success
+/// the global recorder is in place.
 static PROM_HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 
-/// 安装 Prometheus recorder (幂等) 并返 handle 克隆; 已装则从 static 取。
-/// describe_counter 让 render() 带 HELP/TYPE 头 (无观测值时也有 schema)。
-/// ARCH-4: pub 化 — 进程内路径 (fe-pyo3 execute_sync, 不经 fe-ipc/BroadcastHub)
-/// 也须装 recorder, 否则 record_exec_outcome 的 metrics::counter! 无 recorder = no-op。
-/// 幂等 (OnceLock), 多调安全。
+/// Install the Prometheus recorder (idempotent) and return a handle clone; if already
+/// installed, fetch from the static.
+/// describe_counter makes render() emit HELP/TYPE headers (schema present even with no observations).
+/// ARCH-4: made pub — in-process paths (fe-pyo3 execute_sync, bypassing fe-ipc/BroadcastHub)
+/// must also install the recorder; otherwise the metrics::counter! calls in
+/// record_exec_outcome have no recorder = no-op.
+/// Idempotent (OnceLock), safe to call multiple times.
 pub fn install_prometheus_recorder() -> Option<PrometheusHandle> {
     PROM_HANDLE
         .get_or_init(|| {
-            // D6-02: 配置直方图桶与 DURATION_BUCKETS_LE 对齐 — render() 出 _bucket{le=...} 行。
-            // set_buckets_for_metric 消费 self 返 Result<PrometheusBuilder, BuildError>;
-            // .ok()? 转 Option<PrometheusBuilder> (空桶→BuildError→None, 降级仅 JSON)。
+            // D6-02: configure histogram buckets aligned with DURATION_BUCKETS_LE — render()
+            // emits _bucket{le=...} lines.
+            // set_buckets_for_metric consumes self and returns Result<PrometheusBuilder, BuildError>;
+            // .ok()? converts to Option<PrometheusBuilder> (empty buckets → BuildError → None,
+            // degraded to JSON-only).
             let builder = PrometheusBuilder::new()
                 .set_buckets_for_metric(
                     Matcher::Prefix("fe_exec_duration".to_string()),
                     &DURATION_BUCKETS_LE,
                 )
                 .map_err(|e| {
-                    warn!(error = %e, "D6-02: set_buckets_for_metric 失败");
+                    warn!(error = %e, "D6-02: set_buckets_for_metric failed");
                     e
                 })
                 .ok()?;
             let handle = builder
                 .install_recorder()
                 .map_err(|e| {
-                    warn!(error = %e, "M-OPS-02: Prometheus recorder install 失败");
+                    warn!(error = %e, "M-OPS-02: Prometheus recorder install failed");
                     e
                 })
                 .ok()?;
@@ -222,18 +248,19 @@ pub fn install_prometheus_recorder() -> Option<PrometheusHandle> {
             );
             metrics::describe_gauge!("fe_shell_active", "Active background shells");
             metrics::describe_gauge!("fe_connections", "Active UDS connections");
-            // D4-9: 非流式 exec_sem 可用许可 — LB/运维面板据此判饱和 (0=满载分流)。与 health
-            // response available_permits 同源; Prometheus exporter 镜像成 gauge 供 scrape。
+            // D4-9: available permits of the non-streaming exec_sem — LB/ops dashboards use this
+            // to detect saturation (0 = saturated, shed load). Same source as the health
+            // response available_permits; mirrored as a gauge in the Prometheus exporter for scraping.
             metrics::describe_gauge!("fe_exec_sem_available", "Available exec semaphore permits");
             Some(handle)
         })
         .clone()
 }
 
-/// stdio 订阅作用域 (审计 2.9 / Blocker 10) — per-sub 过滤防跨租户泄漏。
-/// 默认 OwnConn: 仅收本连接发起命令的 stdio (多租户隔离基线)。
-/// All: 收全部 (向后兼容 dashboard 场景, 显式 opt-in)。
-/// Tasks: 仅收白名单 task_id 的 stdio (跨连接精确订阅)。
+/// stdio subscription scope (audit 2.9 / Blocker 10) — per-sub filtering prevents cross-tenant leaks.
+/// Default OwnConn: only stdio of commands initiated by this connection (multi-tenant isolation baseline).
+/// All: receive everything (backward-compatible dashboard scenario, explicit opt-in).
+/// Tasks: only stdio of allowlisted task_ids (precise cross-connection subscription).
 #[derive(Clone)]
 enum StdioScope {
     All,
@@ -242,8 +269,9 @@ enum StdioScope {
 }
 
 impl StdioScope {
-    /// 命令 (task_id + 发起连接 conn_id) 是否落本作用域。
-    /// source_conn = 命令发起连接 conn_id; scope 内 OwnConn 存订阅者自身 conn_id。
+    /// Whether a command (task_id + originating connection conn_id) falls into this scope.
+    /// source_conn = conn_id of the connection that initiated the command; OwnConn stores the
+    /// subscriber's own conn_id.
     fn allows(&self, task_id: Option<&str>, source_conn: u64) -> bool {
         match self {
             StdioScope::All => true,
@@ -253,7 +281,7 @@ impl StdioScope {
     }
 }
 
-/// 订阅者 — 一条连接可能持多个订阅, 共享该连接的 push tx
+/// Subscriber — one connection may hold multiple subscriptions, all sharing that connection's push tx
 struct Subscriber {
     conn_id: u64,
     channels: HashSet<String>,
@@ -261,27 +289,35 @@ struct Subscriber {
     tx: mpsc::Sender<Value>,
 }
 
-/// 广播中心 (v1.5 #14) — Arc 共享给 accept_loop/handle_conn/源任务。
-/// registry: sub_id → Subscriber。源任务 lazy 启停: 0 订阅自退, 下次 subscribe 重启。
-/// C-OPS-04: shutdown Notify — executor.shutdown IPC 触发, accept_loop 监听 → 优雅 drain。
-/// C-OPS-05: 运维指标 — AtomicU64 计数 (exec_total/blocked/timeout/success/failed, rollback) +
-///   duration/stdio 累加器 (无锁, 调用方读 snapshot 算均值)。无直方图存储 (内存预算), 聚合够运维。
+/// Broadcast hub (v1.5 #14) — Arc-shared by accept_loop/handle_conn/source tasks.
+/// registry: sub_id → Subscriber. Source tasks start/stop lazily: self-exit at 0 subscribers,
+/// restart on next subscribe.
+/// C-OPS-04: shutdown Notify — triggered by the executor.shutdown IPC, listened on by
+/// accept_loop → graceful drain.
+/// C-OPS-05: ops metrics — AtomicU64 counters (exec_total/blocked/timeout/success/failed,
+/// rollback) + duration/stdio accumulators (lock-free; callers read a snapshot and compute
+/// averages). No histogram storage (memory budget); aggregation is enough for ops.
 struct BroadcastHub {
     registry: Mutex<HashMap<String, Subscriber>>,
     executor: Arc<Executor>,
     conn_counter: AtomicU64,
-    /// M-OPS-04: 活跃连接计数 — handle_conn 入口 fetch_add, drop_conn fetch_sub。无锁, health 读快照。
+    /// M-OPS-04: active connection count — fetch_add at handle_conn entry, fetch_sub in
+    /// drop_conn. Lock-free; health reads a snapshot.
     active_conns: AtomicU64,
     sub_counter: AtomicU64,
-    /// 0827 C-9: 源生命周期代数 — subscribe 该通道时 fetch_add, 源任务启动捕获本代。
-    /// 源任务 0 订阅拟退出时重比对: 若代未变 (无新订阅进入) 才真退; 代变 (中途有新订阅) 续跑。
-    /// 破旧版竞态: 源 0 订阅 break + trailing take() vs 并发 subscribe ensure 见 slot=running 早 return → 源不启。
+    /// 0827 C-9: source lifetime generation — fetch_add on subscribe to that channel; the
+    /// source task captures its generation at startup.
+    /// When the source task is about to exit at 0 subscribers it re-compares: only if the
+    /// generation is unchanged (no new subscribers arrived) does it truly exit; a changed
+    /// generation (new subscribers in the meantime) keeps it running.
+    /// Breaks the old race: source breaks at 0 subs + trailing take() vs a concurrent subscribe
+    /// ensure seeing slot=running and returning early → source never started.
     telemetry_gen: AtomicU64,
     screenshot_gen: AtomicU64,
     telemetry_task: Mutex<Option<JoinHandle<()>>>,
     screenshot_task: Mutex<Option<JoinHandle<()>>>,
     shutdown: Arc<tokio::sync::Notify>,
-    // C-OPS-05 指标
+    // C-OPS-05 metrics
     exec_total: AtomicU64,
     exec_blocked: AtomicU64,
     exec_timeout: AtomicU64,
@@ -289,17 +325,20 @@ struct BroadcastHub {
     exec_failed: AtomicU64,
     rollback_total: AtomicU64,
     rollback_failed: AtomicU64,
-    /// execute 累计墙钟 (ns) + stdio 累计字节 — 配合 exec_total 算均值
+    /// Cumulative execute wall-clock (ns) + cumulative stdio bytes — combined with exec_total for averages
     exec_duration_nanos_sum: AtomicU64,
     stdio_bytes_sum: AtomicU64,
-    /// D6-02: execute 墙钟固定桶直方图 (ns) — p50/p95/p99 经 histogram_quantile 插值。
-    /// 6 桶上界 (秒): 0.005 / 0.05 / 0.5 / 5 / 30 / +Inf。AtomicU64 无锁, snapshot 累加走桶。
+    /// D6-02: fixed-bucket wall-clock histogram for execute (ns) — p50/p95/p99 via
+    /// histogram_quantile interpolation.
+    /// 6 bucket bounds (seconds): 0.005 / 0.05 / 0.5 / 5 / 30 / +Inf. Lock-free AtomicU64;
+    /// snapshots accumulate into buckets.
     exec_duration_buckets: [AtomicU64; DURATION_BUCKETS_LE.len()],
-    /// D6-02: 墙钟 min/max (ns) — 单次最快/最慢, 配合直方图看尾部分布。
+    /// D6-02: wall-clock min/max (ns) — fastest/slowest single run, complements the histogram
+    /// for tail distribution.
     exec_duration_nanos_min: AtomicU64,
     exec_duration_nanos_max: AtomicU64,
-    /// M-OPS-02: Prometheus handle — render() 出 text format 供 executor.metrics_prometheus。
-    /// None = recorder install 失败 (降级: 仅 JSON snapshot, 无 prometheus 端点)。
+    /// M-OPS-02: Prometheus handle — render() emits text format for executor.metrics_prometheus.
+    /// None = recorder install failed (degraded: JSON snapshot only, no prometheus endpoint).
     prom_handle: Option<PrometheusHandle>,
 }
 
@@ -338,8 +377,8 @@ impl BroadcastHub {
         })
     }
 
-    /// C-OPS-05: 记一次 execute 结果 → 原子累加指标。
-    /// exit_code 0=success, -124=timeout, -1=blocked/internal, 其他=failed。
+    /// C-OPS-05: record one execute result → atomically accumulate metrics.
+    /// exit_code 0=success, -124=timeout, -1=blocked/internal, other=failed.
     fn record_exec(&self, r: &ExecutionResult) {
         self.exec_total.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("fe_exec_total").increment(1);
@@ -356,19 +395,21 @@ impl BroadcastHub {
             self.exec_failed.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("fe_exec_failed").increment(1);
         }
-        // 墙钟 (duration_sec 秒 → ns; f64 截断到 u64 纳秒, 累加溢出极不可能 — u64 ns ≈ 584 年)
+        // Wall-clock (duration_sec seconds → ns; f64 truncated to u64 nanoseconds; sum overflow
+        // is extremely unlikely — u64 ns ≈ 584 years)
         let dur_ns = (r.duration_sec.max(0.0) * 1e9) as u64;
         self.exec_duration_nanos_sum
             .fetch_add(dur_ns, Ordering::Relaxed);
-        // stdio 字节 (stdout+stderr 截断后长度 — 真实传输量)
+        // stdio bytes (truncated stdout+stderr length — the real transfer volume)
         let bytes = (r.stdout.len() + r.stderr.len()) as u64;
         self.stdio_bytes_sum.fetch_add(bytes, Ordering::Relaxed);
-        // D6-02: 墙钟直方图 (blocked/timeout duration=0 落首桶; 真实墙钟按桶上界分档)。
+        // D6-02: wall-clock histogram (blocked/timeout have duration=0, falling into the first
+        // bucket; real wall-clock is tiered by bucket bounds).
         let dur_sec = r.duration_sec.max(0.0);
         if let Some(i) = duration_bucket_index(dur_sec) {
             self.exec_duration_buckets[i].fetch_add(1, Ordering::Relaxed);
         }
-        // min/max (CAS 循环: 无锁更新, 无混叠)
+        // min/max (CAS loops: lock-free updates, no aliasing)
         if dur_ns < self.exec_duration_nanos_min.load(Ordering::Relaxed) {
             let mut cur = self.exec_duration_nanos_min.load(Ordering::Relaxed);
             while dur_ns < cur {
@@ -395,11 +436,11 @@ impl BroadcastHub {
                 Err(v) => cur_max = v,
             }
         }
-        // D6-02: 镜像进 Prometheus 直方图 (render() 出 _bucket{le=...})。
+        // D6-02: mirror into the Prometheus histogram (render() emits _bucket{le=...}).
         metrics::histogram!("fe_exec_duration_seconds").record(dur_sec);
     }
 
-    /// C-OPS-05: 记一次 rollback — ok=true 算 total, false 算 total+failed
+    /// C-OPS-05: record one rollback — ok=true counts toward total, false toward total+failed
     fn record_rollback(&self, ok: bool) {
         self.rollback_total.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("fe_rollback_total").increment(1);
@@ -409,9 +450,11 @@ impl BroadcastHub {
         }
     }
 
-    /// C-OPS-05: 指标快照 — 转为 JSON 给 executor.metrics handler。
-    /// 均值用 exec_total 算 (blocked/timeout 不计 duration — 它们 duration_sec=0)。
-    /// D6-02: 墙钟直方图 — 累计计数 (每桶含自身及更小) → histogram_quantile 插值 p50/p95/p99。
+    /// C-OPS-05: metrics snapshot — converted to JSON for the executor.metrics handler.
+    /// Averages computed with exec_total (blocked/timeout do not count duration — their
+    /// duration_sec=0).
+    /// D6-02: wall-clock histogram — cumulative counts (each bucket inclusive of itself and
+    /// smaller) → histogram_quantile interpolation for p50/p95/p99.
     fn metrics_snapshot(&self) -> Value {
         let total = self.exec_total.load(Ordering::Relaxed);
         let dur_ns_sum = self.exec_duration_nanos_sum.load(Ordering::Relaxed);
@@ -422,7 +465,8 @@ impl BroadcastHub {
             0.0
         };
         let avg_stdio_bytes = stdio_sum.checked_div(total).unwrap_or(0);
-        // D6-02: 累计计数 — cumulative[i] = 桶 0..=i 原子求和, 末位 = total (含 +Inf)。
+        // D6-02: cumulative counts — cumulative[i] = atomic sum of buckets 0..=i, last entry =
+        // total (includes +Inf).
         let per_bucket: Vec<u64> = self
             .exec_duration_buckets
             .iter()
@@ -434,7 +478,7 @@ impl BroadcastHub {
             acc += c;
             cumulative.push(acc);
         }
-        cumulative.push(total); // +Inf 末桶 = 全部 execute
+        cumulative.push(total); // +Inf last bucket = all executes
         let p50 = histogram_quantile(&cumulative, 0.5);
         let p95 = histogram_quantile(&cumulative, 0.95);
         let p99 = histogram_quantile(&cumulative, 0.99);
@@ -468,9 +512,10 @@ impl BroadcastHub {
         })
     }
 
-    /// M-OPS-02: Prometheus text format — render() 出 scrape 文本给 executor.metrics_prometheus。
-    /// recorder install 失败 → None → handler 返 -32603 (降级, 仅 JSON snapshot 可用)。
-    /// 不开 HTTP 端口 (保 M-SEC-01 UDS-only); 调用方经 UDS 拉 text 喂自家 exporter。
+    /// M-OPS-02: Prometheus text format — render() emits scrape text for executor.metrics_prometheus.
+    /// recorder install failure → None → handler returns -32603 (degraded, JSON snapshot only).
+    /// No HTTP port opened (preserves M-SEC-01 UDS-only); callers pull the text over UDS and
+    /// feed their own exporter.
     fn metrics_prometheus(&self) -> Option<String> {
         self.prom_handle.as_ref().map(|h| h.render())
     }
@@ -483,8 +528,9 @@ impl BroadcastHub {
         format!("sub-{}", self.sub_counter.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// 注册订阅 — 返回 subscription_id。channels 去重存小写。
-    /// scope = stdio 作用域 (Blocker 10); interval_ms/screenshot_interval_ms 透传源任务 (M-IPC-01)。
+    /// Register a subscription — returns the subscription_id. channels deduplicated, stored lowercase.
+    /// scope = stdio scope (Blocker 10); interval_ms/screenshot_interval_ms passed through to
+    /// the source task (M-IPC-01).
     fn subscribe(
         self: &Arc<Self>,
         conn_id: u64,
@@ -497,7 +543,8 @@ impl BroadcastHub {
         let sub_id = self.next_sub_id();
         let has_telemetry = channels.contains(CH_TELEMETRY);
         let has_screenshot = channels.contains(CH_SCREENSHOT);
-        // C-9: insert + gen bump 同一 registry 锁内 — 源任务重比对 gen 时见最新代, 续跑不误退。
+        // C-9: insert + gen bump under the same registry lock — the source task re-comparing
+        // the generation sees the latest one and keeps running instead of exiting early.
         {
             let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
             reg.insert(
@@ -510,14 +557,15 @@ impl BroadcastHub {
                 },
             );
         }
-        // gen bump 在锁外 (AtomicU64, 顺序保证: insert 先于 bump; 源任务读 gen≥本值见新订阅)。
+        // gen bump outside the lock (AtomicU64, ordering guarantee: insert happens-before the
+        // bump; the source task reading gen >= this value sees the new subscriber).
         if has_telemetry {
             self.telemetry_gen.fetch_add(1, Ordering::SeqCst);
         }
         if has_screenshot {
             self.screenshot_gen.fetch_add(1, Ordering::SeqCst);
         }
-        info!(%sub_id, conn_id, "订阅注册");
+        info!(%sub_id, conn_id, "subscription registered");
         if has_telemetry {
             self.ensure_telemetry_source(interval_ms);
         }
@@ -527,7 +575,7 @@ impl BroadcastHub {
         sub_id
     }
 
-    /// 取消订阅 — 返回是否找到并移除
+    /// Unsubscribe — returns whether it was found and removed
     fn unsubscribe(&self, sub_id: &str) -> bool {
         let removed = self
             .registry
@@ -536,12 +584,12 @@ impl BroadcastHub {
             .remove(sub_id)
             .is_some();
         if removed {
-            info!(%sub_id, "订阅取消");
+            info!(%sub_id, "subscription removed");
         }
         removed
     }
 
-    /// 连接断开 — 清该连接所有订阅
+    /// Connection dropped — clear all subscriptions of that connection
     fn drop_conn(&self, conn_id: u64) {
         self.active_conns.fetch_sub(1, Ordering::Relaxed);
         metrics::gauge!("fe_connections").set(self.active_conns.load(Ordering::Relaxed) as f64);
@@ -550,14 +598,20 @@ impl BroadcastHub {
         reg.retain(|_, s| s.conn_id != conn_id);
         let dropped = before - reg.len();
         if dropped > 0 {
-            info!(conn_id, dropped, "连接断开, 清理订阅");
+            info!(
+                conn_id,
+                dropped, "connection dropped, subscriptions cleared"
+            );
         }
     }
 
-    /// 确保遥测源任务运行 — handle 不在或已结束 (含 panic) 则启动 (C-IPC-02/03)。
-    /// 源任务 0 telemetry 订阅自退并清 handle; panic 后 handle.is_finished()=true 触发重启。
-    /// interval_ms 由调用方传入 (M-IPC-01), 缺省 DEFAULT_INTERVAL_MS。
-    /// 0827 C-9: 启动时捕获本代 gen — 源任务 0 订阅拟退时重比对 gen, 变化则续跑 (见 run_telemetry_source)。
+    /// Ensure the telemetry source task is running — starts it when the handle is absent or
+    /// already finished (including panic) (C-IPC-02/03).
+    /// The source task self-exits at 0 telemetry subscribers and clears the handle; after a
+    /// panic handle.is_finished()=true triggers a restart.
+    /// interval_ms is passed in by the caller (M-IPC-01), defaulting to DEFAULT_INTERVAL_MS.
+    /// 0827 C-9: capture the generation at startup — the source task re-compares the gen when
+    /// about to exit at 0 subscribers and keeps running if it changed (see run_telemetry_source).
     fn ensure_telemetry_source(self: &Arc<Self>, interval_ms: u64) {
         let mut slot = self
             .telemetry_task
@@ -581,12 +635,16 @@ impl BroadcastHub {
                 .take();
         });
         *slot = Some(handle);
-        info!(interval_ms = effective, gen, "遥测源任务启动");
+        info!(
+            interval_ms = effective,
+            gen, "telemetry source task started"
+        );
     }
 
-    /// 确保截图源任务运行 — 同 telemetry 逻辑 (C-IPC-02/03)。
-    /// screenshot_interval_ms 由调用方传入 (M-IPC-01)。
-    /// 0827 C-9: 同 telemetry, 启动捕获 gen 供 run_screenshot_source 重比对。
+    /// Ensure the screenshot source task is running — same logic as telemetry (C-IPC-02/03).
+    /// screenshot_interval_ms is passed in by the caller (M-IPC-01).
+    /// 0827 C-9: same as telemetry, capture the gen at startup for run_screenshot_source to
+    /// re-compare.
     fn ensure_screenshot_source(self: &Arc<Self>, screenshot_interval_ms: u64) {
         let mut slot = self
             .screenshot_task
@@ -610,39 +668,50 @@ impl BroadcastHub {
                 .take();
         });
         *slot = Some(handle);
-        info!(interval_ms = effective, gen, "截图源任务启动");
+        info!(
+            interval_ms = effective,
+            gen, "screenshot source task started"
+        );
     }
 
-    /// 遥测源 — executor.telemetry_stream 单流扇出, 0 订阅自退。
-    /// 0827 C-9: 0 订阅拟退前重比对 gen — gen 变 (中途有新 telemetry 订阅) 则续跑, 不误退漏帧。
+    /// Telemetry source — fan out a single executor.telemetry_stream, self-exit at 0 subscribers.
+    /// 0827 C-9: re-compare the gen before exiting at 0 subscribers — a changed gen (new
+    /// telemetry subscribers arrived meanwhile) keeps it running, avoiding a premature exit
+    /// that drops frames.
     async fn run_telemetry_source(&self, interval_ms: u64, start_gen: u64) {
         let cfg = TelemetryStreamConfig {
             interval_ms,
             max_samples: 0,
-            // L-15: 广播源采样 executor 自身 (聚合视图), 不绑特定子进程 PID
+            // L-15: broadcast source samples the executor itself (aggregated view), not bound to
+            // a specific subprocess PID
             pid: None,
         };
         let (mut rx, handle) = self.executor.telemetry_stream(cfg);
         while let Some(sample) = rx.recv().await {
             let targets = self.collect_targets(CH_TELEMETRY);
             if targets.is_empty() {
-                // C-9: 重比对 gen — 变化表示 0 订阅判断后又有新订阅进入, 续跑不退。
+                // C-9: re-compare the gen — a change means new subscribers arrived after the
+                // 0-subscriber check; keep running instead of exiting.
                 let cur_gen = self.telemetry_gen.load(Ordering::SeqCst);
                 if cur_gen != start_gen {
                     info!(
                         start_gen,
-                        cur_gen, "遥测 0 订阅但 gen 变 (新订阅进入), 续跑"
+                        cur_gen,
+                        "telemetry at 0 subscribers but gen changed (new subscribers), continuing"
                     );
                     continue;
                 }
-                info!(gen = cur_gen, "遥测 0 订阅且 gen 未变, 源任务自退");
+                info!(
+                    gen = cur_gen,
+                    "telemetry at 0 subscribers and gen unchanged, source task self-exiting"
+                );
                 break;
             }
             let data = serde_json::to_value(&sample).unwrap_or(json!({}));
             for (sub_id, _scope, tx) in targets {
                 let frame = notification(sub_id.clone(), CH_TELEMETRY, data.clone());
                 if tx.try_send(frame).is_err() {
-                    warn!(%sub_id, "遥测帧满通道被丢 (P-IPC-01)");
+                    warn!(%sub_id, "telemetry frame dropped, channel full (P-IPC-01)");
                 }
             }
         }
@@ -650,8 +719,11 @@ impl BroadcastHub {
         let _ = handle.await;
     }
 
-    /// 截图源 — 周期 gui_action(Screenshot) 扇出, TCC 未授权帧 data.ok=false 不崩。0 订阅自退。
-    /// 0827 C-9: 0 订阅拟退前重比对 gen — gen 变 (中途有新 screenshot 订阅) 则续跑, 不误退漏帧。
+    /// Screenshot source — periodic gui_action(Screenshot) fan-out; TCC not authorized yields
+    /// frames with data.ok=false, no crash. Self-exit at 0 subscribers.
+    /// 0827 C-9: re-compare the gen before exiting at 0 subscribers — a changed gen (new
+    /// screenshot subscribers arrived meanwhile) keeps it running, avoiding a premature exit
+    /// that drops frames.
     async fn run_screenshot_source(&self, interval_ms: u64, start_gen: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
         interval.tick().await;
@@ -659,16 +731,21 @@ impl BroadcastHub {
             interval.tick().await;
             let targets = self.collect_targets(CH_SCREENSHOT);
             if targets.is_empty() {
-                // C-9: 重比对 gen — 变化表示 0 订阅判断后又有新订阅进入, 续跑不退。
+                // C-9: re-compare the gen — a change means new subscribers arrived after the
+                // 0-subscriber check; keep running instead of exiting.
                 let cur_gen = self.screenshot_gen.load(Ordering::SeqCst);
                 if cur_gen != start_gen {
                     info!(
                         start_gen,
-                        cur_gen, "截图 0 订阅但 gen 变 (新订阅进入), 续跑"
+                        cur_gen,
+                        "screenshot at 0 subscribers but gen changed (new subscribers), continuing"
                     );
                     continue;
                 }
-                info!(gen = cur_gen, "截图 0 订阅且 gen 未变, 源任务自退");
+                info!(
+                    gen = cur_gen,
+                    "screenshot at 0 subscribers and gen unchanged, source task self-exiting"
+                );
                 break;
             }
             let executor = self.executor.clone();
@@ -681,8 +758,9 @@ impl BroadcastHub {
             let data = match shot {
                 Ok(Ok(r)) => {
                     let val = serde_json::to_value(&r).unwrap_or(json!({"ok": false}));
-                    // P-IPC-03: 大帧 (含 PNG b64) 扇出 N 订阅会无界占内存。
-                    // 超 4MB 降级为元数据帧 (去 png_b64), 避免慢消费方堆积。
+                    // P-IPC-03: large frames (with PNG b64) fanned out to N subscribers occupy
+                    // memory without bound.
+                    // Above 4MB degrade to a metadata frame (drop png_b64) to avoid slow-consumer buildup.
                     if val
                         .get("screenshot_png_b64")
                         .and_then(|v| v.as_str())
@@ -694,7 +772,7 @@ impl BroadcastHub {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.len())
                                 .unwrap_or(0),
-                            "截图帧超 {} 字节, 降级去 png_b64 (P-IPC-03)", MAX_SCREENSHOT_B64_BYTES
+                            "screenshot frame exceeds {} bytes, degrading by dropping png_b64 (P-IPC-03)", MAX_SCREENSHOT_B64_BYTES
                         );
                         let mut lite = val.clone();
                         if let Some(obj) = lite.as_object_mut() {
@@ -707,24 +785,24 @@ impl BroadcastHub {
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!(error = %e, "截图源 gui_action 失败");
-                    json!({"ok": false, "error": format!("screenshot 失败: {e}")})
+                    warn!(error = %e, "screenshot source gui_action failed");
+                    json!({"ok": false, "error": format!("screenshot failed: {e}")})
                 }
                 Err(e) => {
-                    warn!(error = %e, "截图源 spawn_blocking 失败");
-                    json!({"ok": false, "error": format!("screenshot 任务失败: {e}")})
+                    warn!(error = %e, "screenshot source spawn_blocking failed");
+                    json!({"ok": false, "error": format!("screenshot task failed: {e}")})
                 }
             };
             for (sub_id, _scope, tx) in targets {
                 let frame = notification(sub_id.clone(), CH_SCREENSHOT, data.clone());
                 if tx.try_send(frame).is_err() {
-                    warn!(%sub_id, "截图帧满通道被丢 (P-IPC-01)");
+                    warn!(%sub_id, "screenshot frame dropped, channel full (P-IPC-01)");
                 }
             }
         }
     }
 
-    /// 收集某通道所有 (sub_id, tx, scope) — 锁内快照, 锁外发送
+    /// Collect all (sub_id, tx, scope) for a channel — snapshot under lock, send outside the lock
     fn collect_targets(&self, channel: &str) -> Vec<(String, StdioScope, mpsc::Sender<Value>)> {
         let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         reg.iter()
@@ -733,12 +811,16 @@ impl BroadcastHub {
             .collect()
     }
 
-    /// stdio 广播 — execute/execute_stream 处理器调, 扇出给**通过 scope 过滤**的 stdio 订阅。
-    /// source_conn = 发起该命令的连接 conn_id (OwnConn 过滤用); data 含 task_id (Tasks 过滤用)。
-    /// Blocker 10 (审计 2.9): 旧版无过滤全广播 = 跨租户泄漏 (Agent A 见 Agent B stdout)。
+    /// stdio broadcast — called by execute/execute_stream handlers, fanned out to stdio subs
+    /// **that pass the scope filter**.
+    /// source_conn = conn_id of the connection that initiated the command (for OwnConn
+    /// filtering); data carries task_id (for Tasks filtering).
+    /// Blocker 10 (audit 2.9): the old unfiltered broadcast to everyone = cross-tenant leak
+    /// (Agent A sees Agent B's stdout).
     fn broadcast_stdio(&self, data: Value, source_conn: u64) {
-        // D4-4: 快路径 — 0 stdio 订阅时跳过 task_id 提取 + 逐订阅 frame 构建 (避免无订阅时
-        // 仍锁 registry 建 Vec + clone Value)。collect_targets 空即无订阅, 直接返回零工作。
+        // D4-4: fast path — with 0 stdio subscribers skip task_id extraction + per-sub frame
+        // building (avoids locking the registry to build a Vec + clone Value when there are no
+        // subscribers). An empty collect_targets means no subscribers; return with zero work.
         let targets = self.collect_targets(CH_STDIO);
         if targets.is_empty() {
             return;
@@ -753,14 +835,17 @@ impl BroadcastHub {
             }
             let frame = notification(sub_id.clone(), CH_STDIO, data.clone());
             if tx.try_send(frame).is_err() {
-                warn!(%sub_id, "stdio 帧满通道被丢 (P-IPC-01)");
+                warn!(%sub_id, "stdio frame dropped, channel full (P-IPC-01)");
             }
         }
     }
 
-    /// stdio 广播 (阻塞版) — done 帧专用。done 是流终止标记, 丢不得 (调用方见不到结束)。
-    /// 与 broadcast_stdio 区别: 用 `tx.send(frame).await` (等槽位) 而非 try_send (满即丢)。
-    /// D5-3: 旧版 done 也走 try_send, 慢消费者满通道时 done 被丢, 订阅方永不收尾 → 挂死。
+    /// stdio broadcast (blocking variant) — dedicated to done frames. A done frame is the
+    /// stream-termination marker and must not be dropped (otherwise the caller never sees the end).
+    /// Difference from broadcast_stdio: uses `tx.send(frame).await` (waits for a slot) instead
+    /// of try_send (drop when full).
+    /// D5-3: the old version also used try_send for done; with a slow consumer filling the
+    /// channel the done frame was dropped and the subscriber never saw termination → hang.
     async fn broadcast_stdio_blocking(&self, data: Value, source_conn: u64) {
         let targets = self.collect_targets(CH_STDIO);
         if targets.is_empty() {
@@ -775,17 +860,20 @@ impl BroadcastHub {
                 continue;
             }
             let frame = notification(sub_id.clone(), CH_STDIO, data.clone());
-            // 阻塞等槽位 — done 不可丢。tx 关闭 (订阅方断连) → send 返 Err, warn! 记 (非 panic)。
+            // Block waiting for a slot — done must not be dropped. If tx is closed (subscriber
+            // disconnected) → send returns Err, recorded via warn! (not a panic).
             if tx.send(frame).await.is_err() {
-                warn!(%sub_id, "stdio done 帧发送失败 — 订阅方已断连 (D5-3)");
+                warn!(%sub_id, "stdio done frame send failed — subscriber already disconnected (D5-3)");
             }
         }
     }
 }
 
-/// 构造 server-push notification Value。
-/// 无 id — JSON-RPC notification 约定 (M-IPC-02): 客户端按有无 id 区分响应 vs 推送。
-/// spec 合规; 隐性契约 = 客户端必须实现此区分, 文档已注明。
+/// Build a server-push notification Value.
+/// No id — JSON-RPC notification convention (M-IPC-02): the client distinguishes responses vs
+/// pushes by the presence of id.
+/// Spec-compliant; the implicit contract is that clients must implement this distinction,
+/// documented.
 fn notification(sub_id: String, channel: &str, data: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -798,12 +886,14 @@ fn notification(sub_id: String, channel: &str, data: Value) -> Value {
     })
 }
 
-/// IPC 服务器 — 持有 Arc<Executor> + Arc<BroadcastHub> + Arc<ShellRegistry>,
-/// 换行分隔 JSON-RPC 2.0 over UDS。
-/// Issue #32: in-flight 流式执行注册表 — M-ARCH-1 同 ShellRegistry/BroadcastHub, 状态在 IPC 层,
-/// Executor 保持 per-task 无状态。key = JSON-RPC 请求 id 的字符串形式 (execute_stream 的 id),
-/// value = oneshot::Sender<()>。executor.cancel {id} 查表 send(()) → fe-sandbox kill 进程树。
-/// 流结束 (正常 Done / 消费者断开) 后 deregister, 防泄漏。
+/// IPC server — holds Arc<Executor> + Arc<BroadcastHub> + Arc<ShellRegistry>,
+/// newline-delimited JSON-RPC 2.0 over UDS.
+/// Issue #32: in-flight streaming execution registry — same M-ARCH-1 as
+/// ShellRegistry/BroadcastHub, state lives in the IPC layer, the Executor stays per-task
+/// stateless. key = stringified JSON-RPC request id (the execute_stream id),
+/// value = oneshot::Sender<()>. executor.cancel {id} looks it up and sends (()) → fe-sandbox
+/// kills the process tree.
+/// deregistered after the stream ends (normal Done / consumer disconnect) to prevent leaks.
 pub struct StreamRegistry {
     entries: Mutex<HashMap<String, oneshot::Sender<()>>>,
 }
@@ -823,51 +913,54 @@ impl Default for StreamRegistry {
 }
 
 impl StreamRegistry {
-    /// 注册一个 in-flight 流 — 返回 cancel_rx 传给 execute_streaming。
-    /// id 重复 (同连接同 id 复用) → 旧 Sender drop (其 rx 返 Err, 不影响旧流), 新覆盖。
+    /// Register an in-flight stream — returns the cancel_rx to hand to execute_streaming.
+    /// Duplicate id (same connection reusing an id) → the old Sender is dropped (its rx
+    /// returns Err, the old stream is unaffected) and the new one overwrites it.
     pub fn register(&self, id: String) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel::<()>();
-        let mut map = self.entries.lock().expect("StreamRegistry 锁中毒");
+        let mut map = self.entries.lock().expect("StreamRegistry lock poisoned");
         if map.contains_key(&id) {
-            warn!(stream_id = %id, "流 id 重复, 覆盖旧 cancel Sender (旧流不受影响)");
+            warn!(stream_id = %id, "duplicate stream id, overwriting old cancel Sender (old stream unaffected)");
         }
         map.insert(id, tx);
         rx
     }
 
-    /// 取消一个 in-flight 流 — 返回 true 若找到并 send 成功, false 若 id 不存在 (已结束或未知)。
+    /// Cancel an in-flight stream — returns true if found and send succeeded, false if the id
+    /// does not exist (already finished or unknown).
     pub fn cancel(&self, id: &str) -> bool {
         let tx = {
-            let mut map = self.entries.lock().expect("StreamRegistry 锁中毒");
+            let mut map = self.entries.lock().expect("StreamRegistry lock poisoned");
             map.remove(id)
         };
         match tx {
             Some(tx) => {
                 if tx.send(()).is_ok() {
-                    info!(stream_id = %id, "cancel 已下发 (Issue #32)");
+                    info!(stream_id = %id, "cancel dispatched (Issue #32)");
                     true
                 } else {
-                    // rx 已 drop (流刚结束) — send Err, 视为未取消
-                    info!(stream_id = %id, "cancel 找到但流已结束 (rx drop)");
+                    // rx already dropped (stream just finished) — send Err, treated as not cancelled
+                    info!(stream_id = %id, "cancel found but stream already finished (rx drop)");
                     false
                 }
             }
             None => {
-                info!(stream_id = %id, "cancel 未找到 id (已结束或未知)");
+                info!(stream_id = %id, "cancel id not found (already finished or unknown)");
                 false
             }
         }
     }
 
-    /// 流结束后注销 — 防泄漏 (Done/断开后清表)。幂等。
+    /// Deregister after a stream ends — prevents leaks (cleared on Done/disconnect). Idempotent.
     pub fn deregister(&self, id: &str) {
-        let mut map = self.entries.lock().expect("StreamRegistry 锁中毒");
+        let mut map = self.entries.lock().expect("StreamRegistry lock poisoned");
         map.remove(id);
     }
 }
 
-/// M-ARCH-1: ShellRegistry 移此层 (与 BroadcastHub 并列) — Executor 保持 per-task 无状态;
-/// IPC 层重启 Executor 不丢后台 shell 句柄; serve-path 与 in-process path 可共享同一 registry。
+/// M-ARCH-1: ShellRegistry moved to this layer (alongside BroadcastHub) — the Executor stays
+/// per-task stateless; an Executor restart at the IPC layer does not lose background shell
+/// handles; the serve-path and the in-process path can share the same registry.
 pub struct IpcServer {
     executor: Arc<Executor>,
     hub: Arc<BroadcastHub>,
@@ -877,7 +970,7 @@ pub struct IpcServer {
 
 impl IpcServer {
     pub fn new() -> Self {
-        info!("IpcServer::new() — 持有 Executor + BroadcastHub + ShellRegistry");
+        info!("IpcServer::new() — holding Executor + BroadcastHub + ShellRegistry");
         let executor = Arc::new(Executor::new());
         let hub = BroadcastHub::new(executor.clone());
         let shells = Arc::new(fe_core::shell::ShellRegistry::new());
@@ -904,12 +997,13 @@ impl IpcServer {
         }
     }
 
-    /// M-ARCH-1: 共享调用方已持有的 registry — fe-pyo3 serve() 与 in-process path 见同一批 shell。
+    /// M-ARCH-1: share the caller's already-held registry — fe-pyo3 serve() and the in-process
+    /// path see the same set of shells.
     pub fn with_executor_and_shells(
         executor: Executor,
         shells: Arc<fe_core::shell::ShellRegistry>,
     ) -> Self {
-        info!("IpcServer::with_executor_and_shells() — 共享 ShellRegistry");
+        info!("IpcServer::with_executor_and_shells() — sharing ShellRegistry");
         let executor = Arc::new(executor);
         let hub = BroadcastHub::new(executor.clone());
         let streams = Arc::new(StreamRegistry::new());
@@ -921,15 +1015,19 @@ impl IpcServer {
         }
     }
 
-    /// A-4: 共享调用方已持有的 Executor Arc — fe-pyo3 serve() 不再重建 Executor。
-    /// 调用方先在进程内用 with_extra_whitelist 配的白名单 + SIGHUP 重载的 extras 跨 serve-path 持久
-    /// (旧版 with_executor_and_shells 取 owned Executor 再 Arc::new, serve 重建丢 in-process 白名单)。
-    /// registry 同 M-ARCH-1 共享。三参全 Arc — 与 serve()/serve_blocking() 取 self.executor.clone() 兼容。
+    /// A-4: share the caller's already-held Executor Arc — fe-pyo3 serve() no longer rebuilds
+    /// the Executor.
+    /// Whitelists the caller configured in-process via with_extra_whitelist + SIGHUP-reloaded
+    /// extras persist across the serve-path
+    /// (the old with_executor_and_shells took an owned Executor then Arc::new; serve rebuilding
+    /// it lost the in-process whitelist).
+    /// registry shared as in M-ARCH-1. All three params are Arc — compatible with
+    /// serve()/serve_blocking() taking self.executor.clone().
     pub fn with_executor_arc_and_shells(
         executor: Arc<Executor>,
         shells: Arc<fe_core::shell::ShellRegistry>,
     ) -> Self {
-        info!("IpcServer::with_executor_arc_and_shells() — 共享 Executor Arc + ShellRegistry");
+        info!("IpcServer::with_executor_arc_and_shells() — sharing Executor Arc + ShellRegistry");
         let hub = BroadcastHub::new(executor.clone());
         let streams = Arc::new(StreamRegistry::new());
         Self {
@@ -940,16 +1038,18 @@ impl IpcServer {
         }
     }
 
-    /// C-1 (审计 0827 product adversarial arch): 共享调用方已持有的 StreamRegistry。
-    /// 与 ShellRegistry (M-ARCH-1) 对称 — fe-pyo3 serve() 重启不丢 in-flight execute_stream 的
-    /// cancel 能力 (Issue #32 确定性 cancel 契约)。旧版每个 IpcServer ctor 重建 StreamRegistry →
-    /// cancel_stream(51) 在 serve() 重启后静默 miss, 旧流子进程树残留 (与 P-PYO3-01 同类 bug)。
+    /// C-1 (audit 0827 product adversarial arch): share the caller's already-held StreamRegistry.
+    /// Symmetric with ShellRegistry (M-ARCH-1) — a fe-pyo3 serve() restart does not lose the
+    /// cancel capability of in-flight execute_stream (Issue #32 deterministic cancel contract).
+    /// The old version rebuilt the StreamRegistry in every IpcServer ctor → cancel_stream(51)
+    /// silently missed after a serve() restart, leaving the old stream's subprocess tree behind
+    /// (same bug class as P-PYO3-01).
     pub fn with_executor_arc_shells_and_streams(
         executor: Arc<Executor>,
         shells: Arc<fe_core::shell::ShellRegistry>,
         streams: Arc<StreamRegistry>,
     ) -> Self {
-        info!("IpcServer::with_executor_arc_shells_and_streams() — 共享 Executor Arc + ShellRegistry + StreamRegistry");
+        info!("IpcServer::with_executor_arc_shells_and_streams() — sharing Executor Arc + ShellRegistry + StreamRegistry");
         let hub = BroadcastHub::new(executor.clone());
         Self {
             executor,
@@ -959,17 +1059,17 @@ impl IpcServer {
         }
     }
 
-    /// M-ARCH-1: 暴露 registry 引用 (health probe / dispatch 取用)。
+    /// M-ARCH-1: expose the registry reference (fetched by health probe / dispatch).
     pub fn shells(&self) -> &Arc<fe_core::shell::ShellRegistry> {
         &self.shells
     }
 
-    /// Issue #32: 暴露 StreamRegistry 引用 (serve 路径线程 accept_loop/handle_conn)。
+    /// Issue #32: expose the StreamRegistry reference (serve-path threads accept_loop/handle_conn).
     pub fn streams(&self) -> &Arc<StreamRegistry> {
         &self.streams
     }
 
-    /// 解析 socket 路径 — 参数覆盖 > 环境变量 FUSION_EXECUTOR_SOCK > 默认
+    /// Resolve the socket path — parameter override > env FUSION_EXECUTOR_SOCK > default
     pub fn resolve_sock(override_path: Option<&str>) -> String {
         if let Some(p) = override_path {
             if !p.is_empty() {
@@ -979,19 +1079,23 @@ impl IpcServer {
         std::env::var("FUSION_EXECUTOR_SOCK").unwrap_or_else(|_| default_sock_path())
     }
 
-    /// D6-07: bind socket 带陈旧 socket 自愈。
-    /// 旧版无条件 unlink 旧 socket 再 bind — 会劫持正在运行的实例 (D6-05 多实例冲突)。
-    /// 新版: 直接 bind; EADDRINUSE 时探测 liveness —
-    ///   connect 成功 = 有活实例 → fail-loud (拒绝劫持);
-    ///   connect 失败 = 陈旧死 socket → unlink + 重 bind 一次 (自愈)。
-    /// 残留竞态: check→rebind 窗口内他实例可能 bind 同路径, 二次 bind 仍失败 → fail-loud。
-    /// 真正原子需 bindfd+flock, 对 UDS 本地受信场景过度, 文档标注残留窗口可接受。
-    /// D6-08: 错误消息用英文 FATAL/WARN 关键词便于 ops grep/alert。
+    /// D6-07: bind the socket with stale-socket self-healing.
+    /// The old version unconditionally unlinked the old socket then bound — hijacking a running
+    /// instance (D6-05 multi-instance conflict).
+    /// New version: bind directly; on EADDRINUSE probe liveness —
+    ///   connect succeeds = a live instance exists → fail-loud (refuse to hijack);
+    ///   connect fails = stale dead socket → unlink + rebind once (self-healing).
+    /// Residual race: within the check→rebind window another instance may bind the same path;
+    /// if the second bind still fails → fail-loud.
+    /// True atomicity needs bindfd+flock, overkill for the trusted local UDS scenario; the
+    /// residual window is documented as acceptable.
+    /// D6-08: error messages use English FATAL/WARN keywords for ops grep/alert.
     fn bind_with_stale_recovery(path: &Path) -> Result<UnixListener> {
         match UnixListener::bind(path) {
             Ok(l) => Ok(l),
             Err(e) => {
-                // 仅 EADDRINUSE 走陈旧自愈; 其他 bind 错误 (权限/路径) 直接 fail-loud。
+                // Only EADDRINUSE goes through stale self-healing; other bind errors
+                // (permissions/path) fail-loud directly.
                 let in_use = e
                     .raw_os_error()
                     .map(|c| c == libc::EADDRINUSE || c == libc::EEXIST)
@@ -1004,7 +1108,7 @@ impl IpcServer {
                         e
                     ));
                 }
-                // D6-07: 探测占位 socket 是否活实例。
+                // D6-07: probe whether the socket holder is a live instance.
                 let live = std::os::unix::net::UnixStream::connect(path).is_ok();
                 if live {
                     error!(sock = %path.display(), "FATAL: socket already in use — live instance detected, refusing to hijack; set FUSION_EXECUTOR_SOCK to run a second instance");
@@ -1014,7 +1118,7 @@ impl IpcServer {
                         path.display()
                     ));
                 }
-                // 陈旧死 socket — unlink + 重 bind 一次。
+                // Stale dead socket — unlink + rebind once.
                 warn!(sock = %path.display(), "WARN: stale socket detected (no live listener), unlinking and rebinding");
                 let _ = std::fs::remove_file(path);
                 UnixListener::bind(path).map_err(|e2| {
@@ -1029,26 +1133,33 @@ impl IpcServer {
         }
     }
 
-    /// 异步 serve — bind + chmod 0o600 + accept 循环
-    /// 返回 (shutdown_tx, join_handle): 调用方发 shutdown_tx 触发优雅退出, 可 await join 等待清理
-    /// D6-05/07: bind 经 bind_with_stale_recovery — 活实例 fail-loud, 陈旧 socket 自愈 (不无条件 unlink)。
-    /// D6-05: 多实例需显式设 FUSION_EXECUTOR_SOCK (不同 socket) + FE_LOG_DIR (不同日志) 各实例独立。
+    /// Async serve — bind + chmod 0o600 + accept loop.
+    /// Returns (shutdown_tx, join_handle): the caller sends on shutdown_tx to trigger graceful
+    /// exit, and can await the join handle to wait for cleanup.
+    /// D6-05/07: bind goes through bind_with_stale_recovery — live instance fails loud, stale
+    /// socket self-heals (no unconditional unlink).
+    /// D6-05: multi-instance requires explicitly setting FUSION_EXECUTOR_SOCK (different socket)
+    /// + FE_LOG_DIR (different logs) per instance.
     pub async fn serve(
         &self,
         sock_path: &str,
     ) -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
         let path = Path::new(sock_path).to_path_buf();
-        // C-10: 先建 + 收紧父目录 0o700, 再 bind — 消除 bind→chmod 间窗口。
-        // ensure_sock_dir 内对已存在目录也收紧权限 (旧版早 return 跳过 = 残留宽松目录)。
-        // D3-8: 权限收紧失败 → fail-loud, serve 拒绝启动 (世界可读写 socket = M-SEC-01 绕过)。
+        // C-10: create + tighten the parent directory to 0o700 first, then bind — eliminates the
+        // bind→chmod window.
+        // ensure_sock_dir also tightens permissions on an already-existing directory (the old
+        // early-return skipped that, leaving a permissive directory behind).
+        // D3-8: permission tightening failure → fail-loud, serve refuses to start (a
+        // world-readable/writable socket = M-SEC-01 bypass).
         ensure_sock_dir(&path)?;
         let listener = Self::bind_with_stale_recovery(&path)?;
         chmod_secure(&path)?;
-        info!(sock = %path.display(), "IPC 服务器监听中");
-        // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
-        // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
+        info!(sock = %path.display(), "IPC server listening");
+        // ARCH-1: seatbelt governance — execute + shell_start both default true (commercial
+        // security default, aligned with fe-core serde default_true).
+        // Callers explicitly pass seatbelt:false to disable isolation (trusted local opt-out).
         info!(
-            "seatbelt 默认开启 (execute + shell_start 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
+            "seatbelt enabled by default (execute + shell_start paths) — subprocesses are isolated via macOS sandbox-exec (network deny + execve deny for dangerous binaries). Trusted local callers can pass seatbelt:false to opt out. See health.seatbelt_default_on"
         );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -1056,9 +1167,9 @@ impl IpcServer {
         let hub = self.hub.clone();
         let shells = self.shells.clone();
         let streams = self.streams.clone();
-        // m-OPS-02: SIGHUP 配置热重载任务 — 与 accept_loop 并行, 退出时 abort
+        // M-OPS-02: SIGHUP config hot-reload task — runs alongside accept_loop, aborted on exit
         let sighup_task = tokio::spawn(handle_sighup_reload(executor.clone()));
-        // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
+        // M-OPS-03: runtime-configurable drain timeout (env, default 10s).
         let drain_deadline = resolve_shutdown_timeout();
         let join = tokio::spawn(async move {
             accept_loop(
@@ -1077,39 +1188,45 @@ impl IpcServer {
         Ok((shutdown_tx, join))
     }
 
-    /// 同步阻塞 serve — 供 PyO3 serve() 直接调用 (走 BLOCKING_RT)
-    /// C-PYO3-02: serve_blocking 持 GIL 时 Python 信号 handler 不执行 (主线程阻在
-    /// Rust block_on) → SIGTERM 无法中断。改 Rust 侧 tokio::signal 监听 SIGINT/SIGTERM。
-    /// C-OPS-03: 信号不 select-丢弃 accept_loop (否则 drain 不跑, 孤儿连接)。改为
-    /// 信号任务收信号后 hub.shutdown.notify_waiters(), accept_loop 自身监听该 Notify
-    /// 退出并 drain in-flight 连接 (join_all 10s deadline)。PyO3 serve() 须 py.detach 释 GIL。
+    /// Synchronous blocking serve — called directly by PyO3 serve() (on BLOCKING_RT).
+    /// C-PYO3-02: while serve_blocking holds the GIL, Python signal handlers do not run (the
+    /// main thread is stuck in Rust block_on) → SIGTERM cannot interrupt. Switched to Rust-side
+    /// tokio::signal listening on SIGINT/SIGTERM.
+    /// C-OPS-03: the signal does not select-abandon the accept_loop (otherwise drain never runs,
+    /// orphaned connections). Instead the signal task calls hub.shutdown.notify_waiters() on
+    /// receiving a signal; accept_loop listens on that Notify itself, exits, and drains
+    /// in-flight connections (join_all with a 10s deadline). PyO3 serve() must py.detach to
+    /// release the GIL.
     pub fn serve_blocking(&self, sock_path: &str) -> Result<()> {
         let path = sock_path.to_string();
         let executor = self.executor.clone();
         let hub = self.hub.clone();
         let shells = self.shells.clone();
         let streams = self.streams.clone();
-        // gap #5: IPC 服务器跑专属 IPC_RT (clamp 4-16 worker), 与 BLOCKING_RT (in-process run() 路径)
-        // 隔离。旧版跑 BLOCKING_RT (上限 8), 64 连接扇出饥饿 → 响应写不出 → recv 30s 超时死锁。
+        // gap #5: the IPC server runs on its dedicated IPC_RT (clamped 4-16 workers), isolated
+        // from BLOCKING_RT (the in-process run() path).
+        // The old version ran on BLOCKING_RT (cap 8); a 64-connection fan-out starved it →
+        // responses could not be written → recv 30s timeout deadlock.
         fe_core::IPC_RT.block_on(async move {
             let p = Path::new(&path).to_path_buf();
             ensure_sock_dir(&p)?;
             let listener = Self::bind_with_stale_recovery(&p)?;
             chmod_secure(&p)?;
-            info!(sock = %p.display(), "IPC 服务器监听中 (blocking, IPC_RT, 信号可停)");
-            // ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
-            // 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
+            info!(sock = %p.display(), "IPC server listening (blocking, IPC_RT, signal-stoppable)");
+            // ARCH-1: seatbelt governance — execute + shell_start both default true (commercial
+            // security default, aligned with fe-core serde default_true).
+            // Callers explicitly pass seatbelt:false to disable isolation (trusted local opt-out).
             info!(
-                "seatbelt 默认开启 (execute + shell_start 路径) — 子进程经 macOS sandbox-exec 隔离 (禁网 + 危险二进制 execve deny)。受信本地可透传 seatbelt:false opt-out。查 health.seatbelt_default_on"
+                "seatbelt enabled by default (execute + shell_start paths) — subprocesses are isolated via macOS sandbox-exec (network deny + execve deny for dangerous binaries). Trusted local callers can pass seatbelt:false to opt out. See health.seatbelt_default_on"
             );
             let (_tx, rx) = oneshot::channel::<()>();
-            // 信号任务: 收 SIGINT/SIGTERM → notify_waiters, accept_loop 自行退出并 drain
+            // Signal task: on SIGINT/SIGTERM → notify_waiters; accept_loop exits on its own and drains
             let signal_task = tokio::spawn(wait_signal_and_notify(hub.clone()));
-            // m-OPS-02: SIGHUP 配置热重载任务 — 重载日志级别 + 白名单 (不触发退出)
+            // M-OPS-02: SIGHUP config hot-reload task — reloads log level + whitelist (no exit trigger)
             let sighup_task = tokio::spawn(handle_sighup_reload(executor.clone()));
-            // M-OPS-03: 运行时可配 drain 超时 (env, 默认 10s)。
+            // M-OPS-03: runtime-configurable drain timeout (env, default 10s).
             let drain_deadline = resolve_shutdown_timeout();
-            // accept_loop 运行至 shutdown_notify (信号) 或 shutdown_rx 触发, 内部 drain in-flight
+            // accept_loop runs until shutdown_notify (signal) or shutdown_rx fires, draining in-flight internally
             accept_loop(listener, executor, hub, shells, streams, rx, drain_deadline).await;
             signal_task.abort();
             sighup_task.abort();
@@ -1119,8 +1236,9 @@ impl IpcServer {
     }
 }
 
-/// C-OPS-03/04: 阻塞至 SIGINT/SIGTERM, 然后触发 hub.shutdown.notify_waiters()。
-/// accept_loop 监听该 Notify → 退出 accept 并 drain in-flight 连接 (不被 select 丢弃)。
+/// C-OPS-03/04: block until SIGINT/SIGTERM, then trigger hub.shutdown.notify_waiters().
+/// accept_loop listens on that Notify → exits accept and drains in-flight connections (not
+/// abandoned by select).
 async fn wait_signal_and_notify(hub: Arc<BroadcastHub>) {
     #[cfg(unix)]
     {
@@ -1134,7 +1252,7 @@ async fn wait_signal_and_notify(hub: Arc<BroadcastHub>) {
                 }
             }
             Err(e) => {
-                warn!(error = %e, "SIGTERM 注册失败, 仅监听 SIGINT");
+                warn!(error = %e, "SIGTERM registration failed, listening on SIGINT only");
                 let _ = tokio::signal::ctrl_c().await;
             }
         }
@@ -1143,19 +1261,25 @@ async fn wait_signal_and_notify(hub: Arc<BroadcastHub>) {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-    info!("收到 SIGINT/SIGTERM, 触发优雅 drain");
+    info!("SIGINT/SIGTERM received, triggering graceful drain");
     hub.shutdown.notify_waiters();
 }
 
-/// m-OPS-02: SIGHUP 配置热重载 — 重读 RUST_LOG (日志级别) + FUSION_EXECUTOR_EXTRA_WHITELIST (白名单)。
-/// 与 wait_signal_and_notify 并列 (后者管 SIGINT/SIGTERM 退出; SIGHUP 不退出, 仅重载)。
-/// 无配置 → no-op (不报错); tracing 未 init → 跳过日志重载; env 缺失 → 跳过白名单重载。
-/// 遵守 Executor 无状态约定: executor: Arc<Executor> 经 reload_whitelist(&self) 透传 ArcSwap store。
+/// M-OPS-02: SIGHUP config hot-reload — re-reads RUST_LOG (log level) +
+/// FUSION_EXECUTOR_EXTRA_WHITELIST (whitelist).
+/// Runs alongside wait_signal_and_notify (the latter owns SIGINT/SIGTERM exit; SIGHUP does not
+/// exit, it only reloads).
+/// No config → no-op (no error); tracing not initialized → skip log reload; env missing → skip
+/// whitelist reload.
+/// Honors the Executor stateless contract: executor: Arc<Executor> is passed through
+/// reload_whitelist(&self) into the ArcSwap store.
 ///
-/// IMPL-12 信号竞态断言: 本 handler **永不触发 shutdown** — 不调 hub.shutdown.notify_waiters(),
-/// 不清理连接, 不 abort accept_loop。shutdown 单源 = wait_signal_and_notify (SIGINT/SIGTERM)。
-/// SIGHUP 仅重载配置, server 继续服务。竞态面 = 单源 shutdown, SIGHUP 与退出正交。测试覆盖见
-/// tests::sighup_does_not_trigger_shutdown。
+/// IMPL-12 signal-race assertion: this handler **never triggers shutdown** — it does not call
+/// hub.shutdown.notify_waiters(), does not clean up connections, does not abort accept_loop.
+/// Shutdown has a single source = wait_signal_and_notify (SIGINT/SIGTERM).
+/// SIGHUP only reloads config; the server keeps serving. The race surface = single-source
+/// shutdown; SIGHUP is orthogonal to exit. Test coverage in
+/// tests::sighup_does_not_trigger_shutdown.
 async fn handle_sighup_reload(executor: Arc<Executor>) {
     #[cfg(unix)]
     {
@@ -1163,26 +1287,27 @@ async fn handle_sighup_reload(executor: Arc<Executor>) {
         {
             Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "SIGHUP 注册失败, 配置热重载不可用");
+                warn!(error = %e, "SIGHUP registration failed, config hot-reload unavailable");
                 return;
             }
         };
         loop {
             sighup.recv().await;
-            info!("收到 SIGHUP, 重载配置 (日志级别 + 白名单)");
+            info!("SIGHUP received, reloading config (log level + whitelist)");
             reload_log_level();
             reload_extra_whitelist(&executor);
         }
     }
     #[cfg(not(unix))]
     {
-        // 非 unix 无 SIGHUP — 永久挂起 (不耗 CPU)。
+        // Non-unix has no SIGHUP — suspend forever (no CPU burn).
         std::future::pending::<()>().await;
     }
 }
 
-/// SIGHUP: 重读 RUST_LOG env, 经 FilterHandle.reload_log_filter 换日志级别。
-/// 未设 RUST_LOG → 回退 DEFAULT_FILTER_DIRECTIVE (info); tracing 未 init (handle None) → 跳过。
+/// SIGHUP: re-read the RUST_LOG env and swap the log level via FilterHandle.reload_log_filter.
+/// RUST_LOG unset → fall back to DEFAULT_FILTER_DIRECTIVE (info); tracing not initialized
+/// (handle None) → skip.
 fn reload_log_level() {
     let directive = std::env::var("RUST_LOG")
         .ok()
@@ -1190,15 +1315,21 @@ fn reload_log_level() {
         .unwrap_or_else(|| logging::DEFAULT_FILTER_DIRECTIVE.to_string());
     match logging::current_handle() {
         Some(handle) => match handle.reload_log_filter(&directive) {
-            Ok(()) => info!(directive = %directive, "SIGHUP 日志级别重载完成"),
-            Err(e) => warn!(error = %e, "SIGHUP 日志级别重载失败 (fail-loud, 当前级别不变)"),
+            Ok(()) => info!(directive = %directive, "SIGHUP log level reload complete"),
+            Err(e) => {
+                warn!(error = %e, "SIGHUP log level reload failed (fail-loud, current level unchanged)")
+            }
         },
-        None => warn!("SIGHUP 日志重载: tracing 未初始化, 跳过 (init_tracing 未调)"),
+        None => {
+            warn!("SIGHUP log reload: tracing not initialized, skipping (init_tracing not called)")
+        }
     }
 }
 
-/// SIGHUP: 重读 FUSION_EXECUTOR_EXTRA_WHITELIST env (逗号分割) → Executor.reload_whitelist。
-/// 未设 / 空 → 传空切片 (回退纯基线白名单); Executor 透传 SecurityGuard.reload_extras (基线重建)。
+/// SIGHUP: re-read the FUSION_EXECUTOR_EXTRA_WHITELIST env (comma-separated) →
+/// Executor.reload_whitelist.
+/// Unset / empty → pass an empty slice (fall back to the pure baseline whitelist); the Executor
+/// passes through to SecurityGuard.reload_extras (baseline rebuild).
 fn reload_extra_whitelist(executor: &Arc<Executor>) {
     let extras: Vec<String> = std::env::var("FUSION_EXECUTOR_EXTRA_WHITELIST")
         .ok()
@@ -1211,7 +1342,10 @@ fn reload_extra_whitelist(executor: &Arc<Executor>) {
         .unwrap_or_default();
     let extras_ref: Vec<&str> = extras.iter().map(|s| s.as_str()).collect();
     executor.reload_whitelist(&extras_ref);
-    info!(count = extras.len(), "SIGHUP 白名单重载完成 (基线 + 扩展)");
+    info!(
+        count = extras.len(),
+        "SIGHUP whitelist reload complete (baseline + extras)"
+    );
 }
 
 impl Default for IpcServer {
@@ -1220,10 +1354,11 @@ impl Default for IpcServer {
     }
 }
 
-/// accept 循环 — 收到 shutdown 信号 (oneshot 编程式 或 IPC Notify) 或 listener 关闭则退出。
-/// C-OPS-03: 收集 handle_conn JoinHandle, 退出后 drain (join_all 带 deadline 超时, 超时 abort)。
-/// M-OPS-03: deadline 由调用方传入 (FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS, 默认 10s)。
-/// 并发连接受 MAX_CONNECTIONS 信号量限制 (C-IPC-05)。
+/// Accept loop — exits on shutdown signal (programmatic oneshot or IPC Notify) or listener close.
+/// C-OPS-03: collects handle_conn JoinHandles and drains after exit (join_all with a deadline,
+/// aborting on timeout).
+/// M-OPS-03: deadline passed in by the caller (FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS, default 10s).
+/// Concurrent connections bounded by the MAX_CONNECTIONS semaphore (C-IPC-05).
 async fn accept_loop(
     listener: UnixListener,
     executor: Arc<Executor>,
@@ -1234,37 +1369,40 @@ async fn accept_loop(
     drain_deadline: Duration,
 ) {
     let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    // 审计 2.11: 执行信号量 — 限并发 **非流式执行** (子进程) 非并发连接。全 server 共享, 与连接信号量解耦。
+    // Audit 2.11: exec semaphore — bounds concurrent **non-streaming execs** (subprocesses), not
+    // connections. Shared server-wide, decoupled from the connection semaphore.
     let exec_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_EXECS));
-    // RUN-3: 流式执行信号量 — 与 exec_sem 分离。流式 permit 跨整 chunk→done (长生命周期),
-    // 非流式短 execute 用 exec_sem (16)。分离防 16 长流饿死短命令。
+    // RUN-3: streaming exec semaphore — separate from exec_sem. A streaming permit spans the
+    // whole chunk→done lifetime (long-lived); non-streaming short executes use exec_sem (16).
+    // Separation prevents 16 long streams starving short commands.
     let stream_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS));
-    // C-OPS-03: in-flight 连接 JoinHandle 收集 — drain 时 join_all + deadline
+    // C-OPS-03: in-flight connection JoinHandle collection — join_all + deadline on drain
     let conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>> = Arc::new(AsyncMutex::new(Vec::new()));
     let shutdown_notify = hub.shutdown.clone();
     loop {
         tokio::select! {
             biased;
             _ = &mut shutdown_rx => {
-                info!("shutdown (oneshot) 收到, 停止 accept");
+                info!("shutdown (oneshot) received, stopping accept");
                 break;
             }
             _ = shutdown_notify.notified() => {
-                info!("shutdown (IPC Notify) 收到, 停止 accept");
+                info!("shutdown (IPC Notify) received, stopping accept");
                 break;
             }
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _)) => {
-                        // M-SEC-01: LOCAL_PEERCRED UID 校验 — 他 UID 立即拒, 不占信号量不跑 handler。
+                        // M-SEC-01: LOCAL_PEERCRED UID check — reject other UIDs immediately,
+                        // taking no semaphore slot and running no handler.
                         if !peer_uid_matches(&stream) {
                             continue;
                         }
-                        // 连接数上限 — 信号量满则拒连 (C-IPC-05)
+                        // Connection cap — reject when the semaphore is full (C-IPC-05)
                         let permit = match sem.clone().acquire_owned().await {
                             Ok(p) => p,
                             Err(e) => {
-                                warn!(error = %e, "信号量已关闭, 停止 accept");
+                                warn!(error = %e, "semaphore closed, stopping accept");
                                 break;
                             }
                         };
@@ -1280,23 +1418,28 @@ async fn accept_loop(
                         });
                         conns.lock().await.push(handle);
                     }
-                    Err(e) => warn!(error = %e, "accept 失败"),
+                    Err(e) => warn!(error = %e, "accept failed"),
                 }
             }
         }
     }
-    // C-OPS-03: drain in-flight 连接 — join_all 带 deadline, 超时 abort 剩余
+    // C-OPS-03: drain in-flight connections — join_all with a deadline, aborting the rest on timeout
     drain_connections(conns, drain_deadline).await;
 }
 
-/// C-OPS-03/M-OPS-03 + 0827 C-8/P-1: 优雅 drain — join 所有 in-flight 连接, deadline 内未完则 abort。
-/// deadline 由 serve/serve_blocking 从 FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS 解析 (默认 10s)。
-/// C-8 修: (1) 先 drain handles 出锁再放锁 — join/abort 全锁外, 不阻塞 accept_loop 其他路径;
-///   (2) **全局 deadline** — 记 start, 每条 handle 用 shrink 的 remain = deadline - elapsed,
-///   总耗时 ≤ deadline (旧版 per-handle reset deadline → 64 连接最坏 64×10s = 640s)。
-/// &mut h 引用 await (非 move) → 超时分支 h 仍 owned, h.abort() 可调 (drop JoinHandle 仅 detach 不停 task)。
+/// C-OPS-03/M-OPS-03 + 0827 C-8/P-1: graceful drain — join all in-flight connections, aborting
+/// those unfinished within the deadline.
+/// deadline is resolved by serve/serve_blocking from FUSION_EXECUTOR_SHUTDOWN_TIMEOUT_SECS
+/// (default 10s).
+/// C-8 fixes: (1) drain the handles out of the lock first, then release it — join/abort all
+/// happen outside the lock, not blocking other accept_loop paths;
+/// (2) **global deadline** — record start; each handle uses the shrunk remain = deadline -
+/// elapsed; total time ≤ deadline (the old per-handle reset deadline → 64 connections worst
+/// case 64×10s = 640s).
+/// &mut h is awaited by reference (not moved) → in the timeout branch h is still owned and
+/// h.abort() is callable (dropping a JoinHandle only detaches, never stops the task).
 async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>, deadline: Duration) {
-    // C-8: 取出 handles 立即放锁 — 锁外 join/abort。
+    // C-8: take the handles and release the lock immediately — join/abort outside the lock.
     let handles: Vec<JoinHandle<()>> = {
         let mut g = conns.lock().await;
         std::mem::take(&mut *g)
@@ -1308,7 +1451,7 @@ async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>, deadline
     info!(
         in_flight = total,
         deadline_secs = deadline.as_secs(),
-        "drain in-flight 连接 (全局 deadline, 锁外 join)"
+        "draining in-flight connections (global deadline, join outside lock)"
     );
     let start = tokio::time::Instant::now();
     let mut joined_ok = 0usize;
@@ -1316,7 +1459,7 @@ async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>, deadline
     for mut h in handles {
         let elapsed = start.elapsed();
         if elapsed >= deadline {
-            // 全局预算已耗尽 — 剩余全部 abort + reap。
+            // Global budget exhausted — abort + reap everything remaining.
             h.abort();
             let _ = h.await;
             aborted += 1;
@@ -1325,9 +1468,9 @@ async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>, deadline
         let remain = deadline - elapsed;
         match tokio::time::timeout(remain, &mut h).await {
             Ok(Ok(())) => joined_ok += 1,
-            Ok(Err(e)) => warn!(error = %e, "连接 task join 失败"),
+            Ok(Err(e)) => warn!(error = %e, "connection task join failed"),
             Err(_) => {
-                warn!("连接 drain 全局预算耗尽, abort (强制停)");
+                warn!("connection drain global budget exhausted, aborting (forced stop)");
                 h.abort();
                 let _ = h.await;
                 aborted += 1;
@@ -1335,29 +1478,34 @@ async fn drain_connections(conns: Arc<AsyncMutex<Vec<JoinHandle<()>>>>, deadline
         }
     }
     if aborted > 0 {
-        warn!(aborted, "drain 超时 abort 连接数 (fail-loud)");
+        warn!(aborted, "drain timeout aborted connections (fail-loud)");
     }
     info!(
         in_flight = total,
         drained_ok = joined_ok,
         aborted,
-        "drain 完成"
+        "drain complete"
     );
 }
 
-/// 单连接处理 — DUPLEX (v1.5 #14):
-///   read_task: read_line 分发请求, 响应/流式帧写 locked writer
-///   push_task: 读 push_rx, server-push notification 写 locked writer
-///   共享 writer = Arc<AsyncMutex<OwnedWriteHalf>>, 行写原子 (锁内 write_all)
-///   连接断开 → 清订阅 + close push_task
+/// Per-connection handler — DUPLEX (v1.5 #14):
+///   read_task: read_line dispatches requests; responses/streaming frames written to the locked writer
+///   push_task: reads push_rx, writes server-push notifications to the locked writer
+///   shared writer = Arc<AsyncMutex<OwnedWriteHalf>>; line writes are atomic (write_all under lock)
+///   connection drop → clear subscriptions + close push_task
 ///
-/// 0827 A-6(1) push 通道模型说明 (deferred):
-///   每连接单 push_tx (容量 128) 多路复用该连接所有订阅 (telemetry/stdio/screenshot)。
-///   风险: 慢消费方 (如 telemetry 帧未读) 占满 128 → 同连接其他通道帧背压。
-///   已缓解: 源端 try_send 满即丢 (P-IPC-01, overflow-drop 不阻塞源任务, 不无界占内存),
-///   丢帧仅 warn 不崩 (fail-visible)。per-sub 独立通道 multiplex 是更大架构改动 (需
-///   push_task 按 sub_id 路由多 rx), 现 try_send 丢帧语义对等 bounded channel, 非安全
-///   缺陷, 按 Rule 2 简单优先暂缓。调用方: 慢消费方应开多连接或 own_conn 隔离 stdio。
+/// 0827 A-6(1) push channel model note (deferred):
+///   One push_tx per connection (capacity 128) multiplexes all of that connection's
+///   subscriptions (telemetry/stdio/screenshot).
+///   Risk: a slow consumer (e.g. unread telemetry frames) fills the 128 → backpressure on other
+///   channels of the same connection.
+///   Mitigated: source-side try_send drops when full (P-IPC-01, overflow-drop does not block
+///   the source task, no unbounded memory growth);
+///   dropped frames only warn, no crash (fail-visible). Per-sub independent channel multiplexing
+///   is a bigger architectural change (push_task would need to route multiple rx by sub_id);
+///   the current try_send drop semantics are equivalent to a bounded channel, not a safety
+///   defect — deferred per Rule 2 (simplicity first). Caller guidance: slow consumers should
+///   open multiple connections or isolate stdio with own_conn.
 async fn handle_conn(
     stream: UnixStream,
     executor: Arc<Executor>,
@@ -1375,7 +1523,7 @@ async fn handle_conn(
     let (push_tx, push_rx) = mpsc::channel::<Value>(128);
     let (close_tx, close_rx) = oneshot::channel::<()>();
 
-    // push_task — server-push 帧写出
+    // push_task — writes server-push frames out
     let push_writer = writer.clone();
     let push_handle = tokio::spawn(async move {
         let mut rx = push_rx;
@@ -1384,7 +1532,7 @@ async fn handle_conn(
             tokio::select! {
                 biased;
                 _ = &mut close => {
-                    info!(conn_id, "push_task 收 close, 退出");
+                    info!(conn_id, "push_task received close, exiting");
                     break;
                 }
                 frame = rx.recv() => {
@@ -1393,7 +1541,7 @@ async fn handle_conn(
                             let line = match serde_json::to_string(&v) {
                                 Ok(s) => s + "\n",
                                 Err(e) => {
-                                    warn!(error = %e, "push 帧序列化失败, 跳过");
+                                    warn!(error = %e, "push frame serialization failed, skipping");
                                     continue;
                                 }
                             };
@@ -1409,11 +1557,14 @@ async fn handle_conn(
         }
     });
 
-    // read_task — 逐行分发 (带 1MB 上限 + idle 超时, C-IPC-04/C-IPC-05)
-    // 审计 2.12: 旧版 execute_stream/telemetry_stream 在 read_task 循环内 inline await,
-    // 流式期间不读下一行 → 单连接 subscribe 后 execute_stream 响应被阻到流结束。
-    // 解法: 每请求 spawn 独立任务 (单连接请求并发多路复用), read_task 持续读下一行不阻塞。
-    // 响应/流式帧写共享 Arc<AsyncMutex<Writer>> (锁内 write_all 原子), 跨任务写安全。
+    // read_task — line-by-line dispatch (with 1MB cap + idle timeout, C-IPC-04/C-IPC-05)
+    // Audit 2.12: the old version inlined await of execute_stream/telemetry_stream inside the
+    // read_task loop; during streaming it never read the next line → after subscribe, an
+    // execute_stream response was blocked until the stream ended.
+    // Fix: spawn an independent task per request (per-connection request concurrency
+    // multiplexing); read_task keeps reading the next line without blocking.
+    // Responses/streaming frames write to the shared Arc<AsyncMutex<Writer>> (write_all atomic
+    // under lock), safe across tasks.
     let mut reader = BufReader::new(reader);
     let read_hub = hub.clone();
     let read_exec = executor.clone();
@@ -1422,23 +1573,25 @@ async fn handle_conn(
     let read_push_tx = push_tx.clone();
     let read_writer = writer.clone();
     let read_close = close_tx;
-    // M-2 (审计 0827 arch): 旧版 Vec<JoinHandle> 无界增长 — 长生命周期连接发海量请求,
-    // 已完成 handle 永不剪枝, 连接关闭前全留内存 (handle leak)。JoinSet 内部管理 handle,
-    // try_join_next 周期回收已完成项; 最终 join_all 收尾在飞任务 (并发受 exec_sem/stream_sem 约束)。
+    // M-2 (audit 0827 arch): the old Vec<JoinHandle> grew without bound — a long-lived
+    // connection issuing massive numbers of requests kept finished handles forever, all
+    // resident until connection close (handle leak). JoinSet manages handles internally;
+    // try_join_next periodically reaps finished items; a final join_all collects in-flight
+    // tasks (concurrency bounded by exec_sem/stream_sem).
     let mut req_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         let line = match read_capped_line(&mut reader).await {
             Ok(Some(l)) => l,
             Ok(None) => break,
             Err(code) => {
-                // 超限/超时 → 回 JSON-RPC 错误后断开该连接
+                // Over-limit/timeout → reply with a JSON-RPC error, then drop the connection
                 let data = serde_json::to_string(&err_resp(
                     Value::Null,
                     code,
                     if code == ERR_PARSE {
-                        "请求行超过 1MB 上限"
+                        "request line exceeds the 1MB cap"
                     } else {
-                        "idle 读超时"
+                        "idle read timeout"
                     },
                 ))
                 .unwrap_or_default()
@@ -1474,7 +1627,8 @@ async fn handle_conn(
             .to_string();
         let params = parsed.get("params").cloned().unwrap_or(Value::Null);
 
-        // 2.12: 每请求 spawn 任务, read_task 不阻塞。共享 writer 锁保证行写原子。
+        // 2.12: spawn a task per request; read_task does not block. The shared writer lock keeps
+        // line writes atomic.
         let w = read_writer.clone();
         let ex = read_exec.clone();
         let h = read_hub.clone();
@@ -1489,11 +1643,12 @@ async fn handle_conn(
             )
             .await;
         });
-        // M-2: 周期回收已完成 handle — 释放内存, 防 JoinSet 无界累积。
+        // M-2: periodically reap finished handles — frees memory, prevents unbounded JoinSet growth.
         while req_tasks.try_join_next().is_some() {}
     }
-    // 连接断开 — 等所有在飞请求任务收尾 (它们持 writer 锁写响应), 清订阅, 关 push_task
-    // M-1: bounded join — join 每任务 5s grace, 超时放弃 (任务 detached)。
+    // Connection dropped — wait for all in-flight request tasks to finish (they hold the
+    // writer lock to write responses), clear subscriptions, close push_task.
+    // M-1: bounded join — 5s grace per task, give up on timeout (task detached).
     while let Some(t) = req_tasks.join_next().await {
         let _ = t;
     }
@@ -1502,8 +1657,9 @@ async fn handle_conn(
     let _ = push_handle.await;
 }
 
-/// 单请求分发 — 从 read_task spawn 调用 (审计 2.12 单连接请求多路复用)。
-/// execute (非流式) 取 exec_sem permit; execute_stream 取 stream_sem permit (RUN-3 分离, 防长流饿死短命令)。
+/// Single-request dispatch — spawned from read_task (audit 2.12 per-connection request multiplexing).
+/// execute (non-streaming) takes an exec_sem permit; execute_stream takes a stream_sem permit
+/// (RUN-3 separation, prevents long streams starving short commands).
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
@@ -1525,7 +1681,7 @@ async fn dispatch_request(
         )
         .await
         {
-            warn!(error = %e, "execute_stream 写帧失败");
+            warn!(error = %e, "execute_stream frame write failed");
         }
         return;
     }
@@ -1535,7 +1691,7 @@ async fn dispatch_request(
     }
     if method == "executor.telemetry_stream" {
         if let Err(e) = handle_telemetry_stream(writer, id, params, executor).await {
-            warn!(error = %e, "telemetry_stream 写帧失败");
+            warn!(error = %e, "telemetry_stream frame write failed");
         }
         return;
     }
@@ -1554,16 +1710,19 @@ async fn dispatch_request(
         Err((code, msg)) => err_resp(id, code, &msg),
     };
     let data = serde_json::to_string(&resp)
-        .unwrap_or_else(|_| err_str(Value::Null, ERR_INTERNAL, "响应序列化失败"))
+        .unwrap_or_else(|_| err_str(Value::Null, ERR_INTERNAL, "response serialization failed"))
         + "\n";
     let mut w = writer.lock().await;
     let _ = w.write_all(data.as_bytes()).await;
 }
 
-/// 带 1MB 上限 + idle 超时的行读 (C-IPC-04/C-IPC-05)。
-/// Ok(Some(line)) — 一行 (不含换行); Ok(None) — EOF; Err(code) — 超限 ERR_PARSE / 超时 ERR_INTERNAL。
-/// 审计 Blocker 7 / 2.10: 原 read_until 无界缓冲到换行才查上限 → 无换行洪水 OOM。
-/// 解法: fill_buf+consume 分块, 每次 extend 前查 buf.len()+take > MAX_LINE_BYTES 即拒 (in-loop cap, fail-loud)。
+/// Line read with a 1MB cap + idle timeout (C-IPC-04/C-IPC-05).
+/// Ok(Some(line)) — one line (newline excluded); Ok(None) — EOF; Err(code) — over-limit
+/// ERR_PARSE / timeout ERR_INTERNAL.
+/// Audit Blocker 7 / 2.10: the original read_until buffered without bound until a newline
+/// before checking the cap → OOM on a newline-less flood.
+/// Fix: fill_buf+consume in chunks; before each extend, reject when buf.len()+take >
+/// MAX_LINE_BYTES (in-loop cap, fail-loud).
 async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<String>, i64> {
@@ -1589,7 +1748,7 @@ async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
             warn!(
                 len = buf.len() + take,
                 max = MAX_LINE_BYTES,
-                "请求行超 1MB, 拒连 (in-loop cap, 无换行洪水防护)"
+                "request line over 1MB, rejected (in-loop cap, newline-less flood protection)"
             );
             return Err(ERR_PARSE);
         }
@@ -1601,11 +1760,12 @@ async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
                 .to_string();
             return Ok(Some(line));
         }
-        // 无换行继续读 (buf.len()+take 已限, 不会无界增长)
+        // No newline yet, keep reading (buf.len()+take is capped, no unbounded growth)
     }
 }
 
-/// 订阅 — 解析 channels/interval_ms/screenshot_interval_ms, 注册 hub, 响应 {ok, subscription_id} (M-IPC-01)
+/// Subscribe — parse channels/interval_ms/screenshot_interval_ms, register with the hub,
+/// respond {ok, subscription_id} (M-IPC-01)
 async fn handle_subscribe(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
     id: Value,
@@ -1614,9 +1774,12 @@ async fn handle_subscribe(
     hub: &Arc<BroadcastHub>,
     push_tx: &mpsc::Sender<Value>,
 ) {
-    // L-7 + M-7(1): channels 规范化 + 校验。旧版原样存 (大小写敏感) → "Telemetry" 不匹配
-    // 小写 CH_TELEMETRY, 源任务永不启 = 幽灵订阅 (收不到推帧); 未知通道名也静默接受。
-    // 修: 统一 to_lowercase, 拒非 {telemetry,stdio,screenshot} 通道名 (-32600, fail-loud)。
+    // L-7 + M-7(1): channel normalization + validation. The old version stored them as-is
+    // (case-sensitive) → "Telemetry" never matched the lowercase CH_TELEMETRY, the source task
+    // never started = ghost subscription (no push frames received); unknown channel names were
+    // also silently accepted.
+    // Fix: normalize with to_lowercase; reject channel names outside
+    // {telemetry,stdio,screenshot} (-32600, fail-loud).
     let known_channels = [CH_TELEMETRY, CH_STDIO, CH_SCREENSHOT];
     let channels: HashSet<String> = params
         .get("channels")
@@ -1628,11 +1791,11 @@ async fn handle_subscribe(
         })
         .unwrap_or_default();
     if channels.is_empty() {
-        let resp = err_resp(id, ERR_INVALID_REQ, "缺少 channels");
+        let resp = err_resp(id, ERR_INVALID_REQ, "missing channels");
         write_line(writer, resp).await;
         return;
     }
-    // M-7(1): 拒未知通道名 (旧版静默接受 → 幽灵订阅)。
+    // M-7(1): reject unknown channel names (the old version silently accepted them → ghost subscription).
     let unknown: Vec<&str> = channels
         .iter()
         .filter(|c| !known_channels.contains(&c.as_str()))
@@ -1643,14 +1806,15 @@ async fn handle_subscribe(
             id,
             ERR_INVALID_REQ,
             &format!(
-                "未知通道: {} (合法: telemetry/stdio/screenshot)",
+                "unknown channels: {} (valid: telemetry/stdio/screenshot)",
                 unknown.join(",")
             ),
         );
         write_line(writer, resp).await;
         return;
     }
-    // interval_ms (遥测) / screenshot_interval_ms (截图) — 透传源任务 (M-IPC-01)
+    // interval_ms (telemetry) / screenshot_interval_ms (screenshot) — passed through to the
+    // source task (M-IPC-01)
     let interval_ms = params
         .get("interval_ms")
         .and_then(|v| v.as_u64())
@@ -1659,13 +1823,15 @@ async fn handle_subscribe(
         .get("screenshot_interval_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_SCREENSHOT_INTERVAL_MS);
-    // stdio 作用域 (Blocker 10, 破审计 §2.9 跨租户泄漏):
-    //   all=true → All (全广播); task_ids=[...] → Tasks 白名单; 默认 → OwnConn(仅本连接命令)
+    // stdio scope (Blocker 10, breaks the audit §2.9 cross-tenant leak):
+    //   all=true → All (broadcast to everyone); task_ids=[...] → Tasks allowlist; default →
+    //   OwnConn (only this connection's commands)
     let scope = if params.get("all").and_then(|v| v.as_bool()).unwrap_or(false) {
         StdioScope::All
     } else if let Some(arr) = params.get("task_ids").and_then(|v| v.as_array()) {
-        // M-7(3): 旧版空 task_ids 静默变空 Tasks 集 (永不匹配 = 死订阅, 收不到任何 stdio, 无信号)。
-        // 修: 空 task_ids → fail-loud -32600 (调用方明显误用, 非"无过滤")。
+        // M-7(3): the old version silently turned an empty task_ids into an empty Tasks set
+        // (never matches = dead subscription, no stdio ever received, no signal).
+        // Fix: empty task_ids → fail-loud -32600 (clear caller misuse, not "no filter").
         let set: HashSet<String> = arr
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -1674,7 +1840,7 @@ async fn handle_subscribe(
             let resp = err_resp(
                 id,
                 ERR_INVALID_REQ,
-                "task_ids 非空数组 (空集永不匹配, 用 all=true 或省略 task_ids)",
+                "task_ids must be a non-empty array (an empty set never matches; use all=true or omit task_ids)",
             );
             write_line(writer, resp).await;
             return;
@@ -1695,7 +1861,7 @@ async fn handle_subscribe(
     write_line(writer, resp).await;
 }
 
-/// 取消订阅 — 移除 hub 注册, 响应 {ok}
+/// Unsubscribe — remove the hub registration, respond {ok}
 async fn handle_unsubscribe(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
     id: Value,
@@ -1705,7 +1871,7 @@ async fn handle_unsubscribe(
     let sub_id = match params.get("subscription_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
-            let resp = err_resp(id, ERR_INVALID_REQ, "缺少 subscription_id");
+            let resp = err_resp(id, ERR_INVALID_REQ, "missing subscription_id");
             write_line(writer, resp).await;
             return;
         }
@@ -1715,15 +1881,16 @@ async fn handle_unsubscribe(
     write_line(writer, resp).await;
 }
 
-/// 写一行 JSON Value (锁内 write_all, 原子)。
-/// 序列化失败回退有效错误帧, 裸 `\n` 会让客户端挂起 (P-IPC-02)。
+/// Write one JSON Value line (write_all under lock, atomic).
+/// On serialization failure fall back to a valid error frame; a bare `\n` would hang the
+/// client (P-IPC-02).
 async fn write_line(writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>, v: Value) {
     let line = match serde_json::to_string(&v) {
         Ok(s) => s + "\n",
         Err(e) => {
-            warn!(error = %e, "Value 序列化失败, 回退错误帧");
+            warn!(error = %e, "Value serialization failed, falling back to error frame");
             format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{},\"message\":\"响应序列化失败\"}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{},\"message\":\"response serialization failed\"}}}}\n",
                 ERR_INTERNAL
             )
         }
@@ -1732,8 +1899,9 @@ async fn write_line(writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>, 
     let _ = w.write_all(line.as_bytes()).await;
 }
 
-/// 流式执行 — chunk 帧 + done 帧, 共用 id, 换行分隔逐帧写出。
-/// v1.5 #14: chunk/done 同时广播给 stdio 订阅 (跨连接 fan-out)。
+/// Streaming execution — chunk frames + done frame, shared id, newline-delimited frames
+/// written one by one.
+/// v1.5 #14: chunk/done are also broadcast to stdio subscribers (cross-connection fan-out).
 /// chunk: {"jsonrpc":"2.0","id":id,"result":{"type":"chunk","data":"..."}}
 /// done:  {"jsonrpc":"2.0","id":id,"result":{"type":"done","result":{...ExecutionResult}}}
 #[allow(clippy::too_many_arguments)]
@@ -1753,7 +1921,7 @@ async fn handle_execute_stream(
             let frame = serde_json::to_string(&err_resp(
                 id,
                 ERR_INVALID_REQ,
-                &format!("params 无效: {}", e),
+                &format!("invalid params: {}", e),
             ))? + "\n";
             let mut w = writer.lock().await;
             w.write_all(frame.as_bytes()).await?;
@@ -1761,15 +1929,19 @@ async fn handle_execute_stream(
         }
     };
     let task_id = req.task_id.clone();
-    // RUN-3: 取流式 permit — stream_sem 与非流式 exec_sem 分离 (容量 64 vs 16)。
-    // 流式持 permit 跨整 chunk→done 生命周期 (长); 若共用 exec_sem, 16 长流占满 → 短 execute 饿死。
-    // stream_sem 容量 = MAX_CONNECTIONS, 受连接信号量上限保护, 不与非流式短执行争抢。
+    // RUN-3: acquire the streaming permit — stream_sem is separate from the non-streaming
+    // exec_sem (capacity 64 vs 16).
+    // A stream holds its permit across the whole chunk→done lifetime (long); sharing exec_sem
+    // would let 16 long streams fill it → short executes starve.
+    // stream_sem capacity = MAX_CONNECTIONS, bounded by the connection semaphore cap, so it does
+    // not contend with non-streaming short executions.
     let _stream_permit = stream_sem
         .acquire()
         .await
-        .map_err(|e| anyhow::anyhow!("stream_sem 已关闭: {e}"))?;
-    // Issue #32: 注册 in-flight 流 — cancel_rx 传给 execute_streaming。
-    // id 字符串化作 StreamRegistry key (executor.cancel {id} 查表)。流结束 deregister。
+        .map_err(|e| anyhow::anyhow!("stream_sem closed: {e}"))?;
+    // Issue #32: register the in-flight stream — cancel_rx is handed to execute_streaming.
+    // id stringified as the StreamRegistry key (executor.cancel {id} looks it up). deregister
+    // when the stream ends.
     let stream_id = id.to_string();
     let cancel_rx = streams.register(stream_id.clone());
     let (mut rx, handle) = match executor.execute_streaming(req, Some(cancel_rx)).await {
@@ -1779,7 +1951,7 @@ async fn handle_execute_stream(
             let frame = serde_json::to_string(&err_resp(
                 id,
                 ERR_INTERNAL,
-                &format!("execute_stream 失败: {}", e),
+                &format!("execute_stream failed: {}", e),
             ))? + "\n";
             let mut w = writer.lock().await;
             w.write_all(frame.as_bytes()).await?;
@@ -1797,10 +1969,12 @@ async fn handle_execute_stream(
             }
             fe_core::ExecutionStreamEvent::Done(r) => {
                 let result_val = serde_json::to_value(&r).unwrap_or(json!({}));
-                // L-6: streaming exec 完成也记指标 — 旧版漏 record_exec, Prometheus
-                // fe_exec_total 漏计流式执行 (仅非流式 execute 计)。与非流式 handler 对齐。
+                // L-6: record metrics for completed streaming execs too — the old version missed
+                // record_exec, so Prometheus fe_exec_total undercounted streaming executions
+                // (only non-streaming execute was counted). Aligned with the non-streaming handler.
                 hub.record_exec(&r);
-                // D5-3: done 帧走阻塞广播 — 不可丢 (订阅方须见流终止标记)。
+                // D5-3: the done frame goes through the blocking broadcast — must not be dropped
+                // (subscribers must see the stream-termination marker).
                 hub.broadcast_stdio_blocking(
                     json!({
                         "task_id": task_id,
@@ -1819,41 +1993,51 @@ async fn handle_execute_stream(
             break;
         }
     }
-    // M-1 (审计 0827 arch): handle.await 无超时 → spawned 任务在 rx 关闭后若挂死,
-    // handle 永不完成, 泄漏一个 tokio task + 占用 stream_sem 槽位 (RUN-3 饥饿)。
-    // 5s grace: rx 已关闭说明 sandbox 侧 run_streaming 已退, join 仅收尾, 正常 <1ms。
-    // 超时 = 任务挂死, 放弃 join (任务 detached, 不阻塞 stream_sem 释放)。
+    // M-1 (audit 0827 arch): handle.await with no timeout → if the spawned task hangs after rx
+    // closes, the handle never completes, leaking a tokio task + occupying a stream_sem slot
+    // (RUN-3 starvation).
+    // 5s grace: rx closed means the sandbox-side run_streaming has exited; the join is just
+    // cleanup, normally <1ms.
+    // Timeout = task hung, give up the join (task detached, does not block stream_sem release).
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     streams.deregister(&stream_id);
     Ok(())
 }
 
-/// Issue #32: executor.cancel — 服务端确定性 kill in-flight 流的进程树。
-/// params: {id: <JSON-RPC id>} — id 须与 execute_stream 的请求 id 一致 (StreamRegistry key)。
-/// 响应: {ok: true, cancelled: true} 若找到并下发 cancel; {ok: false, cancelled: false} 若 id 不存在
-/// (已结束或未知)。cancel = 本地确定性 kill 进程树 (非协作停止请求) — 下发后 fe-sandbox SIGINT→
-/// SIGKILL 进程组, Done 帧 exit_code -1 + cancelled true。调用方 best-effort: cancel 发出后仍应读 done 帧。
+/// Issue #32: executor.cancel — server-side deterministic kill of an in-flight stream's
+/// process tree.
+/// params: {id: <JSON-RPC id>} — id must match the execute_stream request id (StreamRegistry key).
+/// Response: {ok: true, cancelled: true} if found and cancel dispatched; {ok: false,
+/// cancelled: false} if the id does not exist (already finished or unknown).
+/// cancel = local deterministic process-tree kill (NOT a cooperative stop request) — once
+/// dispatched fe-sandbox SIGINT→SIGKILL the process group; the Done frame carries exit_code -1
+/// + cancelled true. Caller best-effort: after sending cancel, still read the done frame.
 async fn handle_cancel(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
     id: Value,
     params: Value,
     streams: &Arc<StreamRegistry>,
 ) {
-    // id 可为 number/string/null — 与 StreamRegistry key (id.to_string()) 对齐。
+    // id may be number/string/null — aligned with the StreamRegistry key (id.to_string()).
     let target = params.get("id").cloned().unwrap_or(Value::Null);
     let target_str = target.to_string();
     let cancelled = streams.cancel(&target_str);
     let resp = ok_resp(id, json!({ "ok": cancelled, "cancelled": cancelled }));
-    let frame = serde_json::to_string(&resp)
-        .unwrap_or_else(|_| err_str(Value::Null, ERR_INTERNAL, "cancel 响应序列化失败"))
-        + "\n";
+    let frame = serde_json::to_string(&resp).unwrap_or_else(|_| {
+        err_str(
+            Value::Null,
+            ERR_INTERNAL,
+            "cancel response serialization failed",
+        )
+    }) + "\n";
     let mut w = writer.lock().await;
     let _ = w.write_all(frame.as_bytes()).await;
 }
 
-/// 实时遥测流 (请求发起, 非 subscribe) — 逐帧写出 TelemetrySample, 共用 id。
+/// Real-time telemetry stream (request-initiated, not subscribe) — writes TelemetrySample
+/// frames one by one, shared id.
 /// sample: {"jsonrpc":"2.0","id":id,"result":{"type":"sample",...TelemetrySample}}
-/// params: {interval_ms?:u64, max_samples?:u64, pid?:u32} (缺省 10Hz / 无限 / executor pid)
+/// params: {interval_ms?:u64, max_samples?:u64, pid?:u32} (defaults 10Hz / unlimited / executor pid)
 async fn handle_telemetry_stream(
     writer: &Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
     id: Value,
@@ -1885,13 +2069,14 @@ async fn handle_telemetry_stream(
             break;
         }
     }
-    // M-1: 同 execute_stream — bounded join, 防 spawned 任务挂死泄漏 task + sem 槽位。
+    // M-1: same as execute_stream — bounded join, prevents a hung spawned task from leaking a
+    // task + a sem slot.
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     Ok(())
 }
 
-/// 处理单个方法 → Ok(Value) | Err((code, msg))
-/// v1.5 #14: execute (非流式) 完成后广播 stdio done 给订阅
+/// Handle a single method → Ok(Value) | Err((code, msg))
+/// v1.5 #14: after execute (non-streaming) completes, broadcast the stdio done to subscribers
 async fn handle_method(
     method: &str,
     params: Value,
@@ -1903,18 +2088,25 @@ async fn handle_method(
 ) -> Result<Value, (i64, String)> {
     match method {
         "executor.health" => {
-            // C-OPS-05: ok 由真实探针决定 (非硬编码) — 探 BLOCKING_RT 响应 + 外部依赖 (git)。
-            // D2-2 修 (2026-08-28): 旧版 probe_runtime 在 BLOCKING_RT 上 spawn 空任务 + 1s 超时;
-            // 16 并发执行饱和 + worker 数有限时, 探针任务排队 → 超时 → rt_ok=false → 误报摘除正常忙碌实例。
-            // 新版区分 alive/busy/dead: 短超时 (200ms) 探 BLOCKING_RT 响应 (空闲 worker 立即拾取);
-            // 超时再查 exec_sem 可用许可 — 0=饱和 (忙碌但健康, LB 应分流非摘除), >0 仍超时=停摆 (真不健康)。
+            // C-OPS-05: ok is decided by real probes (not hardcoded) — probes BLOCKING_RT
+            // responsiveness + external dependencies (git).
+            // D2-2 fix (2026-08-28): the old probe_runtime spawned an empty task on BLOCKING_RT
+            // with a 1s timeout; when 16 concurrent execs saturated the limited workers, the
+            // probe task queued → timeout → rt_ok=false → falsely flagging a healthy busy
+            // instance for removal.
+            // New version distinguishes alive/busy/dead: a short timeout (200ms) probes
+            // BLOCKING_RT responsiveness (an idle worker picks it up immediately);
+            // on timeout, check exec_sem available permits — 0=saturated (busy but healthy, LB
+            // should shed load, not remove), >0 and still timing out = stalled (truly unhealthy).
             let rt = probe_runtime(Duration::from_millis(200), exec_sem.available_permits()).await;
-            // D4-9: health 探针同步镜像 exec_sem 可用数成 Prometheus gauge (scrape 路径互补)。
+            // D4-9: the health probe mirrors the exec_sem available count into a Prometheus
+            // gauge (complements the scrape path).
             metrics::gauge!("fe_exec_sem_available").set(exec_sem.available_permits() as f64);
             let deps = probe_dependencies().await;
-            // 任一核心依赖缺失 → ok:false (依赖不健康 = 服务降级)
+            // Any core dependency missing → ok:false (unhealthy dependency = degraded service)
             let deps_ok = deps.iter().all(|d| d["ok"].as_bool() == Some(true));
-            // ok 仅在 dead (停摆) 或依赖缺失时 false; busy 仍 ok=true (忙碌是正常负载, 非故障)。
+            // ok is false only when dead (stalled) or a dependency is missing; busy still has
+            // ok=true (busy is normal load, not failure).
             let ok = rt.healthy() && deps_ok;
             Ok(json!({
                 "ok": ok,
@@ -1922,39 +2114,48 @@ async fn handle_method(
                 "git_sha": env!("FE_GIT_SHA"),
                 "build_time": env!("FE_BUILD_TIME"),
                 "ax_trusted": fe_core::gui::GuiController::ax_trusted(),
-                // ARCH-1: seatbelt 治理信号 — execute + shell_start 均默认 true (商用安全默认)。
-                // 负载均衡器/运维查此字段知实例默认开运行时隔离。
+                // ARCH-1: seatbelt governance signal — execute + shell_start both default true
+                // (commercial security default).
+                // Load balancers/ops read this field to know the instance defaults to runtime
+                // isolation enabled.
                 "seatbelt_default_on": true,
-                // D2-2: runtime 三态 — alive (空闲响应)/busy (饱和分流)/dead (停摆摘除)。
-                // ok=alive||busy; dead → ok=false。busy 供 LB 分流 (非摘除)。
+                // D2-2: runtime tri-state — alive (idle-responsive)/busy (saturated, shed
+                // load)/dead (stalled, remove).
+                // ok=alive||busy; dead → ok=false. busy is for LB load shedding (not removal).
                 "runtime": { "ok": rt.healthy(), "state": rt.state(), "available_permits": rt.available_permits },
                 "dependencies": deps,
-                // M-OPS-04/M-OPS-05: 运维深度指标 — 连接数/worker 线程/活跃 shell/内存。
-                // 运维面板 + 负载均衡器据此判断实例负载与 shell 注册表水位。
+                // M-OPS-04/M-OPS-05: deep ops metrics — connections/worker threads/active
+                // shells/memory.
+                // Ops dashboards + load balancers use this to judge instance load and shell
+                // registry watermark.
                 "depth": probe_health_depth(shells, hub)
             }))
         }
         "executor.execute" => {
             let req: ExecutionRequest = serde_json::from_value(params)
-                .map_err(|e| (ERR_INVALID_REQ, format!("params 无效: {}", e)))?;
+                .map_err(|e| (ERR_INVALID_REQ, format!("invalid params: {}", e)))?;
             let task_id = req.task_id.clone();
-            // 审计 2.11: 取执行 permit 限并发子进程 (非连接)。execute_async 启子进程, permit 持到返回。
+            // Audit 2.11: take an exec permit to bound concurrent subprocesses (not connections).
+            // execute_async spawns a subprocess; the permit is held until return.
             let _exec_permit = exec_sem
                 .acquire()
                 .await
-                .map_err(|e| (ERR_INTERNAL, format!("exec_sem 已关闭: {e}")))?;
-            // D4-9: 取 permit 后镜像可用数成 gauge (permit drop 在 handler 末尾, Rust 无 drop 钩子点位,
-            // 故 acquire 后即时 set 一次反映新水位; 下一请求 acquire 时再刷新)。
+                .map_err(|e| (ERR_INTERNAL, format!("exec_sem closed: {e}")))?;
+            // D4-9: after acquiring the permit, mirror the available count into a gauge (the
+            // permit drops at the end of the handler and Rust has no drop-hook hook point,
+            // so set once right after acquire to reflect the new watermark; refreshed again on
+            // the next request's acquire).
             metrics::gauge!("fe_exec_sem_available").set(exec_sem.available_permits() as f64);
             let r: ExecutionResult = executor
                 .execute_async(req)
                 .await
-                .map_err(|e| (ERR_INTERNAL, format!("execute 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("execute failed: {}", e)))?;
             hub.record_exec(&r);
-            // D4-9: 释放前刷新水位 (permit 即将 drop 归还)。
+            // D4-9: refresh the watermark before release (the permit is about to drop and be returned).
             metrics::gauge!("fe_exec_sem_available").set((exec_sem.available_permits() + 1) as f64);
             let val = serde_json::to_value(&r).unwrap_or(json!({}));
-            // D5-3: done 帧走阻塞广播 — 不可丢 (订阅方须见流终止标记)。
+            // D5-3: the done frame goes through the blocking broadcast — must not be dropped
+            // (subscribers must see the stream-termination marker).
             hub.broadcast_stdio_blocking(
                 json!({
                     "task_id": task_id,
@@ -1967,20 +2168,23 @@ async fn handle_method(
             Ok(val)
         }
         "executor.snapshot_create" => {
-            let cwd = param_str(&params, "cwd").ok_or((ERR_INVALID_REQ, "缺少 cwd".to_string()))?;
+            let cwd =
+                param_str(&params, "cwd").ok_or((ERR_INVALID_REQ, "missing cwd".to_string()))?;
             let id = executor
                 .snapshot_create_async(&cwd)
                 .await
-                .map_err(|e| (ERR_INTERNAL, format!("snapshot_create 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("snapshot_create failed: {}", e)))?;
             Ok(json!({"snapshot_id": id}))
         }
-        // D6-03 (审计 0827 product): 快照清单 — on-disk NDJSON 索引读回, 供 on-call/审计查询。
+        // D6-03 (audit 0827 product): snapshot listing — reads back the on-disk NDJSON index
+        // for on-call/audit queries.
         "executor.list_snapshots" => {
-            let cwd = param_str(&params, "cwd").ok_or((ERR_INVALID_REQ, "缺少 cwd".to_string()))?;
+            let cwd =
+                param_str(&params, "cwd").ok_or((ERR_INVALID_REQ, "missing cwd".to_string()))?;
             let snaps = executor
                 .list_snapshots_async(&cwd)
                 .await
-                .map_err(|e| (ERR_INTERNAL, format!("list_snapshots 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("list_snapshots failed: {}", e)))?;
             let arr: Vec<serde_json::Value> = snaps
                 .into_iter()
                 .map(|s| {
@@ -1993,19 +2197,23 @@ async fn handle_method(
                 .collect();
             Ok(json!({"snapshots": arr}))
         }
-        // Issue #11 / #12.4: 非执行预校验 — 调用方 (fusion-code) 先问用户授权再 execute。
-        // Executor 只强制硬黑名单 (never-blocked); interactive confirmation 归 caller (Option A, stateless)。
+        // Issue #11 / #12.4: pre-execution validation — the caller (fusion-code) asks the user
+        // for authorization before execute.
+        // The Executor only enforces the hard blocklist (never-blocked); interactive
+        // confirmation belongs to the caller (Option A, stateless).
         "executor.validate" => {
             let command = param_str(&params, "command")
-                .ok_or((ERR_INVALID_REQ, "缺少 command".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing command".to_string()))?;
             let verdict = executor.validate(&command);
             let allowed = verdict.allowed;
             let reason = verdict.reason.clone();
-            // 手工映射为小写串 — 与 fe-pyo3 validate() 一致, 两传输层 wire shape 统一
+            // Manually map to lowercase strings — consistent with fe-pyo3 validate(), unified
+            // wire shape across both transport layers
             let stage = verdict.stage.map(|s| match s {
                 fe_core::security::SecurityStage::Regex => "regex",
                 fe_core::security::SecurityStage::Tokenizer => "tokenizer",
-                // Issue #23: guard 编排映射的裁决阶段 (verdict 来自 guard.evaluate)。
+                // Issue #23: verdict stage mapped by guard orchestration (verdict comes from
+                // guard.evaluate).
                 fe_core::security::SecurityStage::Semantic => "semantic",
             });
             Ok(json!({
@@ -2017,22 +2225,28 @@ async fn handle_method(
         }
         "executor.rollback" => {
             let snapshot_id = param_str(&params, "snapshot_id")
-                .ok_or((ERR_INVALID_REQ, "缺少 snapshot_id".to_string()))?;
-            let cwd = param_str(&params, "cwd").ok_or((ERR_INVALID_REQ, "缺少 cwd".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing snapshot_id".to_string()))?;
+            let cwd =
+                param_str(&params, "cwd").ok_or((ERR_INVALID_REQ, "missing cwd".to_string()))?;
             let ok = executor
                 .rollback_async(&snapshot_id, &cwd)
                 .await
-                .map_err(|e| (ERR_INTERNAL, format!("rollback 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("rollback failed: {}", e)))?;
             hub.record_rollback(ok);
             if !ok {
-                return Err((-32012, "rollback 失败 (stash apply 或非 repo)".to_string()));
+                return Err((
+                    -32012,
+                    "rollback failed (stash apply or not a repo)".to_string(),
+                ));
             }
             Ok(json!({"ok": true}))
         }
         "executor.diagnostics" => {
-            // 审计 3.9: PTY 合并 stdout+stderr → traceback 在 stdout (stderr 恒空, 见 fe-sandbox
-            // SandboxResult.stderr 文档)。旧版仅读 params.stderr → 切片器拿空串无诊断。
-            // 优先 stdout (PTY 合并流), 回退 stderr/output (stdio-only 后端或旧客户端向后兼容)。
+            // Audit 3.9: PTY merges stdout+stderr → tracebacks land in stdout (stderr always
+            // empty, see fe-sandbox SandboxResult.stderr docs). The old version only read
+            // params.stderr → the slicer got an empty string, no diagnostics.
+            // Prefer stdout (the PTY-merged stream), fall back to stderr/output (backward
+            // compatible with stdio-only backends or old clients).
             let output = param_str(&params, "stdout")
                 .or_else(|| param_str(&params, "stderr"))
                 .or_else(|| param_str(&params, "output"))
@@ -2045,56 +2259,70 @@ async fn handle_method(
         "executor.gui_action" => {
             let action_val = params
                 .get("action")
-                .ok_or((ERR_INVALID_REQ, "缺少 action".to_string()))?;
-            let action: GuiAction = serde_json::from_value(action_val.clone())
-                .map_err(|e| (ERR_INVALID_REQ, format!("action 反序列化失败: {e}")))?;
+                .ok_or((ERR_INVALID_REQ, "missing action".to_string()))?;
+            let action: GuiAction = serde_json::from_value(action_val.clone()).map_err(|e| {
+                (
+                    ERR_INVALID_REQ,
+                    format!("action deserialization failed: {e}"),
+                )
+            })?;
             let result = executor
                 .gui_action(action)
-                .map_err(|e| (ERR_INTERNAL, format!("gui_action 失败: {e}")))?;
+                .map_err(|e| (ERR_INTERNAL, format!("gui_action failed: {e}")))?;
             Ok(serde_json::to_value(&result).unwrap_or(json!({})))
         }
         "executor.gui_action_batch" => {
             let actions_val = params
                 .get("actions")
-                .ok_or((ERR_INVALID_REQ, "缺少 actions".to_string()))?;
-            let actions: Vec<GuiAction> = serde_json::from_value(actions_val.clone())
-                .map_err(|e| (ERR_INVALID_REQ, format!("actions 反序列化失败: {e}")))?;
+                .ok_or((ERR_INVALID_REQ, "missing actions".to_string()))?;
+            let actions: Vec<GuiAction> =
+                serde_json::from_value(actions_val.clone()).map_err(|e| {
+                    (
+                        ERR_INVALID_REQ,
+                        format!("actions deserialization failed: {e}"),
+                    )
+                })?;
             let results = executor
                 .gui_action_batch(actions)
-                .map_err(|e| (ERR_INTERNAL, format!("gui_action_batch 失败: {e}")))?;
+                .map_err(|e| (ERR_INTERNAL, format!("gui_action_batch failed: {e}")))?;
             Ok(serde_json::to_value(&results).unwrap_or(json!({})))
         }
         "executor.metrics" => {
-            // C-OPS-05: 自服务指标 — exec 计数 + duration/stdio 聚合 + rollback 计数。
-            // 运维面板/负载均衡器读此判健康趋势 (拦截率/超时率/回滚失败率), 无外部 exporter 依赖。
+            // C-OPS-05: self-service metrics — exec counts + duration/stdio aggregates +
+            // rollback counts.
+            // Ops dashboards/load balancers read this for health trends (block rate / timeout
+            // rate / rollback failure rate) with no external exporter dependency.
             Ok(hub.metrics_snapshot())
         }
         "executor.metrics_prometheus" => {
-            // M-OPS-02: Prometheus text format — 调用方经 UDS 拉, 喂自家 exporter。
-            // 不开 HTTP 端口 (保 M-SEC-01 UDS-only)。recorder install 失败 → -32603。
+            // M-OPS-02: Prometheus text format — callers pull over UDS and feed their own exporter.
+            // No HTTP port opened (preserves M-SEC-01 UDS-only). recorder install failure → -32603.
             match hub.metrics_prometheus() {
                 Some(text) => Ok(json!({ "ok": true, "text": text })),
                 None => Err((
                     ERR_INTERNAL,
-                    "Prometheus recorder 未安装, 仅 executor.metrics JSON 可用".to_string(),
+                    "Prometheus recorder not installed, only executor.metrics JSON available"
+                        .to_string(),
                 )),
             }
         }
         "executor.shutdown" => {
-            // C-OPS-04: IPC 触发优雅 drain — notify_waiters 唤醒 accept_loop 的 shutdown_notify
-            // 分支 → 停止 accept + drain in-flight 连接 (join_all 10s deadline)。
-            // 响应先回再让 accept_loop 退出 (本连接的 read_task 在 dispatch 后自然结束)。
-            info!("收到 shutdown 请求, 触发优雅 drain (C-OPS-04)");
+            // C-OPS-04: IPC-triggered graceful drain — notify_waiters wakes the accept_loop's
+            // shutdown_notify branch → stop accept + drain in-flight connections (join_all with
+            // a 10s deadline).
+            // The response is sent first, then accept_loop exits (this connection's read_task
+            // ends naturally after dispatch).
+            info!("shutdown request received, triggering graceful drain (C-OPS-04)");
             hub.shutdown.notify_waiters();
             Ok(json!({"ok": true, "shutting_down": true}))
         }
         "executor.file_edit" => {
             let path =
-                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "missing path".to_string()))?;
             let old_string = param_str(&params, "old_string")
-                .ok_or((ERR_INVALID_REQ, "缺少 old_string".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing old_string".to_string()))?;
             let new_string = param_str(&params, "new_string")
-                .ok_or((ERR_INVALID_REQ, "缺少 new_string".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing new_string".to_string()))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str());
             let replace_all = params
                 .get("replace_all")
@@ -2102,33 +2330,33 @@ async fn handle_method(
                 .unwrap_or(false);
             let r = executor
                 .file_edit(&path, &old_string, &new_string, cwd, replace_all)
-                .map_err(|e| (ERR_INTERNAL, format!("file_edit 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("file_edit failed: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         "executor.write_file" => {
-            // #2: write_file(path, content, cwd?) — 整文件创建/覆盖 + 建父目录
+            // #2: write_file(path, content, cwd?) — whole-file create/overwrite + create parent dirs
             let path =
-                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "missing path".to_string()))?;
             let content = param_str(&params, "content")
-                .ok_or((ERR_INVALID_REQ, "缺少 content".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing content".to_string()))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str());
             let r = executor
                 .write_file(&path, &content, cwd)
-                .map_err(|e| (ERR_INTERNAL, format!("write_file 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("write_file failed: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         "executor.glob" => {
             let pattern = param_str(&params, "pattern")
-                .ok_or((ERR_INVALID_REQ, "缺少 pattern".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing pattern".to_string()))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str());
             let entries = executor
                 .glob(&pattern, cwd)
-                .map_err(|e| (ERR_INTERNAL, format!("glob 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("glob failed: {}", e)))?;
             Ok(serde_json::to_value(&entries).unwrap_or(json!({})))
         }
         "executor.grep" => {
             let pattern = param_str(&params, "pattern")
-                .ok_or((ERR_INVALID_REQ, "缺少 pattern".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing pattern".to_string()))?;
             let paths: Vec<String> = params
                 .get("paths")
                 .and_then(|p| p.as_array())
@@ -2137,16 +2365,16 @@ async fn handle_method(
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect()
                 })
-                .ok_or((ERR_INVALID_REQ, "缺少 paths 数组".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing paths array".to_string()))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str());
             let matches = executor
                 .grep(&pattern, &paths, cwd)
-                .map_err(|e| (ERR_INTERNAL, format!("grep 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("grep failed: {}", e)))?;
             Ok(serde_json::to_value(&matches).unwrap_or(json!({})))
         }
         "executor.grep_with_opts" => {
             let pattern = param_str(&params, "pattern")
-                .ok_or((ERR_INVALID_REQ, "缺少 pattern".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing pattern".to_string()))?;
             let paths: Vec<String> = params
                 .get("paths")
                 .and_then(|p| p.as_array())
@@ -2155,79 +2383,79 @@ async fn handle_method(
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect()
                 })
-                .ok_or((ERR_INVALID_REQ, "缺少 paths 数组".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing paths array".to_string()))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str());
-            // #7: opts 子对象 serde 反序列化 (字段全 #[serde(default)], 缺省=默认)
+            // #7: opts sub-object deserialized via serde (all fields #[serde(default)], missing = default)
             let opts: fe_core::tools::GrepOptions = match params.get("opts") {
                 Some(v) => serde_json::from_value(v.clone())
-                    .map_err(|e| (ERR_INVALID_REQ, format!("opts 解析失败: {}", e)))?,
+                    .map_err(|e| (ERR_INVALID_REQ, format!("opts parse failed: {}", e)))?,
                 None => fe_core::tools::GrepOptions::default(),
             };
             let out = executor
                 .grep_with_opts(&pattern, &paths, cwd, &opts)
-                .map_err(|e| (ERR_INTERNAL, format!("grep_with_opts 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("grep_with_opts failed: {}", e)))?;
             Ok(serde_json::to_value(&out).unwrap_or(json!({})))
         }
         "executor.apply_patch" => {
             let diff =
-                param_str(&params, "diff").ok_or((ERR_INVALID_REQ, "缺少 diff".to_string()))?;
+                param_str(&params, "diff").ok_or((ERR_INVALID_REQ, "missing diff".to_string()))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str());
             let r = executor
                 .apply_patch(&diff, cwd)
-                .map_err(|e| (ERR_INTERNAL, format!("apply_patch 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("apply_patch failed: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         "executor.replace_function" => {
             let path =
-                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "missing path".to_string()))?;
             let fn_name = param_str(&params, "fn_name")
-                .ok_or((ERR_INVALID_REQ, "缺少 fn_name".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing fn_name".to_string()))?;
             let new_body = param_str(&params, "new_body")
-                .ok_or((ERR_INVALID_REQ, "缺少 new_body".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing new_body".to_string()))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str());
             let r = executor
                 .replace_function(&path, &fn_name, &new_body, cwd)
-                .map_err(|e| (ERR_INTERNAL, format!("replace_function 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("replace_function failed: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         "executor.multi_edit" => {
             let path =
-                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "missing path".to_string()))?;
             let edits_val = params
                 .get("edits")
-                .ok_or((ERR_INVALID_REQ, "缺少 edits 数组".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing edits array".to_string()))?;
             let edits: Vec<fe_core::tools::MultiEditItem> =
                 serde_json::from_value(edits_val.clone())
-                    .map_err(|e| (ERR_INVALID_REQ, format!("edits 解析失败: {}", e)))?;
+                    .map_err(|e| (ERR_INVALID_REQ, format!("edits parse failed: {}", e)))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str());
             let r = executor
                 .multi_edit(&path, &edits, cwd)
-                .map_err(|e| (ERR_INTERNAL, format!("multi_edit 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("multi_edit failed: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         "executor.notebook_edit" => {
             let path =
-                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "缺少 path".to_string()))?;
+                param_str(&params, "path").ok_or((ERR_INVALID_REQ, "missing path".to_string()))?;
             let cell_id = params.get("cell_id").and_then(|v| v.as_str());
             let cell_number = params.get("cell_number").and_then(|v| v.as_i64());
             let new_source = param_str(&params, "new_source")
-                .ok_or((ERR_INVALID_REQ, "缺少 new_source".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing new_source".to_string()))?;
             let edit_mode: fe_core::tools::NotebookEditMode =
                 match params.get("edit_mode").and_then(|v| v.as_str()) {
                     Some(m) => serde_json::from_value(serde_json::Value::String(m.to_string()))
-                        .map_err(|e| (ERR_INVALID_REQ, format!("edit_mode 解析失败: {}", e)))?,
+                        .map_err(|e| (ERR_INVALID_REQ, format!("edit_mode parse failed: {}", e)))?,
                     None => fe_core::tools::NotebookEditMode::Replace,
                 };
             let cwd = params.get("cwd").and_then(|c| c.as_str());
             let r = executor
                 .notebook_edit(&path, cell_id, cell_number, &new_source, edit_mode, cwd)
-                .map_err(|e| (ERR_INTERNAL, format!("notebook_edit 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("notebook_edit failed: {}", e)))?;
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         "executor.shell_start" => {
-            // #1: 后台持久 shell 启动 — 安全校验在 fe-core (fail-closed)
+            // #1: background persistent shell start — security validation in fe-core (fail-closed)
             let command = param_str(&params, "command")
-                .ok_or((ERR_INVALID_REQ, "缺少 command".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing command".to_string()))?;
             let cwd = params.get("cwd").and_then(|c| c.as_str()).map(String::from);
             let task_id = params
                 .get("task_id")
@@ -2235,7 +2463,7 @@ async fn handle_method(
                 .map(String::from);
             let env: std::collections::HashMap<String, String> = match params.get("env_vars") {
                 Some(v) => serde_json::from_value(v.clone())
-                    .map_err(|e| (ERR_INVALID_REQ, format!("env_vars 解析失败: {}", e)))?,
+                    .map_err(|e| (ERR_INVALID_REQ, format!("env_vars parse failed: {}", e)))?,
                 None => std::collections::HashMap::new(),
             };
             let max_output_chars = params
@@ -2274,15 +2502,17 @@ async fn handle_method(
                 .get("kill_grace_ms")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(500);
-            // Issue #64: 可选 per-shell seatbelt profile — serde 反序列化 (deny_unknown_fields 校验)。
-            let sandbox_profile: Option<fe_sandbox::seatbelt::SandboxProfile> =
-                match params.get("sandbox") {
-                    Some(v) if !v.is_null() => Some(
-                        serde_json::from_value(v.clone())
-                            .map_err(|e| (ERR_INVALID_REQ, format!("sandbox 解析失败: {}", e)))?,
-                    ),
-                    _ => None,
-                };
+            // Issue #64: optional per-shell seatbelt profile — deserialized via serde (with
+            // deny_unknown_fields validation).
+            let sandbox_profile: Option<fe_sandbox::seatbelt::SandboxProfile> = match params
+                .get("sandbox")
+            {
+                Some(v) if !v.is_null() => Some(
+                    serde_json::from_value(v.clone())
+                        .map_err(|e| (ERR_INVALID_REQ, format!("sandbox parse failed: {}", e)))?,
+                ),
+                _ => None,
+            };
             let sp = fe_core::shell::ShellStartParams {
                 command,
                 cwd,
@@ -2299,7 +2529,8 @@ async fn handle_method(
                 sandbox_profile,
             };
             let r = executor.shell_start(shells, sp);
-            // M-OPS-02: fe_shell_active gauge — list_shells 已 reap finished, running 计数即活跃。
+            // M-OPS-02: fe_shell_active gauge — list_shells has already reaped finished shells,
+            // so the running count is the active count.
             let active = Executor::list_shells(shells)
                 .iter()
                 .filter(|s| !s.finished)
@@ -2308,20 +2539,20 @@ async fn handle_method(
             Ok(serde_json::to_value(&r).unwrap_or(json!({})))
         }
         "executor.shell_output" => {
-            // #1: 轮询 tail 快照 + 运行/退出状态
+            // #1: poll a tail snapshot + running/exit status
             let shell_id = param_str(&params, "shell_id")
-                .ok_or((ERR_INVALID_REQ, "缺少 shell_id".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing shell_id".to_string()))?;
             let out = Executor::shell_output(shells, &shell_id)
-                .map_err(|e| (ERR_INTERNAL, format!("shell_output 失败: {}", e)))?;
+                .map_err(|e| (ERR_INTERNAL, format!("shell_output failed: {}", e)))?;
             Ok(serde_json::to_value(&out).unwrap_or(json!({})))
         }
         "executor.kill_shell" => {
-            // #1: kill 进程树 (KillShell parity)
+            // #1: kill the process tree (KillShell parity)
             let shell_id = param_str(&params, "shell_id")
-                .ok_or((ERR_INVALID_REQ, "缺少 shell_id".to_string()))?;
+                .ok_or((ERR_INVALID_REQ, "missing shell_id".to_string()))?;
             let ok = Executor::kill_shell(shells, &shell_id)
-                .map_err(|e| (ERR_INTERNAL, format!("kill_shell 失败: {}", e)))?;
-            // M-OPS-02: fe_shell_active gauge — kill 后重算活跃数。
+                .map_err(|e| (ERR_INTERNAL, format!("kill_shell failed: {}", e)))?;
+            // M-OPS-02: fe_shell_active gauge — recompute the active count after kill.
             let active = Executor::list_shells(shells)
                 .iter()
                 .filter(|s| !s.finished)
@@ -2330,7 +2561,7 @@ async fn handle_method(
             Ok(json!({ "ok": ok }))
         }
         "executor.list_shells" => {
-            // #1: 列出全部后台 shell
+            // #1: list all background shells
             let list = Executor::list_shells(shells);
             Ok(serde_json::to_value(&list).unwrap_or(json!({})))
         }
@@ -2341,8 +2572,10 @@ async fn handle_method(
     }
 }
 
-/// D2-2 (2026-08-28): 运行时健康三态 — 区分 "忙碌但健康" 与 "停摆故障"。
-/// 旧版 bool 探针在饱和负载下误报不健康 (探针任务排队超时), 导致 LB 摘除正常忙碌实例。
+/// D2-2 (2026-08-28): runtime health tri-state — distinguishes "busy but healthy" from
+/// "stalled failure".
+/// The old bool probe falsely reported unhealthy under saturated load (probe task queued and
+/// timed out), causing the LB to remove healthy busy instances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeState {
     Alive,
@@ -2356,12 +2589,12 @@ struct RuntimeHealth {
 }
 
 impl RuntimeHealth {
-    /// ok=alive||busy; dead 才算不健康 (停摆需摘除)。
+    /// ok=alive||busy; only dead counts as unhealthy (stalled requires removal).
     fn healthy(&self) -> bool {
         !matches!(self.state, RuntimeState::Dead)
     }
 
-    /// JSON 序列化用状态字符串。
+    /// State string for JSON serialization.
     fn state(&self) -> &'static str {
         match self.state {
             RuntimeState::Alive => "alive",
@@ -2371,29 +2604,36 @@ impl RuntimeHealth {
     }
 }
 
-/// C-OPS-05 + D2-2: 探 IPC_RT 响应, 区分三态。
-/// 短超时 (调用方传 200ms) spawn 空任务 — 空闲 worker 立即拾取 = alive;
-/// 超时再查 exec_sem 可用许可: 0=饱和 (busy, 忙碌但健康), >0 仍超时=停摆 (dead, 真故障)。
-/// gap #5: health 端点服务 LB 决策 (摘除/分流), 须探实际服务的 runtime = IPC_RT (serve_blocking 入口)。
-/// 旧版探 BLOCKING_RT — serve 模式 BLOCKING_RT 几乎不用 (仅 in-process run() 路径) → 误报 alive。
-/// IPC_RT 停摆 / worker 全死锁 → spawn 永不完成 + 有空闲许可 → dead → ok:false 摘除。
+/// C-OPS-05 + D2-2: probe IPC_RT responsiveness, distinguishing the tri-state.
+/// A short timeout (caller passes 200ms) spawns an empty task — an idle worker picks it up
+/// immediately = alive;
+/// on timeout, check exec_sem available permits: 0=saturated (busy, busy but healthy), >0 and
+/// still timing out = stalled (dead, real failure).
+/// gap #5: the health endpoint serves LB decisions (remove/shed), so it must probe the runtime
+/// that actually serves = IPC_RT (the serve_blocking entry).
+/// The old version probed BLOCKING_RT — in serve mode BLOCKING_RT is barely used (only the
+/// in-process run() path) → falsely reported alive.
+/// IPC_RT stalled / all workers deadlocked → spawn never completes + permits available → dead
+/// → ok:false removal.
 async fn probe_runtime(timeout: Duration, available_permits: usize) -> RuntimeHealth {
     let h = fe_core::IPC_RT.handle();
     let task = h.spawn(async {});
     let state = if tokio::time::timeout(timeout, task).await.is_ok() {
         RuntimeState::Alive
     } else if available_permits == 0 {
-        // 无可用执行许可 = 16 槽全占 = 饱和负载, 探针排队是预期非故障。
+        // No available exec permits = all 16 slots taken = saturated load; the probe queueing is
+        // expected, not a failure.
         warn!(
             available_permits,
-            "D2-2: 健康探针超时但 exec_sem 饱和, 判 busy (忙碌但健康, 非停摆)"
+            "D2-2: health probe timed out but exec_sem saturated, judging busy (busy but healthy, not stalled)"
         );
         RuntimeState::Busy
     } else {
-        // 有空闲执行许可但 runtime 不响应 = worker 停摆/死锁, 真故障。
+        // Available exec permits but the runtime is unresponsive = workers stalled/deadlocked,
+        // a real failure.
         error!(
             available_permits,
-            "D2-2: 健康探针超时且有空闲许可, 判 dead (IPC_RT 停摆/死锁)"
+            "D2-2: health probe timed out with permits available, judging dead (IPC_RT stalled/deadlocked)"
         );
         RuntimeState::Dead
     };
@@ -2403,9 +2643,11 @@ async fn probe_runtime(timeout: Duration, available_permits: usize) -> RuntimeHe
     }
 }
 
-/// C-OPS-05 + 0827 P-1: 探外部依赖 — `git --version` (rollback/快照依赖 git CLI)。
-/// 任一依赖缺失 → 服务降级, ok=false。返回 [{name, ok, version?}]。
-/// P-1 修: 旧版 spawn 两次 `git --version` (一次判 ok, 一次取 version) — 合并为单次 spawn。
+/// C-OPS-05 + 0827 P-1: probe external dependencies — `git --version` (rollback/snapshots
+/// depend on the git CLI).
+/// Any missing dependency → degraded service, ok=false. Returns [{name, ok, version?}].
+/// P-1 fix: the old version spawned `git --version` twice (once for ok, once for the version)
+/// — merged into a single spawn.
 async fn probe_dependencies() -> Vec<Value> {
     let out = tokio::process::Command::new("git")
         .arg("--version")
@@ -2425,13 +2667,16 @@ async fn probe_dependencies() -> Vec<Value> {
     vec![d]
 }
 
-/// M-OPS-04/M-OPS-05: health 深度指标 — 连接数/worker 线程数/活跃 shell 数/内存 (MB)。
-/// - connections: BroadcastHub.active_conns 原子快照 (无锁)。
-/// - workers: IPC_RT worker_threads — 与 fe-core IPC_RT 初始化公式一致 (available_parallelism, clamp 4-16)。
-/// - active_shells: Executor::list_shells(registry).filter(!finished) 计数; M-OPS-05 接近 MAX_SHELLS 时 warn。
-/// - mem_mb: 本进程 RSS via sysinfo (轻量单次 refresh, 无采样任务)。
+/// M-OPS-04/M-OPS-05: deep health metrics — connections/worker threads/active shells/memory (MB).
+/// - connections: atomic snapshot of BroadcastHub.active_conns (lock-free).
+/// - workers: IPC_RT worker_threads — same formula as the fe-core IPC_RT init
+///   (available_parallelism, clamp 4-16).
+/// - active_shells: count of Executor::list_shells(registry).filter(!finished); M-OPS-05 warns
+///   when nearing MAX_SHELLS.
+/// - mem_mb: this process's RSS via sysinfo (lightweight single refresh, no sampling task).
 ///
-/// M-ARCH-1: registry 由 IpcServer 持有 (Executor 无状态), 经 dispatch_request 传引用。
+/// M-ARCH-1: the registry is held by IpcServer (Executor stateless), passed by reference
+/// through dispatch_request.
 fn probe_health_depth(shells: &Arc<fe_core::shell::ShellRegistry>, hub: &BroadcastHub) -> Value {
     let connections = hub.active_conns.load(Ordering::Relaxed);
     let workers = std::thread::available_parallelism()
@@ -2440,15 +2685,16 @@ fn probe_health_depth(shells: &Arc<fe_core::shell::ShellRegistry>, hub: &Broadca
         .clamp(4, 16);
     let sh = Executor::list_shells(shells);
     let active_shells = sh.iter().filter(|s| !s.finished).count();
-    // M-OPS-05: 接近上限告警 (80%) — 防 registry 打满导致新 shell_start 被迫 reap。
+    // M-OPS-05: near-capacity warning (80%) — prevents the registry filling up and forcing new
+    // shell_starts to reap existing shells.
     let max_shells = fe_core::shell::MAX_SHELLS;
     if max_shells > 0 && active_shells * 5 >= max_shells * 4 {
         warn!(
             active_shells,
-            max_shells, "M-OPS-05: 活跃 shell 接近上限 (>=80%), 调用方应清理后台任务"
+            max_shells, "M-OPS-05: active shells near capacity (>=80%), callers should clean up background tasks"
         );
     }
-    // mem_mb — 本进程 RSS (sysinfo 轻量 refresh)
+    // mem_mb — this process's RSS (lightweight sysinfo refresh)
     let mem_mb = current_proc_mem_mb();
     json!({
         "connections": connections,
@@ -2459,8 +2705,8 @@ fn probe_health_depth(shells: &Arc<fe_core::shell::ShellRegistry>, hub: &Broadca
     })
 }
 
-/// sysinfo 取本进程 RSS (MB) — M-OPS-04 health mem_mb 探针。
-/// 复用 fe-telemetry 同款 3-arg refresh_processes_specifics (sysinfo 0.32 API)。
+/// Read this process's RSS (MB) via sysinfo — the M-OPS-04 health mem_mb probe.
+/// Reuses the same 3-arg refresh_processes_specifics as fe-telemetry (sysinfo 0.32 API).
 fn current_proc_mem_mb() -> f64 {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
     let pid = sysinfo::Pid::from_u32(std::process::id());
@@ -2493,17 +2739,18 @@ fn err_str(id: Value, code: i64, message: &str) -> String {
     serde_json::to_string(&err_resp(id, code, message)).unwrap_or_default()
 }
 
-/// chmod 0o600 — 仅 owner 可读写 (本地提权防护, C-IPC-01)。
-/// 监听前已 unlink 旧 socket, bind 后立即收紧权限。
-/// D3-8 企业硬化: 权限收紧失败 = world 可读写 socket = M-SEC-01 绕过 → fail-loud 返 Err, serve 拒绝启动。
+/// chmod 0o600 — owner read/write only (local privilege-escalation protection, C-IPC-01).
+/// The old socket was unlinked before listening; permissions are tightened immediately after bind.
+/// D3-8 enterprise hardening: permission tightening failure = a world-readable/writable socket
+/// = M-SEC-01 bypass → fail-loud Err, serve refuses to start.
 #[cfg(unix)]
 fn chmod_secure(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-        error!(path = %path.display(), error = %e, "FATAL: chmod 0o600 socket 失败 — 拒绝 world-readable socket 启动 (D3-8)");
-        anyhow::anyhow!("chmod 0o600 socket 失败 (D3-8 企业硬化): {}: {}", path.display(), e)
+        error!(path = %path.display(), error = %e, "FATAL: chmod 0o600 socket failed — refusing to start with a world-readable socket (D3-8)");
+        anyhow::anyhow!("chmod 0o600 socket failed (D3-8 enterprise hardening): {}: {}", path.display(), e)
     })?;
-    info!(path = %path.display(), "socket 收紧 0o600 (owner-only rw, C-IPC-01)");
+    info!(path = %path.display(), "socket tightened to 0o600 (owner-only rw, C-IPC-01)");
     Ok(())
 }
 
@@ -2512,15 +2759,22 @@ fn chmod_secure(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// M-SEC-01 + 0827 C-10: 建 socket 父目录 0o700 — 私有目录阻他 UID connect (目录无搜索权限)。
-/// 仅对 HOME 下默认路径生效; 显式 /tmp 覆盖路径走 chmod_secure 0o600 单文件。
-/// C-10 修: 已存在目录**也收紧 0o700** (旧版早 return = 残留宽松目录, 他 UID 可 traverse+connect)。
-/// 仅对本次新建/本服务 socket 父目录收紧; 上级 (HOME 本身) 不动 — 收紧的是 ~/.fusion-executor。
-/// D3-8 企业硬化:
-///   - create_dir_all 失败 → fail-loud Err (无法建私有目录 = 无法保证隔离)。
-///   - 我们新建的目录 chmod 0o700 失败 → fail-loud Err (自己建的目录理应可收紧, 失败 = FS 异常)。
-///   - 已存在非自有目录 (如共享 /tmp 根) chmod EPERM/EACCES → 降级 warn + Ok (非 HOME 默认路径, 靠文件 0o600 兜底)。
-///   - chmod 其他错误 (只读 FS/IO) → fail-loud Err。
+/// M-SEC-01 + 0827 C-10: create the socket parent directory 0o700 — a private directory blocks
+/// other UIDs from connecting (no search permission on the directory).
+/// Only effective for the HOME default path; explicit /tmp override paths rely on the
+/// chmod_secure 0o600 single file.
+/// C-10 fix: an already-existing directory is **also tightened to 0o700** (the old early-return
+/// left a permissive directory behind; other UIDs could traverse+connect).
+/// Only this run's/newly created socket parent directory is tightened; parents (HOME itself)
+/// are untouched — what gets tightened is ~/.fusion-executor.
+/// D3-8 enterprise hardening:
+///   - create_dir_all failure → fail-loud Err (cannot create the private directory = isolation
+///     cannot be guaranteed).
+///   - chmod 0o700 failure on a directory we just created → fail-loud Err (our own directory
+///     should be tightenable; failure = FS anomaly).
+///   - chmod EPERM/EACCES on a pre-existing non-owned directory (e.g. a shared /tmp root) →
+///     degrade to warn + Ok (not the HOME default path; relies on the file 0o600 as fallback).
+///   - other chmod errors (read-only FS/IO) → fail-loud Err.
 #[cfg(unix)]
 fn ensure_sock_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -2533,32 +2787,34 @@ fn ensure_sock_dir(path: &Path) -> Result<()> {
     let pre_existing = parent.exists();
     if !pre_existing {
         std::fs::create_dir_all(parent).map_err(|e| {
-            error!(dir = %parent.display(), error = %e, "FATAL: 建 socket 私有目录失败 — 拒绝启动 (D3-8 M-SEC-01)");
-            anyhow::anyhow!("建 socket 私有目录失败 (D3-8 M-SEC-01): {}: {}", parent.display(), e)
+            error!(dir = %parent.display(), error = %e, "FATAL: failed to create the private socket directory — refusing to start (D3-8 M-SEC-01)");
+            anyhow::anyhow!("failed to create the private socket directory (D3-8 M-SEC-01): {}: {}", parent.display(), e)
         })?;
-        info!(dir = %parent.display(), "M-SEC-01: socket 父目录已建");
+        info!(dir = %parent.display(), "M-SEC-01: socket parent directory created");
     }
-    // C-10: 无论新建或已存在, 尝试收紧 0o700。
+    // C-10: regardless of new or pre-existing, attempt to tighten to 0o700.
     match std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
         Ok(()) => {
-            info!(dir = %parent.display(), "M-SEC-01: socket 父目录收紧 0o700 (阻他 UID traverse/connect)");
+            info!(dir = %parent.display(), "M-SEC-01: socket parent directory tightened to 0o700 (blocks other-UID traverse/connect)");
         }
         Err(e) => {
             let perm_denied = matches!(e.raw_os_error(), Some(1) | Some(13)); // EPERM/EACCES
             if !pre_existing || !perm_denied {
-                // 新建目录收紧失败 (我们拥有, 应可收紧) 或非权限类 IO 错误 → fail-loud。
-                error!(dir = %parent.display(), error = %e, "FATAL: chmod 0o700 私有目录失败 — 拒绝其他 UID traverse/connect (D3-8 M-SEC-01)");
+                // A newly created directory failing to tighten (we own it, should be
+                // tightenable) or a non-permission IO error → fail-loud.
+                error!(dir = %parent.display(), error = %e, "FATAL: chmod 0o700 on the private directory failed — refusing other-UID traverse/connect (D3-8 M-SEC-01)");
                 return Err(anyhow::anyhow!(
-                    "chmod 0o700 私有目录失败 (D3-8 M-SEC-01): {}: {}",
+                    "chmod 0o700 on the private directory failed (D3-8 M-SEC-01): {}: {}",
                     parent.display(),
                     e
                 ));
             }
-            // 已存在非自有目录 (如共享 /tmp 根) 无权 chmod → 降级: 靠 socket 文件 0o600 兜底。
+            // Pre-existing non-owned directory (e.g. shared /tmp root) cannot be chmod'd →
+            // degrade: rely on the socket file 0o600 as fallback.
             warn!(
                 dir = %parent.display(),
                 error = %e,
-                "M-SEC-01: 非自有 socket 父目录无权收紧 0o700 (共享 /tmp 等) — 降级靠文件 0o600 兜底"
+                "M-SEC-01: cannot tighten a non-owned socket parent directory to 0o700 (shared /tmp etc.) — degrading to file 0o600 as fallback"
             );
         }
     }
@@ -2570,9 +2826,10 @@ fn ensure_sock_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// M-SEC-01: LOCAL_PEERCRED UID 校验 — accept 后查对端 UID, 须等于本进程 UID。
-/// 防同主机他 UID 经符号链接或 /tmp 覆盖路径越权 connect。零 unsafe (nix safe wrapper)。
-/// 返回 true=放行 (同 UID), false=拒 (他 UID 或取凭证失败, fail-closed)。
+/// M-SEC-01: LOCAL_PEERCRED UID check — after accept, the peer UID must equal this process's UID.
+/// Prevents other UIDs on the same host from connecting via a symlink or /tmp override path.
+/// Zero unsafe (nix safe wrapper).
+/// Returns true=allow (same UID), false=reject (other UID or credential fetch failed, fail-closed).
 #[cfg(unix)]
 fn peer_uid_matches(stream: &tokio::net::UnixStream) -> bool {
     use nix::sys::socket::getsockopt;
@@ -2587,14 +2844,14 @@ fn peer_uid_matches(stream: &tokio::net::UnixStream) -> bool {
             } else {
                 warn!(
                     peer_uid,
-                    self_uid, "M-SEC-01: 拒他 UID 连接 (LOCAL_PEERCRED)"
+                    self_uid, "M-SEC-01: rejected other-UID connection (LOCAL_PEERCRED)"
                 );
                 false
             }
         }
         Err(e) => {
-            // fail-closed: 取不到对端凭证 → 拒 (防降级绕过)
-            warn!(error = %e, "M-SEC-01: LOCAL_PEERCRED 取凭证失败, fail-closed 拒连");
+            // fail-closed: peer credentials unavailable → reject (prevents degraded bypass)
+            warn!(error = %e, "M-SEC-01: LOCAL_PEERCRED credential fetch failed, rejecting connection (fail-closed)");
             false
         }
     }
@@ -2639,22 +2896,24 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
         )
         .await;
-        // C-OPS-05: ok 由真实探针决定 (IPC_RT + git 依赖), CI 环境 git 存在 → ok=true。
+        // C-OPS-05: ok is decided by real probes (IPC_RT + git dependency); git exists in CI →
+        // ok=true.
         assert_eq!(resp["result"]["ok"], true);
-        // ARCH-1: seatbelt 治理信号 — execute 默认开启 (商用安全默认)。
+        // ARCH-1: seatbelt governance signal — execute enabled by default (commercial security default).
         assert_eq!(resp["result"]["seatbelt_default_on"], true);
-        // ax_trusted = 真实 AXIsProcessTrusted() 查询 (C-GUI-01), CI 无 TCC 时为 false。
-        // 仅断言字段存在且为布尔, 不硬编码 true。
+        // ax_trusted = real AXIsProcessTrusted() query (C-GUI-01), false when CI has no TCC.
+        // Only assert the field exists and is boolean, never hardcode true.
         assert!(
             resp["result"]["ax_trusted"].is_boolean(),
-            "ax_trusted 应为布尔: {}",
+            "ax_trusted should be a boolean: {}",
             resp["result"]["ax_trusted"]
         );
-        // C-OPS-05: runtime 探针 — IPC_RT spawn 空任务超时探活
-        // D2-2: runtime 三态 (alive/busy/dead); 空闲测试环境应 alive, ok=true。
+        // C-OPS-05: runtime probe — IPC_RT spawns an empty task with a timeout as liveness check.
+        // D2-2: runtime tri-state (alive/busy/dead); an idle test environment should be alive,
+        // ok=true.
         assert_eq!(
             resp["result"]["runtime"]["ok"], true,
-            "runtime 应健康 (IPC_RT 可响应): {}",
+            "runtime should be healthy (IPC_RT responsive): {}",
             resp["result"]["runtime"]
         );
         assert!(
@@ -2662,35 +2921,40 @@ mod tests {
                 resp["result"]["runtime"]["state"].as_str(),
                 Some("alive") | Some("busy")
             ),
-            "D2-2: runtime.state 应为 alive 或 busy (非 dead): {}",
+            "D2-2: runtime.state should be alive or busy (not dead): {}",
             resp["result"]["runtime"]
         );
         assert!(
             resp["result"]["runtime"]["available_permits"].is_number(),
-            "D2-2: runtime.available_permits 应为数字: {}",
+            "D2-2: runtime.available_permits should be a number: {}",
             resp["result"]["runtime"]
         );
-        // C-OPS-05: dependencies 数组 — git CLI (rollback 依赖)
+        // C-OPS-05: dependencies array — git CLI (rollback depends on it)
         let deps = &resp["result"]["dependencies"];
-        assert!(deps.is_array(), "dependencies 应为数组: {}", deps);
+        assert!(deps.is_array(), "dependencies should be an array: {}", deps);
         let git_dep = deps
             .as_array()
             .unwrap()
             .iter()
             .find(|d| d["name"] == "git")
-            .expect("dependencies 应含 git");
-        assert_eq!(git_dep["ok"], true, "git 依赖应健康: {}", git_dep);
+            .expect("dependencies should contain git");
+        assert_eq!(
+            git_dep["ok"], true,
+            "git dependency should be healthy: {}",
+            git_dep
+        );
         assert!(
             git_dep["version"].is_string(),
-            "git 应报 version: {}",
+            "git should report version: {}",
             git_dep
         );
         let _ = std::fs::remove_file(&sock);
     }
 
-    // gap #5 回归: 64 并发 echo 全完成, 无死锁饥饿。
-    // 旧 bug: serve_blocking 跑共享 BLOCKING_RT (上限 8 worker), 64 连接扇出饥饿 →
-    // 响应写不出 → recv 30s 超时 (32/64 hang)。修复后专属 IPC_RT (clamp 4-16) 隔离。
+    // gap #5 regression: 64 concurrent echoes all complete, no deadlock starvation.
+    // Old bug: serve_blocking ran on the shared BLOCKING_RT (cap 8 workers); a 64-connection
+    // fan-out starved it → responses could not be written → recv 30s timeout (32/64 hung).
+    // Fixed by the dedicated IPC_RT (clamp 4-16) isolation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_echo_64_all_complete() {
         let sock = tmp_sock("conc64");
@@ -2715,23 +2979,23 @@ mod tests {
             let (i, resp, dur) = h.await.unwrap();
             assert_eq!(
                 resp["result"]["exit_code"], 0,
-                "conn {i}: 响应异常 (旧 bug 此处 hang 超时): {resp}"
+                "conn {i}: bad response (the old bug hung here until timeout): {resp}"
             );
             ok += 1;
             if dur > max_dur {
                 max_dur = dur;
             }
         }
-        assert_eq!(ok, n, "应全部 {n} 完成, 实际 {ok}");
-        // 旧 bug max dur ~30s (recv 超时); 修复后应 <15s 预算。
+        assert_eq!(ok, n, "all {n} should complete, got {ok}");
+        // Old bug max dur ~30s (recv timeout); after the fix should fit a <15s budget.
         assert!(
             max_dur.as_secs() < 15,
-            "max dur {max_dur:?} 超预算 (旧 bug 32 hang 30s)"
+            "max dur {max_dur:?} over budget (old bug: 32 hung for 30s)"
         );
         let _ = std::fs::remove_file(&sock);
     }
 
-    // M-OPS-04/M-OPS-05: health 深度指标 — connections/workers/active_shells/max_shells/mem_mb
+    // M-OPS-04/M-OPS-05: deep health metrics — connections/workers/active_shells/max_shells/mem_mb
     #[tokio::test]
     async fn health_depth_fields_present() {
         let sock = tmp_sock("health_depth");
@@ -2743,8 +3007,8 @@ mod tests {
         )
         .await;
         let depth = &resp["result"]["depth"];
-        assert!(depth.is_object(), "depth 应为对象: {}", depth);
-        // M-OPS-04: 五字段齐
+        assert!(depth.is_object(), "depth should be an object: {}", depth);
+        // M-OPS-04: all five fields present
         for key in [
             "connections",
             "workers",
@@ -2752,47 +3016,51 @@ mod tests {
             "max_shells",
             "mem_mb",
         ] {
-            assert!(depth.get(key).is_some(), "depth 缺字段 {key}: {depth}");
+            assert!(
+                depth.get(key).is_some(),
+                "depth missing field {key}: {depth}"
+            );
         }
-        // M-OPS-04: 本次 RPC 连接计入 — 至少 1 个活跃连接
+        // M-OPS-04: this RPC's connection counts — at least 1 active connection
         let conns = depth["connections"].as_u64();
         assert!(
             conns.is_some() && conns.unwrap() >= 1,
-            "connections 应 >=1 (本次 RPC 在连): {depth}"
+            "connections should be >=1 (this RPC is connected): {depth}"
         );
-        // M-OPS-04: workers >=2 (BLOCKING_RT 下限)
+        // M-OPS-04: workers >=2 (BLOCKING_RT floor)
         let workers = depth["workers"].as_u64();
         assert!(
             workers.is_some() && workers.unwrap() >= 2,
-            "workers 应 >=2: {depth}"
+            "workers should be >=2: {depth}"
         );
-        // M-OPS-05: max_shells == 256 (fe-shell 上限)
+        // M-OPS-05: max_shells == 256 (fe-shell cap)
         assert_eq!(
             depth["max_shells"].as_u64(),
             Some(256),
-            "max_shells 应为 256: {depth}"
+            "max_shells should be 256: {depth}"
         );
-        // M-OPS-05: active_shells == 0 (无后台 shell 启动)
+        // M-OPS-05: active_shells == 0 (no background shells started)
         assert_eq!(
             depth["active_shells"].as_u64(),
             Some(0),
-            "active_shells 应为 0: {depth}"
+            "active_shells should be 0: {depth}"
         );
-        // M-OPS-04: mem_mb 非负 (本进程 RSS)
+        // M-OPS-04: mem_mb non-negative (this process's RSS)
         let mem = depth["mem_mb"].as_f64();
         assert!(
             mem.is_some() && mem.unwrap() >= 0.0,
-            "mem_mb 应 >=0: {depth}"
+            "mem_mb should be >=0: {depth}"
         );
         let _ = std::fs::remove_file(&sock);
     }
 
-    // M-OPS-03: 可配 shutdown drain 超时 — 纯函数解析 (无 env 副作用, 线程安全单测)。
+    // M-OPS-03: configurable shutdown drain timeout — pure function parse (no env side
+    // effects, thread-safe unit test).
     #[test]
     fn mops03_shutdown_timeout_parse() {
-        // 缺省 → 默认 10s
+        // missing → default 10s
         assert_eq!(parse_shutdown_timeout(None), SHUTDOWN_DEADLINE);
-        // 合法区间内 → 覆盖
+        // within the valid range → override
         assert_eq!(
             parse_shutdown_timeout(Some("5".into())),
             Duration::from_secs(5)
@@ -2805,7 +3073,7 @@ mod tests {
             parse_shutdown_timeout(Some("  42  ".into())),
             Duration::from_secs(42)
         );
-        // 越界 → 回退默认
+        // out of range → fall back to default
         assert_eq!(parse_shutdown_timeout(Some("0".into())), SHUTDOWN_DEADLINE);
         assert_eq!(
             parse_shutdown_timeout(Some("301".into())),
@@ -2815,7 +3083,7 @@ mod tests {
             parse_shutdown_timeout(Some("99999".into())),
             SHUTDOWN_DEADLINE
         );
-        // 非数字 → 回退默认
+        // non-numeric → fall back to default
         assert_eq!(
             parse_shutdown_timeout(Some("abc".into())),
             SHUTDOWN_DEADLINE
@@ -2823,13 +3091,14 @@ mod tests {
         assert_eq!(parse_shutdown_timeout(Some("".into())), SHUTDOWN_DEADLINE);
     }
 
-    // Issue #11 / #12.4: executor.validate 非执行预校验 over UDS — 调用方先问授权再 execute
+    // Issue #11 / #12.4: executor.validate non-executing pre-check over UDS — the caller asks
+    // for authorization before execute
     #[tokio::test]
     async fn validate_roundtrip() {
         let sock = tmp_sock("validate");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
-        // 安全命令
+        // Safe command
         let resp = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.validate","params":{"command":"echo hi"}}"#,
@@ -2838,7 +3107,7 @@ mod tests {
         assert_eq!(resp["result"]["allowed"], true);
         assert_eq!(resp["result"]["blocked"], false);
         assert!(resp["result"]["reason"].is_null());
-        // 危险命令 — 非执行, 仅返 verdict
+        // Dangerous command — not executed, only returns a verdict
         let resp2 = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":2,"method":"executor.validate","params":{"command":"rm -rf /"}}"#,
@@ -2846,7 +3115,10 @@ mod tests {
         .await;
         assert_eq!(resp2["result"]["allowed"], false);
         assert_eq!(resp2["result"]["blocked"], true);
-        assert!(resp2["result"]["reason"].is_string(), "reason 应为字符串");
+        assert!(
+            resp2["result"]["reason"].is_string(),
+            "reason should be a string"
+        );
         assert_eq!(resp2["result"]["stage"], "regex");
         let _ = std::fs::remove_file(&sock);
     }
@@ -2887,17 +3159,18 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    // C-OPS-05b: executor.metrics 返运行态计数 — execute 一次后 exec_total>=1, exec_success>=1
+    // C-OPS-05b: executor.metrics returns live counters — after one execute, exec_total>=1,
+    // exec_success>=1
     #[tokio::test]
     async fn metrics_roundtrip_after_execute() {
         let sock = tmp_sock("metrics");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
-        // 先跑一次成功命令, 累 metrics 计数
+        // Run one successful command first to accumulate metrics counters
         let req = r#"{"jsonrpc":"2.0","id":3,"method":"executor.execute","params":{"command":"echo hi"}}"#;
         let resp = rpc(&sock, req).await;
         assert_eq!(resp["result"]["exit_code"], 0);
-        // 读 metrics 快照
+        // Read the metrics snapshot
         let mresp = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":4,"method":"executor.metrics","params":{}}"#,
@@ -2912,12 +3185,12 @@ mod tests {
         );
         assert!(
             m["execute_duration_sec_avg"].is_number(),
-            "execute_duration_sec_avg 应为数字: {}",
+            "execute_duration_sec_avg should be a number: {}",
             m["execute_duration_sec_avg"]
         );
         assert!(
             m["stdio_bytes_total"].as_u64().is_some(),
-            "stdio_bytes_total 应为 u64: {}",
+            "stdio_bytes_total should be u64: {}",
             m["stdio_bytes_total"]
         );
         assert_eq!(m["exec_blocked"], 0);
@@ -2925,8 +3198,8 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    // M-OPS-02: executor.metrics_prometheus 返 Prometheus text format — execute 一次后
-    // fe_exec_total 命中 + HELP/TYPE 头 (describe_counter 注册)。
+    // M-OPS-02: executor.metrics_prometheus returns Prometheus text format — after one execute,
+    // fe_exec_total is hit + HELP/TYPE headers (registered via describe_counter).
     #[tokio::test]
     async fn metrics_prometheus_after_execute() {
         let sock = tmp_sock("metrics-prom");
@@ -2942,35 +3215,36 @@ mod tests {
         .await;
         assert!(presp["result"]["ok"].as_bool().unwrap_or(false));
         let text = presp["result"]["text"].as_str().unwrap_or("");
-        // describe_counter 注册的 HELP/TYPE 头应在文本里。
+        // HELP/TYPE headers registered by describe_counter should be in the text.
         assert!(
             text.contains("# HELP fe_exec_total"),
-            "缺 fe_exec_total HELP: {text}"
+            "missing fe_exec_total HELP: {text}"
         );
         assert!(
             text.contains("# TYPE fe_exec_total counter"),
-            "缺 fe_exec_total TYPE: {text}"
+            "missing fe_exec_total TYPE: {text}"
         );
         assert!(
             text.contains("fe_exec_total"),
-            "缺 fe_exec_total 指标行: {text}"
+            "missing fe_exec_total metric line: {text}"
         );
         assert!(
             text.contains("# TYPE fe_connections gauge"),
-            "缺 fe_connections gauge: {text}"
+            "missing fe_connections gauge: {text}"
         );
-        // D4-9: exec_sem 可用许可 gauge — execute 后 health 路径镜像, 应含 HELP/TYPE/指标行。
+        // D4-9: exec_sem available-permit gauge — mirrored by the health path after execute;
+        // should contain HELP/TYPE/metric lines.
         assert!(
             text.contains("# HELP fe_exec_sem_available"),
-            "缺 fe_exec_sem_available HELP: {text}"
+            "missing fe_exec_sem_available HELP: {text}"
         );
         assert!(
             text.contains("# TYPE fe_exec_sem_available gauge"),
-            "缺 fe_exec_sem_available TYPE: {text}"
+            "missing fe_exec_sem_available TYPE: {text}"
         );
         assert!(
             text.contains("fe_exec_sem_available"),
-            "缺 fe_exec_sem_available 指标行: {text}"
+            "missing fe_exec_sem_available metric line: {text}"
         );
         let _ = std::fs::remove_file(&sock);
     }
@@ -2999,7 +3273,7 @@ mod tests {
                 continue;
             }
             let v: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(v["id"], 7, "所有帧应共用 id");
+            assert_eq!(v["id"], 7, "all frames should share the id");
             let rtype = v["result"]["type"].as_str().unwrap_or("");
             if rtype == "chunk" {
                 if v["result"]["data"].as_str().unwrap_or("").contains("hi") {
@@ -3009,12 +3283,13 @@ mod tests {
             }
             if rtype == "done" {
                 assert_eq!(v["result"]["result"]["exit_code"], 0);
-                // stdout 可在 chunk 帧或 done.result.stdout (快 echo 时 done 聚合可能空,
-                // 数据在 chunk) — 二者见一即过, 避免流式聚合竞态假失败。
+                // stdout may appear in a chunk frame or done.result.stdout (for a fast echo the
+                // done aggregate may be empty, with the data in chunks) — seeing either passes,
+                // avoiding a false failure from the streaming-aggregation race.
                 let done_stdout = v["result"]["result"]["stdout"].as_str().unwrap_or("");
                 assert!(
                     saw_hi || done_stdout.contains("hi"),
-                    "应在 chunk 或 done.stdout 见 'hi'"
+                    "'hi' should appear in a chunk or done.stdout"
                 );
                 break;
             }
@@ -3066,7 +3341,7 @@ mod tests {
                 break;
             }
             let v: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(v["id"], 11, "遥测帧共用 id");
+            assert_eq!(v["id"], 11, "telemetry frames share the id");
             assert_eq!(v["result"]["type"], "sample");
             let sample = &v["result"]["sample"];
             assert!(sample["mem_mb"].as_f64().unwrap_or(0.0) >= 0.0);
@@ -3076,13 +3351,13 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(count, 3, "应收到 3 帧遥测样本");
+        assert_eq!(count, 3, "should receive 3 telemetry sample frames");
         let _ = std::fs::remove_file(&sock);
     }
 
-    // ── v1.5 #14 双向 server-push 测试 ──
+    // ── v1.5 #14 bidirectional server-push tests ──
 
-    /// 读一行 (用于 subscribe 后持续读推送帧)
+    /// Read one line (used to keep reading push frames after subscribe)
     async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Option<Value> {
         let mut buf = Vec::new();
         if reader.read_until(b'\n', &mut buf).await.unwrap() == 0 {
@@ -3108,8 +3383,8 @@ mod tests {
         .await
         .unwrap();
         let mut reader = BufReader::new(s);
-        // 第一行 = subscribe 响应
-        let resp = read_line(&mut reader).await.expect("subscribe 响应");
+        // First line = subscribe response
+        let resp = read_line(&mut reader).await.expect("subscribe response");
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["ok"], true);
         let sub_id = resp["result"]["subscription_id"]
@@ -3117,7 +3392,7 @@ mod tests {
             .expect("subscription_id")
             .to_string();
         assert!(sub_id.starts_with("sub-"));
-        // 后续行 = server-push notification (无 id, 有 method=executor.event)
+        // Subsequent lines = server-push notifications (no id, method=executor.event)
         let mut got = 0;
         let deadline = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(deadline);
@@ -3126,7 +3401,7 @@ mod tests {
                 _ = &mut deadline => break,
                 frame = read_line(&mut reader) => {
                     let frame = match frame { Some(f) => f, None => break };
-                    assert!(frame.get("id").is_none(), "notification 无 id: {frame}");
+                    assert!(frame.get("id").is_none(), "notification must have no id: {frame}");
                     assert_eq!(frame["method"], "executor.event");
                     assert_eq!(frame["params"]["subscription_id"], sub_id);
                     assert_eq!(frame["params"]["channel"], "telemetry");
@@ -3136,7 +3411,10 @@ mod tests {
                 }
             }
         }
-        assert!(got >= 3, "应收到 >=3 telemetry 推送帧, got={got}");
+        assert!(
+            got >= 3,
+            "should receive >=3 telemetry push frames, got={got}"
+        );
         let _ = std::fs::remove_file(&sock);
     }
 
@@ -3170,10 +3448,10 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        // 等一帧确认推送在工作
+        // Wait one frame to confirm the push is working
         let first = read_line(&mut reader).await.unwrap();
         assert_eq!(first["params"]["subscription_id"], sub_id);
-        // 取消订阅
+        // Unsubscribe
         let unsub = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"executor.unsubscribe","params":{{"subscription_id":"{sub_id}"}}}}
 "#,
@@ -3182,8 +3460,9 @@ mod tests {
         let unsub_resp = read_line(&mut reader).await.unwrap();
         assert_eq!(unsub_resp["id"], 2);
         assert_eq!(unsub_resp["result"]["ok"], true);
-        // 取消后短时内不应再收到该 sub 的推送 (遥测源 0 订阅自退)
-        // 读 300ms — 最多拿到 0 帧 (源已停); 容忍可能的残留 1 帧
+        // After unsubscribing no further pushes for this sub should arrive (the telemetry source
+        // self-exits at 0 subscribers)
+        // Read for 300ms — expect at most 0 frames (source stopped); tolerate a possible trailing 1
         let mut extra = 0;
         let deadline = tokio::time::sleep(Duration::from_millis(300));
         tokio::pin!(deadline);
@@ -3195,18 +3474,23 @@ mod tests {
                 }
             }
         }
-        assert!(extra <= 1, "取消订阅后不应持续推送, extra={extra}");
+        assert!(
+            extra <= 1,
+            "no continuous pushing after unsubscribe, extra={extra}"
+        );
         let _ = std::fs::remove_file(&sock);
     }
 
     #[tokio::test]
     async fn stdio_broadcasts_across_connections() {
-        // 连接 A 订阅 stdio (scope=all 跨连接收), 连接 B execute_stream → A 收推送
-        // Blocker 10: 默认 own_conn 已隔离跨连接; 显式 all 才全广播。
+        // Connection A subscribes to stdio (scope=all, received cross-connection), connection B
+        // execute_stream → A receives the push.
+        // Blocker 10: default own_conn already isolates cross-connection; only explicit all
+        // broadcasts fully.
         let sock = tmp_sock("stdio-bcast");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
-        // 连接 A: subscribe stdio, all=true
+        // Connection A: subscribe stdio, all=true
         let sa = UnixStream::connect(&sock).await.unwrap();
         let (rha, mut writer_a) = sa.into_split();
         let mut reader_a = BufReader::new(rha);
@@ -3222,7 +3506,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        // 连接 B: execute_stream echo
+        // Connection B: execute_stream echo
         let sb = UnixStream::connect(&sock).await.unwrap();
         let (rhb, mut writer_b) = sb.into_split();
         let mut reader_b = BufReader::new(rhb);
@@ -3231,9 +3515,9 @@ mod tests {
 "#,
         )
         .await;
-        // B 读到自己的 done 帧
+        // B reads its own done frame
         let mut b_done = false;
-        // A 应收到 stdio 推送 (chunk 和/或 done)
+        // A should receive the stdio push (chunk and/or done)
         let mut a_stdio = false;
         let deadline = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(deadline);
@@ -3279,24 +3563,25 @@ mod tests {
                 break;
             }
         }
-        assert!(b_done, "B 应收到自己 done 帧");
-        assert!(a_stdio, "A 应收到 stdio 跨连接推送");
+        assert!(b_done, "B should receive its own done frame");
+        assert!(a_stdio, "A should receive the cross-connection stdio push");
         let _ = std::fs::remove_file(&sock);
     }
 
-    // ── T3 审计修复测试 ──
+    // ── T3 audit-fix tests ──
 
     #[tokio::test]
     async fn capped_line_rejects_oversize_request() {
-        // C-IPC-04: 超 1MB 无换行请求 → ERR_PARSE (-32700) 拒连
+        // C-IPC-04: >1MB request without a newline → ERR_PARSE (-32700) disconnect
         let sock = tmp_sock("capped");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
         let s = UnixStream::connect(&sock).await.unwrap();
         let (rd, mut wr) = s.into_split();
-        // 发 2MB 无换行字节 — 应触发拒连 (server 读到超限即回错误帧 + 断开)
+        // Send 2MB of newline-free bytes — should trigger the disconnect (the server replies with
+        // an error frame + closes as soon as it reads past the limit)
         let blob = vec![b'A'; MAX_LINE_BYTES + 100];
-        // 后台写完 (server 消费前 write_all 会阻塞)
+        // Write completes in the background (write_all blocks until the server consumes)
         let write_task = tokio::spawn(async move { wr.write_all(&blob).await });
         let mut buf = Vec::new();
         let mut reader = BufReader::new(rd);
@@ -3305,7 +3590,7 @@ mod tests {
         let text = String::from_utf8_lossy(&buf);
         assert!(
             text.contains("-32700"),
-            "超限应回含 -32700 的错误帧: {text}"
+            "oversize should return an error frame containing -32700: {text}"
         );
         let _ = write_task.await;
         let _ = std::fs::remove_file(&sock);
@@ -3313,48 +3598,54 @@ mod tests {
 
     #[tokio::test]
     async fn read_capped_line_rejects_no_newline_flood() {
-        // Blocker 7 / 2.10: 无换行洪水 (2MB 无 \n) 应 in-loop 拒连 ERR_PARSE, 不 OOM 不无界缓冲
+        // Blocker 7 / 2.10: a newline-free flood (2MB with no \n) must be rejected in-loop with
+        // ERR_PARSE — no OOM, no unbounded buffering until a newline
         let blob = vec![b'A'; MAX_LINE_BYTES + 100];
         let mut reader = BufReader::new(std::io::Cursor::new(blob));
         let res = read_capped_line(&mut reader).await;
         assert_eq!(
             res,
             Err(ERR_PARSE),
-            "无换行洪水应回 ERR_PARSE 非 OOM/缓冲到换行"
+            "newline-free flood should return ERR_PARSE, not OOM/buffer-until-newline"
         );
     }
 
     #[tokio::test]
     async fn read_capped_line_chunked_under_limit_succeeds() {
-        // 分块读: 多次 fill_buf (无换行累积) 到恰 <1MB 后给换行 → 仍 Ok
+        // Chunked read: multiple fill_buf calls (accumulating without a newline) up to just <1MB,
+        // then a newline arrives → still Ok
         let mut blob = vec![b'A'; MAX_LINE_BYTES - 10];
         blob.push(b'\n');
         let mut reader = BufReader::new(std::io::Cursor::new(blob));
         let res = read_capped_line(&mut reader).await;
-        assert!(res.is_ok(), "恰 <1MB 行应成功: {res:?}");
+        assert!(res.is_ok(), "a line just under 1MB should succeed: {res:?}");
         let line = res.unwrap().unwrap();
         assert_eq!(line.len(), MAX_LINE_BYTES - 10);
     }
 
     #[tokio::test]
     async fn socket_permissions_are_owner_only() {
-        // C-IPC-01: socket 权限 0o600 (仅 owner)
+        // C-IPC-01: socket permissions 0o600 (owner only)
         let sock = tmp_sock("perm");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let meta = std::fs::metadata(&sock).expect("socket 元数据");
+            let meta = std::fs::metadata(&sock).expect("socket metadata");
             let mode = meta.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "socket 权限应为 0o600, 实际 0o{:o}", mode);
+            assert_eq!(
+                mode, 0o600,
+                "socket permissions should be 0o600, got 0o{:o}",
+                mode
+            );
         }
         let _ = std::fs::remove_file(&sock);
     }
 
     #[tokio::test]
     async fn health_reports_real_ax_trusted() {
-        // C-GUI-01: ax_trusted = 真实 AXIsProcessTrusted(), 非硬编码 true
+        // C-GUI-01: ax_trusted = a real AXIsProcessTrusted() query, not a hardcoded true
         let sock = tmp_sock("health-ax");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
@@ -3364,7 +3655,7 @@ mod tests {
         )
         .await;
         assert!(resp["result"]["ax_trusted"].is_boolean());
-        // 与直接查询一致
+        // Consistent with a direct query
         assert_eq!(
             resp["result"]["ax_trusted"],
             fe_core::gui::GuiController::ax_trusted()
@@ -3374,7 +3665,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_with_custom_interval_accepted() {
-        // M-IPC-01: interval_ms/screenshot_interval_ms 透传, 不报错
+        // M-IPC-01: interval_ms/screenshot_interval_ms passed through, no error
         let sock = tmp_sock("sub-interval");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
@@ -3387,14 +3678,14 @@ mod tests {
         .await
         .unwrap();
         let mut reader = BufReader::new(rd);
-        let resp = read_line(&mut reader).await.expect("subscribe 响应");
+        let resp = read_line(&mut reader).await.expect("subscribe response");
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["ok"], true);
         let sub_id = resp["result"]["subscription_id"]
             .as_str()
             .expect("subscription_id")
             .to_string();
-        // 取消订阅, 停源
+        // Unsubscribe, stop the source
         let unsub = format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"executor.unsubscribe\",\"params\":{{\"subscription_id\":\"{}\"}}}}\n",
             sub_id
@@ -3404,16 +3695,18 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    // ── Blocker 10 (审计 §2.9 跨租户泄漏) per-sub scope 过滤 ──
+    // ── Blocker 10 (audit §2.9 cross-tenant leak) per-sub scope filtering ──
 
     #[tokio::test]
     async fn stdio_own_conn_default_blocks_cross_connection() {
-        // 连接 A 默认订阅 stdio (own_conn), 连接 B execute_stream → A 不应收 B 的 stdio。
-        // 这是跨租户隔离基线 (审计 §2.9: 旧版全广播致 Agent A 见 Agent B stdout)。
+        // Connection A subscribes to stdio with the default (own_conn), connection B
+        // execute_stream → A must not receive B's stdio.
+        // This is the cross-tenant isolation baseline (audit §2.9: the old full broadcast let
+        // Agent A see Agent B's stdout).
         let sock = tmp_sock("stdio-ownconn");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
-        // 连接 A: subscribe stdio (无 scope 字段 → 默认 own_conn)
+        // Connection A: subscribe stdio (no scope field → default own_conn)
         let sa = UnixStream::connect(&sock).await.unwrap();
         let (rha, mut writer_a) = sa.into_split();
         let mut reader_a = BufReader::new(rha);
@@ -3425,7 +3718,7 @@ mod tests {
             .await;
         let resp = read_line(&mut reader_a).await.unwrap();
         assert_eq!(resp["result"]["ok"], true);
-        // 连接 B: execute_stream echo
+        // Connection B: execute_stream echo
         let sb = UnixStream::connect(&sock).await.unwrap();
         let (rhb, mut writer_b) = sb.into_split();
         let mut reader_b = BufReader::new(rhb);
@@ -3435,7 +3728,7 @@ mod tests {
 "#,
             )
             .await;
-        // B 读到自己 done 帧 (确认命令执行了)
+        // B reads its own done frame (confirms the command ran)
         let mut b_done = false;
         let mut a_got_stdio = false;
         let deadline = tokio::time::sleep(Duration::from_secs(3));
@@ -3472,23 +3765,27 @@ mod tests {
                 }
             }
             if b_done {
-                // 命令已完成, 给 A 一小窗确认无推送后退出
+                // Command finished; give A a short window to confirm no pushes, then exit
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 break;
             }
         }
-        assert!(b_done, "B 应收到自己 done 帧");
-        assert!(!a_got_stdio, "默认 own_conn 应拦截跨连接 stdio (审计 §2.9)");
+        assert!(b_done, "B should receive its own done frame");
+        assert!(
+            !a_got_stdio,
+            "default own_conn should block cross-connection stdio (audit §2.9)"
+        );
         let _ = std::fs::remove_file(&sock);
     }
 
     #[tokio::test]
     async fn stdio_task_ids_whitelist_receives_matched() {
-        // 连接 A 订阅 stdio task_ids=["t1"], 连接 B execute_stream task_id="t1" → A 收推送。
+        // Connection A subscribes to stdio task_ids=["t1"], connection B execute_stream
+        // task_id="t1" → A receives the push.
         let sock = tmp_sock("stdio-taskids");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
-        // 连接 A: subscribe stdio, task_ids=["t1"]
+        // Connection A: subscribe stdio, task_ids=["t1"]
         let sa = UnixStream::connect(&sock).await.unwrap();
         let (rha, mut writer_a) = sa.into_split();
         let mut reader_a = BufReader::new(rha);
@@ -3500,7 +3797,7 @@ mod tests {
             .await;
         let resp = read_line(&mut reader_a).await.unwrap();
         assert_eq!(resp["result"]["ok"], true);
-        // 连接 B: execute_stream echo, task_id="t1"
+        // Connection B: execute_stream echo, task_id="t1"
         let sb = UnixStream::connect(&sock).await.unwrap();
         let (rhb, mut writer_b) = sb.into_split();
         let mut reader_b = BufReader::new(rhb);
@@ -3547,20 +3844,23 @@ mod tests {
                 break;
             }
         }
-        assert!(b_done, "B 应收到自己 done 帧");
-        assert!(a_stdio, "task_ids 白名单匹配应收到 stdio 推送");
+        assert!(b_done, "B should receive its own done frame");
+        assert!(
+            a_stdio,
+            "task_ids whitelist match should receive the stdio push"
+        );
         let _ = std::fs::remove_file(&sock);
     }
 
-    // Issue #1: 后台 shell 启停轮询 over UDS — shell_start→shell_output→kill_shell→list_shells
+    // Issue #1: background shell start/poll/kill over UDS — shell_start→shell_output→kill_shell→list_shells
     #[tokio::test]
     async fn shell_start_output_kill_list_over_uds() {
         let sock = tmp_sock("shell");
-        // D3-1: python3 -c 内联解释器需 opt-in (此用例测 shell_start 非 D3-1)
+        // D3-1: python3 -c inline interpreter needs opt-in (this case tests shell_start, not D3-1)
         let server = IpcServer::with_executor(Executor::new().with_allow_inline_interpreter(true));
         let (_tx, _join) = server.serve(&sock).await.unwrap();
 
-        // 启动长任务
+        // Start a long task
         let start = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.shell_start","params":{"command":"python3 -c 'import time; time.sleep(30)'"}}"#,
@@ -3570,7 +3870,7 @@ mod tests {
         let sid = start["result"]["shell_id"].as_str().unwrap().to_string();
         assert!(sid.starts_with("sh-"));
 
-        // 轮询: 运行中, 无 exit_code
+        // Poll: running, no exit_code yet
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         let out = rpc(
             &sock,
@@ -3604,9 +3904,12 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(after["result"]["running"], false, "kill 后应结束");
+        assert_eq!(
+            after["result"]["running"], false,
+            "should be finished after kill"
+        );
 
-        // list_shells 含本 shell
+        // list_shells contains this shell
         let list = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":5,"method":"executor.list_shells","params":{}}"#,
@@ -3616,7 +3919,7 @@ mod tests {
         let arr = list["result"].as_array().unwrap();
         assert!(arr.iter().any(|e| e["shell_id"] == sid));
 
-        // 拦截: rm -rf / → blocked_by_security, shell_id null
+        // Block: rm -rf / → blocked_by_security, shell_id null
         let blocked = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":6,"method":"executor.shell_start","params":{"command":"rm -rf /"}}"#,
@@ -3629,16 +3932,17 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    // D3-2: shell_start 默认 seatbelt=true (商用安全默认)。不传 seatbelt →
-    // fe-ipc unwrap_or(true) → 经 sandbox-exec 隔离; 白名单 python3 正常 echo。
-    // 显式 seatbelt:false → opt-out 关隔离。两路径白名单命令均 ok=true。
+    // D3-2: shell_start defaults seatbelt=true (commercial-safe default). Omitting seatbelt →
+    // fe-ipc unwrap_or(true) → isolated via sandbox-exec; whitelisted python3 echoes normally.
+    // Explicit seatbelt:false → opt-out disables isolation. Both paths return ok=true for
+    // whitelisted commands.
     #[tokio::test]
     async fn shell_start_defaults_seatbelt_on() {
         let sock = tmp_sock("shell_seatbelt");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
 
-        // 不传 seatbelt → 默认 true, 白名单 echo 经 sandbox-exec 正常
+        // Omit seatbelt → defaults true; whitelisted echo works via sandbox-exec
         let on = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.shell_start","params":{"command":"echo d3-2-on"}}"#,
@@ -3647,7 +3951,7 @@ mod tests {
         assert_eq!(on["result"]["ok"], true);
         let sid_on = on["result"]["shell_id"].as_str().unwrap().to_string();
 
-        // 显式 seatbelt:false → opt-out
+        // Explicit seatbelt:false → opt-out
         let off = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":2,"method":"executor.shell_start","params":{"command":"echo d3-2-off","seatbelt":false}}"#,
@@ -3656,7 +3960,7 @@ mod tests {
         assert_eq!(off["result"]["ok"], true);
         let sid_off = off["result"]["shell_id"].as_str().unwrap().to_string();
 
-        // 收尾: 两 shell 均 kill (防泄漏)
+        // Cleanup: kill both shells (prevent leaks)
         for sid in [sid_on.as_str(), sid_off.as_str()] {
             let _ = rpc(
                 &sock,
@@ -3671,22 +3975,22 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    // C-OPS-04: executor.shutdown IPC 触发 hub.shutdown.notify_waiters() →
-    // accept_loop 退出 + drain in-flight。响应应为 {ok:true, shutting_down:true}。
-    // serve 的 join handle 应在 deadline 内完成 (accept_loop 返回)。
+    // C-OPS-04: executor.shutdown over IPC triggers hub.shutdown.notify_waiters() →
+    // accept_loop exits + drains in-flight. Response should be {ok:true, shutting_down:true}.
+    // The serve join handle should complete within the deadline (accept_loop returns).
     #[tokio::test]
     async fn shutdown_ipc_triggers_graceful_drain() {
         let sock = tmp_sock("shutdown");
         let server = IpcServer::new();
         let (_tx, join) = server.serve(&sock).await.unwrap();
-        // 先 health 确认 server 活
+        // health first to confirm the server is alive
         let h = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
         )
         .await;
         assert_eq!(h["result"]["ok"], true);
-        // 触发 shutdown
+        // Trigger shutdown
         let resp = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":2,"method":"executor.shutdown","params":{}}"#,
@@ -3694,25 +3998,30 @@ mod tests {
         .await;
         assert_eq!(resp["result"]["ok"], true);
         assert_eq!(resp["result"]["shutting_down"], true);
-        // accept_loop 退出 → serve join 在 deadline 内完成 (drain 空连接秒退)
+        // accept_loop exits → serve join completes within the deadline (drain of an empty
+        // connection returns instantly)
         let done = tokio::time::timeout(SHUTDOWN_DEADLINE, join).await;
         assert!(
             done.is_ok(),
-            "serve join 应在 SHUTDOWN_DEADLINE 内完成 (drain 后)"
+            "serve join should complete within SHUTDOWN_DEADLINE (after drain)"
         );
-        // socket 文件应被 serve 清理
-        assert!(!Path::new(&sock).exists(), "shutdown 后 sock 应被清理");
+        // The socket file should be cleaned up by serve
+        assert!(
+            !Path::new(&sock).exists(),
+            "sock should be removed after shutdown"
+        );
     }
 
-    // C-OPS-03: in-flight 连接在 shutdown 时被 drain (join 完成, 非孤儿)。
-    // 起一个 sleep 长命令 → 触发 shutdown → drain 超时 abort 该连接 (其内子进程
-    // 由 sandbox 退出 kill)。验证: serve join 在 deadline+缓冲 内完成。
+    // C-OPS-03: in-flight connections are drained at shutdown (join completes, not orphaned).
+    // Start a long sleep command → trigger shutdown → drain times out and aborts that connection
+    // (its child process is killed by the sandbox on exit). Verify: serve join completes within
+    // deadline+buffer.
     #[tokio::test]
     async fn shutdown_drains_inflight_connection() {
         let sock = tmp_sock("drain");
         let server = IpcServer::new();
         let (_tx, join) = server.serve(&sock).await.unwrap();
-        // 起长命令 (sleep 30s, 不等响应 — 慢请求占连接)
+        // Start the long command (sleep 30s, no response wait — the slow request holds the connection)
         let mut long_conn = UnixStream::connect(&sock).await.unwrap();
         long_conn
             .write_all(
@@ -3723,38 +4032,40 @@ mod tests {
             )
             .await
             .unwrap();
-        // 确认命令已派发 (health 走另一连接)
+        // Confirm the command was dispatched (health over another connection)
         let h = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":2,"method":"executor.health","params":{}}"#,
         )
         .await;
         assert_eq!(h["result"]["ok"], true);
-        // 触发 shutdown → drain in-flight (长命令连接超 10s → abort)
+        // Trigger shutdown → drain in-flight (the long-command connection exceeds 10s → abort)
         let resp = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":3,"method":"executor.shutdown","params":{}}"#,
         )
         .await;
         assert_eq!(resp["result"]["shutting_down"], true);
-        // drain deadline 10s + abort 缓冲: serve join 应在 ~12s 内完成
+        // drain deadline 10s + abort buffer: serve join should finish within ~12s
         let done = tokio::time::timeout(Duration::from_secs(12), join).await;
         assert!(
             done.is_ok(),
-            "serve join 应在 drain deadline+缓冲内完成 (in-flight abort 后)"
+            "serve join should complete within drain deadline+buffer (after in-flight abort)"
         );
         drop(long_conn);
         let _ = std::fs::remove_file(&sock);
     }
 
-    // M-SEC-01: LOCAL_PEERCRED UID 校验 — 同 UID 连接应放行 (CI 进程同 UID connect 自己)。
-    // 跨 UID 拒绝需不同 UID 进程, 非单测可行 (记于 README/审计报告)。
-    // 此测验证: (1) peer_uid_matches 对真实同 UID stream 返 true;
-    //          (2) ensure_sock_dir 建私有 0o700 目录;
-    //          (3) default_sock_path 落在 HOME/.fusion-executor/fe.sock (非 /tmp)。
+    // M-SEC-01: LOCAL_PEERCRED UID check — a same-UID connection must be allowed (the CI process
+    // connects to itself with the same UID).
+    // Cross-UID rejection needs a different-UID process, not feasible in a unit test (noted in
+    // README/audit report).
+    // This test verifies: (1) peer_uid_matches returns true for a real same-UID stream;
+    //          (2) ensure_sock_dir creates a private 0o700 directory;
+    //          (3) default_sock_path lands under HOME/.fusion-executor/fe.sock (not /tmp).
     #[tokio::test]
     async fn msec01_peer_uid_same_uid_allowed() {
-        // (1) 同 UID stream 放行
+        // (1) same-UID stream allowed
         let sock = tmp_sock("msec01");
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
         let connect_task = tokio::spawn({
@@ -3766,62 +4077,66 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         assert!(
             peer_uid_matches(&stream),
-            "M-SEC-01: 同 UID 连接应被 LOCAL_PEERCRED 放行"
+            "M-SEC-01: same-UID connection should be allowed by LOCAL_PEERCRED"
         );
         connect_task.await.unwrap();
         let _ = std::fs::remove_file(&sock);
 
-        // (2) default_sock_path 落在 HOME 私有目录, 非 /tmp (m-OPS-01 + M-SEC-01)
+        // (2) default_sock_path lands in the HOME private directory, not /tmp (m-OPS-01 + M-SEC-01)
         let def = default_sock_path();
         assert!(
             !def.starts_with("/tmp/"),
-            "M-SEC-01/m-OPS-01: 默认 socket 不应落在全局可扫描 /tmp: {}",
+            "M-SEC-01/m-OPS-01: default socket must not land in globally scannable /tmp: {}",
             def
         );
         assert!(
             def.ends_with(DEFAULT_SOCK_NAME),
-            "默认 socket 应以 {} 结尾: {}",
+            "default socket should end with {}: {}",
             DEFAULT_SOCK_NAME,
             def
         );
 
-        // (3) ensure_sock_dir 在不存在的 HOME 下子目录建 0o700 私有目录
+        // (3) ensure_sock_dir creates a 0o700 private directory under a not-yet-existing HOME subdir
         let probe = std::env::temp_dir()
             .join(format!("fe-msec01-probe-{}", std::process::id()))
             .join("subdir")
             .join("fe.sock");
-        ensure_sock_dir(&probe).expect("ensure_sock_dir 应成功建 0o700 父目录");
+        ensure_sock_dir(&probe).expect("ensure_sock_dir should create the 0o700 parent directory");
         let parent = probe.parent().unwrap();
-        assert!(parent.exists(), "ensure_sock_dir 应建父目录");
+        assert!(
+            parent.exists(),
+            "ensure_sock_dir should create the parent directory"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
             assert_eq!(
                 mode, 0o700,
-                "M-SEC-01: 私有 socket 目录应 0o700, 实际 {:#o}",
+                "M-SEC-01: private socket directory should be 0o700, got {:#o}",
                 mode
             );
         }
         let _ = std::fs::remove_dir_all(parent);
     }
 
-    // M-SEC-01/m-OPS-01: 默认 socket 路径 (~/.fusion-executor/fe.sock) serve 能起 —
-    // 捕获 bind-before-mkdir 顺序 bug: ensure_sock_dir 必须在 UnixListener::bind 前,
-    // 否则父目录不存在时 bind 失败。隔离 HOME 到 tempdir, 走真实 default_sock_path。
+    // M-SEC-01/m-OPS-01: the default socket path (~/.fusion-executor/fe.sock) must serve —
+    // catches the bind-before-mkdir ordering bug: ensure_sock_dir must run before
+    // UnixListener::bind, otherwise bind fails when the parent directory does not exist.
+    // Isolates HOME to a tempdir and goes through the real default_sock_path.
     #[tokio::test]
     async fn msec01_default_sock_dir_serve_works() {
         let fake_home = std::env::temp_dir().join(format!("fe-msec01-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
-        // 注入 HOME (default_sock_path 读 HOME), 测试结束恢复
+        // Inject HOME (default_sock_path reads HOME), restored at test end
         let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", &fake_home);
 
         let sock = IpcServer::resolve_sock(None);
         assert!(
             sock.starts_with(fake_home.display().to_string().as_str()),
-            "resolve_sock(None) 应落在隔离 HOME 下: {}",
+            "resolve_sock(None) should land under the isolated HOME: {}",
             sock
         );
         let server = IpcServer::new();
@@ -3833,13 +4148,17 @@ mod tests {
         .await;
         assert_eq!(resp["result"]["ok"], true);
 
-        // 私有目录权限 0o700
+        // Private directory permissions 0o700
         let dir = Path::new(&sock).parent().unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "私有 socket 目录应 0o700, 实际 {:#o}", mode);
+            assert_eq!(
+                mode, 0o700,
+                "private socket directory should be 0o700, got {:#o}",
+                mode
+            );
         }
 
         let _ = std::fs::remove_file(&sock);
@@ -3850,9 +4169,11 @@ mod tests {
         }
     }
 
-    // D3-8 企业硬化: socket 父目录权限收紧失败 → serve fail-loud 拒绝启动 (不残留 world-accessible socket)。
-    // 构造只读父目录: create_dir_all 成功但 chmod 0o700 因父目录无写权限失败 → ensure_sock_dir Err → serve Err。
-    // 注: macOS root 可绕 chmod, 故本测试仅非 root 跑断言; root 跳过 (CI 非 root)。
+    // D3-8 enterprise hardening: socket parent-directory tightening failure → serve fail-loud
+    // refuses to start (no world-accessible socket left behind).
+    // Builds a read-only parent: create_dir_all succeeds but chmod 0o700 fails for lack of write
+    // permission on the parent → ensure_sock_dir Err → serve Err.
+    // Note: macOS root can bypass chmod, so assertions run only as non-root; root skips (CI is non-root).
     #[cfg(unix)]
     #[tokio::test]
     async fn d38_serve_fails_when_sock_dir_not_tightenable() {
@@ -3863,7 +4184,7 @@ mod tests {
         }
         let tmp = std::env::temp_dir().join(format!("fe-d38-ro-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        // 建外层目录, 然后剥写权限 — 内层子目录 create_dir_all 会失败
+        // Create the outer directory, then strip write permission — the inner create_dir_all fails
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
         let sock = tmp.join("nope").join("fe.sock");
@@ -3871,14 +4192,14 @@ mod tests {
         let res = server.serve(sock.to_str().unwrap()).await;
         assert!(
             res.is_err(),
-            "D3-8: 不可建/不可收紧 socket 私有目录应 fail-loud 返 Err, 实际 Ok"
+            "D3-8: uncreatable/untightenable socket private directory should fail-loud with Err, got Ok"
         );
-        // 恢复权限清理 (否则 remove_dir_all 也无写权限)
+        // Restore permissions for cleanup (otherwise remove_dir_all also lacks write permission)
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // D3-8: 正常路径 ensure_sock_dir + chmod_secure 返 Ok (幂等 — 已 0o700 目录仍 Ok)。
+    // D3-8: the normal path of ensure_sock_dir + chmod_secure returns Ok (idempotent — an already-0o700 directory still returns Ok).
     #[cfg(unix)]
     #[tokio::test]
     async fn d38_sock_hardening_ok_on_normal_path() {
@@ -3887,19 +4208,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("fe.sock");
-        ensure_sock_dir(&sock_path).expect("D3-8: 正常路径 ensure_sock_dir 应 Ok");
+        ensure_sock_dir(&sock_path).expect("D3-8: normal-path ensure_sock_dir should return Ok");
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "D3-8: 正常路径目录应收紧 0o700");
-        // 幂等: 二次调用已收紧目录仍 Ok
-        ensure_sock_dir(&sock_path).expect("D3-8: ensure_sock_dir 幂等应 Ok");
+        assert_eq!(
+            mode, 0o700,
+            "D3-8: normal-path directory should be tightened to 0o700"
+        );
+        // Idempotent: a second call on the already-tightened directory still returns Ok
+        ensure_sock_dir(&sock_path)
+            .expect("D3-8: ensure_sock_dir idempotent call should return Ok");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // m-OPS-02: env-var 测试串行化 (set_var/remove_var 跨并行测试竞态)。
+    // m-OPS-02: env-var tests serialized (set_var/remove_var race across parallel tests).
     static MOPS02_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    // D3-6: validate 现 fail-closed (不可解析二进制不放行)。SIGHUP reload 测试需真实二进制
-    // 落可信目录才能 resolve 通过, 故建临时 bin 目录 + 真实可执行文件 + 登记 Executor 可信目录。
+    // D3-6: validate is now fail-closed (unresolvable binaries are not allowed). SIGHUP reload
+    // tests need a real binary inside a trusted directory to resolve, so build a temp bin
+    // directory + a real executable + register it as an Executor trusted directory.
     fn mops02_make_tool(dir: &Path, name: &str) {
         std::fs::create_dir_all(dir).unwrap();
         let p = dir.join(name);
@@ -3913,11 +4239,13 @@ mod tests {
         }
     }
 
-    // m-OPS-02: reload_extra_whitelist 解析 FUSION_EXECUTOR_EXTRA_WHITELIST (逗号分割/去空白/去空) → Executor 白名单更新。
+    // m-OPS-02: reload_extra_whitelist parses FUSION_EXECUTOR_EXTRA_WHITELIST (comma-split /
+    // whitespace-trimmed / empties dropped) → Executor whitelist update.
     #[test]
     fn mops02_reload_extra_whitelist_parses_env() {
         let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // D3-6: 真实二进制 + 可信目录 + 绝对路径调用, 否则 validate fail-closed 拦 (resolve 失败)。
+        // D3-6: real binary + trusted directory + absolute-path invocation, otherwise validate
+        // fail-closed blocks it (resolve failure).
         let dir = std::env::temp_dir().join("fe_mops02_sighup_dir");
         let _ = std::fs::remove_dir_all(&dir);
         mops02_make_tool(&dir, "sighup-tool-xyz");
@@ -3925,10 +4253,14 @@ mod tests {
         let executor = Arc::new(Executor::new().with_trusted_bin_dirs(&[dir.to_str().unwrap()]));
         let sighup_abs = dir.join("sighup-tool-xyz");
         let other_abs = dir.join("other-tool");
-        // 先用 validate 断言非基线工具默认被拦 (白名单未含 → whitelist-reject)
+        // First assert via validate that a non-baseline tool is blocked by default (not in the
+        // whitelist → whitelist-reject)
         let v = executor.validate(&format!("{} --version", sighup_abs.display()));
-        assert!(!v.allowed, "扩展前 sighup-tool-xyz 应被拦");
-        // 设 env → reload → 应放行
+        assert!(
+            !v.allowed,
+            "sighup-tool-xyz should be blocked before the extension"
+        );
+        // Set env → reload → should be allowed
         std::env::set_var(
             "FUSION_EXECUTOR_EXTRA_WHITELIST",
             " sighup-tool-xyz ,,other-tool ",
@@ -3937,70 +4269,77 @@ mod tests {
         let v = executor.validate(&format!("{} --version", sighup_abs.display()));
         assert!(
             v.allowed,
-            "SIGHUP 重载后 sighup-tool-xyz 应放行: {:?}",
+            "sighup-tool-xyz should be allowed after SIGHUP reload: {:?}",
             v.reason
         );
         let v = executor.validate(&format!("{} run", other_abs.display()));
-        assert!(v.allowed, "逗号第二项 other-tool 应放行: {:?}", v.reason);
-        // 基线恒在
+        assert!(
+            v.allowed,
+            "second comma item other-tool should be allowed: {:?}",
+            v.reason
+        );
+        // Baseline always present
         let v = executor.validate("python3 --version");
-        assert!(v.allowed, "基线 python3 恒放行");
+        assert!(v.allowed, "baseline python3 always allowed");
         std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // m-OPS-02: 空 env → 回退纯基线 (项目扩展清空)。
+    // m-OPS-02: empty env → fall back to pure baseline (project extras cleared).
     #[test]
     fn mops02_reload_extra_whitelist_empty_clears_extras() {
         let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // D3-6: 真实二进制 + 可信目录 + 绝对路径调用, 否则 validate fail-closed 拦。
+        // D3-6: real binary + trusted directory + absolute-path invocation, otherwise validate fail-closed blocks it.
         let dir = std::env::temp_dir().join("fe_mops02_cleartool_dir");
         let _ = std::fs::remove_dir_all(&dir);
         mops02_make_tool(&dir, "temp-tool");
         let executor = Arc::new(Executor::new().with_trusted_bin_dirs(&[dir.to_str().unwrap()]));
         let temp_abs = dir.join("temp-tool");
-        // 先加扩展
+        // Add the extra first
         std::env::set_var("FUSION_EXECUTOR_EXTRA_WHITELIST", "temp-tool");
         reload_extra_whitelist(&executor);
         assert!(
             executor
                 .validate(&format!("{} run", temp_abs.display()))
                 .allowed,
-            "先加 temp-tool 放行: 详见 reload 后 validate reason"
+            "temp-tool should be allowed after adding: see validate reason after reload"
         );
-        // 清 env → reload → 回退基线
+        // Clear env → reload → fall back to baseline
         std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
         reload_extra_whitelist(&executor);
         assert!(
             !executor
                 .validate(&format!("{} run", temp_abs.display()))
                 .allowed,
-            "空 reload 后 temp-tool 应已拦 (回退基线)"
+            "temp-tool should be blocked after empty reload (baseline fallback)"
         );
-        assert!(executor.validate("python3 --version").allowed, "基线恒在");
+        assert!(
+            executor.validate("python3 --version").allowed,
+            "baseline always present"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // m-OPS-02: reload_log_level 无 handle (tracing 未 init) → 不 panic, 仅 warn。
+    // m-OPS-02: reload_log_level without a handle (tracing not initialized) → no panic, just warn.
     #[test]
     fn mops02_reload_log_level_no_panic_without_handle() {
-        // 不调 init_tracing (避免污染全局 subscriber) → current_handle() 多为 None。
-        // 无论 None 或 Some, reload_log_level 不应 panic。
+        // No init_tracing call (avoid polluting the global subscriber) → current_handle() is usually None.
+        // Whether None or Some, reload_log_level must not panic.
         reload_log_level();
     }
 
-    // m-OPS-02: reload_log_level 读 RUST_LOG env (合法 directive 经 handle 不崩)。
+    // m-OPS-02: reload_log_level reads the RUST_LOG env (a valid directive must not crash via the handle).
     #[test]
     fn mops02_reload_log_level_reads_rust_log() {
         let _g = MOPS02_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RUST_LOG", "debug");
-        reload_log_level(); // 无 handle → no-op 路径, 不崩; 有 handle → 应接受 debug
+        reload_log_level(); // no handle → no-op path, no crash; with handle → should accept debug
         std::env::remove_var("RUST_LOG");
     }
 
-    // ===== 0827 fe-ipc P0-P3 修复回归测试 =====
+    // ===== 0827 fe-ipc P0-P3 fix regression tests =====
 
-    // M-7(1): 未知通道名 → -32600 (旧版静默接受 → 幽灵订阅, 永不收推帧)。
+    // M-7(1): unknown channel name → -32600 (old version silently accepted → ghost subscription, never receives pushed frames).
     #[tokio::test]
     async fn subscribe_rejects_unknown_channel() {
         let sock = tmp_sock("sub-unknown");
@@ -4014,13 +4353,13 @@ mod tests {
         .await;
         assert_eq!(
             resp["error"]["code"], -32600,
-            "未知通道应 -32600 fail-loud: {resp}"
+            "unknown channel should fail-loud with -32600: {resp}"
         );
         let _ = std::fs::remove_file(&sock);
     }
 
-    // L-7: 混合大小写通道名 ("Telemetry") 应规范化为小写并收到推帧 (旧版原样存 →
-    // 不匹配小写 CH_TELEMETRY = 幽灵订阅, 源任务永不启)。
+    // L-7: mixed-case channel name ("Telemetry") should be lowercased and receive pushed frames (old
+    // version stored as-is → no match against lowercase CH_TELEMETRY = ghost subscription, source task never starts).
     #[tokio::test]
     async fn subscribe_lowercases_mixedcase_channel() {
         let sock = tmp_sock("sub-lower");
@@ -4029,30 +4368,30 @@ mod tests {
         let s = UnixStream::connect(&sock).await.unwrap();
         let (rh, mut writer) = s.into_split();
         let mut reader = BufReader::new(rh);
-        // 大写 "Telemetry" — 应规范化为 "telemetry" 并匹配源扇出
+        // Uppercase "Telemetry" — should be normalized to "telemetry" and match the source fan-out
         let req = br#"{"jsonrpc":"2.0","id":1,"method":"executor.subscribe","params":{"channels":["Telemetry"],"interval_ms":20}}
 "#;
         writer.write_all(req).await.unwrap();
         let resp = read_line(&mut reader).await.unwrap();
         assert_eq!(
             resp["result"]["ok"], true,
-            "大写通道应被接受 (规范化): {resp}"
+            "uppercase channel should be accepted (normalized): {resp}"
         );
         let sub_id = resp["result"]["subscription_id"]
             .as_str()
             .unwrap()
             .to_string();
-        // 首帧应为 telemetry 推送 (订阅生效, 源任务启)
+        // First frame should be a telemetry push (subscription active, source task started)
         let first = read_line(&mut reader).await.unwrap();
         assert_eq!(
             first["params"]["subscription_id"], sub_id,
-            "规范化后应收到 telemetry 推帧 (非幽灵订阅): {first}"
+            "after normalization a telemetry frame should arrive (not a ghost subscription): {first}"
         );
         assert_eq!(first["params"]["channel"], "telemetry");
         let _ = std::fs::remove_file(&sock);
     }
 
-    // M-7(3): 空 task_ids 数组 → -32600 (旧版静默变空 Tasks 集 = 死订阅, 永不匹配)。
+    // M-7(3): empty task_ids array → -32600 (old version silently became an empty Tasks set = dead subscription, never matches).
     #[tokio::test]
     async fn subscribe_rejects_empty_task_ids() {
         let sock = tmp_sock("sub-empty-tids");
@@ -4066,19 +4405,20 @@ mod tests {
         .await;
         assert_eq!(
             resp["error"]["code"], -32600,
-            "空 task_ids 应 -32600 (死订阅 fail-loud): {resp}"
+            "empty task_ids should fail-loud with -32600 (dead subscription): {resp}"
         );
         let _ = std::fs::remove_file(&sock);
     }
 
-    // L-6: streaming execute 完成应记指标 — execute_stream 后 metrics_prometheus 含 fe_exec_total。
-    // 旧版 Done 分支漏 record_exec → 流式执行 Prometheus 不可见。
+    // L-6: completing a streaming execute should record metrics — after execute_stream,
+    // metrics_prometheus contains fe_exec_total.
+    // Old version missed record_exec in the Done branch → streaming executions invisible to Prometheus.
     #[tokio::test]
     async fn stream_exec_records_metric() {
         let sock = tmp_sock("stream-metric");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
-        // 先取基线 fe_exec_total 文本行 (可能其他测试已 populate, 取基线计数)
+        // Read the baseline fe_exec_total text first (other tests may have populated it; take the baseline count)
         let base = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.metrics_prometheus","params":{}}"#,
@@ -4086,7 +4426,7 @@ mod tests {
         .await;
         let base_text = base["result"]["text"].as_str().unwrap_or("");
         let base_count = extract_exec_total(base_text);
-        // 跑一次 execute_stream (echo)
+        // Run one execute_stream (echo)
         let mut s = UnixStream::connect(&sock).await.unwrap();
         let req = r#"{"jsonrpc":"2.0","id":7,"method":"executor.execute_stream","params":{"command":"echo hi","enable_rollback_snapshot":false}}"#;
         s.write_all((req.to_string() + "\n").as_bytes())
@@ -4116,8 +4456,8 @@ mod tests {
                 break;
             }
         }
-        assert!(got_done, "execute_stream 应收到 done 帧");
-        // 再取 metrics — fe_exec_total 应增 1
+        assert!(got_done, "execute_stream should receive a done frame");
+        // Read metrics again — fe_exec_total should increase by 1
         let after = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":2,"method":"executor.metrics_prometheus","params":{}}"#,
@@ -4127,14 +4467,14 @@ mod tests {
         let after_count = extract_exec_total(after_text);
         assert!(
             after_count > base_count,
-            "L-6: execute_stream 应使 fe_exec_total 递增 ({} → {}), 旧版漏 record_exec 不增",
+            "L-6: execute_stream should increment fe_exec_total ({} → {}); old version missed record_exec and did not increment",
             base_count,
             after_count
         );
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// 从 Prometheus text 提取 fe_exec_total 计数值。
+    /// Extract the fe_exec_total counter value from Prometheus text.
     fn extract_exec_total(text: &str) -> u64 {
         for line in text.lines() {
             if line.starts_with("fe_exec_total ") || line.starts_with("fe_exec_total{") {
@@ -4148,8 +4488,9 @@ mod tests {
         0
     }
 
-    // C-9: subscribe telemetry 通道应使 telemetry_gen 递增 (源生命周期代数, 供源任务
-    // 0 订阅重比对续跑/自退)。非 telemetry 订阅不动 telemetry_gen。
+    // C-9: subscribing to the telemetry channel should bump telemetry_gen (source lifecycle
+    // generation, used by the source task to re-check continue/exit on zero subscribers).
+    // Non-telemetry subscriptions must not touch telemetry_gen.
     #[tokio::test]
     async fn telemetry_gen_bumps_on_telemetry_subscribe() {
         let executor = Arc::new(Executor::new());
@@ -4158,43 +4499,51 @@ mod tests {
         let before = hub.telemetry_gen.load(Ordering::SeqCst);
         let mut chans = HashSet::new();
         chans.insert(CH_TELEMETRY.to_string());
-        // 用大 interval_ms 防 0 订阅自退竞态干扰 gen 断言 (gen bump 在 ensure_source 之前, 源
-        // 启动后立刻 0 订阅会 break — 但 telemetry_stream 单流喂帧, 不 break; gen 已 bump 即断言点)。
+        // Use a large interval_ms so the zero-subscriber self-exit race does not disturb the gen assertion (the
+        // gen bump happens before ensure_source; with 0 subscribers right after start the source would break —
+        // but telemetry_stream feeds a single stream and does not break; gen being bumped is the assertion point).
         let _sid = hub.subscribe(1, chans, StdioScope::OwnConn(1), tx, 5000, 1000);
         let after = hub.telemetry_gen.load(Ordering::SeqCst);
         assert_eq!(
             after,
             before + 1,
-            "C-9: telemetry 订阅应 bump telemetry_gen"
+            "C-9: telemetry subscription should bump telemetry_gen"
         );
-        // 非 telemetry 订阅不动 telemetry_gen
+        // Non-telemetry subscription must not touch telemetry_gen
         let (tx2, _rx2) = mpsc::channel::<Value>(8);
         let mut chans2 = HashSet::new();
         chans2.insert(CH_STDIO.to_string());
         let before2 = hub.telemetry_gen.load(Ordering::SeqCst);
         let _sid2 = hub.subscribe(2, chans2, StdioScope::OwnConn(2), tx2, 5000, 1000);
         let after2 = hub.telemetry_gen.load(Ordering::SeqCst);
-        assert_eq!(after2, before2, "C-9: stdio 订阅不应动 telemetry_gen");
-        // screenshot 订阅 bump screenshot_gen 非 telemetry_gen
+        assert_eq!(
+            after2, before2,
+            "C-9: stdio subscription must not touch telemetry_gen"
+        );
+        // screenshot subscription bumps screenshot_gen, not telemetry_gen
         let (tx3, _rx3) = mpsc::channel::<Value>(8);
         let mut chans3 = HashSet::new();
         chans3.insert(CH_SCREENSHOT.to_string());
         let _sid3 = hub.subscribe(3, chans3, StdioScope::OwnConn(3), tx3, 5000, 1000);
         let after3 = hub.telemetry_gen.load(Ordering::SeqCst);
-        assert_eq!(after3, before2, "C-9: screenshot 订阅不应动 telemetry_gen");
+        assert_eq!(
+            after3, before2,
+            "C-9: screenshot subscription must not touch telemetry_gen"
+        );
         let shot_after = hub.screenshot_gen.load(Ordering::SeqCst);
         assert_eq!(
             shot_after, 1,
-            "C-9: screenshot 订阅应 bump screenshot_gen 到 1"
+            "C-9: screenshot subscription should bump screenshot_gen to 1"
         );
     }
 
-    // C-10: ensure_sock_dir 对已存在的宽松目录 (0o755) 也收紧 0o700 (旧版早 return = 残留宽松)。
+    // C-10: ensure_sock_dir must also tighten a pre-existing loose directory (0o755) to 0o700
+    // (old version returned early = loose directory left behind).
     #[cfg(unix)]
     #[tokio::test]
     async fn ensure_sock_dir_tightens_existing_loose_dir() {
         use std::os::unix::fs::PermissionsExt;
-        // 建一个宽松目录 (0o755) 模拟旧版残留
+        // Create a loose directory (0o755) simulating the old leftover
         let dir = std::env::temp_dir().join(format!(
             "fe-ipc-sockdir-test-{}-{}",
             std::process::id(),
@@ -4204,24 +4553,25 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let sock_path = dir.join("fe.sock");
-        // 调 ensure_sock_dir — 应收紧 0o700
-        ensure_sock_dir(&sock_path).expect("ensure_sock_dir 应成功收紧已存在目录 0o700");
+        // Call ensure_sock_dir — should tighten to 0o700
+        ensure_sock_dir(&sock_path)
+            .expect("ensure_sock_dir should tighten the existing directory to 0o700");
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o700,
-            "C-10: 已存在宽松目录应被收紧 0o700, 实际 {:#o}",
+            "C-10: pre-existing loose directory should be tightened to 0o700, got {:#o}",
             mode
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // IMPL-12 信号竞态: SIGHUP 仅重载配置, 永不触发 shutdown。
-    // 不发真 SIGHUP (进程级信号在测试二进制内不可靠, 影响整个 test runner),
-    // 改直调 handle_sighup_reload 循环体所调的 reload_log_level + reload_extra_whitelist
-    // (与 SIGHUP 等价路径), 验证:
-    //   1. serve join 未完成 (shutdown Notify + oneshot 均未被触发 → accept_loop 未退);
-    //   2. server 仍可接受 health RPC (连接未被清理, 服务继续)。
-    // env 测试须串行 (set_var/remove_var 跨测试竞态)。
+    // IMPL-12 signal race: SIGHUP only reloads config, never triggers shutdown.
+    // No real SIGHUP is sent (process-level signals are unreliable inside the test binary and would
+    // hit the whole test runner); instead call reload_log_level + reload_extra_whitelist directly —
+    // the same calls the handle_sighup_reload loop body makes (equivalent path to SIGHUP) — and verify:
+    //   1. the serve join does not complete (shutdown Notify + oneshot both untriggered → accept_loop alive);
+    //   2. the server still accepts health RPCs (connections not torn down, service continues).
+    // env tests must be serialized (set_var/remove_var race across parallel tests).
     #[cfg(unix)]
     #[tokio::test]
     async fn sighup_does_not_trigger_shutdown() {
@@ -4230,7 +4580,7 @@ mod tests {
         let sock = tmp_sock("sighup-noshutdown");
         let server = IpcServer::new();
         let (shutdown_tx, mut join) = server.serve(&sock).await.unwrap();
-        // 先确认 server 活
+        // First confirm the server is alive
         let h = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
@@ -4238,11 +4588,13 @@ mod tests {
         .await;
         assert_eq!(h["result"]["ok"], true);
 
-        // 模拟 SIGHUP 效果: 直调 reload 路径 (handle_sighup_reload 循环体的两个调用)。
-        // env lock 仅守同步 set_var/remove_var + reload (非 async), 守卫在块末 drop — 不跨 await。
+        // Simulate the SIGHUP effect: call the reload path directly (the two calls in the
+        // handle_sighup_reload loop body).
+        // The env lock only guards synchronous set_var/remove_var + reload (non-async); the guard
+        // drops at the end of the block — never across an await.
         {
             let _g = SIGHUP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // 设可解析的 RUST_LOG + 非空白名单扩展, 走 reload 真实分支。
+            // Set a parseable RUST_LOG + non-empty whitelist extras to exercise the real reload branch.
             std::env::set_var("RUST_LOG", "warn");
             std::env::set_var("FUSION_EXECUTOR_EXTRA_WHITELIST", "jq,gh");
             reload_log_level();
@@ -4251,15 +4603,16 @@ mod tests {
             std::env::remove_var("FUSION_EXECUTOR_EXTRA_WHITELIST");
         }
 
-        // 断言 1: serve join 未完成 — shutdown Notify + oneshot 均未触发 (reload 不碰 shutdown)。
-        // 短超时探测, join 仍 Pending = server 未退。
+        // Assertion 1: serve join not completed — shutdown Notify + oneshot both untriggered
+        // (reload never touches shutdown).
+        // Probe with a short timeout; join still Pending = the server has not exited.
         let pending = tokio::time::timeout(Duration::from_millis(200), &mut join).await;
         assert!(
             pending.is_err(),
-            "IMPL-12: reload 后 serve 不应退出 (SIGHUP 不触发 shutdown), 实际 join 已完成"
+            "IMPL-12: after reload serve must not exit (SIGHUP never triggers shutdown), but join completed"
         );
 
-        // 断言 2: server 仍可接受新 RPC — 连接未被清理, 服务继续。
+        // Assertion 2: the server still accepts new RPCs — connections not torn down, service continues.
         let h2 = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":2,"method":"executor.health","params":{}}"#,
@@ -4267,18 +4620,23 @@ mod tests {
         .await;
         assert_eq!(
             h2["result"]["ok"], true,
-            "IMPL-12: reload 后 server 仍应服务, 实际 health 失败"
+            "IMPL-12: the server should still serve after reload, but health failed"
         );
 
-        // 清理: 显式触发 shutdown 让 serve join 完成 (避免 leak)。
+        // Cleanup: trigger shutdown explicitly so the serve join completes (avoid a leak).
         let _ = shutdown_tx.send(());
         let done = tokio::time::timeout(SHUTDOWN_DEADLINE, join).await;
-        assert!(done.is_ok(), "显式 shutdown 后 serve join 应完成");
+        assert!(
+            done.is_ok(),
+            "serve join should complete after explicit shutdown"
+        );
         let _ = std::fs::remove_file(&sock);
     }
 
-    // D6-02: 墙钟直方图 — 记 N 次不同 duration, p50/p95/p99 插值正确 + 桶计数对齐。
-    // 构造 10 次: 5 次 0.001s (首桶 ≤0.005), 3 次 0.1s (次桶 ≤0.05 外, 落 0.5 桶), 2 次 1.0s (落 5.0 桶)。
+    // D6-02: wall-clock histogram — record N different durations, p50/p95/p99 interpolate correctly
+    // + bucket counts align.
+    // Build 10 samples: 5x0.001s (first bucket ≤0.005), 3x0.1s (outside the ≤0.05 bucket, lands in
+    // the 0.5 bucket), 2x1.0s (lands in the 5.0 bucket).
     #[test]
     fn d602_histogram_quantiles_interpolated() {
         install_prometheus_recorder();
@@ -4307,32 +4665,40 @@ mod tests {
         }
         let snap = hub.metrics_snapshot();
         let total = snap["exec_total"].as_u64().unwrap();
-        assert_eq!(total, 10, "D6-02: 10 次 execute 应全计");
-        // 桶上界 [0.005, 0.05, 0.5, 5.0, 30.0] → 0.001 落首(5), 0.1 落 0.5 桶(3), 1.0 落 5.0 桶(2)。
+        assert_eq!(total, 10, "D6-02: all 10 executes should be counted");
+        // Bucket upper bounds [0.005, 0.05, 0.5, 5.0, 30.0] → 0.001 lands in the first (5), 0.1 in
+        // the 0.5 bucket (3), 1.0 in the 5.0 bucket (2).
         let buckets = snap["execute_duration_buckets"].as_array().unwrap();
-        assert_eq!(buckets[0].as_u64(), Some(5), "≤0.005 桶应 5");
-        assert_eq!(buckets[1].as_u64(), Some(0), "0.05 桶应空");
-        assert_eq!(buckets[2].as_u64(), Some(3), "0.5 桶应 3");
-        assert_eq!(buckets[3].as_u64(), Some(2), "5.0 桶应 2");
-        assert_eq!(buckets[4].as_u64(), Some(0), "30.0 桶应空");
-        // p50: 累计 [5,5,8,10,10,10], 0.5 分位 target=5, 首桶累计 5 ≥ 5 → 返首桶上界 0.005。
+        assert_eq!(buckets[0].as_u64(), Some(5), "≤0.005 bucket should be 5");
+        assert_eq!(buckets[1].as_u64(), Some(0), "0.05 bucket should be empty");
+        assert_eq!(buckets[2].as_u64(), Some(3), "0.5 bucket should be 3");
+        assert_eq!(buckets[3].as_u64(), Some(2), "5.0 bucket should be 2");
+        assert_eq!(buckets[4].as_u64(), Some(0), "30.0 bucket should be empty");
+        // p50: cumulative [5,5,8,10,10,10], 0.5 quantile target=5, first-bucket cumulative 5 ≥ 5
+        // → returns the first bucket bound 0.005.
         let p50 = snap["execute_duration_sec_p50"].as_f64().unwrap();
-        assert_eq!(p50, 0.005, "D6-02: p50 应插值到首桶上界 0.005");
-        // min/max: 0.001 → 1.0s。
+        assert_eq!(
+            p50, 0.005,
+            "D6-02: p50 should interpolate to the first bucket bound 0.005"
+        );
+        // min/max: 0.001 → 1.0s.
         assert!(
             (snap["execute_duration_sec_min"].as_f64().unwrap() - 0.001).abs() < 1e-9,
-            "min 应 0.001"
+            "min should be 0.001"
         );
         assert!(
             (snap["execute_duration_sec_max"].as_f64().unwrap() - 1.0).abs() < 1e-9,
-            "max 应 1.0"
+            "max should be 1.0"
         );
         // avg: (5*0.001 + 3*0.1 + 2*1.0)/10 = 2.305/10 = 0.2305
         let avg = snap["execute_duration_sec_avg"].as_f64().unwrap();
-        assert!((avg - 0.2305).abs() < 1e-9, "avg 应 0.2305, 实际 {avg}");
+        assert!(
+            (avg - 0.2305).abs() < 1e-9,
+            "avg should be 0.2305, got {avg}"
+        );
     }
 
-    // D6-02: Prometheus text format — 直方图 render 出 _bucket{le=...} 行 + HELP/TYPE 头。
+    // D6-02: Prometheus text format — the histogram renders _bucket{le=...} lines + HELP/TYPE headers.
     #[test]
     fn d602_prometheus_histogram_buckets_rendered() {
         install_prometheus_recorder();
@@ -4346,75 +4712,87 @@ mod tests {
         let text = hub.metrics_prometheus().unwrap_or_default();
         assert!(
             text.contains("# HELP fe_exec_duration_seconds"),
-            "D6-02: prometheus 应含直方图 HELP 头"
+            "D6-02: prometheus should contain the histogram HELP header"
         );
         assert!(
             text.contains("# TYPE fe_exec_duration_seconds histogram"),
-            "D6-02: prometheus 应含直方图 TYPE 头"
+            "D6-02: prometheus should contain the histogram TYPE header"
         );
         assert!(
             text.contains("fe_exec_duration_seconds_bucket{le=\"0.005\"}"),
-            "D6-02: 应有 le=0.005 桶行"
+            "D6-02: should have a le=0.005 bucket line"
         );
         assert!(
             text.contains("fe_exec_duration_seconds_bucket{le=\"+Inf\"}"),
-            "D6-02: 应有 +Inf 末桶行"
+            "D6-02: should have a +Inf final bucket line"
         );
     }
 
-    // D6-07: bind_with_stale_recovery — 陈旧死 socket (无 listener) 应 unlink + rebind 成功。
+    // D6-07: bind_with_stale_recovery — a stale dead socket (no listener) should be unlinked + rebound successfully.
     #[tokio::test]
     async fn d607_stale_socket_rebind_succeeds() {
         let sock = tmp_sock("d607-stale");
-        // 留一个无 listener 的陈旧 socket 文件 (模拟崩溃残留)。
+        // Leave a stale socket file with no listener (simulating a crash leftover).
         std::fs::File::create(&sock).unwrap();
-        assert!(Path::new(&sock).exists(), "前置: 陈旧 socket 存在");
+        assert!(
+            Path::new(&sock).exists(),
+            "precondition: stale socket exists"
+        );
         let server = IpcServer::new();
         let (_tx, join) = server
             .serve(&sock)
             .await
-            .expect("陈旧 socket 应自愈 rebind");
-        // 健康 roundtrip 证明 listener 真活。
+            .expect("stale socket should self-heal and rebind");
+        // A healthy roundtrip proves the listener is really alive.
         let resp = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":1,"method":"executor.health","params":{}}"#,
         )
         .await;
-        assert_eq!(resp["result"]["ok"], true, "D6-07: 自愈后 listener 应响应");
+        assert_eq!(
+            resp["result"]["ok"], true,
+            "D6-07: listener should respond after self-heal"
+        );
         let _ = std::fs::remove_file(&sock);
         drop(join);
     }
 
-    // D6-05: bind_with_stale_recovery — 活实例占位时应 fail-loud, 不劫持。
+    // D6-05: bind_with_stale_recovery — when a live instance holds the socket, fail-loud instead of hijacking.
     #[tokio::test]
     async fn d605_live_socket_refuses_hijack() {
         let sock = tmp_sock("d605-live");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
-        // 第二实例尝试同 socket → Err (活 listener 探测成功)。
+        // A second instance trying the same socket → Err (live-listener probe succeeds).
         let server2 = IpcServer::new();
         let err = server2.serve(&sock).await;
-        assert!(err.is_err(), "D6-05: 活实例占位时应 fail-loud 拒绝劫持");
+        assert!(
+            err.is_err(),
+            "D6-05: should fail-loud and refuse to hijack while a live instance holds the socket"
+        );
         let msg = format!("{}", err.err().unwrap());
         assert!(
             msg.contains("already in use") || msg.contains("FATAL"),
-            "D6-05: 错误消息应含 already in use/FATAL 关键词, 实际: {msg}"
+            "D6-05: error message should contain already in use/FATAL keywords, got: {msg}"
         );
         let _ = std::fs::remove_file(&sock);
     }
 
     // ── Issue #32: server-side cancel (deterministic kill) ──
 
-    /// execute_stream 长跑任务 + 同连接 executor.cancel → Done 帧 exit_code -1 + cancelled true。
-    /// 多路复用: read_task 每请求 spawn, 同连接 cancel 帧与 stream 帧交错写共享 writer。
+    /// execute_stream long-running task + executor.cancel on the same connection → Done frame
+    /// exit_code -1 + cancelled true.
+    /// Multiplexing: read_task spawns per request; the cancel frame and stream frames interleave
+    /// writes on the shared writer.
     #[tokio::test]
     async fn issue32_cancel_inflight_stream_kills_process_over_uds() {
         let sock = tmp_sock("cancel-stream");
         let server = IpcServer::new();
         let (_tx, _join) = server.serve(&sock).await.unwrap();
         let mut s = UnixStream::connect(&sock).await.unwrap();
-        // python3 白名单, 非内联 (脚本路径) 过 D3-1 网关; seatbelt 默认 true 但 macOS 上
-        // 非 seatbelt 退化为 rlimit, 仍能跑。长跑防自然退出抢在 cancel 前。
+        // python3 is whitelisted and non-inline (script path) passes the D3-1 gateway; seatbelt
+        // defaults to true but on macOS a non-seatbelt run degrades to rlimits and still runs.
+        // Long-running so a natural exit cannot beat the cancel.
         let script = std::env::temp_dir().join(format!("fe-cancel-{}.py", std::process::id()));
         std::fs::write(&script, b"while True:\n    pass\n").unwrap();
         let req = format!(
@@ -4423,25 +4801,30 @@ mod tests {
         );
         s.write_all((req + "\n").as_bytes()).await.unwrap();
         let mut reader = BufReader::new(s);
-        // 等流启动 (读首 chunk 或确定 spawn 已跑): sleep 500ms 后发 cancel。
+        // Wait for the stream to start (first chunk read or spawn confirmed): sleep 500ms then send cancel.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        // cancel 须同连接发送 — reader 已占用读侧, 但写侧仍可用? BufReader 包装了 s 的所有权。
-        // 故改: 用第二个连接发 cancel (cancel 跨连接生效, StreamRegistry 全 server 共享)。
+        // cancel should be sent on the same connection — the reader owns the read side; is the write
+        // side still usable? BufReader took ownership of s.
+        // So instead: send cancel over a second connection (cancel works cross-connection, the
+        // StreamRegistry is server-wide).
         let cancel_resp = rpc(
             &sock,
             r#"{"jsonrpc":"2.0","id":99,"method":"executor.cancel","params":{"id":5}}"#,
         )
         .await;
-        assert_eq!(cancel_resp["id"], 99, "cancel 响应带请求 id");
+        assert_eq!(
+            cancel_resp["id"], 99,
+            "cancel response carries the request id"
+        );
         assert_eq!(
             cancel_resp["result"]["ok"], true,
-            "应找到 in-flight 流 id=5"
+            "in-flight stream id=5 should be found"
         );
         assert_eq!(
             cancel_resp["result"]["cancelled"], true,
-            "cancel 应下发成功"
+            "cancel should be delivered successfully"
         );
-        // 读 stream 的 done 帧 — cancel 后进程树被 kill, done exit_code -1 + cancelled true。
+        // Read the stream's done frame — after cancel the process tree is killed, done exit_code -1 + cancelled true.
         let mut buf = Vec::new();
         let mut done: Option<Value> = None;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4450,7 +4833,7 @@ mod tests {
             let read_fut = reader.read_until(b'\n', &mut buf);
             let n = match tokio::time::timeout_at(deadline, read_fut).await {
                 Ok(n) => n.unwrap_or(0),
-                Err(_) => break, // 超时兜底, 避测试挂死
+                Err(_) => break, // timeout fallback, keeps the test from hanging
             };
             if n == 0 {
                 break;
@@ -4468,20 +4851,20 @@ mod tests {
                 break;
             }
         }
-        let done = done.expect("Issue #32: 应收到 done 帧");
+        let done = done.expect("Issue #32: should receive a done frame");
         assert_eq!(
             done["result"]["result"]["exit_code"], -1,
-            "Issue #32: cancel done exit_code 应为 -1"
+            "Issue #32: cancel done exit_code should be -1"
         );
         assert_eq!(
             done["result"]["result"]["cancelled"], true,
-            "Issue #32: cancelled 应透传 true"
+            "Issue #32: cancelled should pass through as true"
         );
         let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// cancel 未知 id → {ok:false, cancelled:false}, 不崩。
+    /// cancel with an unknown id → {ok:false, cancelled:false}, no crash.
     #[tokio::test]
     async fn issue32_cancel_unknown_id_returns_false() {
         let sock = tmp_sock("cancel-unknown");
@@ -4493,10 +4876,13 @@ mod tests {
         )
         .await;
         assert_eq!(resp["id"], 8);
-        assert_eq!(resp["result"]["ok"], false, "未知 id 应 ok false");
+        assert_eq!(
+            resp["result"]["ok"], false,
+            "unknown id should return ok false"
+        );
         assert_eq!(
             resp["result"]["cancelled"], false,
-            "未知 id 应 cancelled false"
+            "unknown id should return cancelled false"
         );
         let _ = std::fs::remove_file(&sock);
     }

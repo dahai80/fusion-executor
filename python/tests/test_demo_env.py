@@ -77,7 +77,7 @@ def test_up_refuses_second_app_while_running(runner, tmp_path):
     repo_b = _make_repo(tmp_path / "repo-d")
     runner.up(repo_a)
     try:
-        with pytest.raises(DemoEnvError, match="单 app per guest"):
+        with pytest.raises(DemoEnvError, match="single app per guest"):
             runner.up(repo_b)
     finally:
         runner.stop()
@@ -85,7 +85,7 @@ def test_up_refuses_second_app_while_running(runner, tmp_path):
 
 def test_up_without_start_sh_fails_visibly(runner, tmp_path):
     repo = _make_repo(tmp_path / "repo-e", with_start_sh=False)
-    with pytest.raises(DemoEnvError, match=r"无 start\.sh"):
+    with pytest.raises(DemoEnvError, match=r"has no start\.sh"):
         runner.up(repo)
 
 
@@ -107,7 +107,7 @@ def test_stop_without_state_is_noop(runner):
 
 def test_invalid_app_name_rejected(runner, tmp_path):
     repo = _make_repo(tmp_path / "ok-name")
-    with pytest.raises(DemoEnvError, match="app 名非法"):
+    with pytest.raises(DemoEnvError, match="invalid app name"):
         runner.up(repo, name="../evil")
 
 
@@ -116,7 +116,7 @@ def test_probe_llm_endpoint_unreachable_is_informational(tmp_path):
 
     ok, detail = probe_llm_endpoint("http://127.0.0.1:1")
     assert ok is False
-    assert "不可达" in detail
+    assert "unreachable" in detail
 
 
 def test_sandbox_profile_plumbed_through_shell_start():

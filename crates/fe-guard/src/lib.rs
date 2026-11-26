@@ -1,14 +1,15 @@
-// fe-guard: fusion-guard Phase 3 消费侧 sync UDS 客户端 + 本地 wire 镜像 + 规则缓存。
-// 跨工程约束: fusion-guard READ-ONLY — 此 crate 仅镜像 guard wire 契约 (不 path dep 进 fusion-guard),
-// 保持 fusion-executor 构建独立。crate unsafe_code="deny" 沿用 workspace。
+// fe-guard: fusion-guard Phase 3 consumer-side sync UDS client + local wire mirror + rule cache.
+// Cross-project constraint: fusion-guard is READ-ONLY — this crate only mirrors the guard wire
+// contract (no path dep into fusion-guard), keeping fusion-executor builds independent.
+// crate unsafe_code="deny" inherited from the workspace.
 //
-// wire 契约 (verified from fusion-guard read-only 源):
-//   framing = 换行分隔 JSON (FRAMING_BYTE=0x0A, MAX_LINE_BYTES=1MB), REQ_TIMEOUT_SECS=2。
+// wire contract (verified from fusion-guard read-only source):
+//   framing = newline-delimited JSON (FRAMING_BYTE=0x0A, MAX_LINE_BYTES=1MB), REQ_TIMEOUT_SECS=2.
 //   guard.ping        -> {pong:bool, version:String, rules_epoch:u64}
-//   guard.evaluate    params 位置序: [content(0), caller_epoch(1,u64), tenant_id(2),
+//   guard.evaluate    params positional: [content(0), caller_epoch(1,u64), tenant_id(2),
 //                        requester(3), action(4), content_type(5,def"shell"), category_hint(6,opt)]
 //                      -> GuardVerdict
-//   guard.rules.dump  -> {rules:Vec<GuardRule>, epoch:u64}  (仅 regex-stage 规则)
+//   guard.rules.dump  -> {rules:Vec<GuardRule>, epoch:u64}  (regex-stage rules only)
 //   error codes: -32001 Unauthorized/Forbidden, -32002 RateLimited, -32003 StaleEpoch,
 //                -32010 Engine/timeout/internal/connection-limit
 
@@ -23,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-// ---------- wire 镜像类型 ----------
+// ---------- wire mirror types ----------
 
-// 风险等级 (lowercase 序列化 l1/l2/l3/l4, repr u8, L4=最高=绝对 Block)。
+// Risk level (lowercase serialization l1/l2/l3/l4, repr u8, L4=highest=absolute Block).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[repr(u8)]
@@ -54,7 +55,7 @@ impl Ord for RiskLevel {
     }
 }
 
-// 安全动作 (lowercase: allow|preview|redact|block; 严重度序 Block>Redact>Preview>Allow)。
+// Security action (lowercase: allow|preview|redact|block; severity order Block>Redact>Preview>Allow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GuardAction {
@@ -79,7 +80,7 @@ impl GuardAction {
     }
 }
 
-// 扫描阶段 (lowercase: regex|ast|semantic)。
+// Scan stage (lowercase: regex|ast|semantic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStage {
@@ -88,7 +89,8 @@ pub enum CheckStage {
     Semantic,
 }
 
-// 规则作用域 (lowercase; 镜像 guard.rules.dump 返回项的字段, 不在本 crate 起决策作用)。
+// Rule scope (lowercase; mirrors fields of guard.rules.dump items, plays no decision role
+// in this crate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleScope {
@@ -98,7 +100,7 @@ pub enum RuleScope {
     Filesystem,
 }
 
-// guard.evaluate 返回裁决 (镜像 fg-core GuardVerdict)。
+// guard.evaluate verdict (mirrors fg-core GuardVerdict).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardVerdict {
     pub action: GuardAction,
@@ -124,13 +126,13 @@ pub struct GuardVerdict {
 }
 
 impl GuardVerdict {
-    // high_risk 判定 (与 guard 内一致): L3||L4 OR action==Block。
+    // high_risk judgment (consistent with guard itself): L3||L4 OR action==Block.
     pub fn high_risk(&self) -> bool {
         matches!(self.risk_level, RiskLevel::L3 | RiskLevel::L4) || self.action.is_block()
     }
 }
 
-// guard.rules.dump 返回的 regex-stage 规则项 (镜像 fg-rules GuardRule)。
+// regex-stage rule item returned by guard.rules.dump (mirrors fg-rules GuardRule).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardRule {
     pub name: String,
@@ -142,14 +144,14 @@ pub struct GuardRule {
     pub scope: RuleScope,
 }
 
-// guard.rules.dump 返回外壳 {rules, epoch}。
+// guard.rules.dump envelope {rules, epoch}.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleSet {
     pub rules: Vec<GuardRule>,
     pub epoch: u64,
 }
 
-// guard.ping 返回。
+// guard.ping response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GuardPing {
     pub pong: bool,
@@ -157,9 +159,10 @@ pub struct GuardPing {
     pub rules_epoch: u64,
 }
 
-// ---------- 错误 ----------
+// ---------- errors ----------
 
-// 客户端错误。code 映射 guard JSON-RPC error code; 任何 IO/超时/连接失败 → Unavailable (fail-closed)。
+// Client error. `code` maps to the guard JSON-RPC error code; any IO/timeout/connection
+// failure → Unavailable (fail-closed).
 #[derive(Debug, Error)]
 pub enum GuardError {
     #[error("guard unreachable: {0}")]
@@ -182,12 +185,13 @@ pub enum GuardError {
     Serde(#[from] serde_json::Error),
 }
 
-// ---------- sync UDS 客户端 ----------
+// ---------- sync UDS client ----------
 
 const REQ_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
-// JSON-RPC 请求外壳 (params 用位置数组, 对齐 guard evaluate 的位置序契约)。
+// JSON-RPC request envelope (params as a positional array, aligned with the guard evaluate
+// positional contract).
 #[derive(Debug, Serialize)]
 struct RpcRequest {
     jsonrpc: &'static str,
@@ -196,7 +200,7 @@ struct RpcRequest {
     params: serde_json::Value,
 }
 
-// JSON-RPC 响应外壳 (result 或 error 二选一)。
+// JSON-RPC response envelope (result or error, one of the two).
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
     #[allow(dead_code)]
@@ -212,8 +216,9 @@ struct RpcError {
     message: String,
 }
 
-// 无 tokio 的 sync 客户端 (fe-security 是 sync crate)。每次调用新建连接 (evaluate 非热路径,
-// 每命令一次; 池化需帧状态机+id demux 无收益, ~0.5ms connect 可接受)。
+// Sync client without tokio (fe-security is a sync crate). A fresh connection per call
+// (evaluate is not a hot path, once per command; pooling needs a framing state machine +
+// id demux with no benefit, ~0.5ms connect is acceptable).
 #[derive(Debug, Clone)]
 pub struct GuardClient {
     sock: PathBuf,
@@ -242,8 +247,9 @@ impl GuardClient {
         self.id_counter.fetch_add(1, Ordering::Relaxed)
     }
 
-    // 发送一条 JSON-RPC 请求并读取单行响应 (per-call 连接)。错误码映射 GuardError;
-    // IO/超时/连接失败 → Unavailable (调用方据此走 fail-closed 降级)。
+    // Send one JSON-RPC request and read a single-line response (per-call connection).
+    // Error codes map to GuardError; IO/timeout/connection failure → Unavailable (the caller
+    // branches its fail-closed fallback on this).
     fn call(
         &self,
         method: &'static str,
@@ -259,7 +265,8 @@ impl GuardClient {
         let mut payload = serde_json::to_vec(&req)?;
         payload.push(b'\n');
 
-        // 连接失败 = guard 宕机 → Unavailable (非 Io 变体, 语义更清晰供降级路径分支)。
+        // Connect failure = guard down → Unavailable (not the Io variant, clearer semantics
+        // for the fallback path to branch on).
         let mut stream = match UnixStream::connect(&self.sock) {
             Ok(s) => s,
             Err(e) => {
@@ -272,7 +279,7 @@ impl GuardClient {
 
         stream.write_all(&payload)?;
 
-        // read_until + 累计字节上限 (对齐 guard C17 OOM guard; take(MAX_LINE_BYTES+1))。
+        // read_until + cumulative byte cap (aligned with guard C17 OOM guard; take(MAX_LINE_BYTES+1)).
         let mut reader = BufReader::new(&stream);
         let mut line: Vec<u8> = Vec::new();
         reader
@@ -284,7 +291,7 @@ impl GuardClient {
                 "response exceeded {MAX_LINE_BYTES} bytes"
             )));
         }
-        // 去尾换行。
+        // Trim trailing newline.
         while line.last() == Some(&b'\n') {
             line.pop();
         }
@@ -293,7 +300,8 @@ impl GuardClient {
         }
 
         let resp: RpcResponse = serde_json::from_slice(&line)?;
-        // 防御性 id 匹配: 丢弃 id 不符的行 (guard 不会在同连接回非匹配 id, 但防御性)。
+        // Defensive id matching: drop lines whose id does not match (guard never replies with
+        // a mismatched id on the same connection, but this is defensive).
         if let Some(rid) = resp.id {
             if rid != id {
                 return Err(GuardError::BadResponse(format!(
@@ -308,13 +316,15 @@ impl GuardClient {
             .ok_or_else(|| GuardError::BadResponse("missing result".into()))
     }
 
-    // JSON-RPC error code → GuardError。-32001 鉴权失败 → Unauthorized (调用方 fail-closed 非 degrade)。
+    // JSON-RPC error code → GuardError. -32001 auth failure → Unauthorized (caller fails
+    // closed, does not degrade).
     fn map_error(e: RpcError) -> GuardError {
         match e.code {
             -32001 => GuardError::Unauthorized(e.message),
             -32002 => GuardError::RateLimited,
             -32003 => {
-                // guard StaleEpoch message 含 caller/guard epoch; 客户端不解析, 保留原始语义。
+                // guard StaleEpoch message contains caller/guard epochs; the client does not
+                // parse it, preserving the original semantics.
                 GuardError::StaleEpoch {
                     caller: 0,
                     guard: 0,
@@ -325,7 +335,7 @@ impl GuardClient {
         }
     }
 
-    // guard.ping -> {pong, version, rules_epoch}。
+    // guard.ping -> {pong, version, rules_epoch}.
     pub fn ping(&self) -> Result<GuardPing, GuardError> {
         let v = self.call("guard.ping", serde_json::Value::Array(vec![]))?;
         let ping: GuardPing = serde_json::from_value(v)?;
@@ -335,8 +345,9 @@ impl GuardClient {
         Ok(ping)
     }
 
-    // guard.rules.dump -> {rules, epoch}。caller_epoch 当前 guard handler 不校验 (仅 mutation 路径校验),
-    // 但保留参数位对齐契约。
+    // guard.rules.dump -> {rules, epoch}. caller_epoch is currently not validated by the
+    // guard handler (only mutation paths validate it), but the positional slot is kept to
+    // align with the contract.
     pub fn rules_dump(&self, caller_epoch: u64) -> Result<RuleSet, GuardError> {
         let params = serde_json::json!([caller_epoch]);
         let v = self.call("guard.rules.dump", params)?;
@@ -344,7 +355,7 @@ impl GuardClient {
         Ok(rs)
     }
 
-    // guard.evaluate (位置序 params)。返 GuardVerdict。
+    // guard.evaluate (positional params). Returns GuardVerdict.
     pub fn evaluate(
         &self,
         content: &str,
@@ -371,12 +382,14 @@ impl GuardClient {
     }
 }
 
-// ---------- 规则缓存 ----------
+// ---------- rule cache ----------
 
-// 磁盘 + 内存规则缓存。guard 活时 rules_dump 写盘 + 更新内存; guard 宕 → 读盘加载内存。
-// 降级模式仅 regex-stage 规则 (dump 本身仅返 regex-stage), 不复现 guard 完整裁决 (诚实标注限制)。
+// Disk + in-memory rule cache. While guard is alive, rules_dump writes to disk + updates
+// memory; guard down → load from disk into memory. Degraded mode has regex-stage rules only
+// (the dump itself returns regex-stage only) and does not reproduce the guard's full verdict
+// (limitation honestly labeled).
 //
-// 缓存目录: ~/.fusion-executor/guard-rules.json (HOME-private 0o600)。
+// Cache path: ~/.fusion-executor/guard-rules.json (HOME-private 0o600).
 pub struct RulesCache {
     path: PathBuf,
     inner: Mutex<CacheInner>,
@@ -385,7 +398,8 @@ pub struct RulesCache {
 #[derive(Debug, Clone, Default)]
 struct CacheInner {
     epoch: u64,
-    // 预编译 regex 避降级路径每次重编译 (parse 失败的规则跳过 + warn, 不整体失败)。
+    // Pre-compiled regexes so the degraded path does not recompile each time (rules whose
+    // parse fails are skipped + warned, never a total failure).
     compiled: Vec<Option<CompiledRule>>,
 }
 
@@ -418,7 +432,8 @@ impl RulesCache {
     fn compile(rs: RuleSet) -> CacheInner {
         let mut compiled = Vec::with_capacity(rs.rules.len());
         for r in &rs.rules {
-            // 仅 regex-stage 规则可本地编译复现 (dump 仅返 regex-stage, 但防御性过滤)。
+            // Only regex-stage rules can be locally compiled and reproduced (the dump returns
+            // regex-stage only, but filter defensively).
             if r.stage != CheckStage::Regex {
                 compiled.push(None);
                 continue;
@@ -442,7 +457,8 @@ impl RulesCache {
         }
     }
 
-    // guard 活时刷新: 内存 + 磁盘。写盘失败仅 warn (内存仍可用, 不阻塞)。
+    // Refresh while guard is alive: memory + disk. A persist failure only warns (memory is
+    // still fresh, not blocking).
     pub fn refresh(&self, rs: RuleSet) {
         let next = Self::compile(rs.clone());
         *self.inner.lock().expect("rules cache lock poisoned") = next;
@@ -466,18 +482,20 @@ impl RulesCache {
         self.inner.lock().expect("rules cache lock poisoned").epoch
     }
 
-    // 降级路径: 内存 regex 规则逐条 match, 命中返 block 命中 (action Block OR risk L3/L4)。
-    // 仅 regex-stage, 比 live guard 粗 (tokenizer/AST/semantic 不在 dump) — gap #2 即此后果。
+    // Degraded path: match content against in-memory regex rules one by one; a hit returns a
+    // block verdict (action Block OR risk L3/L4). Regex-stage only, coarser than the live
+    // guard (tokenizer/AST/semantic are not in the dump) — gap #2 is exactly this consequence.
     pub fn run_cached_rules(&self, content: &str) -> Option<GuardVerdict> {
         let inner = self.inner.lock().expect("rules cache lock poisoned");
         for c in inner.compiled.iter().flatten() {
             if c.re.is_match(content) {
-                // 降级命中即 block (guard 宕机, fail-closed, 严于 live guard)。
+                // A degraded hit blocks outright (guard down, fail-closed, stricter than the
+                // live guard).
                 if c.action.is_block() || matches!(c.risk_level, RiskLevel::L3 | RiskLevel::L4) {
                     return Some(GuardVerdict {
                         action: GuardAction::Block,
                         risk_level: c.risk_level,
-                        reason: format!("guard 不可达, 缓存规则命中: {}", c.reason),
+                        reason: format!("guard unreachable, cached rule hit: {}", c.reason),
                         stage: CheckStage::Regex,
                         requires_approval: matches!(c.risk_level, RiskLevel::L3),
                         redacted_content: None,
@@ -506,7 +524,7 @@ impl RulesCache {
     }
 }
 
-// ---------- 单元测试 ----------
+// ---------- unit tests ----------
 
 #[cfg(test)]
 mod tests {
@@ -554,7 +572,7 @@ mod tests {
         assert!(s.contains("\"action\":\"block\""), "action lowercase: {s}");
         assert!(s.contains("\"risk_level\":\"l4\""), "risk lowercase: {s}");
         assert!(s.contains("\"stage\":\"regex\""), "stage lowercase: {s}");
-        // category_hint None → 省略 (skip_serializing_if)。
+        // category_hint None → omitted (skip_serializing_if).
         assert!(!s.contains("category_hint"), "hint omitted: {s}");
         let back: GuardVerdict = serde_json::from_str(&s).unwrap();
         assert_eq!(back.action, GuardAction::Block);
@@ -563,7 +581,7 @@ mod tests {
 
     #[test]
     fn verdict_serde_old_json_category_hint_default() {
-        // 旧 verdict JSON 缺 category_hint/redacted_content → #[serde(default)] 可解。
+        // Old verdict JSON missing category_hint/redacted_content → #[serde(default)] parses it.
         let s = r#"{"action":"allow","risk_level":"l1","reason":"","stage":"regex","requires_approval":false,"seatbelt_required":false,"verdict_epoch":0,"verdict_ttl_secs":0,"inferred_category":""}"#;
         let v: GuardVerdict = serde_json::from_str(s).unwrap();
         assert_eq!(v.action, GuardAction::Allow);
@@ -603,7 +621,7 @@ mod tests {
         cache.refresh(sample_ruleset(42));
         assert_eq!(cache.epoch(), 42);
         assert!(!cache.is_empty());
-        // 磁盘持久化可重载。
+        // Disk persistence can be reloaded.
         let cache2 = RulesCache::new(path.clone());
         assert_eq!(cache2.epoch(), 42, "disk reload epoch");
         assert!(!cache2.is_empty());
@@ -647,7 +665,7 @@ mod tests {
 
     #[test]
     fn guard_client_connect_fail_unavailable() {
-        // 指向不存在 socket → Unavailable (fail-closed, 无 panic)。
+        // Point at a non-existent socket → Unavailable (fail-closed, no panic).
         let mut sock = std::env::temp_dir();
         sock.push(format!("fe-guard-nope-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
@@ -661,7 +679,7 @@ mod tests {
 
     #[test]
     fn map_error_codes() {
-        // 直接验证 code→variant 映射 (供降级路径分支正确)。
+        // Directly verify the code→variant mapping (so the fallback path branches correctly).
         let cases: [(i32, &str); 4] = [
             (-32001, "unauthorized"),
             (-32002, "rate"),

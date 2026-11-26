@@ -11,14 +11,14 @@ from .models import ToolDecision
 
 logger = logging.getLogger("fusion_executor.agent_loop")
 
-# AC7 (Issue #46): Agent loop — 把 LayaToolSelector 接进 executor 管线。
-# 之前 LayaToolSelector 是独立库 + example + benchmark, executor.py 零引用 (re-acceptance P0 gap)。
-# AgentLoop: build context → laya select tool → execute via FusionSandboxExecutor → feed back → repeat。
+# AC7 (Issue #46): agent loop — wires LayaToolSelector into the executor pipeline.
+# Previously LayaToolSelector was a standalone library + example + benchmark with zero references from executor.py
+# (re-acceptance P0 gap). AgentLoop: build context → laya select tool → execute via FusionSandboxExecutor → feed back → repeat.
 MAX_STEPS_DEFAULT = 8
 
 
 class AgentStep:
-    """单步执行记录 — 供调用方审计 / 回放。"""
+    """Single-step execution record — for caller audit / replay."""
 
     def __init__(self, step: int, decision: ToolDecision, tool_result: Any, error: str | None) -> None:
         self.step = step
@@ -40,22 +40,22 @@ class AgentStep:
 
 
 class AgentLoop:
-    """Issue #46 AC7: 多步 agent 循环 — laya 选工具, executor 执行, 结果回灌, 重复。
+    """Issue #46 AC7: multi-step agent loop — laya picks a tool, the executor runs it, the result is fed back, repeat.
 
-    替代 "LLM 生成 tool call JSON" 步骤:
+    Replaces the "LLM generates tool-call JSON" step:
       1. build context state from conversation
       2. LayaToolSelector.select_tool → ToolDecision
-      3. tool_id != "none" 且非降级 → 执行工具 → 结果回灌 conversation
-      4. tool_id == "none" 或降级 → 终止 (调用方走 LLM 生成响应)
-      5. 重复直到 none/降级/达到 max_steps
+      3. tool_id != "none" and not degraded → execute the tool → feed the result back into the conversation
+      4. tool_id == "none" or degraded → terminate (the caller generates a response via its LLM)
+      5. repeat until none/degraded/max_steps reached
 
-    工具执行映射 tool_id → FusionSandboxExecutor 方法 (确定性, 非 LLM):
+    Tool execution maps tool_id → FusionSandboxExecutor methods (deterministic, not LLM):
       file_edit    → file_edit(path, ...)
       write_file   → write_file(path, content)
       shell_exec   → run(command, ...)
       code_search  → grep(pattern, ...)
-      web_fetch    → (无原生工具 — 调用方注入 handler)
-      rag_query    → (同上)
+      web_fetch    → (no native tool — caller-injected handler)
+      rag_query    → (same as above)
       gui_action   → gui_action(action)
     """
 
@@ -69,22 +69,22 @@ class AgentLoop:
         extra_handlers: dict[str, Callable[[dict], Any]] | None = None,
     ) -> None:
         if max_steps < 1:
-            raise ValueError(f"max_steps 须 >= 1, got {max_steps}")
+            raise ValueError(f"max_steps must be >= 1, got {max_steps}")
         self.selector = selector
         self.executor = executor
         self.max_steps = max_steps
         self.whitelist = whitelist
         # extra_handlers: tool_id -> callable(params_dict) -> result
-        # 注入 web_fetch/rag_query 等无原生 executor 方法的工具
+        # injects tools with no native executor method such as web_fetch/rag_query
         self.extra_handlers = extra_handlers or {}
         self._metrics = Counter()
 
     def run(self, user_request: str, context: str = "") -> dict[str, Any]:
-        """执行 agent 循环 — 返回步骤记录 + 最终状态。
+        """Run the agent loop — returns step records + final state.
 
         Args:
-            user_request: 用户原始请求
-            context: 初始上下文 (已有会话状态 / 文件列表等)
+            user_request: the original user request
+            context: initial context (existing session state / file listing etc.)
 
         Returns:
             {steps: [AgentStep.to_dict], completed: bool, final_tool: str, metrics: dict}
@@ -106,7 +106,7 @@ class AgentLoop:
                 decision.fell_back,
             )
 
-            # none 或降级 → 终止循环 (调用方走 LLM)
+            # none or degraded → terminate the loop (the caller goes through its LLM)
             if decision.tool_id == "none":
                 self._metrics["none"] += 1
                 steps.append(AgentStep(step_num, decision, None, None))
@@ -120,9 +120,10 @@ class AgentLoop:
                 completed = True
                 break
 
-            # 同工具同参数重复 → 任务已完成或无进展, 终止 (避免 laya 无 done 信号死循环)
-            # laya 421M 无显式 "task complete" 原语, 同决策重复是近似完成信号。
-            # 多步同工具不同参数 (run pytest → edit → run pytest) 不触发, 因 params 不同。
+            # same tool with same params repeated → task done or no progress, terminate
+            # (avoids an infinite loop since laya has no done signal).
+            # laya 421M has no explicit "task complete" primitive; a repeated identical decision is the approximation.
+            # Multi-step same-tool different-params (run pytest → edit → run pytest) does not trigger, because params differ.
             if (
                 prev_decision is not None
                 and prev_decision.tool_id == decision.tool_id
@@ -130,7 +131,7 @@ class AgentLoop:
             ):
                 self._metrics["same_tool_terminate"] += 1
                 logger.info(
-                    "agent step %d: 同工具同参数重复 (%s) → 终止 (任务完成或无进展)",
+                    "agent step %d: repeated same tool with same params (%s) → terminating (task done or no progress)",
                     step_num,
                     decision.tool_id,
                 )
@@ -139,7 +140,7 @@ class AgentLoop:
                 completed = True
                 break
 
-            # 执行选中工具
+            # execute the selected tool
             tool_result, error = self._execute_tool(decision.tool_id, decision.params)
             steps.append(AgentStep(step_num, decision, tool_result, error))
             final_tool = decision.tool_id
@@ -148,21 +149,21 @@ class AgentLoop:
 
             if error:
                 self._metrics["exec_errors"] += 1
-                logger.warning("agent step %d tool %s 执行失败: %s", step_num, decision.tool_id, error)
-                # 执行失败 → 回灌错误信息, 让 laya 下一轮重选
+                logger.warning("agent step %d tool %s execution failed: %s", step_num, decision.tool_id, error)
+                # execution failed → feed the error back so laya re-picks next round
                 conversation = f"{conversation}\n[tool {decision.tool_id} failed: {error}]"
             else:
-                # 结果回灌 conversation (供下一轮 laya 决策)
+                # feed the result back into the conversation (for the next laya decision round)
                 result_text = self._stringify_result(tool_result)
                 conversation = f"{conversation}\n[tool {decision.tool_id} result: {result_text}]"
 
-            # 单工具请求通常一步即完成 — 检查是否还需继续
-            # 若 laya 下一轮选 none 则终止; 否则继续直到 max_steps
-            # 此处不提前 break — 让 laya 自行决定是否需要更多步骤
+            # single-tool requests usually complete in one step — check whether more steps are needed
+            # if laya picks none next round the loop ends; otherwise continue until max_steps
+            # no early break here — let laya decide whether more steps are needed
 
         if not completed:
             self._metrics["max_steps_reached"] += 1
-            logger.warning("agent loop 达 max_steps=%d 未终止", self.max_steps)
+            logger.warning("agent loop reached max_steps=%d without terminating", self.max_steps)
 
         return {
             "steps": [s.to_dict() for s in steps],
@@ -173,11 +174,11 @@ class AgentLoop:
         }
 
     def _execute_tool(self, tool_id: str, params: dict[str, Any]) -> tuple[Any, str | None]:
-        """执行单个工具 — 映射 tool_id → executor 方法 / extra_handler。
+        """Execute a single tool — maps tool_id → executor method / extra_handler.
 
-        返回 (result, error); error 非 None 表示执行失败。
+        Returns (result, error); error not None means execution failed.
         """
-        # 优先 extra_handlers (注入的工具)
+        # extra_handlers (injected tools) take priority
         if tool_id in self.extra_handlers:
             try:
                 return self.extra_handlers[tool_id](params), None
@@ -185,49 +186,49 @@ class AgentLoop:
                 return None, f"{tool_id} handler: {e}"
 
         if self.executor is None:
-            return None, f"无 executor 实例, 无法执行 {tool_id}"
+            return None, f"no executor instance, cannot execute {tool_id}"
 
         try:
             if tool_id == "file_edit":
                 path = params.get("file_path")
                 if not path:
-                    return None, "file_edit 缺 file_path 参数"
-                # file_edit 需 old_string/new_string — params 仅提取 path, 实际编辑内容由 LLM 提供
-                # 此处返回 path 供调用方确认; 真正编辑调 executor.file_edit(path, old, new)
+                    return None, "file_edit missing file_path param"
+                # file_edit needs old_string/new_string — params only extracts the path; the actual edit content comes from the LLM
+                # here we return the path for caller confirmation; the real edit calls executor.file_edit(path, old, new)
                 return {"file_path": path, "ready": True}, None
             if tool_id == "write_file":
                 path = params.get("file_path")
                 if not path:
-                    return None, "write_file 缺 file_path 参数"
+                    return None, "write_file missing file_path param"
                 return {"file_path": path, "ready": True}, None
             if tool_id == "shell_exec":
                 cmd = params.get("command")
                 if not cmd:
-                    return None, "shell_exec 缺 command 参数"
+                    return None, "shell_exec missing command param"
                 result = self.executor.run(cmd)
                 return result, None
             if tool_id == "code_search":
-                # search_query 可能为 None (regex 未匹配) — 回退用请求原文作 pattern
+                # search_query may be None (regex did not match) — fall back to the raw request as pattern
                 query = params.get("search_query") or ""
                 if not query:
-                    return None, "code_search 缺 search_query 参数 (laya 未提取到查询词)"
+                    return None, "code_search missing search_query param (laya extracted no query)"
                 max_results = params.get("max_results", 5)
                 if self.executor is not None:
                     matches = self.executor.grep(query, ["."], cwd=None)
                     return {"matches": matches[: int(max_results)], "count": len(matches)}, None
-                return None, "无 executor, 无法 code_search"
+                return None, "no executor, cannot code_search"
             if tool_id == "gui_action":
                 action_str = params.get("action", "")
-                # action_str 是原始描述 — 调用方解析为 GuiAction dict; 此处透传
+                # action_str is a raw description — the caller parses it into a GuiAction dict; passed through here
                 return {"action": action_str, "ready": True}, None
-            # web_fetch / rag_query 无原生 executor 方法 — 须注入 handler
-            return None, f"工具 {tool_id} 无原生实现 — 注入 extra_handlers[{tool_id!r}]"
+            # web_fetch / rag_query have no native executor method — a handler must be injected
+            return None, f"tool {tool_id} has no native implementation — inject extra_handlers[{tool_id!r}]"
         except Exception as e:
-            return None, f"{tool_id} 执行异常: {e}"
+            return None, f"{tool_id} execution exception: {e}"
 
     @staticmethod
     def _stringify_result(result: Any) -> str:
-        """把工具结果转为回灌 conversation 的文本 (截断防 context 爆炸)。"""
+        """Convert a tool result into text for feeding back into the conversation (truncated to prevent context explosion)."""
         if result is None:
             return "none"
         text = str(result)
@@ -237,5 +238,5 @@ class AgentLoop:
         return dict(self._metrics)
 
     def metrics(self) -> dict[str, int]:
-        """返回进程内指标 (steps/none/fallback/exec_errors/per-tool)。"""
+        """Return in-process metrics (steps/none/fallback/exec_errors/per-tool)."""
         return self._metrics_snapshot()

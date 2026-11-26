@@ -126,41 +126,42 @@ TIER1_MIN_COUNT = {
 
 # Banned words (kept in sync with guidelines/writing-style.md section 4;
 # Chinese core terms live here, English terms in the separate list below)
+# i18n: user-facing — detection patterns matched against Chinese docs; Chinese by design, do not translate
 FORBIDDEN_ZH = [
-    "强大的",
-    "十分强大",
-    "业界领先",
-    "行业领先",
-    "领先的",
-    "极致的",
-    "极致",
-    "完美的",
-    "完美",
-    "顶级",
-    "顶尖",
-    "最强",
-    "首屈一指",
-    "革命性",
-    "颠覆性",
-    "颠覆",
-    "划时代",
-    "里程碑",
-    "黑科技",
-    "一站式",
-    "全场景",
-    "全栈赋能",
-    "赋能",
-    "闭环打通",
-    "打通",
-    "无与伦比",
-    "卓越",
-    "惊艳",
-    "灵动",
-    "丝滑",
-    "无缝",
-    "海量",
-    "超高",
-    "超低",
+    "强大的",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "十分强大",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "业界领先",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "行业领先",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "领先的",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "极致的",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "极致",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "完美的",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "完美",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "顶级",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "顶尖",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "最强",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "首屈一指",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "革命性",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "颠覆性",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "颠覆",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "划时代",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "里程碑",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "黑科技",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "一站式",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "全场景",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "全栈赋能",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "赋能",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "闭环打通",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "打通",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "无与伦比",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "卓越",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "惊艳",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "灵动",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "丝滑",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "无缝",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "海量",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "超高",  # i18n: user-facing - detection pattern matched against Chinese docs
+    "超低",  # i18n: user-facing - detection pattern matched against Chinese docs
 ]
 FORBIDDEN_EN = [
     "powerful",

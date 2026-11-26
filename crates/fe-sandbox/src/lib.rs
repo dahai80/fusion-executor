@@ -1,10 +1,10 @@
-// fe-sandbox — PTY 沙箱 (FR-02/03, NFR)
+// fe-sandbox — PTY sandbox (FR-02/03, NFR)
 //
-// portable-pty 0.8: openpty → spawn(sh -c cmd, setsid 使子为组长) → 阻塞 reader 线程 → child.wait
-// 超时: SIGINT (graceful) → 500ms → try_wait 仍活 → SIGKILL (forceful), killpg(-pid) 进程树杀
-// 截断: stdout head H=4096 + tail T=8192, 中间折叠 [truncated N chars]
-// OOM: 环形缓冲 cap = 2*effective_max; effective_max = max_output_chars.min(HARD_CEILING) 绝对上限
-// PTY 合并 stdout+stderr → 全入 stdout (stderr 空; traceback 在 tail 可读)
+// portable-pty 0.8: openpty → spawn(sh -c cmd, setsid makes the child the group leader) → blocking reader thread → child.wait
+// Timeout: SIGINT (graceful) → 500ms → try_wait still alive → SIGKILL (forceful), killpg(-pid) kills the process tree
+// Truncation: stdout head H=4096 + tail T=8192, middle folded as [truncated N chars]
+// OOM: ring buffer cap = 2*effective_max; effective_max = max_output_chars.min(HARD_CEILING) absolute ceiling
+// PTY merges stdout+stderr → all into stdout (stderr empty; traceback readable in the tail)
 
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
@@ -24,37 +24,39 @@ use tracing::{debug, info, warn};
 const HEAD_CHARS: usize = 4096;
 const TAIL_CHARS: usize = 8192;
 const DEFAULT_MAX_OUTPUT: usize = 100_000;
-/// Issue #8: timeout_sec == 0 视为"未指定" — 绑定到此上限, 永不真正无界 (防 agent loop 卡死)
-/// Python 层已拒 timeout<=0; 此为 Rust raw 接口的 defense-in-depth 兜底
+/// Issue #8: timeout_sec == 0 treated as "unspecified" — bound to this cap, never truly unbounded (prevents agent loop hang)
+/// Python layer already rejects timeout<=0; this is defense-in-depth fallback for the Rust raw interface
 const DEFAULT_TIMEOUT_CAP_SEC: f64 = 120.0;
-/// C-SB-05: 环形缓冲绝对上限 — 防调用方设 max_output_chars=usize::MAX 打 OOM-kill 主机
+/// C-SB-05: ring buffer absolute ceiling — prevents a caller setting max_output_chars=usize::MAX from OOM-killing the host
 const HARD_CEILING: usize = 64 * 1024 * 1024;
 /// C-SB-01: SIGINT→SIGKILL grace window
-/// 审计 2.4: 50ms 太短 — 大量 buffered IO (git flush/pytest 收集) 来不及落盘即被 SIGKILL,
-/// 保证文件损伤。提至 500ms 给优雅退出留足窗口。可配置化需扩 API 面 (YAGNI), 常量足够。
+/// Audit 2.4: 50ms was too short — heavy buffered IO (git flush / pytest collection) got SIGKILLed
+/// before hitting disk, guaranteeing file damage. Raised to 500ms to leave room for graceful exit.
+/// Making it configurable would expand the API surface (YAGNI); a constant is enough.
 const KILL_GRACE_MS: u64 = 500;
-/// C-SB-02/03: kill 后收 reader 输出超时 — 子进程忽略信号时 reader 永不 EOF
+/// C-SB-02/03: timeout for collecting reader output after a kill — the reader never EOFs when the child ignores signals
 const READER_RECV_TIMEOUT_MS: u64 = 2000;
-/// D3-4 (审计 0827 product): RSS watchdog 轮询间隔。Darwin RLIMIT_AS/RLIMIT_DATA 平台无效,
-/// 改 sysinfo 每 ~200ms 采样子进程树 RSS, 超限 oneshot 通知 select 杀进程树 (缓解非纯修)。
+/// D3-4 (audit 0827 product): RSS watchdog poll interval. Darwin RLIMIT_AS/RLIMIT_DATA are platform no-ops,
+/// so sysinfo samples the child tree RSS every ~200ms instead; on breach a oneshot notifies select to kill the tree (mitigation, not a pure fix).
 const RSS_POLL_MS: u64 = 200;
-/// D3-4: RSS watchdog 默认上限 (MB)。SandboxConfig.rss_limit_mb=0 禁用 watchdog。
+/// D3-4: RSS watchdog default cap (MB). SandboxConfig.rss_limit_mb=0 disables the watchdog.
 const DEFAULT_RSS_LIMIT_MB: u32 = 2048;
 
-/// D3-4: serde skip_serializing_if 辅助 — oom_killed=false 时不序列化 (wire 省字节)。
+/// D3-4: serde skip_serializing_if helper — omitted from serialization when oom_killed=false (saves wire bytes).
 fn is_false(b: &bool) -> bool {
     !b
 }
 
-/// C-PERF-02/C-SB-06: macOS openpty 进程级串行锁 — 高并发 (多线程 BLOCKING_RT 并发 execute,
-/// 或并行测试) 下 openpty 偶返 ENXIO (code -6, 无空闲 PTY 设备)。仅锁 openpty 设备分配临界区,
-/// pair 返回后立即释放; spawn/reader 不持锁 (不串行化命令执行, 仅防 PTY 分配竞态)。
+/// C-PERF-02/C-SB-06: process-level serial lock for macOS openpty — under high concurrency
+/// (multi-threaded BLOCKING_RT concurrent execute, or parallel tests) openpty occasionally returns
+/// ENXIO (code -6, no free PTY device). Only the openpty device-allocation critical section is locked,
+/// released as soon as the pair returns; spawn/reader hold no lock (command execution is not serialized, only PTY allocation races are prevented).
 static PTY_OPEN_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
-/// 开 PTY — 持 PTY_OPEN_LOCK 防 ENXIO 竞态。仅设备分配临界区, 返回 pair 后释放。
-/// 高并发下 openpty 偶发瞬时失败 (ENXIO/EBUSY, 设备分配压力) — 有界退避重试,
-/// 耗尽后仍失败才上抛 (真实 PTY 耗尽不受隐藏)。
+/// Open a PTY — holds PTY_OPEN_LOCK to prevent ENXIO races. Only the device-allocation critical section; released once the pair returns.
+/// Under high concurrency openpty occasionally fails transiently (ENXIO/EBUSY, device allocation pressure) — bounded backoff retry,
+/// surfaced only after retries are exhausted (genuine PTY exhaustion is never hidden).
 fn open_pty_pair() -> Result<portable_pty::PtyPair> {
     let _guard = PTY_OPEN_LOCK.lock().unwrap();
     let pty_system = NativePtySystem::default();
@@ -79,7 +81,7 @@ fn open_pty_pair() -> Result<portable_pty::PtyPair> {
                 std::thread::sleep(std::time::Duration::from_millis(backoff));
                 attempt += 1;
             }
-            Err(e) => return Err(e).context("openpty 失败"),
+            Err(e) => return Err(e).context("openpty failed"),
         }
     }
 }
@@ -88,26 +90,26 @@ fn open_pty_pair() -> Result<portable_pty::PtyPair> {
 pub struct SandboxResult {
     pub exit_code: i32,
     pub stdout: String,
-    /// Issue #4: use_pty=false (stdio 后端) 时独立捕获 fd 2 (stderr-only, FR-03 双工);
-    /// use_pty=true (PTY 默认) 时 PTY 合并 stdout+stderr, 本字段恒空, Slicer 吃 stdout tail。
+    /// Issue #4: with use_pty=false (stdio backend) fd 2 is captured independently (stderr-only, FR-03 duplex);
+    /// with use_pty=true (PTY default) PTY merges stdout+stderr, this field stays empty, the Slicer consumes the stdout tail.
     pub stderr: String,
     pub timed_out: bool,
-    /// D3-4: RSS watchdog 触发超内存 kill。true → 进程树 RSS 超 rss_limit_mb 被 watchdog 杀,
-    /// exit_code=-124 (与 timeout 共用杀约定, timed_out=false)。false → 未达上限或 watchdog 禁用。
+    /// D3-4: RSS watchdog triggered an over-memory kill. true → process tree RSS exceeded rss_limit_mb and was watchdog-killed,
+    /// exit_code=-124 (shares the kill convention with timeout, timed_out=false). false → under the cap or watchdog disabled.
     #[serde(default, skip_serializing_if = "is_false")]
     pub oom_killed: bool,
-    /// Issue #32: server-side cancel 触发确定性进程树 kill。true → 调用方发 executor.cancel,
-    /// sandbox 收 oneshot 后 kill_process_group (SIGINT→grace→SIGKILL + ppid 树), exit_code=-1。
-    /// false → 正常完成 / 超时 / OOM / 消费者断开。与 cancelled 互斥区分 (cancel = 外部显式请求)。
+    /// Issue #32: server-side cancel triggers a deterministic process-tree kill. true → caller sent executor.cancel,
+    /// sandbox received the oneshot and ran kill_process_group (SIGINT→grace→SIGKILL + ppid tree), exit_code=-1.
+    /// false → normal completion / timeout / OOM / consumer disconnect. Distinguished from cancelled (cancel = explicit external request).
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancelled: bool,
-    /// RUN-11: 沙箱子进程 PID — 调用方据此传 telemetry_stream 采样真实任务进程 (非 executor 自身)。
-    /// PTY/stdio spawn 路径有; 拦截/空命令/取消收尾路径视情形 None。
+    /// RUN-11: sandbox child PID — the caller uses it to point telemetry_stream at the real task process (not the executor itself).
+    /// Present on PTY/stdio spawn paths; None on blocked/empty-command/cancel-finalize paths depending on the case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
 }
 
-/// 流式事件 — Chunk (实时 stdio 分块) / Done (最终结果, 含截断后 stdout)
+/// Stream events — Chunk (real-time stdio chunks) / Done (final result, with truncated stdout)
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
@@ -122,34 +124,34 @@ pub struct SandboxConfig {
     pub env: std::collections::HashMap<String, String>,
     pub timeout_sec: f64,
     pub max_output_chars: usize,
-    /// Blocker 1 / 1.1: macOS seatbelt 运行时隔离 (sandbox-exec 包装)。
-    /// true → sandbox-exec -p '<profile>' sh -c '<cmd>' (禁网 + 危险二进制 process-exec deny)。
-    /// 默认 false — 调用方显式开启 (ExecutionRequest.seatbelt 透传)。
+    /// Blocker 1 / 1.1: macOS seatbelt runtime isolation (sandbox-exec wrapper).
+    /// true → sandbox-exec -p '<profile>' sh -c '<cmd>' (network deny + dangerous binary process-exec deny).
+    /// Default false — caller opts in explicitly (ExecutionRequest.seatbelt passthrough).
     pub seatbelt: bool,
-    /// Issue #9: 环境隔离。默认 false → env_clear() + 仅注入最小基线 (PATH/TMPDIR/SHELL) + env。
-    /// true → 继承宿主全量 env (旧行为; 受信本地场景显式 opt-in, 文档化泄漏风险)。
+    /// Issue #9: environment isolation. Default false → env_clear() + minimal baseline injection (PATH/TMPDIR/SHELL) + env.
+    /// true → inherit full host env (old behavior; explicit opt-in for trusted local scenarios, leak risk documented).
     pub inherit_env: bool,
-    /// Issue #4: 捕获后端。true(默认)=PTY (ANSI/Traceback 保真, 但 stdout+stderr 合并)。
-    /// false=stdio 子进程管道 (stdout/stderr 独立捕获, FR-03 双工; 丢失 PTY 保真)。
-    /// 诊断 Slicer 在 stdio 模式直接吃 stderr; PTY 模式吃合并 stdout 的 tail。
+    /// Issue #4: capture backend. true (default) = PTY (ANSI/Traceback fidelity, but stdout+stderr merged).
+    /// false = stdio subprocess pipes (stdout/stderr captured independently, FR-03 duplex; loses PTY fidelity).
+    /// The diagnostics Slicer consumes stderr directly in stdio mode; the merged-stdout tail in PTY mode.
     pub use_pty: bool,
-    /// Issue #3: 进程数上限 (RLIMIT_NPROC, 经 ulimit -u 注入)。默认 1024 — 够 cargo/node/python
-    /// 工具链链式 spawn, 拦 fork bomb 并发扩散 (spread-limit; 真正终止靠 timeout watchdog kill 进程树)。
-    /// 0=不限 NPROC (受信场景 opt-out)。Darwin 实测生效。
+    /// Issue #3: process count cap (RLIMIT_NPROC, injected via ulimit -u). Default 1024 — enough for chained
+    /// cargo/node/python toolchain spawns, blunts fork-bomb concurrency spread (spread-limit; real termination
+    /// relies on the timeout watchdog killing the process tree). 0 = no NPROC cap (trusted-scenario opt-out). Verified working on Darwin.
     pub max_nproc: u32,
-    /// Issue #3: CPU 秒上限 (RLIMIT_CPU, 经 ulimit -t 注入)。默认 0=不限 (依赖 timeout_sec watchdog 兜底)。
-    /// >0 则到顶 SIGXCPU (CPU 死循环防御)。Darwin 实测生效。
+    /// Issue #3: CPU seconds cap (RLIMIT_CPU, injected via ulimit -t). Default 0 = uncapped (relies on the timeout_sec watchdog fallback).
+    /// >0 raises SIGXCPU at the cap (CPU infinite-loop defense). Verified working on Darwin.
     pub max_cpu_sec: u32,
-    /// RUN-10 (审计 0827): 文件描述符上限 (RLIMIT_NOFILE, 经 ulimit -n 注入)。默认 1024 —
-    /// 拦 FD 耗尽攻击 (海量打开 fd 击杀宿主)。0=不限 (受信场景 opt-out)。Darwin 实测生效 (errno 24 EMFILE)。
+    /// RUN-10 (audit 0827): file descriptor cap (RLIMIT_NOFILE, injected via ulimit -n). Default 1024 —
+    /// blunts FD-exhaustion attacks (mass-opened fds killing the host). 0 = uncapped (trusted-scenario opt-out). Verified on Darwin (errno 24 EMFILE).
     pub max_nofile: u32,
-    /// D3-4 (审计 0827 product): 每任务 RSS 上限 (MB)。Darwin RLIMIT_AS/RLIMIT_DATA 平台无效,
-    /// 改 sysinfo 轮询子进程树 RSS, 超限 kill 进程树 (exit_code=-124, oom_killed=true)。
-    /// 默认 DEFAULT_RSS_LIMIT_MB (2048)。0=禁用 watchdog (受信场景 opt-out, 仅靠 timeout 兜底)。
+    /// D3-4 (audit 0827 product): per-task RSS cap (MB). Darwin RLIMIT_AS/RLIMIT_DATA are platform no-ops,
+    /// so sysinfo polls the child tree RSS instead, killing the tree on breach (exit_code=-124, oom_killed=true).
+    /// Default DEFAULT_RSS_LIMIT_MB (2048). 0 = watchdog disabled (trusted-scenario opt-out, only the timeout remains as fallback).
     pub rss_limit_mb: u32,
-    /// Issue #34: 每命令可配置 seatbelt profile。None → 现有固定 profile (禁网 + 定向 FS deny, 字节一致);
-    /// Some → build_profile_from 按 network/filesystem/excluded_commands 参数化。default-off opt-in。
-    /// fail_if_unavailable=true 时 fe-core 入口校验 seatbelt 可用性, 不可用则 fail-closed 拒执行。
+    /// Issue #34: per-command configurable seatbelt profile. None → existing fixed profile (network deny + targeted FS deny, byte-identical);
+    /// Some → build_profile_from parameterized by network/filesystem/excluded_commands. Default-off opt-in.
+    /// With fail_if_unavailable=true fe-core validates seatbelt availability at entry and fail-closed rejects execution when unavailable.
     pub sandbox_profile: Option<seatbelt::SandboxProfile>,
 }
 
@@ -173,20 +175,20 @@ impl Default for SandboxConfig {
     }
 }
 
-/// Issue #9: 最小安全环境基线 — env_clear 后注入, 保证命令可解析 (PATH) + 有临时目录 (TMPDIR) + 有 shell (SHELL)。
-/// 不注入 HOME (多数命令不需; 隔离更彻底)。env_vars 覆盖基线 (调用方显式优先)。
+/// Issue #9: minimal safe environment baseline — injected after env_clear, ensures commands resolve (PATH), have a temp dir (TMPDIR) and a shell (SHELL).
+/// HOME is not injected (most commands don't need it; tighter isolation). env_vars override the baseline (caller-explicit wins).
 const SANDBOX_BASE_SHELL: &str = "/bin/sh";
 
-/// M-SEC-02: 硬化 PATH allowlist — inherit_env=false 时用此 (非宿主 PATH)。
-/// 宿主 PATH 早期恶意条目 (~/.local/bin/python3 包装) 可 shadow 白名单二进制。
-/// allowlist 覆盖 ARM macOS 工具链: /opt/homebrew/bin (pytest/node/cargo/python3/git),
-/// /usr/local/bin, /usr/bin, /bin (echo/sh/git)。nvm/rustup 等 ~ 下工具链用户须 inherit_env=true opt-in。
-/// /usr/sbin:/sbin 保留 (部分系统命令), 不含任何 ~ 下可写路径。
+/// M-SEC-02: hardened PATH allowlist — used when inherit_env=false (not the host PATH).
+/// Early malicious host PATH entries (~/.local/bin/python3 wrappers) can shadow whitelisted binaries.
+/// The allowlist covers the ARM macOS toolchain: /opt/homebrew/bin (pytest/node/cargo/python3/git),
+/// /usr/local/bin, /usr/bin, /bin (echo/sh/git). Users with ~ toolchains (nvm/rustup etc.) must opt in via inherit_env=true.
+/// /usr/sbin:/sbin kept (some system commands); contains no writable ~ paths.
 const SANDBOX_HARDENED_PATH: &str =
     "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-/// M-SEC-02: inherit_env=true 时保留宿主 PATH (全量 env 继承语义); false 时返硬化 allowlist。
-/// 宿主 PATH 不可用时回退硬化 allowlist (非旧 SANDBOX_FALLBACK_PATH — 旧漏 /opt/homebrew/bin)。
+/// M-SEC-02: keeps the host PATH when inherit_env=true (full env inheritance semantics); returns the hardened allowlist when false.
+/// Falls back to the hardened allowlist when the host PATH is unavailable (not the old SANDBOX_FALLBACK_PATH — it missed /opt/homebrew/bin).
 fn sandbox_path(inherit_env: bool) -> String {
     if inherit_env {
         std::env::var("PATH").unwrap_or_else(|_| SANDBOX_HARDENED_PATH.to_string())
@@ -195,16 +197,16 @@ fn sandbox_path(inherit_env: bool) -> String {
     }
 }
 
-/// C-SEC-01: env_vars 总量上限 64KB — 防调用方灌超大 env 打爆子进程 env 缓冲 (OOM/Argument list too long)
+/// C-SEC-01: env_vars total cap 64KB — prevents a caller flooding oversized env from blowing the child env buffer (OOM / Argument list too long)
 const ENV_VARS_TOTAL_CAP: usize = 64 * 1024;
 
-/// C-SEC-01: 危险 env 名 denylist — 命中即 fail-loud (沙箱逃逸向量, 无威胁模型可豁免)。
-///   - DYLD_*/LD_PRELOAD/LD_LIBRARY_PATH: 动态库注入, 加载恶意 .dylib/.so 进沙箱子进程
-///   - PYTHONPATH/PYTHONSTARTUP/PYTHONHOME: 解释器启动劫持, 自动执行 payload
-///   - NODE_OPTIONS/NODE_PATH: node --require / require() 路径劫持
-///   - PERL5OPT/RUBYOPT: 解释器自动加载
-///   - BASH_ENV/ENV/ZDOTDIR: 交互 shell 启动脚本劫持
-///   - PS1: 提示符展开命令替换 (`$(...)`) 执行
+/// C-SEC-01: dangerous env name denylist — any hit fails loud (sandbox escape vector, no threat model grants an exemption).
+///   - DYLD_*/LD_PRELOAD/LD_LIBRARY_PATH: dynamic library injection, loads malicious .dylib/.so into the sandboxed child
+///   - PYTHONPATH/PYTHONSTARTUP/PYTHONHOME: interpreter startup hijack, auto-executes payload
+///   - NODE_OPTIONS/NODE_PATH: node --require / require() path hijack
+///   - PERL5OPT/RUBYOPT: interpreter auto-load
+///   - BASH_ENV/ENV/ZDOTDIR: interactive shell startup script hijack
+///   - PS1: prompt expansion executes command substitution (`$(...)`)
 fn is_dangerous_env_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if upper.starts_with("DYLD_") {
@@ -228,28 +230,28 @@ fn is_dangerous_env_name(name: &str) -> bool {
     )
 }
 
-/// C-SEC-01: 校验 cfg.env — 危险名 denylist + 64KB 总量上限。命中即 Err (fail-loud)。
+/// C-SEC-01: validates cfg.env — dangerous-name denylist + 64KB total cap. Any hit returns Err (fail-loud).
 fn validate_env_vars(env: &std::collections::HashMap<String, String>) -> Result<()> {
     let mut total: usize = 0;
     for (k, v) in env {
         if is_dangerous_env_name(k) {
-            warn!(env_name = %k, "C-SEC-01: 危险 env 名被拒 (沙箱逃逸向量)");
+            warn!(env_name = %k, "C-SEC-01: dangerous env name rejected (sandbox escape vector)");
             bail!(
-                "危险环境变量 '{}' 被拒 (C-SEC-01: 库注入/解释器劫持逃逸向量)",
+                "dangerous environment variable '{}' rejected (C-SEC-01: library injection / interpreter hijack escape vector)",
                 k
             );
         }
-        // k + '=' + v, 溢出即 Err (防 usize 溢出绕过 cap)
+        // k + '=' + v, saturating so usize overflow cannot bypass the cap
         let entry = k.len().saturating_add(1).saturating_add(v.len());
         total = total.saturating_add(entry);
         if total > ENV_VARS_TOTAL_CAP {
             warn!(
                 total,
                 cap = ENV_VARS_TOTAL_CAP,
-                "C-SEC-01: env_vars 总量超 64KB 上限"
+                "C-SEC-01: env_vars total exceeds the 64KB cap"
             );
             bail!(
-                "env_vars 总量 {} 字节超 {} 上限 (C-SEC-01: env 缓冲 OOM 防护)",
+                "env_vars total {} bytes exceeds the {} cap (C-SEC-01: env buffer OOM protection)",
                 total,
                 ENV_VARS_TOTAL_CAP
             );
@@ -266,7 +268,7 @@ fn configure_env(cmd: &mut portable_pty::CommandBuilder, cfg: &SandboxConfig) ->
         cmd.env("TMPDIR", std::env::temp_dir());
         cmd.env("SHELL", SANDBOX_BASE_SHELL);
         debug!(
-            "env 隔离: env_clear + 硬化 PATH/TMPDIR/SHELL ({} env_vars 覆盖)",
+            "env isolation: env_clear + hardened PATH/TMPDIR/SHELL ({} env_vars overrides)",
             cfg.env.len()
         );
     }
@@ -276,8 +278,8 @@ fn configure_env(cmd: &mut portable_pty::CommandBuilder, cfg: &SandboxConfig) ->
     Ok(())
 }
 
-/// Issue #4: stdio 后端环境配置 — 与 configure_env 同语义 (env_clear + 基线 + env_vars),
-/// 但作用于 std::process::Command (非 portable-pty CommandBuilder)。
+/// Issue #4: stdio backend env configuration — same semantics as configure_env (env_clear + baseline + env_vars),
+/// but applied to std::process::Command (not the portable-pty CommandBuilder).
 fn configure_std_env(cmd: &mut std::process::Command, cfg: &SandboxConfig) -> Result<()> {
     validate_env_vars(&cfg.env)?;
     if !cfg.inherit_env {
@@ -286,7 +288,7 @@ fn configure_std_env(cmd: &mut std::process::Command, cfg: &SandboxConfig) -> Re
         cmd.env("TMPDIR", std::env::temp_dir());
         cmd.env("SHELL", SANDBOX_BASE_SHELL);
         debug!(
-            "env 隔离 (stdio): env_clear + 硬化 PATH/TMPDIR/SHELL ({} env_vars 覆盖)",
+            "env isolation (stdio): env_clear + hardened PATH/TMPDIR/SHELL ({} env_vars overrides)",
             cfg.env.len()
         );
     }
@@ -296,23 +298,26 @@ fn configure_std_env(cmd: &mut std::process::Command, cfg: &SandboxConfig) -> Re
     Ok(())
 }
 
-/// Issue #4: 收 reader 线程输出 — kill 后 reader 可能永不 EOF, recv_timeout 兜底
+/// Issue #4: collect reader-thread output — the reader may never EOF after a kill, recv_timeout is the fallback
 fn recv_output(rx: &std_mpsc::Receiver<Result<String>>, pid: Option<u32>, label: &str) -> String {
     match rx.recv_timeout(Duration::from_millis(READER_RECV_TIMEOUT_MS)) {
         Ok(Ok(s)) => s,
         Ok(Err(_)) => {
-            warn!(?pid, label, "stdio reader 送了 Err (不应发生)");
+            warn!(?pid, label, "stdio reader sent Err (should not happen)");
             String::new()
         }
         Err(std_mpsc::RecvTimeoutError::Timeout) => {
-            warn!(?pid, label, "kill 后 stdio reader 未 EOF, 返回空");
+            warn!(
+                ?pid,
+                label, "stdio reader did not EOF after kill, returning empty"
+            );
             String::new()
         }
         Err(std_mpsc::RecvTimeoutError::Disconnected) => String::new(),
     }
 }
 
-/// 沙箱 — PTY 执行 + 超时 + 截断 + OOM 上限
+/// Sandbox — PTY execution + timeout + truncation + OOM cap
 pub struct Sandbox;
 
 impl Sandbox {
@@ -328,18 +333,18 @@ impl Sandbox {
                 ..Default::default()
             });
         }
-        // Issue #4: use_pty=false 走 stdio 后端 (stdout/stderr 独立), 否则 PTY (合并, 默认)
+        // Issue #4: use_pty=false takes the stdio backend (stdout/stderr independent), otherwise PTY (merged, default)
         if !cfg.use_pty {
             return self.run_stdio(cfg).await;
         }
-        // C-SEC-01: env_vars 早校验 — openpty 前 fail-loud, 拦截不浪费 PTY 资源 (defense-in-depth)
+        // C-SEC-01: early env_vars validation — fail-loud before openpty, blocks without wasting PTY resources (defense-in-depth)
         validate_env_vars(&cfg.env)?;
         info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run (PTY)");
 
         let pair = open_pty_pair()?;
 
-        // Blocker 1 / 1.1: seatbelt=true → sandbox-exec 包装 (禁网 + 危险二进制 execve deny)
-        // Issue #3: max_nproc/max_cpu_sec 经 wrap_rlimits 注入 ulimit 到 sh -c 脚本
+        // Blocker 1 / 1.1: seatbelt=true → sandbox-exec wrapper (network deny + dangerous binary execve deny)
+        // Issue #3: max_nproc/max_cpu_sec inject ulimits into the sh -c script via wrap_rlimits
         let mut cmd = seatbelt::build_command(
             &cfg.command,
             cfg.seatbelt,
@@ -356,7 +361,7 @@ impl Sandbox {
         let mut child = pair
             .slave
             .spawn_command(cmd)
-            .context("spawn_command 失败")?;
+            .context("spawn_command failed")?;
         let pid = child.process_id();
         debug!(
             ?pid,
@@ -366,23 +371,23 @@ impl Sandbox {
             "child spawned"
         );
 
-        // 释放 slave — spawn 后不再需要
+        // Release the slave — not needed after spawn
         drop(pair.slave);
 
-        // reader 阻塞 → 独立线程, 通过 mpsc 传递完整输出
+        // reader blocks → dedicated thread, full output passed via mpsc
         let effective_max = effective_output_cap(cfg.max_output_chars);
         let max_cap = effective_max.saturating_mul(2);
         let mut reader = pair
             .master
             .try_clone_reader()
-            .context("try_clone_reader 失败")?;
+            .context("try_clone_reader failed")?;
         let (tx, rx) = std_mpsc::channel::<Result<String>>();
         let _reader_handle = std::thread::spawn(move || {
-            // 环形缓冲: 超过 max_cap 时只保留尾部 effective_max
-            // D4-5: 读缓冲 16KB (原 4KB) — 大输出时减半 read syscall 次数, 微秒级收益低风险。
-            // D4-8: 评估 VecDeque ring buffer 后否决 — 溢出 drain 在非热路径 (仅超大输出触发),
-            // 且最终 String::from_utf8_lossy 需连续切片, VecDeque 须 make_contiguous 额外 rotate,
-            // 无净收益 (pop_front O(keep) == Vec drain O(keep))。保留 Vec + drain (off-hot-path, 诚实标注)。
+            // Ring buffer: past max_cap keep only the trailing effective_max
+            // D4-5: read buffer 16KB (was 4KB) — halves read syscall count on large output, microsecond-level gain at low risk.
+            // D4-8: VecDeque ring buffer evaluated and rejected — overflow drain is off the hot path (only huge output triggers it),
+            // and the final String::from_utf8_lossy needs contiguous slices, so VecDeque would need make_contiguous plus an extra rotate;
+            // no net gain (pop_front O(keep) == Vec drain O(keep)). Keeping Vec + drain (off-hot-path, honestly labeled).
             let mut buf = Vec::<u8>::with_capacity(16384);
             let mut tmp = [0u8; 16384];
             loop {
@@ -396,11 +401,11 @@ impl Sandbox {
                         }
                     }
                     Err(e) => {
-                        // 审计 2.8: 旧版 send(Err) 后 buf drop — 超时命令已收的 partial stdout
-                        // (含 traceback) 全丢。改 send Ok(buf) 保留已收部分, 仅记 warn 不短路。
+                        // Audit 2.8: the old code sent Err and dropped buf — partial stdout already
+                        // collected (including traceback) was fully lost. Now sends Ok(buf) to keep the collected part, logging only a warn.
                         let partial = String::from_utf8_lossy(&buf).into_owned();
                         let _ = tx.send(Ok(partial));
-                        warn!(error = %e, "reader read 失败, 返回已收 partial 输出");
+                        warn!(error = %e, "reader read failed, returning the partial output collected so far");
                         return;
                     }
                 }
@@ -409,18 +414,18 @@ impl Sandbox {
             let _ = tx.send(Ok(s));
         });
 
-        // take_writer 持有到子进程结束 — 不送 EOF, 避免 PTY 回显 ^D/退格污染输出 (L-SB-07 折中)
-        // L-SB-07: 本沙箱不提供 stdin, 读 stdin 命令 (cat) 将阻塞到 timeout 被 kill (kill_tree 兜底)
-        // 不通过 drop writer 发 EOF — portable-pty PTY drop 会回显控制字符污染 stdout
-        let _writer = pair.master.take_writer().context("take_writer 失败")?;
+        // take_writer is held until the child exits — no EOF is sent, avoiding PTY echoing ^D/backspace polluting the output (L-SB-07 tradeoff)
+        // L-SB-07: this sandbox provides no stdin; stdin-reading commands (cat) block until timeout kills them (kill_tree fallback)
+        // EOF is not sent by dropping the writer — portable-pty PTY drop echoes control characters that pollute stdout
+        let _writer = pair.master.take_writer().context("take_writer failed")?;
 
-        // wait 阻塞 → spawn_blocking; 超时 → SIGINT→500ms→SIGKILL 进程树杀 (C-SB-01/04)
+        // wait blocks → spawn_blocking; timeout → SIGINT→500ms→SIGKILL process-tree kill (C-SB-01/04)
         let wait_fut = tokio::task::spawn_blocking(move || child.wait());
-        // Issue #8 / L-SB-06: timeout<0 拒绝 (调用方 bug); timeout==0 绑定 DEFAULT_TIMEOUT_CAP_SEC,
-        // 永不真正无界 (FR-02 bounded execution; 防 agent loop 卡死)。Python 层已拒 <=0, 此为 raw 接口兜底
+        // Issue #8 / L-SB-06: timeout<0 rejected (caller bug); timeout==0 bound to DEFAULT_TIMEOUT_CAP_SEC,
+        // never truly unbounded (FR-02 bounded execution; prevents agent loop hang). Python layer rejects <=0; this is the raw-interface fallback
         if cfg.timeout_sec < 0.0 {
             drop(pair.master);
-            bail!("timeout_sec 不能为负: {}", cfg.timeout_sec);
+            bail!("timeout_sec must not be negative: {}", cfg.timeout_sec);
         }
         let effective_timeout = if cfg.timeout_sec == 0.0 {
             DEFAULT_TIMEOUT_CAP_SEC
@@ -430,7 +435,7 @@ impl Sandbox {
         let timeout_dur = Duration::from_secs_f64(effective_timeout);
         let sleep = tokio::time::sleep(timeout_dur);
 
-        // D3-4: RSS watchdog — rss_limit_mb=0 禁用。oneshot 通知 select 第 3 分支杀进程树。
+        // D3-4: RSS watchdog — rss_limit_mb=0 disables it. A oneshot notifies select branch 3 to kill the process tree.
         let (oom_tx, mut oom_rx) = tokio::sync::oneshot::channel::<()>();
         let oom_handle = if cfg.rss_limit_mb > 0 {
             let pid_oom = pid.unwrap_or(0);
@@ -444,19 +449,19 @@ impl Sandbox {
         };
 
         let (timed_out, oom_killed, raw_exit) = tokio::select! {
-            biased; // L-SB-01: wait 优先 — 干净退出时不误报 -124
+            biased; // L-SB-01: wait first — no spurious -124 on clean exit
             join_res = wait_fut => {
                 if let Some(h) = oom_handle { h.abort(); }
                 drop(_writer);
                 drop(pair.master);
                 let status = join_res
-                    .map_err(|e| anyhow::anyhow!("wait 线程 panic: {e}"))?
-                    .context("wait 失败")?;
+                    .map_err(|e| anyhow::anyhow!("wait thread panicked: {e}"))?
+                    .context("wait failed")?;
                 (false, false, status.exit_code() as i32)
             }
             _oom = &mut oom_rx => {
-                // D3-4: OOM 在 timeout 之前触发 (内存炸弹可能先于超时)。干净退出仍优 (biased)。
-                warn!(?pid, rss_limit_mb = cfg.rss_limit_mb, "RSS watchdog 超限, kill 进程组 (OOM)");
+                // D3-4: OOM fires before timeout (a memory bomb may breach before the timeout). Clean exit still wins (biased).
+                warn!(?pid, rss_limit_mb = cfg.rss_limit_mb, "RSS watchdog breach, killing process group (OOM)");
                 let res = kill_process_group_async(pid).await;
                 drop(_writer);
                 drop(pair.master);
@@ -464,7 +469,7 @@ impl Sandbox {
             }
             _ = sleep => {
                 if let Some(h) = oom_handle { h.abort(); }
-                warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组");
+                warn!(?pid, timeout_sec = effective_timeout, "timeout, killing process group");
                 let res = kill_process_group_async(pid).await;
                 drop(_writer);
                 drop(pair.master);
@@ -472,27 +477,33 @@ impl Sandbox {
             }
         };
 
-        // C-SB-02: kill 后 reader 可能永不 EOF (子进程忽略信号, 持 slave fd)
-        // — rx.recv 加超时, 超时则返回已收部分输出
+        // C-SB-02: after a kill the reader may never EOF (child ignores signals, holds the slave fd)
+        // — rx.recv gets a timeout; on timeout return the partial output collected so far
         let raw_output = match rx.recv_timeout(Duration::from_millis(READER_RECV_TIMEOUT_MS)) {
             Ok(Ok(s)) => s,
-            // 审计 2.8: reader 2.8 修复后从不送 Err, 此分支保留兜底 — 送 Err 意味逻辑
-            // 漏改, 返已收部分 (channel 在 Err 时 buf 已 drop 无法回收, 故空) 记 warn。
+            // Audit 2.8: after the 2.8 fix the reader never sends Err; this branch stays as a fallback —
+            // an Err means a logic change was missed; return the collected part (the channel's buf is already dropped on Err and unrecoverable, hence empty) and warn.
             Ok(Err(_)) => {
-                warn!(?pid, "reader 送了 Err (不应发生, 2.8 修复后走 Ok partial)");
+                warn!(
+                    ?pid,
+                    "reader sent Err (should not happen; post-2.8-fix path sends Ok partial)"
+                );
                 String::new()
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                warn!(?pid, "kill 后 reader 未 EOF, 返回已收部分输出");
+                warn!(
+                    ?pid,
+                    "reader did not EOF after kill, returning the partial output collected"
+                );
                 String::new()
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => String::new(),
         };
 
-        // PTY ONLCR 把 \n 转 \r\n — 归一化 CRLF→LF (保留程序输出的独立 \r 如进度条)
+        // PTY ONLCR converts \n to \r\n — normalize CRLF→LF (keep standalone \r from program output, e.g. progress bars)
         let normalized = raw_output.replace("\r\n", "\n");
         let stdout = truncate_output(&normalized, effective_max);
-        debug!(out_len = stdout.len(), timed_out, "sandbox run 完成");
+        debug!(out_len = stdout.len(), timed_out, "sandbox run done");
 
         Ok(SandboxResult {
             exit_code: raw_exit,
@@ -500,18 +511,18 @@ impl Sandbox {
             stderr: String::new(),
             timed_out,
             oom_killed,
-            cancelled: false, // Issue #32: 非流式 run 无 cancel 通道
-            pid,              // RUN-11: 回填子进程 PID (PTY 路径 child.process_id())
+            cancelled: false, // Issue #32: non-streaming run has no cancel channel
+            pid,              // RUN-11: backfill the child PID (PTY path child.process_id())
         })
     }
 
-    /// Issue #4: stdio 后端 — std::process::Command + 独立 Stdio::piped (stdout/stderr 分离)。
-    /// 非 PTY: 丢失 ANSI/Traceback 保真, 但满足 FR-03 双工捕获 + Slicer 直接吃 stderr。
-    /// 复用截断/OOM-cap/超时/SIGINT→SIGKILL 进程树杀语义 (与 PTY run() 等价)。
+    /// Issue #4: stdio backend — std::process::Command + independent Stdio::piped (stdout/stderr separated).
+    /// Not PTY: loses ANSI/Traceback fidelity, but satisfies FR-03 duplex capture + the Slicer consumes stderr directly.
+    /// Reuses the truncation/OOM-cap/timeout/SIGINT→SIGKILL process-tree kill semantics (equivalent to PTY run()).
     async fn run_stdio(&self, cfg: SandboxConfig) -> Result<SandboxResult> {
-        // C-SEC-01: env_vars 早校验 — spawn 前 fail-loud (defense-in-depth, 与 PTY 路径一致)
+        // C-SEC-01: early env_vars validation — fail-loud before spawn (defense-in-depth, same as the PTY path)
         validate_env_vars(&cfg.env)?;
-        info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run (stdio, 分离 stdout/stderr)");
+        info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run (stdio, separated stdout/stderr)");
         let mut cmd = seatbelt::build_std_command(
             &cfg.command,
             cfg.seatbelt,
@@ -527,24 +538,24 @@ impl Sandbox {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        // C-14: stdio 路径无 setsid (portable-pty PTY 路径有), 子进程继承 executor pgid。
-        // process_group(0) = exec 前 setpgid(0,0) 使 child pgid = child pid, killpg(-pid) 同 PTY 路径生效。
-        // CommandExt::process_group (Rust 1.64+ stable) 在 pre_exec 设新进程组。
+        // C-14: the stdio path has no setsid (the portable-pty PTY path does), so the child inherits the executor pgid.
+        // process_group(0) = setpgid(0,0) before exec, making child pgid = child pid so killpg(-pid) works like the PTY path.
+        // CommandExt::process_group (Rust 1.64+ stable) sets the new process group in pre_exec.
         cmd.process_group(0);
 
-        let mut child = cmd.spawn().context("spawn (stdio) 失败")?;
+        let mut child = cmd.spawn().context("spawn (stdio) failed")?;
         let pid: Option<u32> = Some(child.id());
         debug!(?pid, "child spawned (stdio), pgid = pid (process_group(0))");
-        // 取出 stdout/stderr handle 后移走 child 剩余引用供 wait
-        let mut stdout_handle = child.stdout.take().context("stdout piped 失败")?;
-        let mut stderr_handle = child.stderr.take().context("stderr piped 失败")?;
+        // Take the stdout/stderr handles, then move the remaining child reference for wait
+        let mut stdout_handle = child.stdout.take().context("stdout piped failed")?;
+        let mut stderr_handle = child.stderr.take().context("stderr piped failed")?;
 
         let effective_max = effective_output_cap(cfg.max_output_chars);
         let max_cap = effective_max.saturating_mul(2);
         let tail_cap = effective_max;
 
-        // stdout reader 线程 — 环形缓冲 (与 PTY 一致 OOM-cap)
-        // D4-5: 读缓冲 16KB (原 4KB) — 见 PTY 路径同款注释 (减半 syscall)。
+        // stdout reader thread — ring buffer (same OOM-cap as PTY)
+        // D4-5: read buffer 16KB (was 4KB) — see the identical PTY-path comment (halved syscalls).
         let (out_tx, out_rx) = std_mpsc::channel::<Result<String>>();
         let _out_handle = std::thread::spawn(move || {
             let mut buf = Vec::<u8>::with_capacity(16384);
@@ -562,7 +573,7 @@ impl Sandbox {
                     Err(e) => {
                         let partial = String::from_utf8_lossy(&buf).into_owned();
                         let _ = out_tx.send(Ok(partial));
-                        warn!(error = %e, "stdio stdout reader 失败, 返回已收 partial");
+                        warn!(error = %e, "stdio stdout reader failed, returning the partial collected");
                         return;
                     }
                 }
@@ -571,8 +582,8 @@ impl Sandbox {
             let _ = out_tx.send(Ok(s));
         });
 
-        // stderr reader 线程 — 独立缓冲 (Issue #4 核心分离)
-        // D4-5: 读缓冲 16KB (原 4KB) — 见 PTY 路径同款注释 (减半 syscall)。
+        // stderr reader thread — independent buffer (core Issue #4 separation)
+        // D4-5: read buffer 16KB (was 4KB) — see the identical PTY-path comment (halved syscalls).
         let (err_tx, err_rx) = std_mpsc::channel::<Result<String>>();
         let _err_handle = std::thread::spawn(move || {
             let mut buf = Vec::<u8>::with_capacity(16384);
@@ -590,7 +601,7 @@ impl Sandbox {
                     Err(e) => {
                         let partial = String::from_utf8_lossy(&buf).into_owned();
                         let _ = err_tx.send(Ok(partial));
-                        warn!(error = %e, "stdio stderr reader 失败, 返回已收 partial");
+                        warn!(error = %e, "stdio stderr reader failed, returning the partial collected");
                         return;
                     }
                 }
@@ -599,9 +610,9 @@ impl Sandbox {
             let _ = err_tx.send(Ok(s));
         });
 
-        // wait + 超时 (复用 timeout 边界规则 + kill_tree)
+        // wait + timeout (reuses the timeout boundary rules + kill_tree)
         if cfg.timeout_sec < 0.0 {
-            bail!("timeout_sec 不能为负: {}", cfg.timeout_sec);
+            bail!("timeout_sec must not be negative: {}", cfg.timeout_sec);
         }
         let effective_timeout = if cfg.timeout_sec == 0.0 {
             DEFAULT_TIMEOUT_CAP_SEC
@@ -612,10 +623,10 @@ impl Sandbox {
         let wait_fut = tokio::task::spawn_blocking(move || child.wait());
         let sleep = tokio::time::sleep(timeout_dur);
 
-        // D3-4: RSS watchdog (stdio 路径同 PTY)
+        // D3-4: RSS watchdog (stdio path, same as PTY)
         let (oom_tx, mut oom_rx) = tokio::sync::oneshot::channel::<()>();
-        // pid 此处恒 Some (child.id() spawn 后必有), 但下游 kill_process_group_async/recv_output/
-        // result.pid 需 Option<u32>; 保持 Option 兼容, allow clippy unnecessary_literal_unwrap。
+        // pid is always Some here (child.id() exists after spawn), but downstream kill_process_group_async/recv_output/
+        // result.pid need Option<u32>; keep Option for compatibility, allow clippy unnecessary_literal_unwrap.
         #[allow(clippy::unnecessary_literal_unwrap)]
         let pid_oom = pid.unwrap_or(0);
         let oom_handle = if cfg.rss_limit_mb > 0 {
@@ -633,18 +644,18 @@ impl Sandbox {
             join_res = wait_fut => {
                 if let Some(h) = oom_handle { h.abort(); }
                 let status = join_res
-                    .map_err(|e| anyhow::anyhow!("wait 线程 panic: {e}"))?
-                    .context("wait 失败")?;
+                    .map_err(|e| anyhow::anyhow!("wait thread panicked: {e}"))?
+                    .context("wait failed")?;
                 (false, false, status.code().unwrap_or(-1))
             }
             _oom = &mut oom_rx => {
-                warn!(?pid, rss_limit_mb = cfg.rss_limit_mb, "RSS watchdog 超限, kill 进程组 (OOM, stdio)");
+                warn!(?pid, rss_limit_mb = cfg.rss_limit_mb, "RSS watchdog breach, killing process group (OOM, stdio)");
                 let res = kill_process_group_async(pid).await;
                 (false, true, res.exit_code)
             }
             _ = sleep => {
                 if let Some(h) = oom_handle { h.abort(); }
-                warn!(?pid, timeout_sec = effective_timeout, "超时 (stdio), kill 进程组");
+                warn!(?pid, timeout_sec = effective_timeout, "timeout (stdio), killing process group");
                 let res = kill_process_group_async(pid).await;
                 (true, false, res.exit_code)
             }
@@ -652,14 +663,14 @@ impl Sandbox {
 
         let raw_stdout = recv_output(&out_rx, pid, "stdout");
         let raw_stderr = recv_output(&err_rx, pid, "stderr");
-        // stdio 无 PTY ONLCR 回显, 无 CRLF 归一化需求
+        // stdio has no PTY ONLCR echo, no CRLF normalization needed
         let stdout = truncate_output(&raw_stdout, effective_max);
         let stderr = truncate_output(&raw_stderr, effective_max);
         debug!(
             out_len = stdout.len(),
             err_len = stderr.len(),
             timed_out,
-            "sandbox run (stdio) 完成"
+            "sandbox run (stdio) done"
         );
 
         Ok(SandboxResult {
@@ -668,14 +679,14 @@ impl Sandbox {
             stderr,
             timed_out,
             oom_killed,
-            cancelled: false, // Issue #32: 非流式 run 无 cancel 通道
-            pid,              // RUN-11: 回填子进程 PID (stdio 路径 child.id())
+            cancelled: false, // Issue #32: non-streaming run has no cancel channel
+            pid,              // RUN-11: backfill the child PID (stdio path child.id())
         })
     }
 
-    /// 流式执行 — stdio 实时分块推送, 结束发送最终 SandboxResult。
-    /// 返回 (Receiver<StreamEvent>, JoinHandle) — 调用方消费 Receiver 直到收到 Done。
-    /// 非破坏性: 与 run() 并存, 逻辑等价 (head+tail 截断在 Done 内的 stdout 完成)。
+    /// Streaming execution — real-time stdio chunk pushes, final SandboxResult sent at the end.
+    /// Returns (Receiver<StreamEvent>, JoinHandle) — the caller consumes the Receiver until Done arrives.
+    /// Non-breaking: coexists with run(), logically equivalent (head+tail truncation applied to the stdout inside Done).
     pub fn run_streaming(
         &self,
         cfg: SandboxConfig,
@@ -693,7 +704,7 @@ impl Sandbox {
             });
             return Ok((rx, handle));
         }
-        // C-SEC-01: env_vars 早校验 — openpty 前 fail-loud, 拦截不浪费 PTY 资源
+        // C-SEC-01: early env_vars validation — fail-loud before openpty, blocks without wasting PTY resources
         validate_env_vars(&cfg.env)?;
         info!(command = %cfg.command, timeout = cfg.timeout_sec, "sandbox run_streaming");
 
@@ -715,7 +726,7 @@ impl Sandbox {
         let mut child = pair
             .slave
             .spawn_command(cmd)
-            .context("spawn_command 失败")?;
+            .context("spawn_command failed")?;
         let pid = child.process_id();
         debug!(
             ?pid,
@@ -726,13 +737,13 @@ impl Sandbox {
         );
         drop(pair.slave);
 
-        // reader 线程 — 实时分块 (inner_tx) + 环形缓冲; EOF 时送最终完整累积 (inner_tx)
+        // reader thread — real-time chunks (inner_tx) + ring buffer; at EOF sends the final full accumulation (inner_tx)
         let effective_max = effective_output_cap(cfg.max_output_chars);
         let max_cap = effective_max.saturating_mul(2);
         let mut reader = pair
             .master
             .try_clone_reader()
-            .context("try_clone_reader 失败")?;
+            .context("try_clone_reader failed")?;
         enum ReaderMsg {
             Chunk(String),
             Eof(String),
@@ -741,7 +752,7 @@ impl Sandbox {
         let _reader_handle = std::thread::spawn(move || {
             let mut buf = Vec::<u8>::with_capacity(16384);
             let mut tmp = [0u8; 16384];
-            // L-SB-02: 跨块多字节 UTF-8 — 保留尾部不完整字节带入下块
+            // L-SB-02: multi-byte UTF-8 across chunks — keep the trailing incomplete bytes for the next chunk
             let mut pending: Vec<u8> = Vec::new();
             let mut overflow_marked = false;
             loop {
@@ -753,7 +764,7 @@ impl Sandbox {
                             let keep = buf.len().saturating_sub(effective_max);
                             buf.drain(0..keep);
                         }
-                        // L-SB-02: 合并 pending, 只解码到最后完整字符边界
+                        // L-SB-02: merge pending, decode only up to the last complete character boundary
                         let mut combined = std::mem::take(&mut pending);
                         combined.extend_from_slice(&tmp[..n]);
                         let safe = utf8_safe_prefix_len(&combined);
@@ -761,9 +772,9 @@ impl Sandbox {
                         pending = combined[safe..].to_vec();
                         let chunk = String::from_utf8_lossy(decodable).replace("\r\n", "\n");
                         if !chunk.is_empty() {
-                            // L-SB-03: 通道满/关闭 — 满则发 overflow 标记一次, 关闭则退出
+                            // L-SB-03: channel full/closed — if full send the overflow marker once, if closed exit
                             if inner_tx.blocking_send(ReaderMsg::Chunk(chunk)).is_err() {
-                                warn!("streaming 通道关闭, 停止读循环");
+                                warn!("streaming channel closed, stopping the read loop");
                                 break;
                             }
                             if !overflow_marked && inner_tx.capacity() == 0 {
@@ -774,11 +785,11 @@ impl Sandbox {
                         }
                     }
                     Err(e) => {
-                        // 审计 2.8: 旧版送 Eof(空) — buf drop 丢 partial stdout。改送 Eof(buf)
-                        // 保留已收部分 (含 traceback), Done 内 stdout 携 partial。
+                        // Audit 2.8: the old code sent Eof(empty) — buf drop lost the partial stdout. Now sends Eof(buf)
+                        // to keep the collected part (including traceback); the stdout inside Done carries the partial.
                         let partial = String::from_utf8_lossy(&buf).into_owned();
                         let _ = inner_tx.blocking_send(ReaderMsg::Eof(partial));
-                        warn!("streaming read 失败, 送已收 partial 输出: {e}");
+                        warn!("streaming read failed, sending the partial output collected: {e}");
                         return;
                     }
                 }
@@ -787,13 +798,13 @@ impl Sandbox {
             let _ = inner_tx.blocking_send(ReaderMsg::Eof(s));
         });
 
-        // take_writer 持有到结束 — 同 run(), 不发 EOF 避免 PTY 回显污染 (L-SB-07 折中)
-        let _writer = pair.master.take_writer().context("take_writer 失败")?;
+        // take_writer held until the end — same as run(), no EOF sent to avoid PTY echo pollution (L-SB-07 tradeoff)
+        let _writer = pair.master.take_writer().context("take_writer failed")?;
         let wait_fut = tokio::task::spawn_blocking(move || child.wait());
-        // Issue #8 / L-SB-06: timeout<0 拒绝; timeout==0 绑定 DEFAULT_TIMEOUT_CAP_SEC, 永不真正无界
+        // Issue #8 / L-SB-06: timeout<0 rejected; timeout==0 bound to DEFAULT_TIMEOUT_CAP_SEC, never truly unbounded
         if cfg.timeout_sec < 0.0 {
             drop(pair.master);
-            bail!("timeout_sec 不能为负: {}", cfg.timeout_sec);
+            bail!("timeout_sec must not be negative: {}", cfg.timeout_sec);
         }
         let effective_timeout = if cfg.timeout_sec == 0.0 {
             DEFAULT_TIMEOUT_CAP_SEC
@@ -802,50 +813,50 @@ impl Sandbox {
         };
         let timeout_dur = Duration::from_secs_f64(effective_timeout);
         let max_output_final = effective_output_cap(cfg.max_output_chars);
-        // D3-4: rss_limit_mb (u32 Copy) 提前捕获 — cfg.command 在 build_command 时 move, 此处仅读剩余字段
+        // D3-4: rss_limit_mb (u32 Copy) captured early — cfg.command is moved at build_command time, only the remaining fields are read here
         let rss_limit_mb = cfg.rss_limit_mb;
 
-        // 协调任务 — 转发 chunk 到 outer; wait/timeout 并行; EOF+exit 后发 Done
+        // Coordination task — forwards chunks to outer; wait/timeout in parallel; Done sent after EOF+exit
         let (outer_tx, outer_rx) = mpsc::channel::<StreamEvent>(64);
-        // Blocker 6 (审计 2.1): 消费者断开 → kill 子进程, 防孤儿。pid 克隆供 phase-1 循环用
-        // (exit_fut 闭包也需 pid 作超时 kill, 克隆避免 move 后无法引用)
+        // Blocker 6 (audit 2.1): consumer disconnect → kill the child, no orphans. pid cloned for the phase-1 loop
+        // (the exit_fut closure also needs pid for the timeout kill; cloning avoids an unreferenceable move)
         let pid_for_cancel = pid;
         let cancel_rx = cancel_rx;
         let handle = tokio::spawn(async move {
-            // D3-4: RSS watchdog — exit_fut 内持 oom_rx 第 3 分支, 超限先于 timeout 杀进程树。
-            // oneshot 在 exit_fut 内创建, 保证 watchdog 任务与 exit_fut 同 spawn 作用域生命周期一致。
+            // D3-4: RSS watchdog — oom_rx held inside exit_fut branch 3, breach kills the tree before the timeout.
+            // The oneshot is created inside exit_fut, keeping the watchdog task's lifetime aligned with exit_fut's spawn scope.
             let (oom_tx, mut oom_rx) = tokio::sync::oneshot::channel::<()>();
-            // D3-4: handle detach — watchdog 在 oom_tx drop 后 (exit_fut 释放) 自退, 无需显式 abort。
+            // D3-4: handle detach — the watchdog self-exits after oom_tx drops (exit_fut released), no explicit abort needed.
             let _oom_handle_stream = if rss_limit_mb > 0 {
                 let pid_oom = pid_for_cancel.unwrap_or(0);
                 Some(tokio::spawn(rss_watchdog(pid_oom, rss_limit_mb, oom_tx)))
             } else {
                 None
             };
-            // exit future: wait 或 timeout, 先到者决定 (timed_out, oom_killed, raw_exit)
+            // exit future: wait or timeout, first to arrive decides (timed_out, oom_killed, raw_exit)
             let mut exit_fut = Box::pin(async move {
                 tokio::select! {
-                    biased; // L-SB-01: wait 优先
+                    biased; // L-SB-01: wait first
                     join_res = wait_fut => {
                         drop(_writer);
                         drop(pair.master);
                         match join_res {
                             Ok(Ok(status)) => (false, false, status.exit_code() as i32),
                             _ => {
-                                warn!("wait 线程 panic/失败");
+                                warn!("wait thread panicked/failed");
                                 (false, false, -1)
                             }
                         }
                     }
                     _oom = &mut oom_rx => {
-                        warn!(?pid, rss_limit_mb, "RSS watchdog 超限, kill 进程组 (OOM, streaming)");
+                        warn!(?pid, rss_limit_mb, "RSS watchdog breach, killing process group (OOM, streaming)");
                         let res = kill_process_group_async(pid).await;
                         drop(_writer);
                         drop(pair.master);
                         (false, true, res.exit_code)
                     }
                     _ = tokio::time::sleep(timeout_dur) => {
-                        warn!(?pid, timeout_sec = effective_timeout, "超时, kill 进程组 (streaming)");
+                        warn!(?pid, timeout_sec = effective_timeout, "timeout, killing process group (streaming)");
                         let res = kill_process_group_async(pid).await;
                         drop(_writer);
                         drop(pair.master);
@@ -856,14 +867,14 @@ impl Sandbox {
 
             let mut eof_output: Option<String> = None;
             let mut exit_done: Option<(bool, bool, i32)> = None;
-            // Blocker 6: 消费者断开标志 — send 失败后 kill 子进程并跳出
+            // Blocker 6: consumer-disconnect flag — on send failure kill the child and break out
             let mut cancelled = false;
-            // Issue #32: cancel 标志 — 区分 cancel (外部显式请求) vs 消费者断开 (Blocker 6),
-            // Done 帧 cancelled 字段据此设 (cancel=true 仅 cancel 路径, 断开=false)。
+            // Issue #32: cancel flag — distinguishes cancel (explicit external request) from consumer disconnect (Blocker 6);
+            // the Done frame's cancelled field is set accordingly (cancelled=true only on the cancel path, disconnect=false).
             let mut cancel_requested = false;
 
-            // Issue #32: cancel future — hoisted outside loop (oneshot::Receiver !Unpin,
-            // Pin::new fails; Box::pin once, .as_mut() poll). pending-forever 若无 cancel_rx.
+            // Issue #32: cancel future — hoisted outside the loop (oneshot::Receiver is !Unpin,
+            // Pin::new fails; Box::pin once, poll via .as_mut()). pending-forever when no cancel_rx.
             let mut cancel_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
                 if let Some(rx) = cancel_rx {
                     Box::pin(async move {
@@ -873,25 +884,25 @@ impl Sandbox {
                     Box::pin(std::future::pending::<()>())
                 };
 
-            // 阶段 1: exit 与 chunk 并发 — 未收到 exit 前无超时收 chunk
+            // Phase 1: exit and chunks concurrent — chunks received without timeout until exit arrives
             while exit_done.is_none() {
                 tokio::select! {
-                    biased; // L-SB-01: exit 优先
+                    biased; // L-SB-01: exit first
                     e = &mut exit_fut => {
                         exit_done = Some(e);
                     }
-                    // Issue #32: server-side cancel → 确定性进程树 kill (非协作停). 复用 kill_process_group
-                    // (SIGINT→KILL_GRACE_MS grace→SIGKILL + kill_descendants_ppid 防 setsid 孤儿).
+                    // Issue #32: server-side cancel → deterministic process-tree kill (not a cooperative stop). Reuses kill_process_group
+                    // (SIGINT→KILL_GRACE_MS grace→SIGKILL + kill_descendants_ppid guarding against setsid orphans).
                     _ = cancel_fut.as_mut() => {
-                        warn!(?pid_for_cancel, "streaming 收到 cancel 请求, kill 进程树 (Issue #32)");
+                        warn!(?pid_for_cancel, "streaming received a cancel request, killing the process tree (Issue #32)");
                         let _ = kill_process_group_async(pid_for_cancel).await;
                         cancelled = true;
                         cancel_requested = true;
                         break;
                     }
-                    // Blocker 6: 消费者断开 outer_rx (即使无输出静默期) → closed() 就绪 → kill 子进程
+                    // Blocker 6: consumer dropped outer_rx (even with no output in flight) → closed() ready → kill the child
                     _ = outer_tx.closed() => {
-                        warn!(?pid_for_cancel, "streaming 消费者断开 (closed), kill 子进程防孤儿 (Blocker 6)");
+                        warn!(?pid_for_cancel, "streaming consumer disconnected (closed), killing the child to prevent orphans (Blocker 6)");
                         let _ = kill_process_group_async(pid_for_cancel).await;
                         cancelled = true;
                         break;
@@ -899,9 +910,9 @@ impl Sandbox {
                     msg = inner_rx.recv() => {
                         match msg {
                             Some(ReaderMsg::Chunk(c)) => {
-                                // Blocker 6: send 失败 = 消费者断开 outer_rx → kill 子进程, 跳出
+                                // Blocker 6: send failure = consumer dropped outer_rx → kill the child, break out
                                 if outer_tx.send(StreamEvent::Chunk { data: c }).await.is_err() {
-                                    warn!(?pid_for_cancel, "streaming 消费者断开, kill 子进程防孤儿 (Blocker 6)");
+                                    warn!(?pid_for_cancel, "streaming consumer disconnected, killing the child to prevent orphans (Blocker 6)");
                                     let _ = kill_process_group_async(pid_for_cancel).await;
                                     cancelled = true;
                                     break;
@@ -919,13 +930,13 @@ impl Sandbox {
                     }
                 }
             }
-            // Blocker 6: 消费者断开后 exit_fut 仍持 wait_fut, abort 释放; 子进程已 kill。
-            // 不走 phase-2 (exit_done=None → unwrap panic); 直接合成 cancelled Done 收尾。
+            // Blocker 6: after consumer disconnect exit_fut still holds wait_fut, released via abort; the child is already killed.
+            // Phase-2 is skipped (exit_done=None → unwrap panic); a cancelled Done is synthesized directly to wrap up.
             if cancelled {
                 debug!(
                     ?pid_for_cancel,
                     cancelled_by_cancel = cancel_requested,
-                    "streaming 已取消, 收尾"
+                    "streaming cancelled, wrapping up"
                 );
                 let raw_output = eof_output.unwrap_or_default();
                 let stdout = truncate_output(&raw_output.replace("\r\n", "\n"), max_output_final);
@@ -935,19 +946,19 @@ impl Sandbox {
                         stdout,
                         stderr: String::new(),
                         timed_out: false,
-                        oom_killed: false, // D3-4: 取消路径无 OOM (kill 由消费者断开触发非 watchdog)
-                        cancelled: cancel_requested, // Issue #32: 仅 cancel 请求路径 true, 消费者断开 false
-                        pid: pid_for_cancel,         // RUN-11: 回填子进程 PID (取消收尾, 子已 kill)
+                        oom_killed: false, // D3-4: no OOM on the cancel path (the kill was triggered by consumer disconnect, not the watchdog)
+                        cancelled: cancel_requested, // Issue #32: true only on the cancel-request path, false on disconnect
+                        pid: pid_for_cancel, // RUN-11: backfill the child PID (cancel finalize, child already killed)
                     }))
                     .await;
                 return;
             }
 
-            // 阶段 2: exit 已到 — 排空 reader 直到 EOF/None。
-            // C-SB-03 grace 超时防 reader 永不 EOF。必须循环: exit 先于 reader 刷盘时,
-            // reader 可能仍持多条 Chunk + 末尾 Eof; 单次 recv 只取一条会漏掉 Eof,
-            // 导致 eof_output 留 None → unwrap_or_default 空串 → done.stdout 丢全部输出
-            // (CI 慢机 echo hi 竞态: exit 比 PTY flush 快)。
+            // Phase 2: exit arrived — drain the reader until EOF/None.
+            // C-SB-03 grace timeout guards against a reader that never EOFs. Must loop: when exit precedes the reader flush,
+            // the reader may still hold several Chunks plus a trailing Eof; a single recv would miss the Eof,
+            // leaving eof_output None → unwrap_or_default empty string → done.stdout loses all output
+            // (slow-CI echo hi race: exit beats the PTY flush).
             if eof_output.is_none() {
                 let deadline =
                     tokio::time::Instant::now() + Duration::from_millis(READER_RECV_TIMEOUT_MS);
@@ -965,7 +976,7 @@ impl Sandbox {
                             break;
                         }
                         Err(_) => {
-                            warn!(?pid, "streaming kill 后 reader 未 EOF, 合成空 eof");
+                            warn!(?pid, "streaming reader did not EOF after kill, synthesizing an empty eof");
                             eof_output = Some(String::new());
                             break;
                         }
@@ -973,14 +984,14 @@ impl Sandbox {
                 }
             }
 
-            // M-FT-02: cancelled 分支已早 return, 走到此必 Some; unwrap_or_else 防重构破不变量致 panic
+            // M-FT-02: the cancelled branch returned early, so this must be Some; unwrap_or_else guards against a refactor breaking the invariant and panicking
             let (timed_out, oom_killed, raw_exit) = exit_done.unwrap_or((false, false, -1));
             let raw_output = eof_output.unwrap_or_default();
             let normalized = raw_output.replace("\r\n", "\n");
             let stdout = truncate_output(&normalized, max_output_final);
             debug!(
                 out_len = stdout.len(),
-                timed_out, oom_killed, "sandbox run_streaming 完成"
+                timed_out, oom_killed, "sandbox run_streaming done"
             );
             let _ = outer_tx
                 .send(StreamEvent::Done(SandboxResult {
@@ -989,8 +1000,8 @@ impl Sandbox {
                     stderr: String::new(),
                     timed_out,
                     oom_killed,
-                    cancelled: false,    // Issue #32: 正常完成路径非 cancel
-                    pid: pid_for_cancel, // RUN-11: 回填子进程 PID (正常完成)
+                    cancelled: false, // Issue #32: the normal-completion path is not a cancel
+                    pid: pid_for_cancel, // RUN-11: backfill the child PID (normal completion)
                 }))
                 .await;
         });
@@ -1005,27 +1016,27 @@ impl Default for Sandbox {
     }
 }
 
-/// head + tail 截断 — 中间折叠为 [truncated N chars]
-/// L-SB-04: 极小上限 tail-only 回退保证返回不超 max
-/// 审计 2.5: 旧版 chars().collect::<Vec<char>> 物化全量 char Vec — 64MB 输入峰值 320MB
-/// (Vec<char> 每元素 4 字节 + 原 String)。改 byte-offset: char_indices 一次遍历记录
-/// 第 N 个 char 的字节偏移, 切片原 str — 零额外物化 (仅 Vec<usize> 偏移, N 个 8 字节)。
+/// head + tail truncation — middle folded as [truncated N chars]
+/// L-SB-04: tiny-cap tail-only fallback guarantees the return stays within max
+/// Audit 2.5: the old chars().collect::<Vec<char>> materialized a full char Vec — 64MB input peaked at 320MB
+/// (Vec<char> 4 bytes per element plus the original String). Switched to byte offsets: one char_indices pass records
+/// the byte offset of the Nth char and slices the original str — zero extra materialization (only a Vec<usize> of offsets, N x 8 bytes).
 pub fn truncate_output(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    // m-PERF-01: 字节长度短路 — s.len()<=max 则 bytes<=max, 而 chars<=bytes, 故 chars<=max
-    // 必无截断。常见小输出免 O(n) chars().count() 全量遍历。
+    // m-PERF-01: byte-length short-circuit — s.len()<=max implies bytes<=max, and chars<=bytes, so chars<=max
+    // means no truncation is possible. Common small outputs skip the O(n) chars().count() full scan.
     if s.len() <= max {
         return s.to_string();
     }
-    // D4-perf-fix: 单次 char_indices 遍历收集 total_chars + head_end_byte (第 HEAD_CHARS 个 char
-    // 的字节偏移) + tail_start_byte (倒数第 TAIL_CHARS 个 char 的字节偏移, 用环形缓冲只留末
-    // TAIL_CHARS+1 个偏移)。取代旧版 4 趟 O(n) 扫描 (chars().count + 2× nth_char_byte_offset +
-    // out.chars().count)。环形缓冲 = (TAIL_CHARS+1)*8 字节 ≈ 65KB, 远小于全偏移表。
+    // D4-perf-fix: a single char_indices pass collects total_chars + head_end_byte (the byte offset of the
+    // HEAD_CHARS-th char) + tail_start_byte (the byte offset of the TAIL_CHARS-th char from the end, using a
+    // ring buffer that keeps only the last TAIL_CHARS+1 offsets). Replaces the old 4-pass O(n) scan
+    // (chars().count + 2x nth_char_byte_offset + out.chars().count). The ring buffer is (TAIL_CHARS+1)*8 bytes = ~65KB, far smaller than a full offset table.
     let mut total_chars: usize = 0;
     let mut head_end_byte: Option<usize> = None;
-    // 环形缓冲: 末 (TAIL_CHARS+1) 个 char 的字节起始偏移, 容量固定 TAIL_CHARS+1
+    // Ring buffer: byte start offsets of the last (TAIL_CHARS+1) chars, fixed capacity TAIL_CHARS+1
     let cap = TAIL_CHARS + 1;
     let mut ring: Vec<usize> = Vec::with_capacity(cap);
     for (i, _) in s.char_indices() {
@@ -1041,16 +1052,16 @@ pub fn truncate_output(s: &str, max: usize) -> String {
     if total_chars <= max {
         return s.to_string();
     }
-    // ring 现含末 cap 个 char 的偏移; ring[0] = 倒数第 min(cap,total) 个 char 的字节起点。
-    // tail_start = 第 (total - TAIL_CHARS) 个 char 的偏移 = ring 中倒数第 TAIL_CHARS 个的前一个,
-    // 即 ring[len - TAIL_CHARS - 1] (当 total > TAIL_CHARS)。
+    // ring now holds the offsets of the last cap chars; ring[0] = the byte start of the min(cap,total)-th char from the end.
+    // tail_start = the offset of the (total - TAIL_CHARS)-th char = the one before the TAIL_CHARS-th from the end in ring,
+    // i.e. ring[len - TAIL_CHARS - 1] (when total > TAIL_CHARS).
     let tail_start_byte = if total_chars > TAIL_CHARS {
         ring[ring.len() - TAIL_CHARS - 1]
     } else {
         0
     };
     if max <= HEAD_CHARS + TAIL_CHARS {
-        // 极小上限: 只保留尾部 max 个 char — 找第 (total-max) 个 char 的字节偏移
+        // Tiny cap: keep only the trailing max chars — find the byte offset of the (total-max)-th char
         let skip = total_chars.saturating_sub(max);
         let byte_start = if skip == 0 {
             0
@@ -1074,10 +1085,10 @@ pub fn truncate_output(s: &str, max: usize) -> String {
         dropped,
         &s[tail_start_byte..]
     );
-    // L-SB-04: head+marker+tail 超 max 时回退 tail-only。
-    // D4-perf-fix: 用算术算 out 的 char 数 (head_chars + marker_chars + tail_chars) 取代
-    // out.chars().count() 全量遍历。marker = "\n[truncated N chars]\n", 其 char 数 = 字节数
-    // (纯 ASCII), 跳过格式化再数。
+    // L-SB-04: fall back to tail-only when head+marker+tail exceeds max.
+    // D4-perf-fix: compute out's char count arithmetically (head_chars + marker_chars + tail_chars) instead of
+    // a full out.chars().count() scan. marker = "\n[truncated N chars]\n", whose char count equals its byte count
+    // (pure ASCII), skipping the format-then-count.
     let marker = format!("\n[truncated {} chars]\n", dropped);
     let out_chars = HEAD_CHARS + marker.chars().count() + TAIL_CHARS.min(total_chars);
     if out_chars > max {
@@ -1094,8 +1105,8 @@ pub fn truncate_output(s: &str, max: usize) -> String {
     out
 }
 
-/// 返回第 `n` 个 char (0-indexed) 的字节起始偏移。n==0 → 0; n>=总 char 数 → s.len()
-/// 审计 2.5: 取代全量 chars().collect(), 仅遍历到第 n 个停, 零物化。
+/// Returns the byte start offset of the `n`-th char (0-indexed). n==0 → 0; n>=total chars → s.len()
+/// Audit 2.5: replaces the full chars().collect(); iterates only to the n-th char and stops, zero materialization.
 fn nth_char_byte_offset(s: &str, n: usize) -> usize {
     if n == 0 {
         return 0;
@@ -1108,31 +1119,31 @@ fn nth_char_byte_offset(s: &str, n: usize) -> usize {
     s.len()
 }
 
-/// L-SB-02: 返回最后一个完整 UTF-8 字符的字节边界 (切断多字节序列时余数留给下块)
-/// 无效字节 (孤立续字节) 整体跳过 — from_utf8_lossy 转 U+FFFD
+/// L-SB-02: returns the byte boundary of the last complete UTF-8 character (leftover bytes from a cut multi-byte sequence go to the next chunk)
+/// Invalid bytes (orphan continuation bytes) are skipped whole — from_utf8_lossy turns them into U+FFFD
 fn utf8_safe_prefix_len(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
     }
-    // 从末尾回溯找完整序列起点
+    // Walk backwards from the end to find the start of a complete sequence
     let n = bytes.len();
     let mut i = n;
     while i > 0 {
         let last = bytes[i - 1];
         if last < 0x80 {
-            // ASCII — 完整单字节
+            // ASCII — complete single byte
             return i;
         }
         if last & 0xC0 == 0x80 {
-            // 续字节 (10xxxxxx) — 继续回溯找首字节
+            // Continuation byte (10xxxxxx) — keep walking back for the lead byte
             i -= 1;
-            // 一个 UTF-8 字符最多 4 字节, 避免无限回溯
+            // A UTF-8 char is at most 4 bytes, avoid unbounded backtracking
             if n - i > 3 {
                 return n;
             }
             continue;
         }
-        // 首字节 — 校验后续续字节数是否足够
+        // Lead byte — check whether enough continuation bytes follow
         let need = if last & 0xE0 == 0xC0 {
             1
         } else if last & 0xF0 == 0xE0 {
@@ -1140,28 +1151,28 @@ fn utf8_safe_prefix_len(bytes: &[u8]) -> usize {
         } else if last & 0xF8 == 0xF0 {
             3
         } else {
-            // 非法首字节 — 当作完整, lossy 转 U+FFFD
+            // Invalid lead byte — treat as complete, lossy conversion yields U+FFFD
             return n;
         };
         let have = n - (i - 1);
         if have > need {
             return n;
         }
-        // 不完整多字节序列 — 截断在此, 余数留下块
+        // Incomplete multi-byte sequence — cut here, remainder goes to the next chunk
         return i - 1;
     }
     0
 }
 
-/// C-SB-05: 输出上限钳制 — 调用方 max_output_chars 受 HARD_CEILING (64MB) 绝对上限约束
+/// C-SB-05: output cap clamp — caller max_output_chars is constrained by the HARD_CEILING (64MB) absolute ceiling
 pub fn effective_output_cap(cfg_max: usize) -> usize {
     cfg_max.min(HARD_CEILING)
 }
 
-/// A-11: kill_process_group 的结构化结果 — 区分"已成功信号"与"已回收僵尸"与"退出码"。
-/// signaled=true  = 至少一路信号 (SIGINT 或 SIGKILL) 成功投递 (killpg 返 Ok 或非 ESRCH)。
-/// reaped=true    = 最终阻塞 waitpid 在本调用内回收了僵尸 (reap=true 时)。
-/// exit_code      = -124 (超时约定, 调用方区分"主动杀"用 exit_code.is_signal 报告) 或子进程被信号杀的码。
+/// A-11: structured result of kill_process_group — distinguishes "signal delivered" from "zombie reaped" from "exit code".
+/// signaled=true  = at least one signal (SIGINT or SIGKILL) was delivered successfully (killpg returned Ok or non-ESRCH).
+/// reaped=true    = the final blocking waitpid reaped the zombie within this call (when reap=true).
+/// exit_code      = -124 (timeout convention; the caller distinguishes "active kill" via exit_code.is_signal reporting) or the code of a signal-killed child.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KillResult {
     pub signaled: bool,
@@ -1169,42 +1180,46 @@ pub struct KillResult {
     pub exit_code: i32,
 }
 
-/// A-10: 封装 BSD 负-pid 进程组信号, 隐藏双否定。
-/// 负 pid = 进程组 (BSD 扩展, macOS 支持; POSIX killpg 语义)。killpg(pgid, sig) 等价 kill(-pgid, sig)。
-/// 返回 true = 信号投递成功 (Ok); false = 进程组已不存在 (ESRCH) 或权限不足 (EPERM/EINVAL 报 warn)。
+/// A-10: wraps BSD negative-pid process group signaling, hiding the double negation.
+/// Negative pid = process group (BSD extension, supported on macOS; POSIX killpg semantics). killpg(pgid, sig) equals kill(-pgid, sig).
+/// Returns true = signal delivered (Ok); false = the process group no longer exists (ESRCH) or permission denied (EPERM/EINVAL logged as warn).
 fn kill_pgid(pgid: Pid, sig: Signal, pid: u32) -> bool {
     match nix::sys::signal::killpg(pgid, sig) {
         Ok(()) => {
-            debug!(?pid, ?sig, "killpg 已发 (负 pid = 进程组, BSD 扩展)");
+            debug!(
+                ?pid,
+                ?sig,
+                "killpg sent (negative pid = process group, BSD extension)"
+            );
             true
         }
         Err(nix::errno::Errno::ESRCH) => {
-            debug!(?pid, ?sig, "killpg: 进程组已不存在 (ESRCH)");
+            debug!(?pid, ?sig, "killpg: process group no longer exists (ESRCH)");
             false
         }
         Err(e) => {
-            warn!(?pid, ?sig, "killpg 失败: {e}");
+            warn!(?pid, ?sig, "killpg failed: {e}");
             false
         }
     }
 }
 
-/// 单 pid 信号投递 (非进程组) — ESRCH 静默 (进程已退), 其他 errno warn。
+/// Single-pid signal delivery (not process group) — ESRCH is silent (process already exited), other errnos warn.
 fn kill_pid(pid: u32, sig: Signal) -> bool {
     match nix::sys::signal::kill(Pid::from_raw(pid as i32), sig) {
         Ok(()) => true,
         Err(nix::errno::Errno::ESRCH) => false,
         Err(e) => {
-            warn!(pid, ?sig, "kill 单 pid 失败: {e}");
+            warn!(pid, ?sig, "kill on single pid failed: {e}");
             false
         }
     }
 }
 
-/// D3-4 (审计 0827 product): RSS watchdog — sysinfo 轮询子进程树 RSS, 超限返回总 MB。
-/// Darwin RLIMIT_AS/RLIMIT_DATA 无效, 用 sysinfo 每 ~200ms 采 root + 后代 RSS 之和。
-/// 返回 Some(total_mb) 超限 (调用方据此 oneshot 通知 select 杀进程树); None 未超限或进程消失。
-/// 单次快照遍历, 进程树在遍历期间 fork 新后代由下轮轮询兜底 (与 collect_descendants 同 best-effort)。
+/// D3-4 (audit 0827 product): RSS watchdog — sysinfo polls the child tree RSS, returns the total MB on breach.
+/// Darwin RLIMIT_AS/RLIMIT_DATA are no-ops, so sysinfo samples root + descendants RSS every ~200ms.
+/// Returns Some(total_mb) on breach (the caller then notifies select via oneshot to kill the tree); None when under the cap or the process vanished.
+/// Single-snapshot pass; new descendants forked during traversal are covered by the next poll round (same best-effort as collect_descendants).
 async fn rss_watchdog(root_pid: u32, limit_mb: u32, oom_tx: tokio::sync::oneshot::Sender<()>) {
     let poll = Duration::from_millis(RSS_POLL_MS);
     let limit_bytes = (limit_mb as u64).saturating_mul(1024 * 1024);
@@ -1213,7 +1228,10 @@ async fn rss_watchdog(root_pid: u32, limit_mb: u32, oom_tx: tokio::sync::oneshot
         let mut sys = sysinfo::System::new_all();
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         let Some(root_proc) = sys.process(sysinfo::Pid::from_u32(root_pid)) else {
-            debug!(root_pid, "RSS watchdog: root 进程已退出, 自退");
+            debug!(
+                root_pid,
+                "RSS watchdog: root process exited, self-terminating"
+            );
             return;
         };
         let mut total: u64 = root_proc.memory();
@@ -1239,7 +1257,7 @@ async fn rss_watchdog(root_pid: u32, limit_mb: u32, oom_tx: tokio::sync::oneshot
                 root_pid,
                 limit_mb,
                 rss_mb = mb,
-                "D3-4 RSS watchdog 触发: 进程树 RSS 超限, oneshot 通知 select 杀进程树"
+                "D3-4 RSS watchdog triggered: process tree RSS over the cap, oneshot notifies select to kill the tree"
             );
             let _ = oom_tx.send(());
             return;
@@ -1250,18 +1268,18 @@ async fn rss_watchdog(root_pid: u32, limit_mb: u32, oom_tx: tokio::sync::oneshot
     }
 }
 
-/// RUN-9 (审计 0827): ppid-tree 后代遍历 — setsid 孙进程逃逸进程组, killpg 杀不到。
-/// macOS 无 cgroups / 无 /proc, 用 sysinfo 遍历全进程, 按 ppid 树收集 root 的所有后代
-/// (含跨组 setsid 孤儿), 逐个投递信号。返回被信号的后代 pid 集 (root 自身不含, 由 killpg 覆盖)。
+/// RUN-9 (audit 0827): ppid-tree descendant walk — setsid grandchildren escape the process group and are out of killpg's reach.
+/// macOS has no cgroups / no /proc, so sysinfo walks all processes and collects all of root's descendants via the ppid tree
+/// (including cross-group setsid orphans), signaling each one. Returns the signaled descendant pid set (root itself excluded, covered by killpg).
 ///
-/// 单次快照遍历 — 进程在遍历期间可能 fork 新后代, 故调用方应先杀再快照 (杀后 fork 的孤儿
-/// 由后续 timeout/watchdog 兜底; setsid 脱组是 syscall 无法拦, 此为 best-effort 纵深防御)。
+/// Single-snapshot pass — processes may fork new descendants during traversal, so the caller should kill first, then snapshot (orphans forked
+/// after the kill are covered by the later timeout/watchdog; setsid de-grouping is a syscall that cannot be intercepted — this is best-effort defense in depth).
 fn collect_descendants(root_pid: u32) -> Vec<u32> {
     let mut sys = sysinfo::System::new_all();
-    // 全进程刷新一次取 ppid 关系 (new_all 已刷新, 此处显式确证最新快照)
+    // Refresh all processes once for ppid relations (new_all already refreshed; this explicitly confirms the latest snapshot)
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let mut descendants = Vec::new();
-    // BFS: 从 root 出发, 找所有 ppid == 已知 pid 的进程
+    // BFS: start from root, find all processes whose ppid == a known pid
     let mut frontier = vec![root_pid];
     let mut seen = std::collections::HashSet::new();
     seen.insert(root_pid);
@@ -1281,14 +1299,14 @@ fn collect_descendants(root_pid: u32) -> Vec<u32> {
     debug!(
         root_pid,
         descendant_count = descendants.len(),
-        "ppid-tree 后代收集 (RUN-9 setsid 兜底)"
+        "ppid-tree descendant collection (RUN-9 setsid fallback)"
     );
     descendants
 }
 
-/// RUN-9: 对 root 的所有后代 (跨组 setsid 孤儿) 投递信号 — ppid-tree 兜底, 补 killpg 漏杀。
-/// 先 SIGINT 优雅, 收集后代集, 逐个投递; 调用方在 grace 后再 SIGKILL 兜底时再调一次本 fn。
-/// 信号失败的单 pid 不阻断其余 (尽力杀)。
+/// RUN-9: signals all descendants of root (cross-group setsid orphans) — ppid-tree fallback covering what killpg misses.
+/// SIGINT gracefully first: collect the descendant set, signal each; the caller calls this fn again when falling back to SIGKILL after the grace period.
+/// A failed single-pid signal does not block the rest (best-effort kill).
 fn kill_descendants_ppid(root_pid: u32, sig: Signal) {
     let descendants = collect_descendants(root_pid);
     if descendants.is_empty() {
@@ -1298,34 +1316,34 @@ fn kill_descendants_ppid(root_pid: u32, sig: Signal) {
         root_pid,
         count = descendants.len(),
         ?sig,
-        "RUN-9 ppid-tree 兜底杀 setsid 脱组后代"
+        "RUN-9 ppid-tree fallback killing setsid de-grouped descendants"
     );
     for desc in descendants {
         kill_pid(desc, sig);
     }
 }
 
-/// C-14/C-15/L-13/A-11 + RUN-9: 进程组杀 — SIGINT (graceful) → grace_ms → 仍活 → SIGKILL (forceful)。
+/// C-14/C-15/L-13/A-11 + RUN-9: process group kill — SIGINT (graceful) → grace_ms → still alive → SIGKILL (forceful).
 ///
-/// **双层杀**: (1) killpg 杀 child pid 对应的进程组 (setsid/`process_group(0)` 使 pgid == child pid);
-/// (2) RUN-9 ppid-tree 兜底 — setsid 孙进程逃逸进程组 (child 再调 setsid 建新会话/组), killpg 杀不到,
-///     用 sysinfo 遍历全进程按 ppid 树收集所有后代 (跨组孤儿) 逐个投递信号。
-/// macOS 无 cgroups, POSIX killpg 非递归; ppid-tree 是 best-effort 纵深防御 (setsid 是 syscall 无法拦,
-/// 杀期间 fork 的新孤儿由后续 timeout/watchdog 兜底)。单次快照遍历, 不追杀快照后 fork 的进程。
+/// **Two-layer kill**: (1) killpg kills the process group of the child pid (setsid/`process_group(0)` makes pgid == child pid);
+/// (2) RUN-9 ppid-tree fallback — setsid grandchildren escape the process group (the child may call setsid again to create a new session/group),
+///     out of killpg's reach; sysinfo walks all processes and collects all descendants via the ppid tree (cross-group orphans), signaling each.
+/// macOS has no cgroups and POSIX killpg is non-recursive; the ppid-tree is best-effort defense in depth (setsid is a syscall that cannot be
+/// intercepted; orphans forked during the kill are covered by the later timeout/watchdog). Single-snapshot pass, does not chase processes forked after the snapshot.
 ///
-/// C-14: `reap` 控制最终阻塞 waitpid。PTY 超时路径 caller 持 `spawn_blocking(child.wait())`
-/// (L-13 双重回收竞争), 故 kill 时 `reap=false` — 仅信号不回收, 让 caller 的 wait 路径回收。
-/// stdio 路径同理。fe-shell (自管 child.wait) 同样 reap=false。仅独立 kill (无 caller wait) 时 reap=true。
+/// C-14: `reap` controls the final blocking waitpid. The PTY timeout path caller holds `spawn_blocking(child.wait())`
+/// (L-13 double-reap race), so the kill uses `reap=false` — signal only, no reap, letting the caller's wait path reap.
+/// Same for the stdio path. fe-shell (self-managed child.wait) also uses reap=false. Only standalone kills (no caller wait) use reap=true.
 ///
-/// C-14 ESRCH 早返修复: SIGINT 返 ESRCH (组不存在) 不再短路返回 -124 — 继续 SIGKILL 兜底,
-/// 因 stdio 路径 `process_group(0)` 失败或 setsid 漏设时组 id 不匹配, SIGINT ESRCH 不代表子进程已死。
+/// C-14 ESRCH early-return fix: SIGINT returning ESRCH (group gone) no longer short-circuits with -124 — SIGKILL fallback still runs,
+/// because on the stdio path a failed `process_group(0)` or a missing setsid leaves the group id mismatched; SIGINT ESRCH does not mean the child is dead.
 ///
-/// grace_ms 可配 (A-11, 默认 KILL_GRACE_MS 500ms); 0 = 跳 grace 直接 SIGKILL。
-/// 返回 KillResult; exit_code=-124 为超时/主动杀约定 (调用方按需区分)。
-/// pid=None (spawn 失败) → KillResult{exit_code: -1}。
+/// grace_ms configurable (A-11, default KILL_GRACE_MS 500ms); 0 = skip grace, straight to SIGKILL.
+/// Returns KillResult; exit_code=-124 is the timeout/active-kill convention (caller distinguishes as needed).
+/// pid=None (spawn failed) → KillResult{exit_code: -1}.
 pub fn kill_process_group(pid: Option<u32>, reap: bool, grace_ms: u64) -> KillResult {
     let Some(pid) = pid else {
-        warn!("kill_process_group: 无 pid (spawn 失败?), 跳过");
+        warn!("kill_process_group: no pid (spawn failed?), skipping");
         return KillResult {
             signaled: false,
             reaped: false,
@@ -1336,40 +1354,40 @@ pub fn kill_process_group(pid: Option<u32>, reap: bool, grace_ms: u64) -> KillRe
     let pid_nix = Pid::from_raw(pid as i32);
 
     let mut signaled = false;
-    // SIGINT 优雅终止 — C-14: ESRCH 不短路, 继续走 SIGKILL 兜底 (可能组 id 错但进程活)
+    // SIGINT graceful termination — C-14: ESRCH does not short-circuit, the SIGKILL fallback still runs (group id may be wrong while the process lives)
     if kill_pgid(pgid, Signal::SIGINT, pid) {
         signaled = true;
     }
-    // RUN-9: ppid-tree 兜底 — setsid 脱组的孙进程, killpg 杀不到, 按 ppid 树逐个 SIGINT
+    // RUN-9: ppid-tree fallback — setsid de-grouped grandchildren out of killpg's reach, SIGINT each via the ppid tree
     kill_descendants_ppid(pid, Signal::SIGINT);
 
-    // grace window 等优雅退出 (grace_ms=0 跳过, 直接 SIGKILL)
+    // grace window for graceful exit (grace_ms=0 skips it, straight to SIGKILL)
     if grace_ms > 0 {
         std::thread::sleep(Duration::from_millis(grace_ms));
     }
 
-    // try_wait (WNOHANG) — 仍活则 SIGKILL
+    // try_wait (WNOHANG) — SIGKILL if still alive
     let still_alive = matches!(
         nix::sys::wait::waitpid(pid_nix, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
         Ok(nix::sys::wait::WaitStatus::StillAlive)
     );
     if still_alive {
-        debug!(?pid, "SIGINT grace 后仍活, 发 SIGKILL");
+        debug!(?pid, "still alive after the SIGINT grace, sending SIGKILL");
         if kill_pgid(pgid, Signal::SIGKILL, pid) {
             signaled = true;
         }
-        // RUN-9: SIGKILL 兜底也补 ppid-tree (grace 期间可能 setsid 出新孤儿仍活)
+        // RUN-9: the SIGKILL fallback also covers the ppid-tree (the grace period may have produced new living setsid orphans)
         kill_descendants_ppid(pid, Signal::SIGKILL);
     }
 
-    // 回收僵尸 — L-13: reap=false 时跳过, 让 caller 的 wait 路径回收 (避免 ECHILD 竞态)
+    // Reap the zombie — L-13: skipped when reap=false, letting the caller's wait path reap (avoids the ECHILD race)
     let mut reaped = false;
     if reap {
         let _ = nix::sys::wait::waitpid(pid_nix, None);
         reaped = true;
         debug!(
             ?pid,
-            "kill_process_group: 阻塞 waitpid 回收僵尸 (reap=true)"
+            "kill_process_group: blocking waitpid reaped the zombie (reap=true)"
         );
     }
 
@@ -1380,11 +1398,11 @@ pub fn kill_process_group(pid: Option<u32>, reap: bool, grace_ms: u64) -> KillRe
     }
 }
 
-/// C-PERF-02: async 进程组杀 — 把 grace sleep 移出 worker 线程。
-/// spawn_blocking 把阻塞段丢给专用阻塞线程池, worker 线程 grace 期间空闲可服务其他任务。
-/// 返回 KillResult (exit_code=-124) 或 JoinHandle panic 兜底 -1。
-/// 同步 kill_process_group 保留给 fe-shell (std::thread 无 tokio runtime, 不可 await)。
-/// reap=false: 超时路径 caller 持 spawn_blocking(child.wait), 避 L-13 双重回收竞争。
+/// C-PERF-02: async process group kill — moves the grace sleep off the worker thread.
+/// spawn_blocking pushes the blocking section to a dedicated blocking pool, keeping the worker thread free to serve other tasks during the grace period.
+/// Returns KillResult (exit_code=-124) or -1 as the JoinHandle panic fallback.
+/// The synchronous kill_process_group is kept for fe-shell (std::thread has no tokio runtime, cannot await).
+/// reap=false: the timeout path caller holds spawn_blocking(child.wait), avoiding the L-13 double-reap race.
 pub async fn kill_process_group_async(pid: Option<u32>) -> KillResult {
     match tokio::task::spawn_blocking(move || kill_process_group(pid, false, KILL_GRACE_MS)).await {
         Ok(res) => res,
@@ -1399,11 +1417,11 @@ pub async fn kill_process_group_async(pid: Option<u32>) -> KillResult {
     }
 }
 
-/// #1 fe-shell 复用: PTY spawn 事务 — openpty + seatbelt::build_command + cwd + configure_env + spawn
-/// 返回 (pid, master_reader, master_writer, child)。调用方 (fe-shell) 自管 reader 线程 + child.wait
-/// 纯 spawn, 不含 reader/timeout/exit 协调 — 那些 run_streaming 自有, 此处仅事务性 setup
+/// #1 fe-shell reuse: PTY spawn transaction — openpty + seatbelt::build_command + cwd + configure_env + spawn
+/// Returns (pid, master_reader, master_writer, child). The caller (fe-shell) manages its own reader thread + child.wait.
+/// Pure spawn, no reader/timeout/exit coordination — run_streaming owns those; this is only the transactional setup
 pub fn spawn_pty(cfg: &SandboxConfig) -> Result<SpawnedPty> {
-    let pair = open_pty_pair().context("spawn_pty: openpty 失败")?;
+    let pair = open_pty_pair().context("spawn_pty: openpty failed")?;
     let mut cmd = seatbelt::build_command(
         &cfg.command,
         cfg.seatbelt,
@@ -1419,18 +1437,18 @@ pub fn spawn_pty(cfg: &SandboxConfig) -> Result<SpawnedPty> {
     let child = pair
         .slave
         .spawn_command(cmd)
-        .context("spawn_pty: spawn_command 失败")?;
+        .context("spawn_pty: spawn_command failed")?;
     let pid = child.process_id();
     let reader = pair
         .master
         .try_clone_reader()
-        .context("spawn_pty: try_clone_reader 失败")?;
+        .context("spawn_pty: try_clone_reader failed")?;
     let writer = pair
         .master
         .take_writer()
-        .context("spawn_pty: take_writer 失败")?;
+        .context("spawn_pty: take_writer failed")?;
     drop(pair.slave);
-    debug!(?pid, seatbelt = cfg.seatbelt, "spawn_pty 子进程已起");
+    debug!(?pid, seatbelt = cfg.seatbelt, "spawn_pty child started");
     Ok(SpawnedPty {
         pid,
         reader,
@@ -1440,13 +1458,13 @@ pub fn spawn_pty(cfg: &SandboxConfig) -> Result<SpawnedPty> {
     })
 }
 
-/// spawn_pty 产物 — fe-shell 自管生命周期
+/// spawn_pty output — fe-shell manages the lifecycle itself
 pub struct SpawnedPty {
     pub pid: Option<u32>,
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
-    /// master 持有到 reader EOF — drop 前保 PTY 活; fe-shell reader 线程结束时 drop
+    /// master held until reader EOF — keeps the PTY alive before drop; fe-shell drops it when its reader thread ends
     pub master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
@@ -1461,9 +1479,9 @@ mod tests {
             .unwrap()
     }
 
-    // 串行化所有 std::env::set_var/remove_var 测试 — Rust 默认多线程并行跑测试,
-    // 全局 env mutation 并发竞态 (线程A set_var 后线程B spawn 读到不一致状态)。
-    // openpty ENXIO 竞态已由生产级 PTY_OPEN_LOCK (open_pty_pair) 解决, 无需测试侧再串行 PTY。
+    // Serialize all std::env::set_var/remove_var tests — Rust runs tests on multiple threads in parallel by default,
+    // and global env mutation races under concurrency (thread A set_var then thread B spawns and reads inconsistent state).
+    // The openpty ENXIO race is already solved by the production-grade PTY_OPEN_LOCK (open_pty_pair); tests need no extra PTY serialization.
     static ENV_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
@@ -1492,7 +1510,7 @@ mod tests {
         assert!(r.stdout.contains("hello"), "stdout={:?}", r.stdout);
     }
 
-    // Issue #9: env 隔离 — 默认 env_clear + 基线, 宿主密钥不泄漏; env_vars 注入; inherit_env 继承
+    // Issue #9: env isolation — default env_clear + baseline, host secrets do not leak; env_vars injection; inherit_env inherits
     #[test]
     fn run_env_isolation_strips_host_secret_by_default() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
@@ -1503,7 +1521,7 @@ mod tests {
         assert_eq!(r.exit_code, 0, "stderr={:?}", r.stderr);
         assert!(
             !r.stdout.contains("leak-me-please"),
-            "宿主密钥 FE_TEST_SECRET 不应泄漏到默认隔离的子进程: stdout={:?}",
+            "host secret FE_TEST_SECRET must not leak into the default-isolated child: stdout={:?}",
             r.stdout
         );
     }
@@ -1517,25 +1535,25 @@ mod tests {
         assert_eq!(r.exit_code, 0);
         assert!(
             r.stdout.contains("injected"),
-            "env_vars 必须注入: stdout={:?}",
+            "env_vars must be injected: stdout={:?}",
             r.stdout
         );
-        // 基线 PATH/TMPDIR/SHELL 存在
+        // Baseline PATH/TMPDIR/SHELL present
         let base = cfg("python3 -c \"import os;print('PATH' in os.environ, 'TMPDIR' in os.environ, 'SHELL' in os.environ)\"");
         let rb = rt().block_on(Sandbox::new().run(base)).unwrap();
         assert!(
             rb.stdout.contains("True"),
-            "PATH/TMPDIR/SHELL 基线应存在: stdout={:?}",
+            "PATH/TMPDIR/SHELL baseline should be present: stdout={:?}",
             rb.stdout
         );
     }
 
     #[test]
     fn run_env_isolation_uses_hardened_path_allowlist_m_sec_02() {
-        // M-SEC-02: inherit_env=false (默认) → PATH 必为硬化 allowlist, 非宿主 PATH。
-        // 宿主 PATH 含 ~ 下可写条目 (~/.local/bin) 可 shadow 白名单二进制。allowlist 无 ~ 条目。
+        // M-SEC-02: with inherit_env=false (default) the PATH must be the hardened allowlist, not the host PATH.
+        // The host PATH contains writable ~ entries (~/.local/bin) that can shadow whitelisted binaries. The allowlist has no ~ entries.
         let _guard = ENV_TEST_LOCK.lock().unwrap();
-        // 宿主 PATH 塞入恶意哨兵目录 (确认不泄漏)
+        // Stuff a malicious sentinel directory into the host PATH (confirming it does not leak)
         let saved = std::env::var("PATH").ok();
         std::env::set_var(
             "PATH",
@@ -1543,7 +1561,7 @@ mod tests {
         );
         let reflect = "python3 -c \"import os;print(os.environ.get('PATH',''))\"";
         let r = rt().block_on(Sandbox::new().run(cfg(reflect))).unwrap();
-        // 恢复宿主 PATH
+        // Restore the host PATH
         match saved {
             Some(p) => std::env::set_var("PATH", p),
             None => std::env::remove_var("PATH"),
@@ -1552,12 +1570,12 @@ mod tests {
         let child_path = r.stdout.trim();
         assert!(
             !child_path.contains(".local/bin") && !child_path.contains("fe-evil-path"),
-            "M-SEC-02: 宿主 PATH 恶意条目不应泄漏到隔离子进程: PATH={:?}",
+            "M-SEC-02: malicious host PATH entries must not leak into the isolated child: PATH={:?}",
             child_path
         );
         assert_eq!(
             child_path, SANDBOX_HARDENED_PATH,
-            "M-SEC-02: inherit_env=false 应注入硬化 PATH allowlist, 实际={:?}",
+            "M-SEC-02: inherit_env=false must inject the hardened PATH allowlist, got={:?}",
             child_path
         );
     }
@@ -1574,21 +1592,25 @@ mod tests {
         assert_eq!(r.exit_code, 0);
         assert!(
             r.stdout.contains("leak-me-please"),
-            "inherit_env=true 应回退旧行为继承宿主 env: stdout={:?}",
+            "inherit_env=true must fall back to the old behavior of inheriting host env: stdout={:?}",
             r.stdout
         );
     }
 
     #[test]
     fn run_timeout_infinite_loop() {
-        // 无限循环 → 超时 1s → exit -124, 完成 <3s
+        // Infinite loop → 1s timeout → exit -124, done in <3s
         let start = std::time::Instant::now();
         let mut c = cfg("python3 -c \"while True: pass\"");
         c.timeout_sec = 1.0;
         let r = rt().block_on(Sandbox::new().run(c)).unwrap();
-        assert!(r.timed_out, "应超时");
+        assert!(r.timed_out, "should time out");
         assert_eq!(r.exit_code, -124);
-        assert!(start.elapsed().as_secs() < 5, "耗时 {:?}", start.elapsed());
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "elapsed {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -1601,7 +1623,7 @@ mod tests {
 
     #[test]
     fn run_stderr_traceback_in_stdout() {
-        // PTY 合并 — traceback 进 stdout (尾部可读)
+        // PTY merge — traceback lands in stdout (readable in the tail)
         let r = rt().block_on(Sandbox::new().run(cfg("python3 -c \"raise ValueError('boom')\"")));
         let r = r.unwrap();
         assert_ne!(r.exit_code, 0);
@@ -1610,7 +1632,7 @@ mod tests {
 
     #[test]
     fn run_stdio_separates_stdout_stderr() {
-        // Issue #4: use_pty=false stdio 后端 — stdout/stderr 独立捕获
+        // Issue #4: use_pty=false stdio backend — stdout/stderr captured independently
         let mut c = cfg(
             "python3 -c \"import sys; sys.stdout.write('OUT\\n'); sys.stderr.write('ERR\\n')\"",
         );
@@ -1621,26 +1643,29 @@ mod tests {
         assert!(r.stdout.contains("OUT"), "stdout={:?}", r.stdout);
         assert!(
             !r.stdout.contains("ERR"),
-            "stdout 不应被 stderr 污染: {:?}",
+            "stdout must not be polluted by stderr: {:?}",
             r.stdout
         );
         assert!(
             r.stderr.contains("ERR"),
-            "stderr 应独立捕获: {:?}",
+            "stderr should be captured independently: {:?}",
             r.stderr
         );
     }
 
     #[test]
     fn run_stdio_stderr_only_traceback() {
-        // use_pty=false: Python traceback 进 stderr 独立 (非合流 stdout)
+        // use_pty=false: the Python traceback goes to stderr independently (not the merged stdout)
         let mut c = cfg("python3 -c \"raise ValueError('boom-stdio')\"");
         c.use_pty = false;
         let r = rt().block_on(Sandbox::new().run(c));
         let r = r.unwrap();
         assert_ne!(r.exit_code, 0);
         assert!(r.stderr.contains("boom-stdio"), "stderr={:?}", r.stderr);
-        assert!(!r.stdout.contains("boom-stdio"), "stdout 不应含 traceback");
+        assert!(
+            !r.stdout.contains("boom-stdio"),
+            "stdout must not contain the traceback"
+        );
     }
 
     #[test]
@@ -1664,7 +1689,7 @@ mod tests {
         assert!(out.starts_with('A'));
         assert!(out.contains("[truncated"));
         assert!(out.ends_with('A'));
-        // 截断后应明显短于原文
+        // After truncation it should be clearly shorter than the original
         assert!(out.len() < big.len());
     }
 
@@ -1699,7 +1724,7 @@ mod tests {
                 }
             }
             handle.await.unwrap();
-            let done = done.expect("应收到 Done");
+            let done = done.expect("should receive Done");
             assert!(!done.timed_out);
             assert_eq!(done.exit_code, 0);
             assert!(combined.contains("hi"), "chunks={:?}", combined);
@@ -1722,10 +1747,14 @@ mod tests {
                 }
             }
             handle.await.unwrap();
-            let done = done.expect("应收到 Done");
-            assert!(done.timed_out, "应超时");
+            let done = done.expect("should receive Done");
+            assert!(done.timed_out, "should time out");
             assert_eq!(done.exit_code, -124);
-            assert!(start.elapsed().as_secs() < 5, "耗时 {:?}", start.elapsed());
+            assert!(
+                start.elapsed().as_secs() < 5,
+                "elapsed {:?}",
+                start.elapsed()
+            );
         });
     }
 
@@ -1767,19 +1796,19 @@ mod tests {
                 }
             }
             handle.await.unwrap();
-            let done = done.expect("应收到 Done");
-            assert_eq!(done.exit_code, -1, "cancel 路径 exit_code 应 -1");
-            assert!(done.cancelled, "cancelled 应 true (Issue #32)");
-            assert!(!done.timed_out, "非超时");
+            let done = done.expect("should receive Done");
+            assert_eq!(done.exit_code, -1, "cancel path exit_code should be -1");
+            assert!(done.cancelled, "cancelled should be true (Issue #32)");
+            assert!(!done.timed_out, "not a timeout");
             assert!(
                 start.elapsed().as_secs() < 5,
-                "cancel 应快速终止, 耗时 {:?}",
+                "cancel should terminate quickly, elapsed {:?}",
                 start.elapsed()
             );
         });
     }
 
-    // Issue #8 / L-SB-06: timeout=0 绑定 DEFAULT_TIMEOUT_CAP_SEC, 非真正无界。快速命令仍正常完成
+    // Issue #8 / L-SB-06: timeout=0 is bound to DEFAULT_TIMEOUT_CAP_SEC, not truly unbounded. Fast commands still complete normally
     #[test]
     fn run_timeout_zero_bounded_fast_cmd() {
         let mut c = cfg("echo hi");
@@ -1790,76 +1819,80 @@ mod tests {
         assert!(r.stdout.contains("hi"));
     }
 
-    // Issue #8: timeout=0 慢命令超 cap → 触发 -124 (证 bounded, 非无界)
-    // 用 sleep 超过 cap 不现实 (120s 测试太慢); 改设极小 cap 验证语义 — timeout=0 走 cap 分支,
-    // 此处显式设 0.5s 验证慢命令被超时杀 (等价证明 effective_timeout 生效)
+    // Issue #8: timeout=0 with a slow command over the cap → triggers -124 (proves bounded, not unbounded)
+    // Sleeping past the cap is impractical (a 120s test is too slow); instead set a tiny cap to verify the semantics — timeout=0 goes through the cap branch,
+    // here explicitly set to 0.5s to verify the slow command gets timeout-killed (equivalent proof that effective_timeout works)
     #[test]
     fn run_timeout_zero_is_bounded_not_infinite() {
         let mut c = cfg("sleep 5");
         c.timeout_sec = 0.5;
         let r = rt().block_on(Sandbox::new().run(c)).unwrap();
-        assert!(r.timed_out, "timeout=0.5 慢命令应超时");
+        assert!(r.timed_out, "timeout=0.5 slow command should time out");
         assert_eq!(r.exit_code, -124);
     }
 
-    // L-SB-06: 负 timeout 拒绝
+    // L-SB-06: negative timeout rejected
     #[test]
     fn run_negative_timeout_rejected() {
         let mut c = cfg("echo hi");
         c.timeout_sec = -1.0;
         let r = rt().block_on(Sandbox::new().run(c));
-        assert!(r.is_err(), "负 timeout 应报错, got {:?}", r);
+        assert!(r.is_err(), "negative timeout should error, got {:?}", r);
     }
 
-    // L-SB-07 (折中文档行为): 读 stdin 命令 (cat) 无 EOF → 阻塞到 timeout 被 kill_tree 杀
-    // 本沙箱不发 EOF (PTY 回显污染), stdin-reading 命令靠 timeout 兜底
+    // L-SB-07 (documented tradeoff behavior): a stdin-reading command (cat) gets no EOF → blocks until timeout kill_tree
+    // This sandbox sends no EOF (PTY echo pollution); stdin-reading commands rely on the timeout fallback
     #[test]
     fn run_stdin_command_times_out() {
         let start = std::time::Instant::now();
         let mut c = cfg("cat");
         c.timeout_sec = 1.0;
         let r = rt().block_on(Sandbox::new().run(c)).unwrap();
-        assert!(r.timed_out, "cat 无 stdin 应超时");
+        assert!(r.timed_out, "cat without stdin should time out");
         assert_eq!(r.exit_code, -124);
-        assert!(start.elapsed().as_secs() < 5, "耗时 {:?}", start.elapsed());
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "elapsed {:?}",
+            start.elapsed()
+        );
     }
 
-    // L-SB-02: utf8_safe_prefix_len 在多字节边界切断保留余数
+    // L-SB-02: utf8_safe_prefix_len cuts at a multi-byte boundary keeping the remainder
     #[test]
     fn utf8_safe_prefix_splits_multibyte() {
-        let cjk = "中"; // 3 字节 E4 B8 AD
+        let cjk = "中"; // i18n: user-facing — 3-byte UTF-8 fixture E4 B8 AD
         let bytes = cjk.as_bytes();
-        // 完整 3 字节 → 全保留
+        // Complete 3 bytes → all kept
         assert_eq!(utf8_safe_prefix_len(bytes), 3);
-        // 只剩最后 1 字节 (续字节 AD) → 0 (余数留下块)
+        // Only the last byte remains (continuation byte AD) → 0 (remainder goes to the next chunk)
         assert_eq!(utf8_safe_prefix_len(&bytes[2..]), 0);
-        // 剩最后 2 字节 (B8 AD) → 0
+        // Last 2 bytes remain (B8 AD) → 0
         assert_eq!(utf8_safe_prefix_len(&bytes[1..]), 0);
-        // "a中" → 切到 'a' (1 字节)
-        let mixed = "a中".as_bytes();
+        // "a<CJK>" → cut at 'a' (1 byte)
+        let mixed = "a中".as_bytes(); // i18n: user-facing — 3-byte UTF-8 fixture
         assert_eq!(utf8_safe_prefix_len(&mixed[..2]), 1);
-        // 纯 ASCII 全保留
+        // Pure ASCII fully kept
         assert_eq!(utf8_safe_prefix_len(b"abc"), 3);
-        // 空
+        // Empty
         assert_eq!(utf8_safe_prefix_len(b""), 0);
     }
 
-    // L-SB-04: truncate 在 max 刚过 HEAD+TAIL 时回退 tail-only 不超 max
+    // L-SB-04: truncate falls back to tail-only without exceeding max when max is just past HEAD+TAIL
     #[test]
     fn truncate_boundary_marker_overflow_falls_back() {
         let big = "X".repeat(12_300);
-        let max = HEAD_CHARS + TAIL_CHARS + 5; // 12293 — marker 会让输出超 max
+        let max = HEAD_CHARS + TAIL_CHARS + 5; // 12293 — the marker would push the output past max
         let out = truncate_output(&big, max);
         assert!(
             out.chars().count() <= max,
-            "输出 {} 超 max {}",
+            "output {} exceeds max {}",
             out.chars().count(),
             max
         );
         assert!(out.ends_with('X'));
     }
 
-    // C-SB-05: effective_output_cap 钳 HARD_CEILING
+    // C-SB-05: effective_output_cap clamps to HARD_CEILING
     #[test]
     fn effective_output_cap_clamps_ceiling() {
         assert_eq!(effective_output_cap(1000), 1000);
@@ -1867,7 +1900,7 @@ mod tests {
         assert_eq!(effective_output_cap(HARD_CEILING), HARD_CEILING);
     }
 
-    // C-SB-01/04: kill_process_group 无 pid 返回 exit_code -1
+    // C-SB-01/04: kill_process_group with no pid returns exit_code -1
     #[test]
     fn kill_process_group_none_pid_returns_neg1() {
         let res = kill_process_group(None, true, KILL_GRACE_MS);
@@ -1876,43 +1909,46 @@ mod tests {
         assert!(!res.reaped);
     }
 
-    // 审计 2.5: nth_char_byte_offset 多字节边界正确 (取代 Vec<char> 的零物化实现)
+    // Audit 2.5: nth_char_byte_offset is correct at multi-byte boundaries (zero-materialization replacement for Vec<char>)
     #[test]
     fn truncate_byte_offset_multibyte() {
-        // "中" = 3 字节; "中a中" = 7 字节 (3+1+3)
-        let s = "中a中";
-        assert_eq!(nth_char_byte_offset(s, 0), 0); // 首 char 起点 0
-        assert_eq!(nth_char_byte_offset(s, 1), 3); // 'a' 起点 = 字节 3
-        assert_eq!(nth_char_byte_offset(s, 2), 4); // 第二个 '中' 起点 = 字节 4
-        assert_eq!(nth_char_byte_offset(s, 3), 7); // 越界 → len
-        assert_eq!(nth_char_byte_offset(s, 99), 7); // 远超 → len
-        assert_eq!(nth_char_byte_offset("", 1), 0); // 空串
+        // "中" = 3 bytes; "中a中" = 7 bytes (3+1+3)  // i18n: user-facing — 3-byte UTF-8 fixture
+        let s = "中a中"; // i18n: user-facing — 3-byte UTF-8 fixture
+        assert_eq!(nth_char_byte_offset(s, 0), 0); // first char starts at 0
+        assert_eq!(nth_char_byte_offset(s, 1), 3); // 'a' starts at byte 3
+        assert_eq!(nth_char_byte_offset(s, 2), 4); // second CJK char starts at byte 4
+        assert_eq!(nth_char_byte_offset(s, 3), 7); // out of bounds → len
+        assert_eq!(nth_char_byte_offset(s, 99), 7); // far past the end → len
+        assert_eq!(nth_char_byte_offset("", 1), 0); // empty string
     }
 
-    // 审计 2.5: truncate 在多字节输入下保持 head+tail+marker 正确 (旧 Vec<char> 行为等价)
+    // Audit 2.5: truncate keeps head+tail+marker correct on multi-byte input (equivalent to the old Vec<char> behavior)
     #[test]
     fn truncate_multibyte_head_tail_correct() {
-        // 用 3 字节 CJK 拼出超过 HEAD+TAIL 的串, 验证截断后 head/tail 仍是完整 char
-        let head_unit = "你"; // 3 字节
+        // Build a 3-byte CJK string longer than HEAD+TAIL, verify head/tail are still complete chars after truncation
+        let head_unit = "你"; // i18n: user-facing — 3-byte UTF-8 fixture
         let big = head_unit.repeat(HEAD_CHARS + TAIL_CHARS + 100);
         let out = truncate_output(&big, HEAD_CHARS + TAIL_CHARS + 50);
-        // head 应以完整 '你' 结尾 (无半字节); tail 应以完整 '你' 开头
+        // head should end with a complete CJK fixture char (no half bytes); tail should start with one too
         assert!(out.contains("[truncated"));
         assert!(
-            out.starts_with('你'),
-            "head 首字符应完整: {:?}",
+            out.starts_with('你'), // i18n: user-facing — 3-byte UTF-8 fixture
+            "head first char should be complete: {:?}",
             out.chars().next()
         );
         assert!(
-            out.ends_with('你'),
-            "tail 末字符应完整: {:?}",
+            out.ends_with('你'), // i18n: user-facing — 3-byte UTF-8 fixture
+            "tail last char should be complete: {:?}",
             out.chars().last()
         );
-        // 输出不含替换符 (无被切断的多字节序列)
-        assert!(!out.contains('\u{FFFD}'), "不应出现 UTF-8 替换符");
+        // Output contains no replacement char (no cut multi-byte sequences)
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "no UTF-8 replacement char expected"
+        );
     }
 
-    // Blocker 6 (审计 2.1): 消费者断开 outer_rx → 子进程被 kill, 不留孤儿
+    // Blocker 6 (audit 2.1): consumer drops outer_rx → child gets killed, no orphans left
     #[tokio::test]
     async fn streaming_consumer_disconnect_kills_child() {
         let sb = Sandbox::new();
@@ -1936,18 +1972,18 @@ mod tests {
             sandbox_profile: None,
         };
         let (mut rx, handle) = sb.run_streaming(cfg, None).unwrap();
-        // 收首块 (含 "started"), 确认子进程已起
-        let first = rx.recv().await.expect("应收到首块");
+        // Receive the first chunk (contains "started"), confirming the child is up
+        let first = rx.recv().await.expect("should receive the first chunk");
         let first_data = match first {
             StreamEvent::Chunk { data } => data,
-            StreamEvent::Done(_) => panic!("首块应是 Chunk 非 Done"),
+            StreamEvent::Done(_) => panic!("first event should be a Chunk, not Done"),
         };
         assert!(
             first_data.contains("started"),
-            "首块含 started: {:?}",
+            "first chunk contains started: {:?}",
             first_data
         );
-        // 等 pidfile 落盘
+        // Wait for the pidfile to land
         let pid = loop {
             if let Ok(s) = std::fs::read_to_string(&pidfile) {
                 let p: u32 = s.trim().parse().unwrap();
@@ -1955,20 +1991,24 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        // 子进程应存活 (waitpid WNOHANG 探测 — L-13: reap=false 后 kill -0 对僵尸误报存活,
-        // 用 waitpid(WNOHANG) 区分 StillAlive vs Exited/zombie)
+        // The child should be alive (waitpid WNOHANG probe — L-13: after reap=false, kill -0 false-positives on zombies;
+        // waitpid(WNOHANG) distinguishes StillAlive from Exited/zombie)
         let pid_nix = nix::unistd::Pid::from_raw(pid as i32);
         let alive_before = matches!(
             nix::sys::wait::waitpid(pid_nix, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
             Ok(nix::sys::wait::WaitStatus::StillAlive)
         );
-        assert!(alive_before, "drop 前 sleep 子进程应存活, pid={}", pid);
-        // Blocker 6: drop receiver 模拟消费者断开 → 协调任务 send 失败 → kill 子进程
+        assert!(
+            alive_before,
+            "sleep child should be alive before the drop, pid={}",
+            pid
+        );
+        // Blocker 6: drop the receiver to simulate consumer disconnect → coordination task send fails → child killed
         drop(rx);
-        // 等协调任务收尾 (子进程被 kill 后 handle 应结束)
+        // Wait for the coordination task to wrap up (handle should end after the child is killed)
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        // 验证 sleep 进程已死/退出 (waitpid WNOHANG: 非 StillAlive = 已 kill/退出/僵尸已收)。
-        // L-13 reap=false 可能留僵尸; wait_fut 后台回收。给回收宽限, 轮询直到非 StillAlive。
+        // Verify the sleep process is dead/exited (waitpid WNOHANG: not StillAlive = killed/exited/zombie reaped).
+        // L-13 reap=false may leave a zombie; wait_fut reaps in the background. Give it a reap grace, poll until not StillAlive.
         let mut dead = false;
         for _ in 0..20 {
             let s = nix::sys::wait::waitpid(pid_nix, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
@@ -1980,16 +2020,16 @@ mod tests {
         }
         assert!(
             dead,
-            "消费者断开后 sleep 子进程应已被 kill (Blocker 6), pid={}",
+            "sleep child should be killed after consumer disconnect (Blocker 6), pid={}",
             pid
         );
         let _ = std::fs::remove_file(&pidfile);
     }
 
-    // A-12 (0827): seatbelt process-exec denylist 已删 — 二进制隔离由 fe-security allowlist 主导。
-    // rm 不再被 seatbelt process-exec 拦 (denylist 删除); /bin/rm 仍在 fe-security 白名单外
-    // (非 python/node/cargo/...), Stage-2 静态层即拦, 根本到不了 seatbelt 运行层。
-    // 此测试验证 seatbelt 不再拦 rm (A-12 回归守卫): rm 在沙箱内能执行 (无 process-exec deny)。
+    // A-12 (0827): the seatbelt process-exec denylist was removed — binary isolation is led by the fe-security allowlist.
+    // rm is no longer blocked by seatbelt process-exec (denylist deleted); /bin/rm is still outside the fe-security whitelist
+    // (not python/node/cargo/...), so the Stage-2 static layer blocks it and it never reaches the seatbelt runtime layer.
+    // This test verifies seatbelt no longer blocks rm (A-12 regression guard): rm can execute inside the sandbox (no process-exec deny).
     #[test]
     fn seatbelt_a12_drops_process_exec_denylist() {
         let sb = Sandbox::new();
@@ -2003,18 +2043,18 @@ mod tests {
         };
         let r = rt().block_on(sb.run(cfg));
         let r = r.unwrap();
-        // A-12: seatbelt 不再 process-exec deny rm → rm_exit 非 126 (0 或 rm 自身行为)。
-        // 注: 沙箱 run 不经 fe-security 校验 (直传 shell), 故 rm 直达; seatbelt 无 deny → 执行。
+        // A-12: seatbelt no longer process-exec denies rm → rm_exit is not 126 (0 or rm's own behavior).
+        // Note: the sandbox run does not go through fe-security validation (raw shell), so rm reaches the seatbelt; with no deny it executes.
         assert!(
             !r.stdout.contains("rm_exit=126"),
-            "A-12: seatbelt 不应再 process-exec deny rm (denylist 已删), 实际 stdout={}",
+            "A-12: seatbelt should no longer process-exec deny rm (denylist removed), got stdout={}",
             r.stdout
         );
-        info!(stdout = %r.stdout, exit = r.exit_code, "seatbelt A-12 回归: rm 未被 process-exec 拦");
+        info!(stdout = %r.stdout, exit = r.exit_code, "seatbelt A-12 regression: rm not blocked by process-exec");
         let _ = std::fs::remove_file(&tmp);
     }
 
-    // Blocker 1: seatbelt 禁网 — /dev/tcp 外泄被拦
+    // Blocker 1: seatbelt network deny — /dev/tcp exfiltration is blocked
     #[test]
     fn seatbelt_blocks_network() {
         let sb = Sandbox::new();
@@ -2028,12 +2068,12 @@ mod tests {
         let r = r.unwrap();
         assert!(
             r.stdout.contains("Operation not permitted") || !r.stdout.contains("net_done=0"),
-            "网络应被 seatbelt 拦, 实际 stdout={}",
+            "network should be blocked by seatbelt, got stdout={}",
             r.stdout
         );
     }
 
-    // Blocker 1: seatbelt 开启时白名单二进制仍能跑 (allow default 透传)
+    // Blocker 1: with seatbelt on, whitelisted binaries still run (allow default passthrough)
     #[test]
     fn seatbelt_allows_whitelisted_echo() {
         let sb = Sandbox::new();
@@ -2045,15 +2085,19 @@ mod tests {
         };
         let r = rt().block_on(sb.run(cfg));
         let r = r.unwrap();
-        assert_eq!(r.exit_code, 0, "echo 应正常跑, exit={}", r.exit_code);
+        assert_eq!(
+            r.exit_code, 0,
+            "echo should run normally, exit={}",
+            r.exit_code
+        );
         assert!(
             r.stdout.contains("seatbelt_ok"),
-            "echo 输出应透传, stdout={}",
+            "echo output should pass through, stdout={}",
             r.stdout
         );
     }
 
-    // Blocker 1: seatbelt 关闭时无隔离 (回归 — 裸 sh -c 行为不变)
+    // Blocker 1: with seatbelt off there is no isolation (regression — bare sh -c behavior unchanged)
     #[test]
     fn seatbelt_disabled_no_isolation() {
         let sb = Sandbox::new();
@@ -2065,30 +2109,30 @@ mod tests {
         };
         let r = rt().block_on(sb.run(cfg));
         let r = r.unwrap();
-        // 未隔离 → rm 正常 (exit 0), 不应是 126
+        // No isolation → rm runs normally (exit 0), must not be 126
         assert!(
             !r.stdout.contains("rm_exit=126"),
-            "seatbelt 关闭时 rm 不应被拦, stdout={}",
+            "rm should not be blocked with seatbelt off, stdout={}",
             r.stdout
         );
     }
 
-    // Issue #3: RLIMIT_NPROC/CPU 经 ulimit -u/-t 注入 — 子进程可观测生效 rlimit。
-    // Darwin RLIMIT_NPROC 是 per-UID spread-limiter (非 per-tree terminator): cargo 测试
-    // 运行器+系统守护已占大量 UID 进程槽, 低 nproc 直接令 sh 自身 fork python3 EAGAIN,
-    // fork-count 断言非确定。改测可观测 rlimit: setrlimit 跨 fork/exec 继承, python3
-    // resource.getrlimit 读回注入值 — 确定性证明注入端到端生效 (无 fork 依赖)。
+    // Issue #3: RLIMIT_NPROC/CPU injected via ulimit -u/-t — the child can observe the effective rlimit.
+    // Darwin RLIMIT_NPROC is a per-UID spread-limiter (not a per-tree terminator): the cargo test
+    // runner + system daemons already hold many UID process slots, so a low nproc makes sh itself fork python3 with EAGAIN,
+    // and fork-count assertions are non-deterministic. Instead test the observable rlimit: setrlimit is inherited across fork/exec,
+    // python3 resource.getrlimit reads back the injected value — deterministic end-to-end proof of injection (no fork dependency).
     #[test]
     fn nproc_cpu_injection_observable() {
         let sb = Sandbox::new();
-        // 注入经 `ulimit -u/-t`; setrlimit 软上限不能超硬上限 — CI runner 硬上限可能 < 请求值
-        // (如 1333), 内核静默 clamp。探测 soft+hard, 断言 soft ≤ 请求 且 ≤ 硬上限, 不写死 2048。
+        // Injection via `ulimit -u/-t`; the soft setrlimit cap cannot exceed the hard cap — the CI runner hard cap may be lower
+        // than the requested value (e.g. 1333) and the kernel silently clamps. Probe soft+hard, assert soft <= requested and <= hard cap, no hardcoded 2048.
         let cfg = SandboxConfig {
             command: "python3 -c 'import resource; print(\"NPROC\", resource.getrlimit(resource.RLIMIT_NPROC)[0], resource.getrlimit(resource.RLIMIT_NPROC)[1]); print(\"CPU\", resource.getrlimit(resource.RLIMIT_CPU)[0])'".to_string(),
             timeout_sec: 20.0,
-            // nproc=2048: 够 sh+python3 spawn (Darwin RLIMIT_NPROC per-UID, 系统占用高),
-            // 但值经 ulimit -u 注入后 setrlimit 跨 exec 继承, python3 读回确证注入生效。
-            // (低值 64 令 sh 自身 fork python3 EAGAIN — Darwin 平台限制)
+            // nproc=2048: enough for sh+python3 spawn (Darwin RLIMIT_NPROC is per-UID with high system usage),
+            // and the value injected via ulimit -u is inherited across exec via setrlimit, so python3 reading it back confirms the injection works.
+            // (a low value like 64 makes sh itself fork python3 with EAGAIN — Darwin platform limitation)
             max_nproc: 2048,
             max_cpu_sec: 15,
             ..Default::default()
@@ -2097,48 +2141,52 @@ mod tests {
         let r = r.unwrap();
         assert!(
             !r.timed_out,
-            "rlimit 探测不应超时, timed_out=true stdout={}",
+            "rlimit probe should not time out, timed_out=true stdout={}",
             r.stdout
         );
         assert_eq!(
             r.exit_code, 0,
-            "rlimit 探测应 exit 0, exit={} stdout={}",
+            "rlimit probe should exit 0, exit={} stdout={}",
             r.exit_code, r.stdout
         );
         let nproc_line = r
             .stdout
             .lines()
             .find(|ln| ln.starts_with("NPROC"))
-            .unwrap_or_else(|| panic!("stdout 应含 NPROC 行, stdout={}", r.stdout));
+            .unwrap_or_else(|| panic!("stdout should contain an NPROC line, stdout={}", r.stdout));
         let parts: Vec<&str> = nproc_line.split_whitespace().collect();
-        assert_eq!(parts.len(), 3, "NPROC 行应有 soft+hard, 得 {nproc_line}");
-        let nproc_soft: u64 = parts[1].parse().expect("soft NPROC 应为数字");
-        let nproc_hard: u64 = parts[2].parse().expect("hard NPROC 应为数字");
+        assert_eq!(
+            parts.len(),
+            3,
+            "NPROC line should have soft+hard, got {nproc_line}"
+        );
+        let nproc_soft: u64 = parts[1].parse().expect("soft NPROC should be numeric");
+        let nproc_hard: u64 = parts[2].parse().expect("hard NPROC should be numeric");
         assert!(
             nproc_soft <= 2048,
-            "软 NPROC 应 ≤ 请求 2048, 得 {nproc_soft} stdout={}",
+            "soft NPROC should be <= the requested 2048, got {nproc_soft} stdout={}",
             r.stdout
         );
         assert!(
             nproc_soft <= nproc_hard,
-            "软 NPROC 应 ≤ 硬上限, soft={nproc_soft} hard={nproc_hard} stdout={}",
+            "soft NPROC should be <= the hard cap, soft={nproc_soft} hard={nproc_hard} stdout={}",
             r.stdout
         );
         assert!(
             nproc_soft > 0,
-            "注入后 NPROC 应非零, 得 {nproc_soft} stdout={}",
+            "NPROC should be non-zero after injection, got {nproc_soft} stdout={}",
             r.stdout
         );
         assert!(
             r.stdout.contains("CPU 15"),
-            "子进程应观测到注入的 RLIMIT_CPU=15, stdout={}",
+            "child should observe the injected RLIMIT_CPU=15, stdout={}",
             r.stdout
         );
     }
 
-    // RUN-10 (审计 0827): RLIMIT_NOFILE 经 ulimit -n 注入 — 子进程可观测生效 rlimit。
-    // Darwin ulimit -n 实测生效 (errno 24 EMFILE 命中 cap); setrlimit 跨 exec 继承,
-    // python3 resource.getrlimit 读回注入值 — 确定性证明注入端到端生效。
+    // RUN-10 (audit 0827): RLIMIT_NOFILE injected via ulimit -n — the child can observe the effective rlimit.
+    // Darwin ulimit -n verified working (errno 24 EMFILE hits the cap); setrlimit is inherited across exec,
+    // python3 resource.getrlimit reads back the injected value — deterministic end-to-end proof of injection.
     #[test]
     fn nofile_injection_observable() {
         let sb = Sandbox::new();
@@ -2154,57 +2202,61 @@ mod tests {
         let r = r.unwrap();
         assert!(
             !r.timed_out,
-            "NOFILE 探测不应超时, timed_out=true stdout={}",
+            "NOFILE probe should not time out, timed_out=true stdout={}",
             r.stdout
         );
         assert_eq!(
             r.exit_code, 0,
-            "NOFILE 探测应 exit 0, exit={} stdout={}",
+            "NOFILE probe should exit 0, exit={} stdout={}",
             r.exit_code, r.stdout
         );
         let nofile_line = r
             .stdout
             .lines()
             .find(|ln| ln.starts_with("NOFILE"))
-            .unwrap_or_else(|| panic!("stdout 应含 NOFILE 行, stdout={}", r.stdout));
+            .unwrap_or_else(|| panic!("stdout should contain a NOFILE line, stdout={}", r.stdout));
         let parts: Vec<&str> = nofile_line.split_whitespace().collect();
-        assert_eq!(parts.len(), 3, "NOFILE 行应有 soft+hard, 得 {nofile_line}");
-        let nofile_soft: u64 = parts[1].parse().expect("soft NOFILE 应为数字");
-        let nofile_hard: u64 = parts[2].parse().expect("hard NOFILE 应为数字");
+        assert_eq!(
+            parts.len(),
+            3,
+            "NOFILE line should have soft+hard, got {nofile_line}"
+        );
+        let nofile_soft: u64 = parts[1].parse().expect("soft NOFILE should be numeric");
+        let nofile_hard: u64 = parts[2].parse().expect("hard NOFILE should be numeric");
         assert!(
             nofile_soft <= 256,
-            "软 NOFILE 应 ≤ 请求 256, 得 {nofile_soft} stdout={}",
+            "soft NOFILE should be <= the requested 256, got {nofile_soft} stdout={}",
             r.stdout
         );
         assert!(
             nofile_soft <= nofile_hard,
-            "软 NOFILE 应 ≤ 硬上限, soft={nofile_soft} hard={nofile_hard} stdout={}",
+            "soft NOFILE should be <= the hard cap, soft={nofile_soft} hard={nofile_hard} stdout={}",
             r.stdout
         );
         assert!(
             nofile_soft > 0,
-            "注入后 NOFILE 应非零, 得 {nofile_soft} stdout={}",
+            "NOFILE should be non-zero after injection, got {nofile_soft} stdout={}",
             r.stdout
         );
     }
 
-    // RUN-9 (审计 0827): setsid 孙进程逃逸进程组, killpg 杀不到 — ppid-tree 兜底应杀到。
-    // 子进程 sh -c 'setsid sh -c "sleep 30; echo survive"' 脱组; kill_process_group 后
-    // sleep 30 仍活 = 失败。ppid-tree 遍历全进程按 ppid 收集后代逐个杀。
-    // 注: macOS setsid 需 /usr/bin/setsid (或 perl 模拟); 用 perl double-fork+setsid 等价。
+    // RUN-9 (audit 0827): setsid grandchildren escape the process group, out of killpg's reach — the ppid-tree fallback should reach them.
+    // A child `sh -c 'setsid sh -c "sleep 30; echo survive"'` de-groups; if sleep 30 is still alive after kill_process_group, that is a failure.
+    // The ppid-tree walks all processes and collects descendants via ppid, killing each.
+    // Note: macOS setsid needs /usr/bin/setsid (or a perl emulation); a perl double-fork+setsid is equivalent.
     #[test]
     fn kill_process_group_reaches_setsid_orphan() {
-        // 验 collect_descendants 对已知 pid 树返回非空 (sh 的孙 sleep 可见)。
-        // 竞态修正: spawn 后 sh 需时间 fork sleep 孙进程 — 单次立即快照在快机器上常早于 fork,
-        // 得空 → 误红 (本机 --nocapture 慢化时序即过, 裸跑即挂)。轮询至多 1s 等 fork 物化,
-        // 对齐真实使用 (kill 发生在命令运行后而非 spawn 后微秒级)。普通子进程验 ppid-tree 逻辑,
-        // 避 setsid 真脱组 ppid=1 不可追溯。
+        // Verify collect_descendants returns non-empty for a known pid tree (sh's grandchild sleep is visible).
+        // Race fix: after spawn, sh needs time to fork the sleep grandchild — a single immediate snapshot on a fast machine
+        // often precedes the fork, yielding empty → false red (passes with --nocapture slow-down locally, fails bare). Poll for up to
+        // 1s until the fork materializes, aligned with real usage (the kill happens after the command is running, not microseconds after spawn).
+        // A normal child verifies the ppid-tree logic, avoiding a truly de-grouped setsid with ppid=1 that cannot be traced.
         let parent = std::process::id();
         let mut child_cmd = std::process::Command::new("sh");
         child_cmd.arg("-c").arg("sleep 2; echo done");
-        let mut child = child_cmd.spawn().expect("子进程 spawn 失败");
+        let mut child = child_cmd.spawn().expect("child spawn failed");
         let child_pid = child.id();
-        // 轮询 collect_descendants: 等 sh fork 出 sleep 孙进程, 至多 1s (10×100ms)
+        // Poll collect_descendants: wait for sh to fork the sleep grandchild, up to 1s (10x100ms)
         let descendants = {
             let mut got = Vec::new();
             for _ in 0..10 {
@@ -2218,54 +2270,54 @@ mod tests {
         };
         assert!(
             !descendants.is_empty(),
-            "ppid-tree 应收集到 {child_pid} 的后代 (sleep 孙进程), 轮询 1s 仍得空 — fork 未物化或 sysinfo 未刷新"
+            "ppid-tree should collect descendants of {child_pid} (the sleep grandchild); still empty after 1s of polling — fork not materialized or sysinfo not refreshed"
         );
         assert!(
             descendants.iter().all(|d| *d != child_pid),
-            "后代集不应含 root 自身"
+            "the descendant set must not contain root itself"
         );
         assert!(
             !descendants.contains(&parent),
-            "后代集不应回溯到父 (parent={parent})"
+            "the descendant set must not walk back to the parent (parent={parent})"
         );
-        // 清理 — 杀 sh + sleep (kill_process_group 双层)
+        // Cleanup — kill sh + sleep (kill_process_group two layers)
         let _ = kill_process_group(Some(child_pid), true, 0);
         let _ = child.wait();
     }
 
-    // RUN-9: collect_descendants 对不存在 pid 返空 (不 panic)
+    // RUN-9: collect_descendants returns empty for a nonexistent pid (no panic)
     #[test]
     fn collect_descendants_nonexistent_pid_empty() {
-        // pid 2 (kernel_task) 不可能是任意 user pid 的后代 — 取极大值 99999999
+        // pid 2 (kernel_task) can never be a descendant of a user pid — take a large value 99999999
         let descendants = collect_descendants(99999999);
         assert!(
             descendants.is_empty(),
-            "不存在 pid 的后代集应为空, 得 {descendants:?}"
+            "the descendant set of a nonexistent pid should be empty, got {descendants:?}"
         );
     }
 
-    // Issue #3: 默认 max_nproc=1024 不影响正常工具链链式 spawn (cargo/python/node)
+    // Issue #3: the default max_nproc=1024 does not affect normal toolchain chained spawns (cargo/python/node)
     #[test]
     fn default_nproc_allows_normal_chain() {
         let sb = Sandbox::new();
         let cfg = SandboxConfig {
             command: "python3 -c 'print(\"chain-ok\")' && echo done".to_string(),
             timeout_sec: 15.0,
-            // 默认 max_nproc=1024, max_cpu_sec=0 (via ..Default::default())
+            // Default max_nproc=1024, max_cpu_sec=0 (via ..Default::default())
             ..Default::default()
         };
         let r = rt().block_on(sb.run(cfg));
         let r = r.unwrap();
         assert_eq!(
             r.exit_code, 0,
-            "默认 nproc 不应拦正常链, exit={}",
+            "the default nproc must not block a normal chain, exit={}",
             r.exit_code
         );
         assert!(r.stdout.contains("chain-ok"), "stdout={}", r.stdout);
         assert!(r.stdout.contains("done"), "stdout={}", r.stdout);
     }
 
-    // Issue #3: max_nproc=0 显式不限 — fork 满跑不被 nproc 限 (timeout 兜底)
+    // Issue #3: max_nproc=0 explicitly uncapped — a fork-storm is not nproc-limited (timeout fallback)
     #[test]
     fn nproc_zero_no_limit() {
         let sb = Sandbox::new();
@@ -2280,13 +2332,13 @@ mod tests {
         let r = r.unwrap();
         assert_eq!(
             r.exit_code, 0,
-            "nproc=0 正常命令应 exit 0, stdout={}",
+            "with nproc=0 a normal command should exit 0, stdout={}",
             r.stdout
         );
         assert!(r.stdout.contains("no-rlimit-injected"));
     }
 
-    // C-SEC-01: env_vars 危险名 denylist + 64KB 上限
+    // C-SEC-01: env_vars dangerous-name denylist + 64KB cap
     fn env_cfg(cmd: &str, env: &[(&str, &str)]) -> SandboxConfig {
         let mut e = std::collections::HashMap::new();
         for (k, v) in env {
@@ -2304,7 +2356,7 @@ mod tests {
     fn c_sec01_dangerous_env_names_rejected() {
         let cases = [
             "DYLD_INSERT_LIBRARIES",
-            "dyld_library_path", // 大小写不敏感
+            "dyld_library_path", // case-insensitive
             "LD_PRELOAD",
             "LD_LIBRARY_PATH",
             "PYTHONPATH",
@@ -2328,7 +2380,7 @@ mod tests {
             .unwrap_err();
             assert!(
                 err.to_string().contains("C-SEC-01"),
-                "{} 应被 C-SEC-01 拦, 实际: {}",
+                "{} should be blocked by C-SEC-01, got: {}",
                 name,
                 err
             );
@@ -2344,44 +2396,44 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        validate_env_vars(&env).expect("安全 env 名应通过");
+        validate_env_vars(&env).expect("safe env names should pass");
     }
 
     #[test]
     fn c_sec01_env_total_cap_64kb() {
-        // 单条 64KB+1 → 超 cap 拒
+        // A single 64KB+1 entry → over the cap, rejected
         let big = "X".repeat(ENV_VARS_TOTAL_CAP);
         let env: std::collections::HashMap<_, _> =
             [("SAFE_BUT_HUGE".to_string(), big)].into_iter().collect();
         let err = validate_env_vars(&env).unwrap_err();
         assert!(
             err.to_string().contains("C-SEC-01"),
-            "超 cap 应 C-SEC-01 拦: {}",
+            "over the cap should be blocked by C-SEC-01: {}",
             err
         );
     }
 
     #[test]
     fn c_sec01_dylod_injection_blocked_at_run() {
-        // 验收标准 §5.1: "注入 DYLD 被拦" — 真 run() 路径, 非仅单测
+        // Acceptance §5.1: "injected DYLD is blocked" — the real run() path, not just a unit test
         let cfg = env_cfg("echo hi", &[("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib")]);
         let err = rt().block_on(Sandbox::new().run(cfg)).unwrap_err();
         assert!(
             err.to_string().contains("C-SEC-01"),
-            "DYLD 注入应被 run() 拦: {}",
+            "DYLD injection should be blocked by run(): {}",
             err
         );
     }
 
-    // D3-4 (审计 0827 product): per-task RSS watchdog — sysinfo 轮询子进程树 RSS
-    // 超 rss_limit_mb kill (exit_code -124, oom_killed=true)。Darwin RLIMIT_AS/RLIMIT_DATA
-    // 平台无效, 改轮询缓解 (非纯代码修堆限制)。exit_code -124 复用超时约定。
+    // D3-4 (audit 0827 product): per-task RSS watchdog — sysinfo polls the child tree RSS,
+    // kills on breach of rss_limit_mb (exit_code -124, oom_killed=true). Darwin RLIMIT_AS/RLIMIT_DATA
+    // are platform no-ops, so polling is the mitigation (not a pure code fix for the heap limit). exit_code -124 reuses the timeout convention.
     #[test]
     fn rss_watchdog_kills_memory_bomb() {
-        // 内存炸弹: 100 × 10MB 独立 bytearray → RSS 膨胀触发 watchdog。
-        // 阈值 64MB: macOS 内存压缩会把 1GB 虚存压到 ~200MB 物理实存 (ru_maxrss 实测),
-        // 物理 RSS 才是 OOM 真指标 — watchdog 按物理 RSS 裁决正确。64MB 给压缩 3x 余量,
-        // 既能稳定触发, 又保留有意义的 OOM 阈值语义。
+        // Memory bomb: 100 x 10MB independent bytearrays → RSS balloons and triggers the watchdog.
+        // Threshold 64MB: macOS memory compression squeezes 1GB of virtual memory into ~200MB physical (ru_maxrss measured);
+        // physical RSS is the real OOM metric — the watchdog correctly rules on physical RSS. 64MB leaves 3x headroom for compression,
+        // triggering reliably while keeping meaningful OOM threshold semantics.
         let start = std::time::Instant::now();
         let mut c = cfg("python3 -c \"x=[bytearray(b'a'*10**7) for _ in range(100)]; import time; time.sleep(5)\"");
         c.rss_limit_mb = 64;
@@ -2389,42 +2441,49 @@ mod tests {
         let r = rt().block_on(Sandbox::new().run(c)).unwrap();
         assert!(
             r.oom_killed,
-            "内存炸弹应触发 oom_killed, got exit={}",
+            "the memory bomb should trigger oom_killed, got exit={}",
             r.exit_code
         );
-        assert_eq!(r.exit_code, -124, "OOM kill exit 应 -124");
+        assert_eq!(r.exit_code, -124, "OOM kill exit should be -124");
         assert!(
             start.elapsed().as_secs() < 8,
-            "watchdog 应在超时前触发: {:?}",
+            "the watchdog should fire before the timeout: {:?}",
             start.elapsed()
         );
     }
 
     #[test]
     fn rss_watchdog_zero_disables() {
-        // rss_limit_mb=0 禁用 watchdog — 内存炸弹不被 OOM kill (受信 opt-out)
+        // rss_limit_mb=0 disables the watchdog — the memory bomb is not OOM-killed (trusted opt-out)
         let mut c = cfg("python3 -c \"x=[' '*10**7]*10**2; print(len(x))\"");
         c.rss_limit_mb = 0;
         c.timeout_sec = 15.0;
         let r = rt().block_on(Sandbox::new().run(c)).unwrap();
-        assert!(!r.oom_killed, "rss_limit_mb=0 不应触发 oom_killed");
-        assert_eq!(r.exit_code, 0, "正常完成 exit 0, got {}", r.exit_code);
+        assert!(
+            !r.oom_killed,
+            "rss_limit_mb=0 should not trigger oom_killed"
+        );
+        assert_eq!(
+            r.exit_code, 0,
+            "normal completion exits 0, got {}",
+            r.exit_code
+        );
     }
 
     #[test]
     fn rss_watchdog_normal_task_unaffected() {
-        // 常规任务 + 限额 → 不误杀
+        // Normal task + a cap in place → no false kill
         let mut c = cfg("echo hi");
         c.rss_limit_mb = 256;
         let r = rt().block_on(Sandbox::new().run(c)).unwrap();
-        assert_eq!(r.exit_code, 0, "echo 应 exit 0");
-        assert!(!r.oom_killed, "echo 不应触发 oom_killed");
+        assert_eq!(r.exit_code, 0, "echo should exit 0");
+        assert!(!r.oom_killed, "echo should not trigger oom_killed");
         assert!(r.stdout.contains("hi"), "stdout={:?}", r.stdout);
     }
 
     #[tokio::test]
     async fn rss_watchdog_streaming_path() {
-        // 流式路径 watchdog 同样生效 — run_streaming Done 帧 oom_killed=true
+        // The watchdog works on the streaming path too — run_streaming Done frame oom_killed=true
         let sb = Sandbox::new();
         let cfg = SandboxConfig {
             command: "python3 -c \"x=[bytearray(b'a'*10**7) for _ in range(100)]; import time; time.sleep(5)\"".to_string(),
@@ -2451,7 +2510,10 @@ mod tests {
             }
         }
         let _ = handle.await;
-        assert!(done_oom, "流式 Done 帧应 oom_killed=true");
-        assert_eq!(exit_code, -124, "流式 OOM exit 应 -124");
+        assert!(
+            done_oom,
+            "the streaming Done frame should have oom_killed=true"
+        );
+        assert_eq!(exit_code, -124, "the streaming OOM exit should be -124");
     }
 }

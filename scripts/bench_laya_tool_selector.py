@@ -32,7 +32,7 @@ _cache = os.environ.get("HF_HUB_CACHE") or os.path.expanduser("~/.fusion-mlx/mod
 if os.path.isdir(_cache) and not os.environ.get("HF_HUB_CACHE"):
     os.environ["HF_HUB_CACHE"] = _cache
 
-# Issue #60: key/URL 解析单点化 — fusion_core.config, 无 secret 默认值字面量
+# Issue #60: single-point key/URL resolution — fusion_core.config, no secret default-value literals
 from fusion_core.config import client_key, default_mlx_base_url  # noqa: E402
 
 from fusion_executor import DEFAULT_TOOL_WHITELIST, LayaToolSelector  # noqa: E402
@@ -222,10 +222,10 @@ def main() -> int:
     prod_min_conf = 0.7
     laya_result = bench_laya(sel, prod_min_conf)
 
-    # AC8: latency <15ms — 两 backend 均满足 (各自环境):
-    #   - HTTP backend: 服务端 warm 模型, p50~5-7ms (fusion-mlx 须运行)
-    #   - python backend: in-process MLX eval, p50~7ms (fusion-mlx 须停止, 否则
-    #     Metal device 多模型争用膨胀到 ~110-140ms — 非 laya 延迟, 是设备争用)
+    # AC8: latency <15ms — both backends meet it (in their own environments):
+    #   - HTTP backend: server-side warm model, p50 ~5-7ms (fusion-mlx must be running)
+    #   - python backend: in-process MLX eval, p50 ~7ms (fusion-mlx must be stopped, otherwise
+    #     Metal device multi-model contention inflates to ~110-140ms — not laya latency, device contention)
     bk = laya_result["backend"]
     ok_latency = laya_result["p50_latency_ms"] < 15.0
     ok_struct = laya_result["structural_integrity"] >= 0.999
@@ -235,7 +235,9 @@ def main() -> int:
             import httpx
 
             httpx.get("http://localhost:11434/v1/models", timeout=1.0)
-            contention_note = "  ⚠ fusion-mlx 运行中 — Metal 争用膨胀延迟, 停 fusion-mlx 后测真实 AC8"
+            contention_note = (
+                "  WARNING fusion-mlx running — Metal contention inflates latency, stop fusion-mlx to measure true AC8"
+            )
         except httpx.ConnectError:
             pass
     print(

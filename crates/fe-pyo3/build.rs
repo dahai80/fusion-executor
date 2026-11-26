@@ -1,11 +1,11 @@
-// C-OPS-06: 构建期注入 git_sha + build_time 到编译环境变量
-// 供 fe-pyo3 运行时经 env! 读取, 再经 PyO3 暴露给 Python __version__ + IPC health
-// git_sha: `git rev-parse --short=8 HEAD` (无 git 或失败 → "unknown", 不阻断构建)
-// build_time: 编译机当前 UTC 时间 (RFC3339), 注入因 Date::now 在 workflow 不可用 — 此处构建脚本正常
+// C-OPS-06: injects git_sha + build_time into compile-time env vars at build time
+// fe-pyo3 reads them at runtime via env!, then exposes them to Python __version__ + IPC health
+// git_sha: `git rev-parse --short=8 HEAD` (no git or failure → "unknown", never blocks the build)
+// build_time: the build machine's current UTC time (RFC3339), injected because Date::now is unavailable in workflows — fine here in the build script
 use std::process::Command;
 
 fn main() {
-    // 重跑若 HEAD 变 (git_sha 变)
+    // Rerun when HEAD changes (git_sha changes)
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../Cargo.toml");
 

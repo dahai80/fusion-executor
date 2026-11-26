@@ -30,50 +30,52 @@ from .models import (
 
 logger = logging.getLogger("fusion_executor")
 
-DEFAULT_SOCK = os.path.expanduser("~/.fusion-executor/fe.sock")  # IMPL-1: 对齐 Rust M-SEC-01 (HOME 私有 0o700)
-# D6-01: pidfile — serve 启动写 pid, 停机删。ops 可 `kill $(cat fe.pid)` / 监控存活。
-# 与 socket 同目录 (~/.fusion-executor/, HOME 私有 0o700), 不暴露 pid 给其他用户。
+DEFAULT_SOCK = os.path.expanduser(
+    "~/.fusion-executor/fe.sock"
+)  # IMPL-1: aligns with Rust M-SEC-01 (HOME-private 0o700)
+# D6-01: pidfile — written on serve startup, removed on shutdown. Ops can `kill $(cat fe.pid)` / monitor liveness.
+# Lives in the same directory as the socket (~/.fusion-executor/, HOME-private 0o700); never exposes the pid to other users.
 DEFAULT_PIDFILE = os.path.expanduser("~/.fusion-executor/fe.pid")
 SUB_CHANNELS = ("telemetry", "stdio", "screenshot")
-# P-2: subscription 行缓冲上限 — 损坏流 (无 newline) / 超巨帧防护, 超则丢缓冲当流结束
+# P-2: subscription line-buffer cap — guards against corrupted streams (no newline) / oversized frames; on overflow drop the buffer and treat as end-of-stream
 _SUB_BUF_MAX_BYTES = 8 * 1024 * 1024
 
 
 def ensure_socket_dir(path: str = DEFAULT_SOCK) -> None:
-    # IMPL-1: 对齐 Rust M-SEC-01 — 默认 socket 置 ~/.fusion-executor/ (HOME 私有, 0o700)。
-    # serve 前确保目录存在 (Rust 侧亦 mkdir, 此处前置防 bind 前路径缺失; 自定义路径父目录已存在则 no-op)。
-    # makedirs mode 仅创建时生效; 既存目录 (如旧 0o755 残留) 须显式 chmod 收紧, 否则破坏鉴权前提。
+    # IMPL-1: aligns with Rust M-SEC-01 — default socket lives in ~/.fusion-executor/ (HOME-private, 0o700).
+    # Ensure the directory exists before serve (the Rust side also mkdirs; doing it here first prevents a missing path before bind; no-op when the parent of a custom path already exists).
+    # makedirs mode only applies at creation; an existing directory (e.g. leftover 0o755) must be explicitly chmod'ed to tighten it, otherwise the auth premise is broken.
     sock_dir = os.path.dirname(path) or os.path.expanduser("~/.fusion-executor")
     try:
         os.makedirs(sock_dir, mode=0o700, exist_ok=True)
         if os.path.isdir(sock_dir):
             os.chmod(sock_dir, 0o700)
     except OSError as e:
-        logger.warning("ensure_socket_dir 创建 %s 失败: %s", sock_dir, e)
+        logger.warning("ensure_socket_dir failed to create %s: %s", sock_dir, e)
 
 
 def write_pidfile(path: str = DEFAULT_PIDFILE) -> None:
-    # D6-01: serve 启动写 pidfile。目录由 ensure_socket_dir (socket 同目录) 先建。
-    # 失败不阻断 serve (pidfile 是 ops 辅助, 非安全关键) — fail-visible 警告, 继续服务。
+    # D6-01: write the pidfile on serve startup. The directory is created first by ensure_socket_dir (same dir as the socket).
+    # Failure does not block serve (the pidfile is an ops aid, not security-critical) — fail-visible warning, keep serving.
     try:
         pid_dir = os.path.dirname(path)
         if pid_dir:
             os.makedirs(pid_dir, mode=0o700, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
-        logger.info("pidfile 写入 %s (pid=%d)", path, os.getpid())
+        logger.info("pidfile written to %s (pid=%d)", path, os.getpid())
     except OSError as e:
-        logger.warning("pidfile 写入 %s 失败: %s — ops 监控将不可用, serve 继续", path, e)
+        logger.warning("pidfile write to %s failed: %s — ops monitoring will be unavailable, serve continues", path, e)
 
 
 def remove_pidfile(path: str = DEFAULT_PIDFILE) -> None:
-    # D6-01: serve 停机删 pidfile。不存在 (写失败或已被删) 静默 no-op; 删失败警告不抛。
+    # D6-01: remove the pidfile on serve shutdown. Silently no-op when absent (write failed or already removed); warn without raising on delete failure.
     try:
         if os.path.exists(path):
             os.unlink(path)
-            logger.info("pidfile 清理 %s", path)
+            logger.info("pidfile removed %s", path)
     except OSError as e:
-        logger.warning("pidfile 清理 %s 失败: %s", path, e)
+        logger.warning("pidfile removal of %s failed: %s", path, e)
 
 
 class FusionSandboxExecutor:
@@ -91,18 +93,20 @@ class FusionSandboxExecutor:
         try:
             from ._native import NativeExecutor
         except ImportError as e:
-            raise ImportError("fusion_executor._native 未加载 — 运行 `maturin develop` 编译原生扩展") from e
-        # RUN-12: disable_bundle_allowlist=True 关闭 GUI 焦点 app 白名单 (无限制 opt-in, 仅审计日志);
-        #         默认 False 走安全默认集 (Terminal/TextEdit/finder)。测试机 drive 任意 app 时传 True。
-        # D3-1 (审计 0827 product): allow_inline_interpreter=True 开启内联解释器 (python -c / node -e
-        #   / ruby -e / perl -e); 默认 False (企业硬化拒内联代码, 防 agent-driven 任意 payload 绕白名单语义)。
-        #   测试机/本地交互场景依赖 python3 -c, 显式传 True opt-in。
-        # D3-6 (审计 0827 product 4-layer): trusted_bin_dirs 登记项目工具所在目录 — extra_whitelist 的工具
-        #   须 resolve 到可信目录才放行 (fail-closed 防 /tmp/python3 投毒)。测试/调用方登记项目 bin 目录。
-        # Issue #23 (Phase 3): guard 授权编排默认 OFF — 显式传 guard_sock 或设 FUSION_GUARD_SOCK 开启,
-        #   执行前向 fusion-guard daemon 询问每条命令裁决 (allow/preview/redact/block + 风险等级 L1-L4)。
-        #   guard 宕机降级 fail-closed (缓存 regex 规则 + 静态白名单栅栏, 永不 fail-open)。
-        #   guard_tenant / FUSION_EXECUTOR_TENANT 须匹配 guard 配置中本机身份绑定的 tenant, 否则鉴权失败。
+            raise ImportError(
+                "fusion_executor._native not loaded — run `maturin develop` to build the native extension"
+            ) from e
+        # RUN-12: disable_bundle_allowlist=True disables the GUI foreground-app allowlist (unrestricted opt-in, audit-logged only);
+        #         the default False uses the secure default set (Terminal/TextEdit/finder). Pass True when driving arbitrary apps on test machines.
+        # D3-1 (audit 0827 product): allow_inline_interpreter=True enables inline interpreters (python -c / node -e
+        #   / ruby -e / perl -e); default False (enterprise hardening rejects inline code, preventing agent-driven arbitrary payloads from bypassing allowlist semantics).
+        #   Test machines / local interactive scenarios that rely on python3 -c must pass True explicitly to opt in.
+        # D3-6 (audit 0827 product 4-layer): trusted_bin_dirs registers directories holding project tools — tools in extra_whitelist
+        #   must resolve into a trusted directory to be allowed (fail-closed against /tmp/python3 poisoning). Tests/callers register their project bin dirs.
+        # Issue #23 (Phase 3): guard authorization orchestration is OFF by default — pass guard_sock explicitly or set FUSION_GUARD_SOCK to enable,
+        #   each command's verdict (allow/preview/redact/block + risk level L1-L4) is queried from the fusion-guard daemon before execution.
+        #   Guard-outage degradation is fail-closed (cached regex rules + static allowlist fence, never fail-open).
+        #   guard_tenant / FUSION_EXECUTOR_TENANT must match the tenant bound to this host identity in the guard config, otherwise auth fails.
         guard_sock = guard_sock if guard_sock is not None else os.environ.get("FUSION_GUARD_SOCK")
         guard_tenant = guard_tenant if guard_tenant is not None else os.environ.get("FUSION_EXECUTOR_TENANT")
         self._native = NativeExecutor(
@@ -125,8 +129,9 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = False,
         auto_rollback: RollbackPolicy | None = None,
-        # ARCH-1: 默认 True — 对齐 fe-core serde default_true (商用安全默认)。
-        # 受信本地 opt-out 显式传 seatbelt=False。原默认 False 与 UDS execute 路径 (serde 默认 true) 不一致。
+        # ARCH-1: default True — aligns with fe-core serde default_true (commercial security default).
+        # Trusted local callers can opt out by passing seatbelt=False explicitly. The old default False was inconsistent
+        # with the UDS execute path (serde default true).
         seatbelt: bool = True,
         inherit_env: bool = False,
         use_pty: bool = True,
@@ -137,27 +142,29 @@ class FusionSandboxExecutor:
         trace_id: str | None = None,
         sandbox: SandboxProfile | None = None,
     ) -> ExecutionResult:
-        # M-PY-01: 顶前置校验, 早 fail 友好错误 (非延迟到 PyO3 内部 panic/TypeError)
+        # M-PY-01: top-level upfront validation, fail early with friendly errors (instead of deferring to PyO3 panic/TypeError)
         if not isinstance(command, str):
-            raise TypeError(f"command 必须为 str, 得 {type(command).__name__}")
+            raise TypeError(f"command must be str, got {type(command).__name__}")
         if timeout_sec is not None and timeout_sec <= 0:
-            raise ValueError(f"timeout_sec 必须为正数, 得 {timeout_sec}")
+            raise ValueError(f"timeout_sec must be positive, got {timeout_sec}")
         if cwd is not None and not isinstance(cwd, str):
-            raise TypeError(f"cwd 必须为 str|None, 得 {type(cwd).__name__}")
+            raise TypeError(f"cwd must be str|None, got {type(cwd).__name__}")
         if env_vars is not None:
             if not isinstance(env_vars, dict):
-                raise TypeError(f"env_vars 必须为 dict|None, 得 {type(env_vars).__name__}")
+                raise TypeError(f"env_vars must be dict|None, got {type(env_vars).__name__}")
             for k, v in env_vars.items():
                 if not isinstance(k, str) or not isinstance(v, str):
-                    raise TypeError(f"env_vars 键值均须 str, 得 ({type(k).__name__},{type(v).__name__})")
+                    raise TypeError(
+                        f"env_vars keys and values must both be str, got ({type(k).__name__},{type(v).__name__})"
+                    )
         if not isinstance(max_nproc, int) or max_nproc < 0:
-            raise ValueError(f"max_nproc 必须为非负 int, 得 {max_nproc!r}")
+            raise ValueError(f"max_nproc must be a non-negative int, got {max_nproc!r}")
         if not isinstance(max_cpu_sec, int) or max_cpu_sec < 0:
-            raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
+            raise ValueError(f"max_cpu_sec must be a non-negative int, got {max_cpu_sec!r}")
         if not isinstance(max_nofile, int) or max_nofile < 0:
-            raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
+            raise ValueError(f"max_nofile must be a non-negative int, got {max_nofile!r}")
         if not isinstance(rss_limit_mb, int) or rss_limit_mb < 0:
-            raise ValueError(f"rss_limit_mb 必须为非负 int, 得 {rss_limit_mb!r}")
+            raise ValueError(f"rss_limit_mb must be a non-negative int, got {rss_limit_mb!r}")
         logger.debug(
             "run command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s rss_limit_mb=%s",
             command,
@@ -236,9 +243,9 @@ class FusionSandboxExecutor:
         return result
 
     async def run_async(self, command: str, **kw) -> ExecutionResult:
-        # C-PYO3-01: 旧版 return self.run(...) — 假异步, 同步阻塞事件循环 (run 内
-        # BLOCKING_RT.block_on 持 GIL, asyncio 事件循环卡死)。改 asyncio.to_thread
-        # 把同步 run 扔线程池, 事件循环可并发跑其他协程。
+        # C-PYO3-01: older version did `return self.run(...)` — fake async, synchronous blocking of the event loop
+        # (BLOCKING_RT.block_on inside run holds the GIL, stalling the asyncio loop). Now asyncio.to_thread
+        # pushes the synchronous run onto a thread pool so the event loop can run other coroutines concurrently.
         return await asyncio.to_thread(self.run, command, **kw)
 
     def run_streaming(
@@ -251,7 +258,7 @@ class FusionSandboxExecutor:
         env_vars: dict[str, str] | None = None,
         enable_rollback_snapshot: bool = False,
         auto_rollback: RollbackPolicy | None = None,
-        # ARCH-1: 默认 True — 对齐 fe-core serde default_true + run() (见上注释)。
+        # ARCH-1: default True — aligns with fe-core serde default_true + run() (see comment above).
         seatbelt: bool = True,
         inherit_env: bool = False,
         use_pty: bool = True,
@@ -262,23 +269,25 @@ class FusionSandboxExecutor:
         trace_id: str | None = None,
         sandbox: SandboxProfile | None = None,
     ) -> Iterator[str | ExecutionResult]:
-        # M-PY-01: 同 run() 前置校验
+        # M-PY-01: same upfront validation as run()
         if not isinstance(command, str):
-            raise TypeError(f"command 必须为 str, 得 {type(command).__name__}")
+            raise TypeError(f"command must be str, got {type(command).__name__}")
         if timeout_sec is not None and timeout_sec <= 0:
-            raise ValueError(f"timeout_sec 必须为正数, 得 {timeout_sec}")
+            raise ValueError(f"timeout_sec must be positive, got {timeout_sec}")
         if not isinstance(max_nproc, int) or max_nproc < 0:
-            raise ValueError(f"max_nproc 必须为非负 int, 得 {max_nproc!r}")
+            raise ValueError(f"max_nproc must be a non-negative int, got {max_nproc!r}")
         if not isinstance(max_cpu_sec, int) or max_cpu_sec < 0:
-            raise ValueError(f"max_cpu_sec 必须为非负 int, 得 {max_cpu_sec!r}")
+            raise ValueError(f"max_cpu_sec must be a non-negative int, got {max_cpu_sec!r}")
         if not isinstance(max_nofile, int) or max_nofile < 0:
-            raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
+            raise ValueError(f"max_nofile must be a non-negative int, got {max_nofile!r}")
         if not isinstance(rss_limit_mb, int) or rss_limit_mb < 0:
-            raise ValueError(f"rss_limit_mb 必须为非负 int, 得 {rss_limit_mb!r}")
-        # 流式后端仅 PTY: use_pty=False 暂无 stdio 流式实现 (run_streaming 走 portable-pty,
-        # 保 ANSI/Traceback 保真 — 流式主要目的)。需独立 stderr 分流用 run(use_pty=False)。
+            raise ValueError(f"rss_limit_mb must be a non-negative int, got {rss_limit_mb!r}")
+        # Streaming backend is PTY-only: use_pty=False has no stdio streaming implementation yet (run_streaming goes
+        # through portable-pty to keep ANSI/Traceback fidelity — the main point of streaming). For separate stderr use run(use_pty=False).
         if not use_pty:
-            raise ValueError("run_streaming 暂不支持 use_pty=False (无 stdio 流式后端; 用 run() 分流)")
+            raise ValueError(
+                "run_streaming does not support use_pty=False yet (no stdio streaming backend; use run() for split streams)"
+            )
         logger.debug(
             "run_streaming command=%r timeout_sec=%s cwd=%s task_id=%s inherit_env=%s use_pty=%s max_nproc=%s max_cpu_sec=%s max_nofile=%s rss_limit_mb=%s",
             command,
@@ -313,14 +322,14 @@ class FusionSandboxExecutor:
             sandbox_dict,
         )
         for frame in it:
-            # L-PY-02: 严格键 (旧 .get(default) 吞 serde bug, 缺字段静默成功看像 blocked)
+            # L-PY-02: strict keys (old .get(default) swallowed serde bugs; a missing field silently looked like "blocked")
             ftype = frame["type"]
             if ftype == "chunk":
                 data = frame.get("data", "")
                 logger.debug("stream chunk len=%s", len(data))
                 yield data
             elif ftype == "done":
-                # serde tag="type" → Done(ExecutionResult) 扁平为 {"type":"done", exit_code:..., ...}
+                # serde tag="type" → Done(ExecutionResult) flattens into {"type":"done", exit_code:..., ...}
                 result = self._native_result(frame)
                 logger.info(
                     "stream done exit=%s blocked=%s timed_out=%s diag=%s",
@@ -332,13 +341,13 @@ class FusionSandboxExecutor:
                 yield result
                 return
             else:
-                # M-6: 未知帧 type (协议演进新帧/损坏帧) — 不抛保向前兼容, 但 debug 记录可追溯
-                logger.debug("未知流帧 type=%r, 跳过 (向前兼容)", ftype)
+                # M-6: unknown frame type (new frame from protocol evolution / corrupted frame) — don't raise, stay forward-compatible, but log at debug for traceability
+                logger.debug("unknown stream frame type=%r, skipping (forward-compatible)", ftype)
 
     def _native_result(self, payload: dict) -> ExecutionResult:
-        # L-PY-02: 严格校验 (旧 .get(default) 吞缺失字段, Rust 改字段名/serde bug 时
-        # 静默返 exit_code=-1 成功命令看像 blocked/内部错误)。model_validate 抛
-        # ValidationError fail-loud; diagnostics 可选, 单独 build。
+        # L-PY-02: strict validation (old .get(default) swallowed missing fields; when Rust renamed a field / serde bug,
+        # a successful command silently returned exit_code=-1 looking like blocked/internal error). model_validate raises
+        # ValidationError fail-loud; diagnostics is optional and built separately.
         diag = None
         nd = payload.get("diagnostics")
         if nd is not None:
@@ -349,15 +358,15 @@ class FusionSandboxExecutor:
                 code_snippet=nd.get("code_snippet"),
                 raw_trace=nd.get("raw_trace"),
             )
-        # type=done 帧: serde flatten Done 进外层, 含 type/exit_code/... 一次 model_validate
-        # 去掉 type 字段后校验 (type 是流标记非 ExecutionResult 字段)
+        # type=done frame: serde flattens Done into the outer layer with type/exit_code/..., validated in one model_validate
+        # drop the type field before validating (type is a stream marker, not an ExecutionResult field)
         fields = {k: v for k, v in payload.items() if k != "type"}
         fields["diagnostics"] = diag
         return ExecutionResult.model_validate(fields)
 
     def rollback(self, snapshot_id: str, cwd: str | None = None) -> bool:
         if cwd is None:
-            raise ValueError("rollback 需要 cwd")
+            raise ValueError("rollback requires cwd")
         logger.info("rollback snapshot=%s cwd=%s", snapshot_id, cwd)
         return self._native.rollback(snapshot_id, cwd)
 
@@ -366,8 +375,8 @@ class FusionSandboxExecutor:
         return self._native.snapshot_create(cwd)
 
     def list_snapshots(self, cwd: str) -> list[SnapshotInfo]:
-        # D6-03 (审计 0827 product): 快照清单 — on-disk 索引读回, 供运维审计/存活快照发现。
-        # 无状态 (M-ARCH-1): 仅读 cwd 对应索引, executor 不持有快照状态。
+        # D6-03 (audit 0827 product): snapshot listing — read back from the on-disk index, for ops audit / live snapshot discovery.
+        # Stateless (M-ARCH-1): only reads the index for the given cwd; the executor holds no snapshot state.
         logger.info("list_snapshots cwd=%s", cwd)
         native_list = self._native.list_snapshots(cwd)
         out = [SnapshotInfo.model_validate(s.to_dict()) for s in native_list]
@@ -375,11 +384,11 @@ class FusionSandboxExecutor:
         return out
 
     def validate(self, command: str) -> dict:
-        # Issue #11 / #12.4: 非执行预校验 — 调用方先问用户授权再 run (Option A: caller owns gating)。
-        # Executor 只强制硬黑名单 (never-blocked); interactive confirmation 归 caller。
-        # 返回 {allowed: bool, blocked: bool, reason: str|None, stage: "regex"|"tokenizer"|None}
+        # Issue #11 / #12.4: pre-execution validation without executing — the caller asks the user for authorization before run
+        # (Option A: caller owns gating). The executor only enforces the hard blocklist (never-blocked); interactive confirmation belongs to the caller.
+        # Returns {allowed: bool, blocked: bool, reason: str|None, stage: "regex"|"tokenizer"|None}
         if not isinstance(command, str) or not command.strip():
-            raise ValueError(f"command 必须非空字符串, 得 {command!r}")
+            raise ValueError(f"command must be a non-empty string, got {command!r}")
         result = self._native.validate(command)
         logger.info("validate command=%r allowed=%s blocked=%s", command, result.get("allowed"), result.get("blocked"))
         return result
@@ -440,13 +449,13 @@ class FusionSandboxExecutor:
         sandbox: SandboxProfile | None = None,
     ) -> ShellStartResult:
         if not isinstance(max_idle_sec, int) or max_idle_sec < 0:
-            raise ValueError(f"max_idle_sec 必须为非负 int, 得 {max_idle_sec!r}")
+            raise ValueError(f"max_idle_sec must be a non-negative int, got {max_idle_sec!r}")
         if not isinstance(kill_grace_ms, int) or kill_grace_ms < 0:
-            raise ValueError(f"kill_grace_ms 必须为非负 int, 得 {kill_grace_ms!r}")
+            raise ValueError(f"kill_grace_ms must be a non-negative int, got {kill_grace_ms!r}")
         if not isinstance(max_nofile, int) or max_nofile < 0:
-            raise ValueError(f"max_nofile 必须为非负 int, 得 {max_nofile!r}")
+            raise ValueError(f"max_nofile must be a non-negative int, got {max_nofile!r}")
         if sandbox is not None and not isinstance(sandbox, SandboxProfile):
-            raise TypeError(f"sandbox 必须为 SandboxProfile | None, 得 {type(sandbox).__name__}")
+            raise TypeError(f"sandbox must be SandboxProfile | None, got {type(sandbox).__name__}")
         sandbox_payload = sandbox.model_dump() if sandbox is not None else None
         logger.debug(
             "shell_start command=%r cwd=%s task_id=%s seatbelt=%s inherit_env=%s max_idle_sec=%s kill_grace_ms=%s max_nofile=%s sandbox=%s",
@@ -640,16 +649,16 @@ class FusionSandboxExecutor:
         return result
 
     def gui_action(self, action: dict) -> GuiResult:
-        # M-PY-02: 预校验 dict + kind 字段 (旧版接受 None/"string"/{} 全经 Rust 序列化
-        # 往返返中文错误串无结构化字段)。仅拒绝类型错 + 缺 kind; 未知 kind 放行让
-        # Rust 降级 (ok=false, 保留 test_gui_action_bad_kind_degrades 契约)。
+        # M-PY-02: pre-validate the dict + kind field (the old version accepted None/"string"/{} and let them all go
+        # through the Rust round-trip, returning an error string with no structured fields). Only rejects wrong types + missing kind;
+        # unknown kinds pass through so Rust can degrade (ok=false, preserving the test_gui_action_bad_kind_degrades contract).
         if not isinstance(action, dict):
-            raise TypeError(f"action 必须为 dict, 得 {type(action).__name__}")
+            raise TypeError(f"action must be dict, got {type(action).__name__}")
         if "kind" not in action:
-            raise ValueError("action 缺 'kind' 字段")
+            raise ValueError("action is missing the 'kind' field")
         kind = action["kind"]
         if not isinstance(kind, str):
-            raise TypeError(f"action['kind'] 必须为 str, 得 {type(kind).__name__}")
+            raise TypeError(f"action['kind'] must be str, got {type(kind).__name__}")
         logger.debug("gui_action kind=%s action=%s", kind, action)
         native = self._native.gui_action(action)
         result = GuiResult(
@@ -672,18 +681,18 @@ class FusionSandboxExecutor:
         return result
 
     def gui_action_batch(self, actions: list[dict]) -> list[GuiResult]:
-        # #39: 批量原子动作管线 — 顺序执行多动作, 收集每步 GuiResult。
-        # 非事务: 单步失败不中止后续 (调用方据每步 ok 自决重试/补偿)。
+        # #39: batched atomic action pipeline — executes multiple actions in order, collecting a GuiResult per step.
+        # Not transactional: a step failure does not abort later steps (the caller decides retry/compensation based on each step's ok).
         if not isinstance(actions, list):
-            raise TypeError(f"actions 必须为 list, 得 {type(actions).__name__}")
+            raise TypeError(f"actions must be list, got {type(actions).__name__}")
         for i, a in enumerate(actions):
             if not isinstance(a, dict):
-                raise TypeError(f"actions[{i}] 必须为 dict, 得 {type(a).__name__}")
+                raise TypeError(f"actions[{i}] must be dict, got {type(a).__name__}")
             if "kind" not in a:
-                raise ValueError(f"actions[{i}] 缺 'kind' 字段")
+                raise ValueError(f"actions[{i}] is missing the 'kind' field")
             kind = a["kind"]
             if not isinstance(kind, str):
-                raise TypeError(f"actions[{i}]['kind'] 必须为 str, 得 {type(kind).__name__}")
+                raise TypeError(f"actions[{i}]['kind'] must be str, got {type(kind).__name__}")
         logger.debug("gui_action_batch count=%d", len(actions))
         natives = self._native.gui_action_batch(actions)
         results = [
@@ -721,9 +730,9 @@ class FusionSandboxExecutor:
         )
         it = self._native.telemetry_stream(interval_ms, max_samples, pid)
         for count, frame in enumerate(it, start=1):
-            # 3.11: 严格 model_validate (旧 frame.get("ts_ms", 0) 默认 0 — Rust 改字段名/
-            # serde bug 时静默吞缺失字段, ts_ms=0/cpu=0 假数据进融合)。Blocker 11 _STRICT
-            # extra=forbid; 缺必填 ts_ms/cpu_pct/mem_mb → ValidationError fail-loud。
+            # 3.11: strict model_validate (old frame.get("ts_ms", 0) defaulted to 0 — when Rust renamed a field /
+            # serde bug, missing fields were silently swallowed and fake ts_ms=0/cpu=0 data entered the pipeline).
+            # Blocker 11 _STRICT extra=forbid; missing required ts_ms/cpu_pct/mem_mb → ValidationError fail-loud.
             sample = TelemetrySample.model_validate(frame)
             logger.debug("telemetry sample #%s cpu=%.1f%% mem=%.1fMB", count, sample.cpu_pct, sample.mem_mb)
             yield sample
@@ -746,28 +755,29 @@ class FusionSandboxExecutor:
             scope,
             idle_timeout,
         )
-        # M-PY-03: 空通道列表显式拒 (旧版 bad 检查空列表无 bad 项 → 过 → 开订阅无通道
-        # 兴趣 → 永不收推送 → __next__ 阻塞 15s 后 TimeoutError 非 StopIteration)
+        # M-PY-03: reject an empty channel list explicitly (the old bad check found no bad items for an empty list → passed →
+        # opened a subscription with no channel interest → never received pushes → __next__ blocked 15s then TimeoutError instead of StopIteration)
         if not channels:
-            raise ValueError("channels 不能为空")
+            raise ValueError("channels must not be empty")
         bad = [c for c in channels if c not in SUB_CHANNELS]
         if bad:
-            raise ValueError(f"未知通道: {bad}, 可选 {list(SUB_CHANNELS)}")
-        # scope 仅对 stdio 通道生效 (Blocker 10, 破审计 §2.9 跨租户泄漏):
-        #   "all" → 全广播; ["id1",..] → task_id 白名单; "own_conn" (默认) → 仅本连接命令
+            raise ValueError(f"unknown channels: {bad}, options {list(SUB_CHANNELS)}")
+        # scope only applies to the stdio channel (Blocker 10, closes the audit §2.9 cross-tenant leak):
+        #   "all" → full broadcast; ["id1",..] → task_id allowlist; "own_conn" (default) → only this connection's commands
         if scope not in ("all", "own_conn") and not isinstance(scope, list):
-            raise ValueError("scope 须为 'all' | 'own_conn' | task_id 列表")
-        # 3.13: idle_timeout None = 无超时 (长流消费者); 数值 = recv 超时秒数 (旧版硬编 15s,
-        # 慢推送 >15s → 误 StopIteration)。订阅握手必用有限超时, 之后再切 idle_timeout。
+            raise ValueError("scope must be 'all' | 'own_conn' | a list of task_ids")
+        # 3.13: idle_timeout None = no timeout (long-stream consumers); a number = recv timeout in seconds (old
+        # hardcoded 15s meant slow pushes >15s → spurious StopIteration). The subscription handshake must use a finite
+        # timeout; after that switch to idle_timeout.
         path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
         sub = Subscription(path, channels, interval_ms, screenshot_interval_ms, scope, idle_timeout)
         sub._open()
         return sub
 
     def metrics(self, sock_path: str | None = None) -> dict:
-        # C-OPS-05: 运维指标 — 经 UDS 调 executor.metrics 读服务器运行态计数
-        # (exec_total/blocked/timeout/success/failed + duration/stdio 聚合 + rollback)。
-        # 须对运行中的 serve() 实例调用 (无 server → ConnectionRefused)。
+        # C-OPS-05: ops metrics — calls executor.metrics over UDS to read server runtime counters
+        # (exec_total/blocked/timeout/success/failed + duration/stdio aggregates + rollback).
+        # Must be called against a running serve() instance (no server → ConnectionRefused).
         path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
         req = {"jsonrpc": "2.0", "id": 1, "method": "executor.metrics", "params": {}}
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -784,17 +794,17 @@ class FusionSandboxExecutor:
             line = buf.split(b"\n", 1)[0].decode("utf-8").strip()
             resp = json.loads(line) if line else {}
             if "error" in resp:
-                raise RuntimeError(f"metrics 失败: {resp['error']}")
+                raise RuntimeError(f"metrics failed: {resp['error']}")
             logger.info("metrics ok: %s", resp.get("result"))
             return resp.get("result", {})
         finally:
             sock.close()
 
     def metrics_prometheus(self, sock_path: str | None = None) -> str:
-        # M-OPS-02: Prometheus text format — 经 UDS 调 executor.metrics_prometheus 拉
-        # scrape 文本 (fe_exec_total/fe_shell_active/fe_connections... + HELP/TYPE 头)。
-        # 不开 HTTP 端口 (保 M-SEC-01 UDS-only); 调用方喂自家 exporter 或直接展板。
-        # recorder install 失败 → -32603, 调用方降级用 metrics() JSON。
+        # M-OPS-02: Prometheus text format — calls executor.metrics_prometheus over UDS to fetch the
+        # scrape text (fe_exec_total/fe_shell_active/fe_connections... + HELP/TYPE headers).
+        # No HTTP port is opened (keeps M-SEC-01 UDS-only); the caller feeds its own exporter or dashboard directly.
+        # recorder install failure → -32603; the caller degrades to the metrics() JSON.
         path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
         req = {"jsonrpc": "2.0", "id": 1, "method": "executor.metrics_prometheus", "params": {}}
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -811,7 +821,7 @@ class FusionSandboxExecutor:
             line = buf.split(b"\n", 1)[0].decode("utf-8").strip()
             resp = json.loads(line) if line else {}
             if "error" in resp:
-                raise RuntimeError(f"metrics_prometheus 失败: {resp['error']}")
+                raise RuntimeError(f"metrics_prometheus failed: {resp['error']}")
             text = resp.get("result", {}).get("text", "")
             logger.info("metrics_prometheus ok: %d bytes", len(text))
             return text
@@ -819,10 +829,10 @@ class FusionSandboxExecutor:
             sock.close()
 
     def cancel_stream(self, stream_id, *, sock_path: str | None = None) -> bool:
-        # Issue #32: 服务端确定性 cancel — 向运行中的 serve() 发 executor.cancel {id},
-        # 下发后 fe-sandbox SIGINT→SIGKILL 进程树 (非协作停止), 对应 execute_stream 的 Done 帧
-        # exit_code -1 + cancelled true。stream_id = execute_stream 的 JSON-RPC 请求 id
-        # (融合 fusion-code 客户端契约)。best-effort: 已结束/未知 id → False, 不抛。
+        # Issue #32: server-side deterministic cancel — sends executor.cancel {id} to a running serve(),
+        # after which fe-sandbox SIGINT→SIGKILLs the process tree (not a cooperative stop); matches the execute_stream
+        # Done frame exit_code -1 + cancelled true. stream_id = the JSON-RPC request id of the execute_stream call
+        # (aligned with the fusion-code client contract). Best-effort: finished/unknown id → False, no raise.
         path = sock_path or self._sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
         req = {
             "jsonrpc": "2.0",
@@ -844,7 +854,7 @@ class FusionSandboxExecutor:
             line = buf.split(b"\n", 1)[0].decode("utf-8").strip()
             resp = json.loads(line) if line else {}
             if "error" in resp:
-                raise RuntimeError(f"cancel_stream 失败: {resp['error']}")
+                raise RuntimeError(f"cancel_stream failed: {resp['error']}")
             ok = bool(resp.get("result", {}).get("cancelled", False))
             logger.info("cancel_stream id=%s cancelled=%s", stream_id, ok)
             return ok
@@ -864,25 +874,25 @@ class FusionSandboxExecutor:
         extra_handlers: dict[str, Callable[[dict], Any]] | None = None,
         context: str = "",
     ) -> dict[str, Any]:
-        # Issue #46 AC7: AgentLoop 接进 executor 管线 — LayaToolSelector 选工具 →
-        # 本 executor 执行 (self.run/self.grep/...) → 结果回灌 → 重复。
-        # 替代 "LLM 生成 tool call JSON" 步骤 (确定性 laya choice 原语, 非 LLM 自由文本)。
+        # Issue #46 AC7: AgentLoop wired into the executor pipeline — LayaToolSelector picks a tool →
+        # this executor runs it (self.run/self.grep/...) → the result is fed back → repeat.
+        # Replaces the "LLM generates tool-call JSON" step (deterministic laya choice primitive, not LLM free text).
         #
-        # 默认 backend="http" — executor 是 L4 OS 工具, 不加载本地 laya 模型;
-        # HTTP backend 调 fusion-mlx /v1/laya/decide (生产推理路径, 无 laya_mlx 依赖)。
-        # backend="python" 直调 laya_mlx.Agent.system_one (更低延迟, 需本地模型缓存)。
+        # Default backend="http" — the executor is an L4 OS tool and does not load a local laya model;
+        # the HTTP backend calls fusion-mlx /v1/laya/decide (production inference path, no laya_mlx dependency).
+        # backend="python" calls laya_mlx.Agent.system_one directly (lower latency, requires a local model cache).
         #
-        # UDS 暴露暂缓 — fe-ipc 是纯 Rust UDS 服务器 (无 Python callback), laya 是 Python 依赖;
-        # 跨进程调用方 (fusion-code) 可经 Python API 直接调 agent_run, 或后续单独提 UDS agent.run issue。
+        # UDS exposure deferred — fe-ipc is a pure-Rust UDS server (no Python callbacks), laya is a Python dependency;
+        # cross-process callers (fusion-code) can call agent_run via the Python API directly, or file a separate UDS agent.run issue later.
         from .agent_loop import AgentLoop
         from .laya_tool_selector import LayaToolSelector
 
         if not isinstance(user_request, str):
-            raise TypeError(f"user_request 必须为 str, 得 {type(user_request).__name__}")
+            raise TypeError(f"user_request must be str, got {type(user_request).__name__}")
         if max_steps < 1:
-            raise ValueError(f"max_steps 须 >= 1, got {max_steps}")
+            raise ValueError(f"max_steps must be >= 1, got {max_steps}")
         logger.info(
-            "agent_run request=%r backend=%s max_steps=%s min_confidence=%s — 接线 AgentLoop",
+            "agent_run request=%r backend=%s max_steps=%s min_confidence=%s — wiring AgentLoop",
             user_request[:80],
             backend,
             max_steps,
@@ -912,25 +922,26 @@ class FusionSandboxExecutor:
         return result
 
     def serve(self, sock_path: str | None = None) -> None:
-        # C-PYO3-02: 旧版裸 self._native.serve() — fe-pyo3 serve_blocking 无 shutdown
-        # 句柄, SIGINT/SIGTERM 不解 socket 残留。改信号处理 + try/finally 清理:
-        # 注册 SIGINT/SIGTERM → 触发 KeyboardInterrupt 跳出 serve_blocking, finally
-        # os.unlink 残留 socket。serve_blocking 阻塞 recv, 信号在主线程中断。
-        # 3.15: 解析 path (env/default) 后统一传给 Rust — 旧版传原始 sock_path (可能 None),
-        # 与 finally 清理用的 path (env 解析) 不同源, 虽 Rust 亦解析 env 凑巧一致, 但显式
-        # 传 path 消除隐式 env 依赖, 清理与监听严格同一路径。
+        # C-PYO3-02: the old version called bare self._native.serve() — fe-pyo3 serve_blocking has no shutdown
+        # handle, so SIGINT/SIGTERM left a stale socket behind. Now signal handling + try/finally cleanup:
+        # register SIGINT/SIGTERM → raise KeyboardInterrupt to break out of serve_blocking, finally
+        # os.unlink the stale socket. serve_blocking blocks on recv; signals interrupt the main thread.
+        # 3.15: resolve the path (env/default) and pass it uniformly to Rust — the old version passed the raw
+        # sock_path (possibly None), a different source from the path used for the finally cleanup (env-resolved).
+        # Although Rust also resolved the env and they coincidentally matched, passing the path explicitly removes
+        # the implicit env dependency so cleanup and listening use exactly the same path.
         path = sock_path or os.environ.get("FUSION_EXECUTOR_SOCK", DEFAULT_SOCK)
         pid_path = os.environ.get("FUSION_EXECUTOR_PIDFILE", DEFAULT_PIDFILE)
-        # IMPL-1: serve 前确保 socket 父目录存在 (默认 ~/.fusion-executor/ 0o700, 对齐 Rust M-SEC-01)。
+        # IMPL-1: ensure the socket parent directory exists before serve (default ~/.fusion-executor/ 0o700, aligns with Rust M-SEC-01).
         ensure_socket_dir(path)
-        # D6-01: 写 pidfile (ops 监控/kill 用)。socket 同目录, 目录已由 ensure_socket_dir 建。
+        # D6-01: write the pidfile (for ops monitoring/kill). Same dir as the socket; the directory was created by ensure_socket_dir.
         write_pidfile(pid_path)
-        # ARCH-1: seatbelt 治理 — execute + shell_start 均默认 true (商用安全默认, 对齐 fe-core serde default_true)。
-        # 调用方显式传 seatbelt:false 关闭隔离 (受信本地 opt-out)。
+        # ARCH-1: seatbelt governance — both execute + shell_start default to true (commercial security default, aligns with fe-core serde default_true).
+        # Callers can explicitly pass seatbelt:false to disable isolation (trusted local opt-out).
         logger.info(
-            "seatbelt 默认开启 (execute + shell_start 路径) — macOS sandbox-exec 隔离。受信本地可透传 seatbelt:false opt-out。"
+            "seatbelt enabled by default (execute + shell_start paths) — macOS sandbox-exec isolation. Trusted local callers can pass seatbelt:false to opt out."
         )
-        logger.info("serve sock=%s — 启动 UDS JSON-RPC 服务器 (信号可停)", path)
+        logger.info("serve sock=%s — starting UDS JSON-RPC server (stoppable by signal)", path)
         old_int = signal.getsignal(signal.SIGINT)
         old_term = signal.getsignal(signal.SIGTERM)
         raised = False
@@ -940,20 +951,20 @@ class FusionSandboxExecutor:
             self._native.serve(path)
         except KeyboardInterrupt:
             raised = True
-            logger.info("serve 收到停机信号, 关闭服务器")
+            logger.info("serve received shutdown signal, closing server")
         finally:
             signal.signal(signal.SIGINT, old_int)
             signal.signal(signal.SIGTERM, old_term)
             if os.path.exists(path):
                 try:
                     os.unlink(path)
-                    logger.info("serve 清理残留 socket %s", path)
+                    logger.info("serve cleaned up stale socket %s", path)
                 except OSError as e:
-                    logger.warning("serve 清理 socket 失败 %s: %s", path, e)
-            # D6-01: 停机删 pidfile (正常 + 信号 + 异常路径都走 finally)
+                    logger.warning("serve socket cleanup failed %s: %s", path, e)
+            # D6-01: remove the pidfile on shutdown (normal + signal + exception paths all go through finally)
             remove_pidfile(pid_path)
             if raised:
-                raise KeyboardInterrupt("serve 已停机")
+                raise KeyboardInterrupt("serve shut down")
 
 
 class Subscription:
@@ -971,21 +982,21 @@ class Subscription:
         self._interval_ms = interval_ms
         self._screenshot_interval_ms = screenshot_interval_ms
         self._scope = scope
-        # 3.13: idle_timeout None = 流期间无 recv 超时 (长流消费者不误断); 握手用固定 15s。
+        # 3.13: idle_timeout None = no recv timeout during the stream (long-stream consumers are not cut off spuriously); the handshake uses a fixed 15s.
         self._idle_timeout = idle_timeout
         self._sock: socket.socket | None = None
         self._sub_id: str | None = None
         self._buf = b""
-        # IMPL-3: crash 标记 — 区分 "正常流结束" (本端 unsubscribe/close 主动, _closed_by_server=True)
-        # vs "server 崩溃/断连" (socket EOF 无预期, _closed_by_server=False)。__next__ 据此区分:
-        # 主动关闭 → StopIteration (干净流尾); 非预期 EOF → ConnectionError (调用方可 catch 重连/告警)。
+        # IMPL-3: crash marker — distinguishes "normal stream end" (local unsubscribe/close, _closed_by_server=True)
+        # vs "server crash/disconnect" (socket EOF unexpected, _closed_by_server=False). __next__ uses this:
+        # local close → StopIteration (clean stream end); unexpected EOF → ConnectionError (the caller can catch to reconnect/alert).
         self._closed_by_server: bool = False
-        # IMPL-3: _read_json 在 socket EOF 时置 True (区分超时-None), __next__ 据此判 crash。
+        # IMPL-3: _read_json sets this True on socket EOF (distinguishing from timeout-None); __next__ checks it for crash detection.
         self._eof_seen: bool = False
 
     def _open(self) -> None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        # 握手阶段固定 15s 超时 (subscribe 响应应秒级回)
+        # Fixed 15s timeout during the handshake (the subscribe response should come back within seconds)
         sock.settimeout(15.0)
         sock.connect(self._sock_path)
         self._sock = sock
@@ -994,7 +1005,7 @@ class Subscription:
             params["interval_ms"] = self._interval_ms
         if self._screenshot_interval_ms is not None:
             params["screenshot_interval_ms"] = self._screenshot_interval_ms
-        # Blocker 10: stdio 作用域透传 (all=true / task_ids=[..] / 默认 own_conn)
+        # Blocker 10: stdio scope passthrough (all=true / task_ids=[..] / default own_conn)
         if self._scope == "all":
             params["all"] = True
         elif isinstance(self._scope, list):
@@ -1004,9 +1015,9 @@ class Subscription:
         resp = self._read_json()
         if resp is None or "error" in resp:
             err = resp.get("error") if resp else None
-            raise RuntimeError(f"subscribe 失败: {err}")
+            raise RuntimeError(f"subscribe failed: {err}")
         self._sub_id = resp["result"]["subscription_id"]
-        # 3.13: 握手成功后切到 idle_timeout (None=阻塞无超时, 或用户设的秒数)
+        # 3.13: after a successful handshake switch to idle_timeout (None = blocking without timeout, or the user-set seconds)
         sock.settimeout(self._idle_timeout)
         logger.info(
             "subscribe ok sub_id=%s channels=%s idle_timeout=%s", self._sub_id, self._channels, self._idle_timeout
@@ -1015,26 +1026,29 @@ class Subscription:
     def _read_json(self) -> dict | None:
         assert self._sock is not None
         while b"\n" not in self._buf:
-            # M-PY-04: 服务端停推 (telemetry panic/screenshot TCC 拒静默) → recv 15s
-            # 后 socket.timeout。旧版抛 TimeoutError 穿透 __next__, 调用方 for-loop
-            # 得 TimeoutError 非 StopIteration (混合语义)。捕获转 None → __next__ 抛
-            # StopIteration, 干净流尾。
+            # M-PY-04: server stops pushing (telemetry panic / screenshot silently denied by TCC) → recv 15s
+            # then socket.timeout. The old version let TimeoutError propagate out of __next__, so the caller's
+            # for-loop got TimeoutError instead of StopIteration (mixed semantics). Catch and convert to None →
+            # __next__ raises StopIteration, clean stream end.
             try:
                 chunk = self._sock.recv(4096)
             except TimeoutError:
-                logger.warning("subscription recv 超时, 当流结束")
+                logger.warning("subscription recv timed out, treating as end of stream")
                 return None
             if not chunk:
-                # IMPL-3: socket EOF — 区分超时 (上分支, 合法 idle) vs 真断连 (本分支)。
-                # 标记 _eof_seen=True 让 __next__ 据此决定: 主动关闭 → StopIteration;
-                # 非预期 EOF → ConnectionError。
+                # IMPL-3: socket EOF — distinguish timeout (branch above, legitimate idle) from a real disconnect (this branch).
+                # Mark _eof_seen=True so __next__ can decide: local close → StopIteration;
+                # unexpected EOF → ConnectionError.
                 self._eof_seen = True
                 return None
             self._buf += chunk
-            # P-2: 行缓冲无界增长防护 — 损坏流 (无 newline) 或超巨帧会撑爆 _buf。
-            # 截断丢缓冲并 warn, 当流结束 (比 OOM 强; 下次 recv 无 \n 仍 None)。
+            # P-2: unbounded line-buffer growth guard — a corrupted stream (no newline) or an oversized frame would blow up _buf.
+            # Truncate, drop the buffer, and warn, treating it as end of stream (better than OOM; the next recv without \n still returns None).
             if len(self._buf) > _SUB_BUF_MAX_BYTES:
-                logger.warning("subscription _buf 超 %d 字节, 丢弃 (损坏流/超巨帧)", _SUB_BUF_MAX_BYTES)
+                logger.warning(
+                    "subscription _buf exceeded %d bytes, dropping (corrupted stream / oversized frame)",
+                    _SUB_BUF_MAX_BYTES,
+                )
                 self._buf = b""
                 return None
         line, self._buf = self._buf.split(b"\n", 1)
@@ -1051,22 +1065,26 @@ class Subscription:
         return self
 
     def __next__(self) -> dict:
-        # IMPL-3: 本端已主动 close/unsubscribe (_closed_by_server=True, _sock=None) → 干净流尾 StopIteration。
-        # 提前返回, 不再调 _read_json (sock 已关, 其 assert self._sock is not None 会抛)。
+        # IMPL-3: already closed locally via close/unsubscribe (_closed_by_server=True, _sock=None) → clean stream end StopIteration.
+        # Return early, don't call _read_json again (the sock is closed and its assert self._sock is not None would raise).
         if self._sock is None:
             if self._eof_seen and not self._closed_by_server:
-                logger.warning("subscription 非预期断连 (server EOF 无 unsubscribe), 抛 ConnectionError")
+                logger.warning(
+                    "subscription disconnected unexpectedly (server EOF without unsubscribe), raising ConnectionError"
+                )
                 raise ConnectionError("server disconnected unexpectedly")
             raise StopIteration
         while True:
             frame = self._read_json()
             if frame is None:
-                # IMPL-3: 区分流尾原因。_closed_by_server=True = 本端主动 unsubscribe/close
-                # (干净流尾 → StopIteration); _eof_seen=True 且非主动关 = server 崩溃/断连
-                # (→ ConnectionError, 调用方可 catch 重连/告警); 纯超时 (两标志皆 False) =
-                # 合法 idle, 当流尾 StopIteration。
+                # IMPL-3: distinguish end-of-stream causes. _closed_by_server=True = local unsubscribe/close
+                # (clean stream end → StopIteration); _eof_seen=True without a local close = server crash/disconnect
+                # (→ ConnectionError, the caller can catch to reconnect/alert); pure timeout (both flags False) =
+                # legitimate idle, treated as stream end with StopIteration.
                 if self._eof_seen and not self._closed_by_server:
-                    logger.warning("subscription 非预期断连 (server EOF 无 unsubscribe), 抛 ConnectionError")
+                    logger.warning(
+                        "subscription disconnected unexpectedly (server EOF without unsubscribe), raising ConnectionError"
+                    )
                     raise ConnectionError("server disconnected unexpectedly")
                 raise StopIteration
             if "method" in frame and frame.get("method") == "executor.event":
@@ -1074,7 +1092,7 @@ class Subscription:
                 if self._sub_id is None or params.get("subscription_id") == self._sub_id:
                     logger.debug("event channel=%s", params.get("channel"))
                     return params
-            logger.debug("跳过非 event 帧: %s", frame.get("id"))
+            logger.debug("skipping non-event frame: %s", frame.get("id"))
 
     def unsubscribe(self) -> bool:
         if self._sock is None or self._sub_id is None:
@@ -1092,25 +1110,25 @@ class Subscription:
             logger.info("unsubscribe sub_id=%s ok=%s", self._sub_id, ok)
             return ok
         except OSError as e:
-            logger.warning("unsubscribe 发送失败: %s", e)
+            logger.warning("unsubscribe send failed: %s", e)
             return False
         finally:
             if self._sock is not None:
-                # IMPL-3: 主动关标记 — 本端 unsubscribe/close 是预期关闭, __next__ 得 None 应 StopIteration 非 ConnectionError。
+                # IMPL-3: local-close marker — a local unsubscribe/close is an expected close, so __next__ getting None should StopIteration, not ConnectionError.
                 self._closed_by_server = True
                 self._sock.close()
                 self._sock = None
 
     def close(self) -> None:
         if self._sock is not None:
-            # IMPL-3: 同 unsubscribe — 显式 close 属主动关闭, 标记避免误判 crash。
+            # IMPL-3: same as unsubscribe — an explicit close is a local close, mark it to avoid a false crash detection.
             self._closed_by_server = True
             self._sock.close()
             self._sock = None
 
-    # C-PYO3-03: GC 无 unsubscribe = socket FD + 服务端订阅项泄漏。加 __del__ 尽力
-    # close (不保证 unsubscribe 成功, 仅关本地 socket; 服务端侧靠 tx 死通道自退);
-    # __enter__/__exit__ 支持 `with executor.subscribe(...) as sub:` 显式生命周期。
+    # C-PYO3-03: GC without unsubscribe = leaked socket FD + leaked server-side subscription entry. Add __del__ best-effort
+    # close (unsubscribe success is not guaranteed, only the local socket is closed; the server side exits on its own via the dead tx channel);
+    # __enter__/__exit__ support `with executor.subscribe(...) as sub:` for an explicit lifecycle.
     def __enter__(self) -> Subscription:
         return self
 
@@ -1118,7 +1136,7 @@ class Subscription:
         try:
             self.unsubscribe()
         except Exception:
-            logger.debug("__exit__ unsubscribe 异常, 降级 close")
+            logger.debug("__exit__ unsubscribe raised, degrading to close")
         self.close()
 
     def __del__(self) -> None:

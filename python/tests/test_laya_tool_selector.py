@@ -4,14 +4,14 @@ import os
 
 import pytest
 
-# laya-mlx 是可选依赖 (共享 venv 有, CI 可能无) — importorskip 优雅跳过
+# laya-mlx is an optional dependency (present in the shared venv, maybe not in CI) — importorskip skips gracefully
 laya_mlx = pytest.importorskip("laya_mlx")
 
-# 模型缓存检查 — 无缓存则跳过 (CI macos-14 无 laya 模型, 不下载)
+# model cache check — skip when uncached (CI macos-14 has no laya model, do not download)
 _cache = os.environ.get("HF_HUB_CACHE") or os.path.expanduser("~/.fusion-mlx/models")
 _model_dir = os.path.join(_cache, "models--convaiinnovations--laya-typed-decisions")
 if not os.path.isdir(_model_dir):
-    pytest.skip(f"laya 模型未缓存 ({_model_dir}) — 跳过真实模型测试 (CI 路径)", allow_module_level=True)
+    pytest.skip(f"laya model not cached ({_model_dir}) — skipping real-model tests (CI path)", allow_module_level=True)
 
 from fusion_executor import DEFAULT_TOOL_WHITELIST, LayaToolSelector, ToolDecision  # noqa: E402
 from fusion_executor.laya_tool_selector import PARAM_SLOTS  # noqa: E402
@@ -19,17 +19,17 @@ from fusion_executor.laya_tool_selector import PARAM_SLOTS  # noqa: E402
 
 @pytest.fixture(scope="module")
 def selector():
-    """模块级共享 — 模型加载 ~17s, 测试间复用 (warm latency 才有意义)。
+    """Module-level shared fixture — model load ~17s, reused across tests (warm latency is what matters).
 
-    min_confidence=0.0 (不降级) — 测工具选择逻辑, 非置信度门槛。
-    门槛降级由 test_low_confidence_fallback 独立测 (0.99 门槛)。
-    8 选项白名单 → answer_confidence 自然 ~0.3-0.7 (option 多, max prob 分散)。
+    min_confidence=0.0 (no fallback) — tests tool-selection logic, not the confidence gate.
+    Gate fallback is tested separately by test_low_confidence_fallback (0.99 gate).
+    8-option whitelist → answer_confidence naturally ~0.3-0.7 (many options, max prob spread out).
     """
     return LayaToolSelector(min_confidence=0.0)
 
 
 def test_select_tool_file_edit(selector: LayaToolSelector):
-    """'edit src/main.py bug' → file_edit (非降级)."""
+    """'edit src/main.py bug' → file_edit (no fallback)."""
     d = selector.select_tool("I need to edit the file src/main.py to fix a bug")
     assert isinstance(d, ToolDecision)
     assert d.tool_id == "file_edit"
@@ -54,54 +54,54 @@ def test_select_tool_code_search(selector: LayaToolSelector):
 
 
 def test_select_tool_none(selector: LayaToolSelector):
-    """'hello' → none (无需工具)."""
+    """'hello' → none (no tool needed)."""
     d = selector.select_tool("hello, how are you today?")
     assert d.tool_id == "none"
     assert not d.fell_back
 
 
 def test_select_tool_probabilities_sum(selector: LayaToolSelector):
-    """概率分布应覆盖白名单全部 key 且和 ≈ 1."""
+    """probability distribution must cover every whitelist key and sum to ≈ 1."""
     d = selector.select_tool("edit config.yaml")
     total = sum(d.probabilities.values())
-    assert abs(total - 1.0) < 0.05, f"概率和 {total} 偏离 1.0"
+    assert abs(total - 1.0) < 0.05, f"probability sum {total} deviates from 1.0"
     for tid in DEFAULT_TOOL_WHITELIST:
-        assert tid in d.probabilities, f"白名单 key {tid} 缺失于概率分布"
+        assert tid in d.probabilities, f"whitelist key {tid} missing from the probability distribution"
 
 
 def test_low_confidence_fallback():
-    """置信度 < 门槛 → fell_back=True, tool_id='llm_fallback'."""
-    # 门槛设 0.99 — 几乎所有决策都降级 (验证降级路径, 非真实场景)
+    """confidence < gate → fell_back=True, tool_id='llm_fallback'."""
+    # gate set to 0.99 — nearly every decision falls back (exercises the fallback path, not a real scenario)
     sel = LayaToolSelector(min_confidence=0.99)
     d = sel.select_tool("edit main.py")
     assert d.fell_back
     assert d.tool_id == "llm_fallback"
-    # 降级时仍返回原始置信度 + 概率 (供调用方审计)
+    # on fallback the original confidence + probabilities are still returned (for caller audit)
     assert d.confidence >= 0
     assert len(d.probabilities) > 0
 
 
 def test_decide_with_params(selector: LayaToolSelector):
-    """decide() = select_tool + extract_params — file_edit 提取 file_path."""
+    """decide() = select_tool + extract_params — file_edit extracts file_path."""
     d = selector.decide("edit the file src/auth/login.py to add logging")
     assert d.tool_id == "file_edit"
     if not d.fell_back:
         assert "file_path" in d.params
-        # regex 应提取到 .py 路径
+        # the regex should extract the .py path
         fp = d.params.get("file_path")
         assert fp is not None
         assert ".py" in fp
 
 
 def test_decide_none_no_params(selector: LayaToolSelector):
-    """tool_id='none' 时不提参数."""
+    """no param extraction when tool_id='none'."""
     d = selector.decide("hello there")
     assert d.tool_id == "none"
     assert d.params == {}
 
 
 def test_custom_whitelist(selector: LayaToolSelector):
-    """自定义白名单 — 不同 workflow 不同工具集."""
+    """custom whitelist — different workflows, different tool sets."""
     custom = {
         "deploy": "deploy the application to production",
         "rollback": "rollback the last deployment",
@@ -109,19 +109,19 @@ def test_custom_whitelist(selector: LayaToolSelector):
     }
     d = selector.select_tool("deploy to production now", whitelist=custom)
     assert d.tool_id in ("deploy", "rollback", "none", "llm_fallback")
-    # 概率分布应仅含自定义 key
+    # the probability distribution should contain only the custom keys
     for k in d.probabilities:
         assert k in custom
 
 
 def test_empty_whitelist_rejected(selector: LayaToolSelector):
-    """空白名单 → ValueError."""
+    """empty whitelist → ValueError."""
     with pytest.raises(ValueError, match="whitelist"):
         selector.select_tool("anything", whitelist={})
 
 
 def test_metrics_track(selector: LayaToolSelector):
-    """指标计数器: total/fell_back/per_tool/avg_latency."""
+    """metric counters: total/fell_back/per_tool/avg_latency."""
     selector.select_tool("edit a.py")
     selector.select_tool("run make test")
     m = selector.metrics()
@@ -131,12 +131,12 @@ def test_metrics_track(selector: LayaToolSelector):
 
 
 def test_warm_latency_under_15ms(selector: LayaToolSelector):
-    """AC8 验收: warm 决策延迟 < 15ms。
+    """AC8 acceptance: warm decision latency < 15ms.
 
-    python backend 直调 laya_mlx.Agent.system_one (in-process MLX eval)。
-    无 fusion-mlx 运行时 ~7ms (Metal device 独占); fusion-mlx 运行时多模型
-    争用 Metal device → 延迟膨胀到 ~110-140ms (15-20x)。这是 MLX 设备级
-    争用, 非 laya 本身延迟。测 AC8 须在 fusion-mlx 停止时跑 (隔离争用)。
+    The python backend calls laya_mlx.Agent.system_one directly (in-process MLX eval).
+    ~7ms when fusion-mlx is not running (exclusive Metal device); when fusion-mlx runs, multi-model
+    contention on the Metal device inflates latency to ~110-140ms (15-20x). This is MLX device-level
+    contention, not laya latency itself. AC8 must be measured with fusion-mlx stopped (isolating contention).
     """
     import httpx
 
@@ -144,7 +144,7 @@ def test_warm_latency_under_15ms(selector: LayaToolSelector):
     try:
         httpx.get(mlx_url + "/models", timeout=3.0)
         pytest.skip(
-            "fusion-mlx 运行中 — MLX Metal device 多模型争用膨胀延迟 (~110ms), 非 laya 本身。停 fusion-mlx 后测真实 AC8"
+            "fusion-mlx running — MLX Metal device multi-model contention inflates latency (~110ms), not laya itself. Stop fusion-mlx to measure true AC8"
         )
     except httpx.RequestError:
         pass
@@ -159,20 +159,20 @@ def test_warm_latency_under_15ms(selector: LayaToolSelector):
 
     latencies.sort()
     median = latencies[len(latencies) // 2]
-    assert median < 15.0, f"warm 中位延迟 {median:.1f}ms 超 AC8 15ms 门槛 (all: {latencies})"
+    assert median < 15.0, f"warm median latency {median:.1f}ms exceeds the AC8 15ms gate (all: {latencies})"
 
 
 def test_http_backend_latency_under_15ms():
-    """AC8 验收 (HTTP 路径): HTTP backend 决策延迟 < 15ms (生产默认, 服务端 warm 模型)。
+    """AC8 acceptance (HTTP path): HTTP backend decision latency < 15ms (production default, server-side warm model).
 
-    需 fusion-mlx 运行 (~/fusion/fusion-mlx/start.sh start) + laya 模型服务端常驻。
-    无 server → skip。服务端多模型争用 (laya 被驱逐) → warmup 仍 >100ms → skip
-    (非 laya 延迟, 是服务端模型换入换出)。
-    committed evidence: benchmarks/results/laya-tool-selection/report.json (backend=http, p50=6.2ms)。
+    Requires fusion-mlx running (~/fusion/fusion-mlx/start.sh start) + the laya model resident server-side.
+    No server → skip. Server-side multi-model contention (laya evicted) → warmup still >100ms → skip
+    (not laya latency, but server-side model swap-in/out).
+    committed evidence: benchmarks/results/laya-tool-selection/report.json (backend=http, p50=6.2ms).
     """
     import httpx
 
-    # Issue #60: 单点解析 — 显式 key 优先, 无 secret 默认值字面量
+    # Issue #60: single-point resolution — explicit key wins, no secret default-value literals
     from fusion_core.config import client_key, default_mlx_base_url
 
     api_key = client_key()
@@ -185,9 +185,11 @@ def test_http_backend_latency_under_15ms():
             timeout=5.0,
         )
     except httpx.ConnectError:
-        pytest.skip("fusion-mlx 未运行 — 跳过 HTTP backend AC8 延迟测试 (本地需 start.sh start)")
+        pytest.skip("fusion-mlx not running — skipping HTTP backend AC8 latency test (start.sh start needed locally)")
     if resp.status_code != 200:
-        pytest.skip(f"fusion-mlx laya/decide 探活非 200 (status={resp.status_code}) — 跳过 HTTP backend AC8 延迟测试")
+        pytest.skip(
+            f"fusion-mlx laya/decide probe not 200 (status={resp.status_code}) — skipping HTTP backend AC8 latency test"
+        )
 
     sel = LayaToolSelector(min_confidence=0.0, backend="http")
     warmup_lats = []
@@ -197,8 +199,8 @@ def test_http_backend_latency_under_15ms():
     warmup_lats.sort()
     if warmup_lats[-1] > 100.0:
         pytest.skip(
-            f"fusion-mlx 服务端 laya 模型未常驻 (warmup {warmup_lats[-1]:.0f}ms >100ms, 多模型争用驱逐) — "
-            "非 laya 延迟, 是服务端模型换入。独占 fusion-mlx 后测真实 AC8"
+            f"fusion-mlx server-side laya model not resident (warmup {warmup_lats[-1]:.0f}ms >100ms, evicted by multi-model contention) — "
+            "not laya latency, but server-side model swap-in. Measure true AC8 with exclusive fusion-mlx"
         )
 
     latencies = []
@@ -208,11 +210,11 @@ def test_http_backend_latency_under_15ms():
 
     latencies.sort()
     median = latencies[len(latencies) // 2]
-    assert median < 15.0, f"HTTP backend warm 中位延迟 {median:.1f}ms 超 AC8 15ms (all: {latencies})"
+    assert median < 15.0, f"HTTP backend warm median latency {median:.1f}ms exceeds AC8 15ms (all: {latencies})"
 
 
 def test_invalid_min_confidence():
-    """min_confidence 越界 → ValueError."""
+    """min_confidence out of range → ValueError."""
     with pytest.raises(ValueError):
         LayaToolSelector(min_confidence=1.5)
     with pytest.raises(ValueError):
@@ -220,38 +222,38 @@ def test_invalid_min_confidence():
 
 
 def test_strip_filler_prefix_issue54():
-    """issue #54: shell_exec command 前导填充词确定性剥除 — security guard 不再拒 'the'."""
+    """issue #54: deterministic stripping of shell_exec command leading fillers — security guard no longer rejects 'the'."""
     strip = LayaToolSelector._strip_filler_prefix
     assert strip("the command echo hello world") == "echo hello world"
     assert strip("command: ls -la") == "ls -la"
     assert strip("cmd echo x") == "echo x"
-    assert strip("the a command x y") == "x y"  # 嵌套填充 (最多剥 3 层)
-    assert strip("echo the quick brown fox") == "echo the quick brown fox"  # 真实命令不剥
+    assert strip("the a command x y") == "x y"  # nested fillers (at most 3 layers stripped)
+    assert strip("echo the quick brown fox") == "echo the quick brown fox"  # real commands are not stripped
     assert strip("pytest tests/") == "pytest tests/"
     assert strip("") == ""
     assert strip(None) is None
 
 
 def test_regex_extract_multiline_anchor_issue54():
-    """issue #54: $ 锚行尾 (re.MULTILINE) — 回灌 feedback 文本不污染提取."""
+    """issue #54: $ anchors end-of-line (re.MULTILINE) — fed-back feedback text does not pollute extraction."""
     ex = LayaToolSelector._regex_extract
-    # 请求行后跟 feedback 行 — 提取止于请求行行尾
+    # a feedback line follows the request line — extraction stops at the request line's end
     polluted = "run the command echo hi\n[tool shell_exec result: exit_code=0 stdout='hi']"
     assert ex(polluted, PARAM_SLOTS["shell_exec"][0]["extract"]) == "echo hi"
 
 
 def test_decide_shell_exec_command_no_filler(selector: LayaToolSelector):
-    """issue #54 E2E: 'run the command X' → command=X (无填充词, security guard 可执行)."""
+    """issue #54 E2E: 'run the command X' → command=X (no fillers left, executable by the security guard)."""
     d = selector.decide("run the command echo hello world")
     assert d.tool_id == "shell_exec"
     cmd = d.params.get("command")
     assert cmd is not None
-    assert not cmd.startswith(("the ", "command", "result:")), f"command 残留填充词: {cmd!r}"
+    assert not cmd.startswith(("the ", "command", "result:")), f"command retains filler words: {cmd!r}"
     assert "echo" in cmd
 
 
 def test_missing_laya_mlx_error(monkeypatch):
-    """laya_mlx 未安装 → ImportError 带清晰提示 (非静默)."""
+    """laya_mlx not installed → ImportError with a clear message (never silent)."""
     import builtins
 
     real_import = builtins.__import__

@@ -45,7 +45,7 @@ def _derive_name(repo_url: str) -> str:
     if base.endswith(".git"):
         base = base[:-4]
     if not NAME_RE.match(base):
-        raise DemoEnvError(f"无法从 repo url 推导合法 app 名 ({base!r}); 请用 name= 显式指定")
+        raise DemoEnvError(f"cannot derive a valid app name from the repo url ({base!r}); pass name= explicitly")
     return base
 
 
@@ -67,12 +67,12 @@ def _run_cmd(cmd: list[str], *, cwd: str | None = None, timeout: int, what: str)
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
-        raise DemoEnvError(f"{what} 超时 ({timeout}s): {e}") from e
+        raise DemoEnvError(f"{what} timed out ({timeout}s): {e}") from e
     except OSError as e:
-        raise DemoEnvError(f"{what} 启动失败: {e}") from e
+        raise DemoEnvError(f"{what} failed to start: {e}") from e
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip()[-500:]
-        raise DemoEnvError(f"{what} 失败 (exit {proc.returncode}): {tail}")
+        raise DemoEnvError(f"{what} failed (exit {proc.returncode}): {tail}")
     return proc
 
 
@@ -84,17 +84,18 @@ def probe_llm_endpoint(base_url: str) -> tuple[bool, str]:
                 if resp.status < 400:
                     return True, f"{path} -> {resp.status}"
         except urllib.error.URLError as e:
-            logger.info("demo_env probe %s 不可达: %s", url, e.reason)
+            logger.info("demo_env probe %s unreachable: %s", url, e.reason)
         except OSError as e:
-            logger.info("demo_env probe %s 不可达: %s", url, e)
-    return False, f"{base_url} /healthz 与 /v1/models 均不可达 (信息性, 不阻断启动)"
+            logger.info("demo_env probe %s unreachable: %s", url, e)
+    return False, f"{base_url} both /healthz and /v1/models unreachable (informational, does not block startup)"
 
 
 class DemoEnvRunner:
-    """Demo/test 环境沙箱 runner (issue #64): guest 一次跑一个 ai-* app,
-    重依赖 (LLM/推理) 全部走宿主机 fusion-gateway。纯 Python 编排层 —
-    provision (git/venv/pip) 走自身 subprocess (runner 是受信配置动作),
-    app 进程走 shell_start + SandboxProfile (seatbelt 隔离 + env 接线宿主网关)。"""
+    """Demo/test environment sandbox runner (issue #64): a guest runs one ai-* app at a time,
+    with heavy dependencies (LLM/inference) all routed through the host's fusion-gateway. Pure-Python
+    orchestration layer — provision (git/venv/pip) uses its own subprocess (the runner is a trusted
+    configuration action), the app process goes through shell_start + SandboxProfile (seatbelt isolation
+    + env wiring to the host gateway)."""
 
     def __init__(
         self,
@@ -109,8 +110,9 @@ class DemoEnvRunner:
         self.extra_env = dict(extra_env or {})
         self.workspace.mkdir(parents=True, exist_ok=True)
         if executor is None:
-            # D3-6 4-layer: app 自带 start.sh 不在基线白名单 — 追加 basename 扩展 + 登记
-            # workspace 为可信 bin 目录 (start.sh resolve 落在 workspace 内才放行, 防投毒)。
+            # D3-6 4-layer: the app's own start.sh is not in the baseline allowlist — append the basename to
+            # the whitelist + register the workspace as a trusted bin dir (start.sh must resolve inside the
+            # workspace to be allowed, preventing poisoning).
             executor = FusionSandboxExecutor(
                 extra_whitelist=["start.sh"],
                 trusted_bin_dirs=[str(self.workspace)],
@@ -128,7 +130,7 @@ class DemoEnvRunner:
         try:
             return DemoAppState.model_validate(json.loads(self._state_path.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, ValueError) as e:
-            logger.warning("demo_env state.json 损坏, 忽略: %s", e)
+            logger.warning("demo_env state.json corrupted, ignoring: %s", e)
             return None
 
     def _save_state(self, state: DemoAppState | None) -> None:
@@ -143,14 +145,14 @@ class DemoEnvRunner:
         try:
             out = self.executor.shell_output(state.shell_id)
         except RuntimeError as e:
-            logger.info("demo_env shell_output 查询失败 (视为已停): %s", e)
+            logger.info("demo_env shell_output query failed (treating as stopped): %s", e)
             return False
         return bool(out.running)
 
     def status(self) -> dict | None:
         state = self._load_state()
         if state is None:
-            logger.info("demo_env status: 无运行中 app")
+            logger.info("demo_env status: no running app")
             return None
         running = self._is_running(state)
         tail = ""
@@ -166,7 +168,7 @@ class DemoEnvRunner:
     def stop(self) -> dict:
         state = self._load_state()
         if state is None:
-            logger.info("demo_env stop: 无运行中 app (幂等 no-op)")
+            logger.info("demo_env stop: no running app (idempotent no-op)")
             return {"ok": True, "stopped": None}
         ok = self.executor.kill_shell(state.shell_id)
         self._save_state(None)
@@ -189,14 +191,14 @@ class DemoEnvRunner:
                 ssh_url = _ssh_fallback(repo_url)
                 if ssh_url is None or app_dir.exists():
                     raise
-                logger.warning("demo_env https clone 失败, 尝试 ssh fallback: %s", ssh_url)
+                logger.warning("demo_env https clone failed, trying ssh fallback: %s", ssh_url)
                 _run_cmd(
                     ["git", "clone", "--depth", "1", ssh_url, str(app_dir)],
                     timeout=GIT_TIMEOUT_SEC,
                     what=f"git clone {name} (ssh)",
                 )
         if not app_dir.is_dir():
-            raise DemoEnvError(f"clone 后 app 目录不存在: {app_dir}")
+            raise DemoEnvError(f"app directory missing after clone: {app_dir}")
         venv_dir = self.workspace / ".venv"
         if not (venv_dir / "bin" / "python").exists():
             _run_cmd(
@@ -219,32 +221,37 @@ class DemoEnvRunner:
         start_sh = app_dir / "start.sh"
         if not start_sh.exists():
             raise DemoEnvError(
-                f"{name} 无 start.sh — 无法自动启动 (不静默跳过)。"
-                f"请手动启动: cd {app_dir} 后按该项目 README 启动, 或跳过该 app。"
+                f"{name} has no start.sh — cannot auto-start (never silently skipped). "
+                f"Start it manually: cd {app_dir} and follow that project's README, or skip this app."
             )
         if not os.access(start_sh, os.X_OK):
             start_sh.chmod(0o755)
-            logger.info("demo_env start.sh 无执行位, 已 chmod 755: %s", start_sh)
+            logger.info("demo_env start.sh missing the executable bit, chmod 755 applied: %s", start_sh)
         return app_dir
 
     def up(self, repo_url: str, *, name: str | None = None) -> dict:
         app_name = name or _derive_name(repo_url)
         if not NAME_RE.match(app_name):
-            raise DemoEnvError(f"app 名非法 (须 {NAME_RE.pattern}): {app_name!r}")
+            raise DemoEnvError(f"invalid app name (must match {NAME_RE.pattern}): {app_name!r}")
         existing = self._load_state()
         if existing is not None and self._is_running(existing):
             if existing.name == app_name and existing.repo_url == repo_url:
-                logger.info("demo_env up: app=%s 已在运行 (幂等, 直接返回状态)", app_name)
+                logger.info("demo_env up: app=%s already running (idempotent, returning status)", app_name)
                 return self.status()
-            raise DemoEnvError(f"已有一个 app 在运行: {existing.name} (单 app per guest 策略)。先 stop 再 up 新 app。")
+            raise DemoEnvError(
+                f"an app is already running: {existing.name} (single app per guest policy). stop it before up-ing a new app."
+            )
         if existing is not None and existing.name != app_name:
             self._save_state(None)
-            logger.info("demo_env up: 清理已停的旧 app 状态 %s", existing.name)
+            logger.info("demo_env up: cleared stopped old app state %s", existing.name)
         app_dir = self._provision(repo_url, app_name)
         start_sh = app_dir / "start.sh"
         probe_ok, probe_detail = probe_llm_endpoint(self.llm_base_url)
         if not probe_ok:
-            logger.warning("demo_env 宿主网关不可达 (信息性, app UI 仍启动; 推理会失败): %s", probe_detail)
+            logger.warning(
+                "demo_env host gateway unreachable (informational, the app UI still starts; inference will fail): %s",
+                probe_detail,
+            )
         profile = SandboxProfile(network="allow", filesystem="deny_write")
         env_vars = {
             "FUSION_LLM_BASE_URL": self.llm_base_url,
@@ -264,7 +271,7 @@ class DemoEnvRunner:
         )
         if not result.ok:
             raise DemoEnvError(
-                f"start.sh 启动被拒: blocked_by_security={result.blocked_by_security}"
+                f"start.sh start rejected: blocked_by_security={result.blocked_by_security}"
                 f" reason={result.security_reason} error={result.error}"
             )
         state = DemoAppState(
