@@ -7,8 +7,8 @@ doc_type: changelog
 title: {zh: "fusion-executor 变更日志", en: "fusion-executor Changelog"}
 audience: engineer
 status: draft
-version: 0.2.28
-updated: 2026-11-16
+version: 0.2.29
+updated: 2026-11-27
 owner: "@dahai"
 source_of_truth:
   - CHANGELOG.md
@@ -20,6 +20,11 @@ source_of_truth:
 All notable changes to fusion-executor are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.29] — 2026-11
+
+### Changed
+- English-only source batch 2 (issue #78, monorepo-wide batch tracked in fusion#9): 5778 unmarked CJK lines across 37 source files translated to English — comments, doc comments/docstrings, log/error/panic messages, thiserror strings, `security_reason` literals, CLI help text. Covers all 12 Rust crates + build.rs files + bench, the full Python package, and test assertion messages synced in lockstep with the translated package/Rust strings (including the cross-layer fe-tools error wordings). Behavior byte-identical: blocklist regexes, seatbelt profile syntax, git arg arrays, wire/JSON keys, glob patterns all untouched (verified by token-stream diff + full test suites). Per the issue's marker policy, 15 lines keep Chinese with an `# i18n: user-facing` marker: 34 FORBIDDEN_ZH detection patterns in `ci/validate_docs.py` (matched against Chinese docs by design), 2 laya regex patterns containing a functional fullwidth colon, 7 fe-sandbox + 1 fe-shell multibyte UTF-8 fixtures. Gates: residual unmarked CJK = 0 (marker-aware scan); cargo fmt/clippy clean; cargo test workspace green; pytest 332 passed / 10 skipped (all environmental); ruff + docs validator clean.
 
 ## [0.2.28] — 2026-11
 
